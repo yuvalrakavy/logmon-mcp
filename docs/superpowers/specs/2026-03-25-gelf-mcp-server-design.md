@@ -73,9 +73,11 @@ Single Rust binary with a storage trait abstraction for future persistence.
 
 **GELF Listener**: Listens for GELF messages on both UDP and TCP (default port 12201 for both, configurable). UDP receives individual JSON messages; TCP receives null-byte delimited JSON streams. Both are parsed into `LogEntry` structs and forwarded to the trigger engine and log store.
 
-**Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches: flushes the pre-trigger buffer into the LogStore, sends an MCP notification to Claude, and if `auto_activate` is set and filters are defined, clears all filters (restoring implicit `ALL`).
+**Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches: flushes the pre-trigger buffer into the LogStore, sends an MCP notification to Claude, and activates a post-trigger window. During an active post-window, incoming logs skip trigger evaluation entirely and go straight to the store.
 
-**Pre-trigger Buffer**: A small ring buffer (default 500 entries) that captures all incoming logs regardless of filters. Acts as a flight recorder — when a trigger fires, its contents are flushed to the LogStore, providing context around the event.
+**Pre-trigger Buffer**: A small ring buffer (default 500 entries) that captures all incoming logs regardless of filters. Acts as a flight recorder — when a trigger fires, its contents are flushed to the LogStore, providing context before the event.
+
+**Post-trigger Window**: After a trigger fires, the next N logs (per-trigger, default 200) are stored unconditionally, bypassing both trigger evaluation and buffer filters. This captures the aftermath of an event and naturally prevents trigger cascading.
 
 **LogStore (trait)**: Abstraction over log storage. v1 implements `InMemoryStore` — a `VecDeque`-based ring buffer behind a `RwLock`. Max entries configurable (default 10,000). The trait allows swapping in SQLite or file-based persistence later.
 
@@ -197,33 +199,25 @@ struct LogEntry {
 
 To return to buffering everything, remove all filters (restores implicit `ALL` default).
 
-## Pre-trigger Buffer (Flight Recorder)
+## Event Capture Windows
 
-A small rolling buffer that captures ALL incoming logs regardless of buffer filters. When a trigger fires, the pre-trigger buffer is flushed into the LogStore, providing context around the triggering event.
+When a trigger fires, logs are captured in a window around the event, regardless of buffer filters.
 
-### Purpose
+### Pre-trigger Buffer (Flight Recorder)
 
-During normal operation with selective buffer filters, most logs are discarded. But when an error or panic occurs, the logs immediately preceding it — the ones that were being filtered out — are often the most valuable for understanding what went wrong. The pre-trigger buffer solves this by always keeping a recent window of all logs.
+A global rolling ring buffer (default 500 entries) that captures ALL incoming logs regardless of buffer filters. When a trigger fires, its contents are flushed into the LogStore at their correct chronological positions, tagged `source: pre-trigger`. Entries already in the LogStore (from buffer filters) are not duplicated. The buffer is cleared after flush and continues recording.
 
-### Behavior
+Set `GELF_PRE_TRIGGER_SIZE` to 0 to disable.
 
-1. Every incoming log is appended to the pre-trigger buffer (regardless of buffer filters)
-2. The pre-trigger buffer is a fixed-size ring buffer — old entries are evicted as new ones arrive
-3. When a trigger fires:
-   - All entries in the pre-trigger buffer are flushed into the LogStore at their correct chronological positions
-   - Flushed entries are tagged with `source: "pre-trigger"` so Claude can distinguish them from actively filtered logs
-   - The pre-trigger buffer is cleared and continues recording
-4. Entries that are already in the LogStore (because they matched a buffer filter) are not duplicated during flush
+### Post-trigger Window
 
-### Configuration
+After a trigger fires, the next N logs (per-trigger `post_window`, default 200) are stored unconditionally, bypassing both trigger evaluation and buffer filters. Tagged `source: post-trigger`.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `GELF_PRE_TRIGGER_SIZE` | `500` | Max entries in pre-trigger buffer |
+This serves two purposes:
+- Captures the aftermath of an event (retries, cascading failures, recovery)
+- Prevents trigger flooding — during the post-window, no triggers fire, so a cascading error doesn't produce 50 notifications
 
-Also available as CLI arg: `--pre-trigger-size 500`
-
-Set to 0 to disable the pre-trigger buffer.
+If multiple triggers match the same log, the largest `post_window` is used.
 
 ## Trigger System
 
@@ -233,7 +227,7 @@ Set to 0 to disable the pre-trigger buffer.
 struct Trigger {
     id: u32,                        // auto-assigned
     condition: TriggerCondition,
-    auto_activate: bool,            // switch buffer filter from NONE → ALL when fired
+    post_window: u32,               // records to capture after trigger (default 200)
     description: Option<String>,    // optional annotation (e.g., "watching MQTT disconnects")
     match_count: u64,               // how many times this trigger has fired
 }
@@ -249,10 +243,10 @@ enum TriggerCondition {
 
 Shipped out of the box:
 
-| ID | Condition | Auto-activate | Description |
-|----|-----------|---------------|-------------|
-| 1 | level >= ERROR | true | Error-level log detected |
-| 2 | pattern: `panic\|unwrap failed\|stack backtrace` | true | Panic or unwrap failure detected |
+| ID | Condition | Post-window | Description |
+|----|-----------|-------------|-------------|
+| 1 | level >= ERROR | 200 | Error-level log detected |
+| 2 | pattern: `panic\|unwrap failed\|stack backtrace` | 200 | Panic or unwrap failure detected |
 
 Default triggers are mutable — they can be edited or removed like any other trigger.
 
@@ -261,12 +255,19 @@ Default triggers are mutable — they can be edited or removed like any other tr
 For every incoming GELF message:
 
 1. Parse into LogEntry
-2. Append to pre-trigger buffer (always, regardless of filters)
-3. Evaluate all triggers — if matched:
-   a. Flush pre-trigger buffer into LogStore (tagged `source: pre-trigger`, skip duplicates already in store)
-   b. Send MCP notification to Claude
-   c. If `auto_activate` and filters are defined, clear all filters (restoring implicit `ALL`)
-4. Evaluate buffer filters — if no filters defined or any filter matches, append to LogStore (tagged `source: filter`)
+2. If a post-trigger window is active:
+   a. Append to LogStore (tagged `source: post-trigger`), decrement window counter
+   b. Append to pre-trigger buffer
+   c. Skip trigger evaluation and filter evaluation
+   d. If window counter reaches 0, resume normal flow
+3. Otherwise (normal flow):
+   a. Append to pre-trigger buffer
+   b. Evaluate all triggers — if matched:
+      - Flush pre-trigger buffer into LogStore (tagged `source: pre-trigger`, skip duplicates)
+      - Send MCP notification to Claude
+      - Activate post-trigger window (size from trigger's `post_window`)
+      - If multiple triggers match same log, use largest `post_window`
+   c. Evaluate buffer filters — if no filters defined or any filter matches, append to LogStore (tagged `source: filter`)
 
 ## MCP Tools
 
@@ -310,14 +311,14 @@ For every incoming GELF message:
 
 **`get_triggers`**
 - Parameters: none
-- Returns: List of all triggers with id, filter, auto_activate, description, match count
+- Returns: List of all triggers with id, filter, post_window, description, match count
 
 **`add_trigger`**
-- Parameters: `filter` (DSL string), `auto_activate` (bool, default true), optional `description`
+- Parameters: `filter` (DSL string), optional `post_window` (u32, default 200), optional `description`
 - Returns: Created trigger with assigned ID
 
 **`edit_trigger`**
-- Parameters: `id` (u32), optional `filter`, optional `auto_activate`, optional `description`
+- Parameters: `id` (u32), optional `filter`, optional `post_window`, optional `description`
 - Returns: Updated trigger definition
 
 **`remove_trigger`**
@@ -334,8 +335,9 @@ When a trigger fires, Claude receives a notification containing:
     "trigger_description": "Panic or unwrap failure detected",
     "filter": "panic|unwrap failed|stack backtrace",
     "matched_entry": { /* LogEntry */ },
-    "buffer_size": 4523,
-    "active_filters": 0
+    "pre_trigger_flushed": 500,
+    "post_window_size": 200,
+    "buffer_size": 4523
 }
 ```
 
