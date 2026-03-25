@@ -1,4 +1,4 @@
-use gelf_mcp_server::gelf::message::{LogEntry, Level, LogSource, parse_gelf_message};
+use gelf_mcp_server::gelf::message::{Level, parse_gelf_message};
 use serde_json::json;
 
 #[test]
