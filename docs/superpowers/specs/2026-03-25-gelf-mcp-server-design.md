@@ -2,13 +2,13 @@
 
 ## Purpose
 
-An MCP server that collects GELF-formatted logs from the Store ecosystem (store_server, ht_server) and makes them accessible to Claude in real-time. Claude receives notifications when interesting events occur and can query the log buffer on demand.
+An MCP server that collects GELF-formatted logs from any application and makes them accessible to Claude in real-time. Claude receives notifications when interesting events occur and can query the log buffer on demand.
 
-This enables Claude to have direct, continuous access to logs produced by the Store/HT projects during development, without requiring the developer to copy-paste log output.
+This enables Claude to have direct, continuous access to application logs during development, without requiring the developer to copy-paste log output. Any application that emits GELF over UDP (e.g., via Rust's `tracing-gelf`, Python's `pygelf`, Go's `go-gelf`, or any GELF-compatible logging library) can send logs to this server.
 
 ## Context
 
-- `store_server` and `ht_server` both use the `tracing_init` library, which wraps Rust's `tracing` crate and supports GELF output via `tracing-gelf` over UDP.
+- GELF (Graylog Extended Log Format) is a structured log format supported by many logging libraries across languages.
 - The MCP server acts as a GELF receiver, replacing (or running alongside) a traditional log aggregator like Graylog.
 - Primary use case is real-time development debugging. Historical log search will be added later.
 
@@ -20,8 +20,8 @@ Single Rust binary with a storage trait abstraction for future persistence.
 
 ```
 ┌─────────────────┐     ┌─────────────────┐
-│  store_server    │     │   ht_server     │
-│  (tracing_init)  │     │  (tracing_init) │
+│   Application A  │     │  Application B  │
+│  (GELF logging)  │     │  (GELF logging) │
 └────────┬────────┘     └────────┬────────┘
          │ UDP GELF                │ UDP GELF
          └──────────┬─────────────┘
@@ -57,7 +57,7 @@ Single Rust binary with a storage trait abstraction for future persistence.
 
 **UDP GELF Listener**: Binds to a configurable UDP port (default 12201, configurable via `GELF_PORT` env var or CLI arg). Receives GELF JSON messages, parses them into `LogEntry` structs, and forwards to the trigger engine and log store.
 
-**Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of the buffer filter. When a trigger matches, sends an MCP notification to Claude. If the trigger has `auto_activate` set and the current buffer filter is `NONE`, switches the filter to `ALL`.
+**Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches, sends an MCP notification to Claude. If the trigger has `auto_activate` set and filters are defined, clears all filters (restoring implicit `ALL`).
 
 **LogStore (trait)**: Abstraction over log storage. v1 implements `InMemoryStore` — a `VecDeque`-based ring buffer behind a `RwLock`. Max entries configurable (default 10,000). The trait allows swapping in SQLite or file-based persistence later.
 
@@ -75,9 +75,9 @@ struct LogEntry {
     level: Level,                              // ERROR, WARN, INFO, DEBUG, TRACE
     message: String,                           // GELF "short_message"
     full_message: Option<String>,              // GELF "full_message" (stack traces)
-    host: String,                              // GELF "host" (store_server vs ht_server)
-    facility: Option<String>,                  // GELF "facility" (Rust module path)
-    additional_fields: HashMap<String, Value>,  // GELF "_xxx" fields (tracing span data)
+    host: String,                              // GELF "host" (source application)
+    facility: Option<String>,                  // GELF "facility" (module path)
+    additional_fields: HashMap<String, Value>,  // GELF "_xxx" fields (structured data)
 }
 ```
 
@@ -129,9 +129,9 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 |--------|---------|
 | `ALL` | Match all logs |
 | `NONE` | Match no logs |
-| `"BUG",h=ht_server` | "BUG" in any field AND host is ht_server |
+| `"BUG",h=myapp` | "BUG" in any field AND host is myapp |
 | `fa=mqtt` | Facility contains "mqtt" |
-| `"connection refused",h=store_server` | Connection errors from store_server |
+| `"connection refused",h=myapp` | Connection errors from a specific host |
 | `"panic\|unwrap failed\|stack backtrace"` | Panic-related patterns |
 
 ## Buffer Filters
