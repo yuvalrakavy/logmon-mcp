@@ -26,31 +26,41 @@ Single Rust binary with a storage trait abstraction for future persistence.
          │ UDP/TCP GELF             │ UDP/TCP GELF
          └──────────┬─────────────┘
                     ▼
-         ┌─────────────────────────────────┐
-         │      gelf-mcp-server            │
-         │                                 │
-         │  ┌───────────┐  ┌────────────┐  │
-         │  │   GELF    │  │  Trigger    │  │
-         │  │ Listener  │─▶│  Engine     │  │
-         │  └─────┬─────┘  └─────┬──────┘  │
-         │        │              │          │
-         │        ▼              │ notify   │
-         │  ┌───────────┐       │          │
-         │  │  LogStore  │◀──────┘          │
-         │  │  (trait)   │                  │
-         │  └─────┬─────┘                  │
-         │        │                        │
-         │  ┌─────▼─────┐                  │
-         │  │ InMemory   │  (future:       │
-         │  │ RingBuffer │   SQLite impl)  │
-         │  └───────────┘                  │
-         │                                 │
-         │  ┌───────────┐                  │
-         │  │ MCP Server │ stdio / SSE     │
-         │  │ (Tools +   │◀──── Claude     │
-         │  │  Notifs)   │                 │
-         │  └───────────┘                  │
-         └─────────────────────────────────┘
+         ┌──────────────────────────────────────┐
+         │      gelf-mcp-server                 │
+         │                                      │
+         │  ┌───────────┐                       │
+         │  │   GELF    │                       │
+         │  │ Listener  │                       │
+         │  └─────┬─────┘                       │
+         │        │ every log                   │
+         │        ├──────────▶┌────────────┐    │
+         │        │           │  Trigger    │    │
+         │        │           │  Engine     │───── notify
+         │        │           └────────────┘    │
+         │        ▼                             │
+         │  ┌───────────┐                       │
+         │  │  Buffer    │                       │
+         │  │  Filter    │                       │
+         │  └─────┬─────┘                       │
+         │        │ if matched                  │
+         │        ▼                             │
+         │  ┌───────────┐                       │
+         │  │  LogStore  │                       │
+         │  │  (trait)   │                       │
+         │  └─────┬─────┘                       │
+         │        │                             │
+         │  ┌─────▼─────┐                       │
+         │  │ InMemory   │  (future: SQLite)    │
+         │  │ RingBuffer │                       │
+         │  └───────────┘                       │
+         │                                      │
+         │  ┌───────────┐                       │
+         │  │ MCP Server │ stdio / SSE          │
+         │  │ (Tools +   │◀──── Claude          │
+         │  │  Notifs)   │                       │
+         │  └───────────┘                       │
+         └──────────────────────────────────────┘
 ```
 
 ### Component Responsibilities
