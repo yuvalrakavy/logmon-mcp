@@ -140,3 +140,56 @@ fn test_matched_filter_descriptions_attached() {
     assert!(!recent.is_empty());
     assert!(recent[0].matched_filters.contains(&"warnings+".to_string()));
 }
+
+use std::sync::Arc;
+use tokio::time::Duration;
+
+#[tokio::test]
+async fn test_end_to_end_udp_to_query() {
+    let pipeline = Arc::new(gelf_mcp_server::engine::pipeline::LogPipeline::new(1000));
+
+    let udp_handle = gelf_mcp_server::gelf::udp::start_udp_listener(
+        "127.0.0.1:0", pipeline.clone()
+    ).await.unwrap();
+
+    // Send various GELF messages via UDP
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for i in 0..20u64 {
+        let level = if i % 5 == 0 { 3 } else { 6 }; // every 5th is ERROR (GELF level 3)
+        let msg = serde_json::json!({
+            "version": "1.1",
+            "host": "e2e-test",
+            "short_message": format!("message {i}"),
+            "level": level,
+            "facility": "test::e2e"
+        });
+        socket.send_to(
+            msg.to_string().as_bytes(),
+            format!("127.0.0.1:{}", udp_handle.port())
+        ).unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Verify all received
+    assert_eq!(pipeline.store_len(), 20);
+
+    // Query with filter — only errors (GELF level 3 = ERROR)
+    let errors = pipeline.recent_logs(100, Some("l>=ERROR"));
+    assert_eq!(errors.len(), 4); // messages 0, 5, 10, 15
+
+    // Verify triggers fired for errors
+    let triggers = pipeline.list_triggers();
+    assert!(triggers[0].match_count > 0, "error trigger should have fired");
+
+    // Test context query
+    let all_logs = pipeline.recent_logs(100, None);
+    let some_seq = all_logs[10].seq;
+    let context = pipeline.context_by_seq(some_seq, 2, 2);
+    assert!(context.len() >= 3); // at least before + target + after
+
+    // Test clear
+    let cleared = pipeline.clear_logs();
+    assert_eq!(cleared, 20);
+    assert_eq!(pipeline.store_len(), 0);
+}
