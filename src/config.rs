@@ -1,8 +1,8 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "gelf-mcp-server")]
-#[command(about = "MCP server that collects GELF logs and exposes them to Claude")]
+#[command(name = "logmon-mcp-server")]
+#[command(about = "MCP server that collects structured logs and exposes them to Claude")]
 pub struct Config {
     /// Port for both UDP and TCP listeners
     #[arg(long, default_value = "12201", env = "GELF_PORT")]

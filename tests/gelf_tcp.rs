@@ -3,13 +3,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
 use serde_json::json;
-use gelf_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::engine::pipeline::LogPipeline;
 
 #[tokio::test]
 async fn test_tcp_listener_receives_gelf() {
     let pipeline = Arc::new(LogPipeline::new(1000));
 
-    let handle = gelf_mcp_server::gelf::tcp::start_tcp_listener(
+    let handle = logmon_mcp_server::gelf::tcp::start_tcp_listener(
         "127.0.0.1:0", pipeline.clone()
     ).await.unwrap();
 
@@ -30,7 +30,7 @@ async fn test_tcp_listener_receives_gelf() {
 #[tokio::test]
 async fn test_tcp_multiple_clients() {
     let pipeline = Arc::new(LogPipeline::new(1000));
-    let handle = gelf_mcp_server::gelf::tcp::start_tcp_listener(
+    let handle = logmon_mcp_server::gelf::tcp::start_tcp_listener(
         "127.0.0.1:0", pipeline.clone()
     ).await.unwrap();
 
@@ -50,7 +50,7 @@ async fn test_tcp_multiple_clients() {
 #[tokio::test]
 async fn test_tcp_malformed_message() {
     let pipeline = Arc::new(LogPipeline::new(1000));
-    let handle = gelf_mcp_server::gelf::tcp::start_tcp_listener(
+    let handle = logmon_mcp_server::gelf::tcp::start_tcp_listener(
         "127.0.0.1:0", pipeline.clone()
     ).await.unwrap();
 

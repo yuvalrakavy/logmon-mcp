@@ -1,9 +1,9 @@
 use clap::Parser;
-use gelf_mcp_server::config::Config;
-use gelf_mcp_server::engine::pipeline::LogPipeline;
-use gelf_mcp_server::gelf::{udp, tcp};
-use gelf_mcp_server::mcp::server::GelfMcpServer;
-use gelf_mcp_server::mcp::notifications::spawn_notification_dispatcher;
+use logmon_mcp_server::config::Config;
+use logmon_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::gelf::{udp, tcp};
+use logmon_mcp_server::mcp::server::GelfMcpServer;
+use logmon_mcp_server::mcp::notifications::spawn_notification_dispatcher;
 use rmcp::ServiceExt;
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("gelf_mcp_server=info".parse()?)
+                .add_directive("logmon_mcp_server=info".parse()?)
         )
         .init();
 

@@ -1,6 +1,6 @@
 ---
-name: gelf-logs
-description: Use when debugging applications that emit GELF logs, when you need to examine runtime behavior, error patterns, or investigate issues using live log data from the GELF MCP server.
+name: logmon
+description: Use when debugging applications that emit structured logs (GELF format), when you need to examine runtime behavior, error patterns, or investigate issues using live log data from the logmon MCP server.
 ---
 
 # Using the GELF Log Collector

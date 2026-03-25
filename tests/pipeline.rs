@@ -1,5 +1,5 @@
-use gelf_mcp_server::engine::pipeline::LogPipeline;
-use gelf_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use logmon_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
 use chrono::Utc;
 use std::collections::HashMap;
 
@@ -146,9 +146,9 @@ use tokio::time::Duration;
 
 #[tokio::test]
 async fn test_end_to_end_udp_to_query() {
-    let pipeline = Arc::new(gelf_mcp_server::engine::pipeline::LogPipeline::new(1000));
+    let pipeline = Arc::new(logmon_mcp_server::engine::pipeline::LogPipeline::new(1000));
 
-    let udp_handle = gelf_mcp_server::gelf::udp::start_udp_listener(
+    let udp_handle = logmon_mcp_server::gelf::udp::start_udp_listener(
         "127.0.0.1:0", pipeline.clone()
     ).await.unwrap();
 

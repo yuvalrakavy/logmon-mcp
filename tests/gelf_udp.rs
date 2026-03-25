@@ -2,13 +2,13 @@ use std::net::UdpSocket;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use serde_json::json;
-use gelf_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::engine::pipeline::LogPipeline;
 
 #[tokio::test]
 async fn test_udp_listener_receives_gelf() {
     let pipeline = Arc::new(LogPipeline::new(1000));
 
-    let handle = gelf_mcp_server::gelf::udp::start_udp_listener(
+    let handle = logmon_mcp_server::gelf::udp::start_udp_listener(
         "127.0.0.1:0", pipeline.clone()
     ).await.unwrap();
 
@@ -35,7 +35,7 @@ async fn test_udp_listener_receives_gelf() {
 async fn test_udp_malformed_message_counted() {
     let pipeline = Arc::new(LogPipeline::new(1000));
 
-    let handle = gelf_mcp_server::gelf::udp::start_udp_listener(
+    let handle = logmon_mcp_server::gelf::udp::start_udp_listener(
         "127.0.0.1:0", pipeline.clone()
     ).await.unwrap();
 
