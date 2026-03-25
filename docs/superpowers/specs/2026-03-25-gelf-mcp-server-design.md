@@ -71,7 +71,7 @@ Single Rust binary with a storage trait abstraction for future persistence.
 
 ### Component Responsibilities
 
-**GELF Listener**: Listens for GELF messages on both UDP and TCP (default port 12201 for both, configurable). UDP receives individual JSON messages; TCP receives null-byte delimited JSON streams. Both are parsed into `LogEntry` structs and forwarded to the trigger engine and log store.
+**GELF Listener**: Listens for GELF messages on both UDP and TCP (default port 12201 for both, configurable). UDP receives individual JSON messages; TCP receives null-byte delimited JSON streams. Both are parsed into `LogEntry` structs and forwarded to the trigger engine and log store. Malformed messages (invalid JSON, missing required fields, wrong types) are counted and logged to stderr — never crash, never store in the log buffer.
 
 **Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches: flushes the pre-trigger buffer into the LogStore, sends an MCP notification to Claude, and activates a post-trigger window. During an active post-window, incoming logs skip trigger evaluation entirely and go straight to the store.
 
@@ -91,6 +91,7 @@ Normalized from GELF messages:
 
 ```rust
 struct LogEntry {
+    seq: u64,                                  // monotonically increasing, assigned at ingestion
     timestamp: DateTime<Utc>,
     level: Level,                              // ERROR, WARN, INFO, DEBUG, TRACE
     message: String,                           // GELF "short_message"
@@ -101,6 +102,8 @@ struct LogEntry {
 }
 ```
 
+The `seq` field is a unique, monotonically increasing ID assigned when the message is received. Used for deduplication during pre-trigger buffer flush, referencing specific entries, and ordering.
+
 GELF syslog levels are mapped to Rust-style levels: 0-3 → ERROR, 4 → WARN, 5-6 → INFO, 7 → DEBUG. GELF does not define a TRACE level; the `tracing-gelf` crate maps TRACE to syslog level 7 (DEBUG). To distinguish them, we use the `_level` additional field that `tracing-gelf` includes.
 
 ### LogStore Trait
@@ -109,15 +112,18 @@ GELF syslog levels are mapped to Rust-style levels: 0-3 → ERROR, 4 → WARN, 5
 trait LogStore: Send + Sync {
     fn append(&self, entry: LogEntry);
     fn recent(&self, count: usize, filter: Option<Filter>) -> Vec<LogEntry>;
-    fn context(&self, timestamp: DateTime<Utc>, window: Duration) -> Vec<LogEntry>;
+    fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry>;
+    fn context_by_time(&self, timestamp: DateTime<Utc>, window: Duration) -> Vec<LogEntry>;
+    fn contains_seq(&self, seq: u64) -> bool;  // for deduplication during pre-trigger flush
     fn clear(&self);
     fn len(&self) -> usize;
+    fn stats(&self) -> StoreStats;             // total received, total stored, malformed count
 }
 ```
 
 ## Filter DSL
 
-A filter is a comma-separated list of qualifiers. All qualifiers must match (AND semantics). For OR logic, create separate triggers.
+A filter is a comma-separated list of qualifiers. All qualifiers must match (AND semantics). For OR logic, create separate triggers/filters.
 
 ### Qualifier Syntax
 
@@ -125,13 +131,19 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 |------|---------|
 | `<pattern>` | Matched against all fields |
 | `<selector>=<pattern>` | Matched against a specific field |
+| `l>=<level>` | Log level comparison (see Level Selector) |
+
+Use double quotes to include literal commas or equals signs in patterns: `"key=value"`, `"connection refused, retrying"`.
 
 ### Pattern Types
 
 | Form | Meaning | Example |
 |------|---------|---------|
-| `text` | Substring match (contains), case-sensitive | `BUG` matches any field containing "BUG" |
-| `/regex/` | Full regex, delimited by slashes | `/^ERROR:.*timeout/` matches regex pattern |
+| `text` | Substring match (contains), **case-insensitive** | `bug` matches "BUG", "Bug", "bug" |
+| `/regex/` | Full regex, case-sensitive by default | `/^ERROR:.*timeout/` |
+| `/regex/i` | Full regex, case-insensitive | `/connection (refused\|reset)/i` |
+
+Substring matches are case-insensitive because log messages mix cases constantly. Use regex when case matters.
 
 ### Selectors
 
@@ -142,7 +154,20 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 | `mfm` | message or full_message (matches if either contains the pattern) |
 | `h` | host |
 | `fa` | facility (module path) |
+| `l` | level (special: supports `>=`, `<=`, `=` comparisons) |
 | `<other>` | Custom GELF additional field (`_xxx`) |
+
+### Level Selector
+
+The `l` selector uses comparison operators instead of pattern matching:
+
+| Form | Meaning |
+|------|---------|
+| `l>=WARN` | Level is WARN or more severe (WARN, ERROR) |
+| `l<=INFO` | Level is INFO or less severe (INFO, DEBUG, TRACE) |
+| `l=DEBUG` | Level is exactly DEBUG |
+
+Level names are case-insensitive. Severity order: ERROR > WARN > INFO > DEBUG > TRACE.
 
 ### Special Patterns
 
@@ -157,11 +182,14 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 |--------|---------|
 | `ALL` | Match all logs |
 | `NONE` | Match no logs |
-| `BUG,h=myapp` | "BUG" substring in any field AND host contains "myapp" |
+| `l>=ERROR` | All error-level and above |
+| `l>=WARN,h=myapp` | Warnings and errors from myapp |
+| `bug,h=myapp` | "bug" (case-insensitive) in any field AND host contains "myapp" |
 | `fa=mqtt` | Facility contains "mqtt" |
-| `connection refused,h=myapp` | "connection refused" substring from a specific host |
+| `connection refused,h=myapp` | "connection refused" from a specific host |
 | `/panic\|unwrap failed\|stack backtrace/` | Regex: panic-related patterns |
-| `mfm=/timeout.*retry/` | Regex on message or full_message |
+| `mfm=/timeout.*retry/i` | Case-insensitive regex on message or full_message |
+| `"key=value"` | Literal "key=value" in any field (quoted to avoid selector parsing) |
 
 ## Buffer Filters
 
@@ -235,28 +263,25 @@ If multiple triggers match the same log, the largest `post_window` is used.
 ```rust
 struct Trigger {
     id: u32,                        // auto-assigned
-    condition: TriggerCondition,
+    condition: ParsedFilter,        // uses the DSL (level conditions via `l>=` selector)
     pre_window: u32,                // records to flush before trigger (default 500)
     post_window: u32,               // records to capture after trigger (default 200)
+    notify_context: u32,            // entries to include before matched entry in notification (default 5)
     description: Option<String>,    // optional annotation (e.g., "watching MQTT disconnects")
     match_count: u64,               // how many times this trigger has fired
 }
-
-enum TriggerCondition {
-    LevelAtLeast(Level),
-    Filter(ParsedFilter),           // uses the DSL
-    LevelAndFilter(Level, ParsedFilter),
-}
 ```
+
+No separate `TriggerCondition` enum — the DSL handles everything including level conditions via the `l` selector.
 
 ### Default Triggers
 
 Shipped out of the box:
 
-| ID | Condition | Pre-window | Post-window | Description |
-|----|-----------|------------|-------------|-------------|
-| 1 | level >= ERROR | 500 | 200 | Error-level log detected |
-| 2 | pattern: `/panic\|unwrap failed\|stack backtrace/` | 500 | 200 | Panic or unwrap failure detected |
+| ID | Filter | Pre-window | Post-window | Notify-context | Description |
+|----|--------|------------|-------------|----------------|-------------|
+| 1 | `l>=ERROR` | 500 | 200 | 5 | Error-level log detected |
+| 2 | `/panic\|unwrap failed\|stack backtrace/` | 500 | 200 | 5 | Panic or unwrap failure detected |
 
 Default triggers are mutable — they can be edited or removed like any other trigger.
 
@@ -289,20 +314,25 @@ For every incoming GELF message:
 - Retrieves the most recent logs from the buffer, optionally filtered
 
 **`get_log_context`**
-- Parameters: `timestamp` (ISO 8601), `window_secs` (u32, default 5)
-- Returns: Array of LogEntry within the time window around the given timestamp
-- Useful for examining what happened around a specific event
+- Parameters: `seq` (u64, a log entry's sequence number), optional `before` (u32, default 10), optional `after` (u32, default 10)
+- Returns: Array of LogEntry surrounding the specified entry
+- Can also accept `timestamp` (ISO 8601) + `window_secs` (u32, default 5) as an alternative to seq-based lookup
 
 **`export_logs`**
 - Parameters: `path` (file path), optional `count` (u32, default all buffered), optional `filter` (DSL string), optional `format` ("json" or "text", default "json")
 - Returns: Confirmation + number of entries exported
 - Writes matching log entries from the buffer to a file for comparison, sharing, or archival
 
+**`clear_logs`**
+- Parameters: none
+- Returns: Confirmation + number of entries cleared
+- Clears the LogStore buffer. Pre-trigger buffer is unaffected. Useful for starting fresh before a test.
+
 ### Status Tool
 
 **`get_status`**
 - Parameters: none
-- Returns: Active filter count, buffer size, trigger count, UDP port, TCP port, connected TCP clients, uptime
+- Returns: active filter count, buffer size, trigger count, UDP port, TCP port, connected TCP clients, uptime, pre-trigger buffer size/capacity, active post-window state (remaining records, trigger id), total messages received, total messages stored, malformed message count
 
 ### Buffer Filter Management Tools
 
@@ -326,14 +356,14 @@ For every incoming GELF message:
 
 **`get_triggers`**
 - Parameters: none
-- Returns: List of all triggers with id, filter, pre_window, post_window, description, match count
+- Returns: List of all triggers with id, filter, pre_window, post_window, notify_context, description, match count
 
 **`add_trigger`**
-- Parameters: `filter` (DSL string), optional `pre_window` (u32, default 500), optional `post_window` (u32, default 200), optional `description`
+- Parameters: `filter` (DSL string), optional `pre_window` (u32, default 500), optional `post_window` (u32, default 200), optional `notify_context` (u32, default 5), optional `description`
 - Returns: Created trigger with assigned ID
 
 **`edit_trigger`**
-- Parameters: `id` (u32), optional `filter`, optional `pre_window`, optional `post_window`, optional `description`
+- Parameters: `id` (u32), optional `filter`, optional `pre_window`, optional `post_window`, optional `notify_context`, optional `description`
 - Returns: Updated trigger definition
 
 **`remove_trigger`**
@@ -350,11 +380,14 @@ When a trigger fires, Claude receives a notification containing:
     "trigger_description": "Panic or unwrap failure detected",
     "filter": "/panic|unwrap failed|stack backtrace/",
     "matched_entry": { /* LogEntry */ },
+    "context_before": [ /* notify_context entries preceding the match */ ],
     "pre_trigger_flushed": 500,
     "post_window_size": 200,
     "buffer_size": 4523
 }
 ```
+
+The `context_before` array contains up to `notify_context` log entries immediately preceding the matched entry (from the pre-trigger buffer). This gives Claude enough context to assess severity without an extra tool call.
 
 ## Configuration
 
