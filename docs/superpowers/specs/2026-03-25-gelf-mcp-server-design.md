@@ -293,6 +293,11 @@ For every incoming GELF message:
 - Returns: Array of LogEntry within the time window around the given timestamp
 - Useful for examining what happened around a specific event
 
+**`export_logs`**
+- Parameters: `path` (file path), optional `count` (u32, default all buffered), optional `filter` (DSL string), optional `format` ("json" or "text", default "json")
+- Returns: Confirmation + number of entries exported
+- Writes matching log entries from the buffer to a file for comparison, sharing, or archival
+
 ### Status Tool
 
 **`get_status`**
@@ -421,10 +426,12 @@ gelf-mcp-server/
 │       └── notifications.rs  # Notification dispatch to Claude
 ```
 
+## Limitations
+
+- **Chunked GELF UDP is not supported.** Use TCP for messages exceeding the UDP MTU. Chunked GELF reassembly adds complexity for minimal benefit given TCP support.
+
 ## Future Work (Out of Scope for v1)
 
 - **Persistent storage**: SQLite implementation of LogStore for historical queries
 - **Rate anomaly detection**: Trigger on sudden error rate spikes
 - **SSE transport**: For remote/multi-client scenarios
-- **Log export**: Dump buffer to file for sharing
-- **Chunked GELF**: Support reassembly of chunked UDP messages (for payloads exceeding UDP MTU)
