@@ -4,7 +4,7 @@ use crate::filter::matcher::matches_entry;
 use crate::filter::parser::{ParsedFilter, parse_filter, FilterParseError};
 use crate::gelf::message::{LogEntry, LogSource};
 use crate::store::memory::InMemoryStore;
-use crate::store::traits::LogStore;
+use crate::store::traits::{LogStore, StoreStats};
 use std::sync::{RwLock, atomic::{AtomicU32, AtomicU64, Ordering}};
 use thiserror::Error;
 
@@ -72,6 +72,14 @@ impl LogPipeline {
 
     pub fn store_len(&self) -> usize {
         self.store.len()
+    }
+
+    pub fn increment_malformed(&self) {
+        self.store.increment_malformed();
+    }
+
+    pub fn store_stats(&self) -> StoreStats {
+        self.store.stats()
     }
 
     pub fn recent_logs(&self, count: usize, filter_str: Option<&str>) -> Vec<LogEntry> {
