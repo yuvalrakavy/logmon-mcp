@@ -8,7 +8,9 @@ use crate::store::traits::{LogStore, StoreStats};
 use std::sync::{RwLock, atomic::{AtomicU32, AtomicU64, Ordering}};
 use thiserror::Error;
 use chrono;
+use tokio::sync::broadcast;
 
+#[derive(Clone)]
 pub struct PipelineEvent {
     pub trigger_id: u32,
     pub trigger_description: Option<String>,
@@ -40,6 +42,7 @@ pub struct LogPipeline {
     post_window_remaining: AtomicU32,
     next_filter_id: AtomicU32,
     seq_counter: AtomicU64,
+    event_sender: broadcast::Sender<PipelineEvent>,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +59,7 @@ impl LogPipeline {
     pub fn new(store_capacity: usize) -> Self {
         let triggers = TriggerManager::new();
         let max_pre = triggers.max_pre_window() as usize;
+        let (event_sender, _) = broadcast::channel(100);
         Self {
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(max_pre),
@@ -64,6 +68,7 @@ impl LogPipeline {
             post_window_remaining: AtomicU32::new(0),
             next_filter_id: AtomicU32::new(1),
             seq_counter: AtomicU64::new(0),
+            event_sender,
         }
     }
 
@@ -81,6 +86,10 @@ impl LogPipeline {
 
     pub fn store_stats(&self) -> StoreStats {
         self.store.stats()
+    }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
+        self.event_sender.subscribe()
     }
 
     pub fn recent_logs(&self, count: usize, filter_str: Option<&str>) -> Vec<LogEntry> {
@@ -158,6 +167,9 @@ impl LogPipeline {
                 });
             }
 
+            for event in &events {
+                let _ = self.event_sender.send(event.clone()); // ignore if no receivers
+            }
             return events;
         }
 
