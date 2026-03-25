@@ -26,48 +26,56 @@ Single Rust binary with a storage trait abstraction for future persistence.
          │ UDP/TCP GELF             │ UDP/TCP GELF
          └──────────┬─────────────┘
                     ▼
-         ┌──────────────────────────────────────┐
-         │      gelf-mcp-server                 │
-         │                                      │
-         │  ┌───────────┐                       │
-         │  │   GELF    │                       │
-         │  │ Listener  │                       │
-         │  └─────┬─────┘                       │
-         │        │ every log                   │
-         │        ├──────────▶┌────────────┐    │
-         │        │           │  Trigger    │    │
-         │        │           │  Engine     │───── notify
-         │        │           └────────────┘    │
-         │        ▼                             │
-         │  ┌───────────┐                       │
-         │  │  Buffer    │                       │
-         │  │  Filter    │                       │
-         │  └─────┬─────┘                       │
-         │        │ if matched                  │
-         │        ▼                             │
-         │  ┌───────────┐                       │
-         │  │  LogStore  │                       │
-         │  │  (trait)   │                       │
-         │  └─────┬─────┘                       │
-         │        │                             │
-         │  ┌─────▼─────┐                       │
-         │  │ InMemory   │  (future: SQLite)    │
-         │  │ RingBuffer │                       │
-         │  └───────────┘                       │
-         │                                      │
-         │  ┌───────────┐                       │
-         │  │ MCP Server │ stdio / SSE          │
-         │  │ (Tools +   │◀──── Claude          │
-         │  │  Notifs)   │                       │
-         │  └───────────┘                       │
-         └──────────────────────────────────────┘
+         ┌───────────────────────────────────────────────┐
+         │      gelf-mcp-server                          │
+         │                                               │
+         │  ┌───────────┐                                │
+         │  │   GELF    │                                │
+         │  │ Listener  │                                │
+         │  └─────┬─────┘                                │
+         │        │ every log                            │
+         │        ├──────────▶┌────────────┐             │
+         │        │           │  Trigger    │             │
+         │        │           │  Engine     │── notify Claude
+         │        │           └──────┬─────┘             │
+         │        │                  │ on match:         │
+         │        │                  │ flush ──┐         │
+         │        │                  │         │         │
+         │        ├──────────▶┌──────▼──────┐  │         │
+         │        │           │ Pre-trigger  │  │         │
+         │        │           │ Buffer       │──┘         │
+         │        │           │ (all logs)   │            │
+         │        │           └─────────────┘            │
+         │        ▼                   │                  │
+         │  ┌───────────┐            │ flush to store   │
+         │  │  Buffer    │            │                  │
+         │  │  Filter    │            │                  │
+         │  └─────┬─────┘            │                  │
+         │        │ if matched       │                  │
+         │        ▼                  ▼                   │
+         │  ┌───────────────────────────┐               │
+         │  │  LogStore (trait)          │               │
+         │  │  ┌───────────────────┐    │               │
+         │  │  │ InMemory RingBuf  │    │               │
+         │  │  │ (future: SQLite)  │    │               │
+         │  │  └───────────────────┘    │               │
+         │  └───────────────────────────┘               │
+         │                                               │
+         │  ┌───────────┐                                │
+         │  │ MCP Server │ stdio / SSE                   │
+         │  │ (Tools +   │◀──── Claude                   │
+         │  │  Notifs)   │                                │
+         │  └───────────┘                                │
+         └───────────────────────────────────────────────┘
 ```
 
 ### Component Responsibilities
 
 **GELF Listener**: Listens for GELF messages on both UDP and TCP (default port 12201 for both, configurable). UDP receives individual JSON messages; TCP receives null-byte delimited JSON streams. Both are parsed into `LogEntry` structs and forwarded to the trigger engine and log store.
 
-**Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches, sends an MCP notification to Claude. If the trigger has `auto_activate` set and filters are defined, clears all filters (restoring implicit `ALL`).
+**Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches: flushes the pre-trigger buffer into the LogStore, sends an MCP notification to Claude, and if `auto_activate` is set and filters are defined, clears all filters (restoring implicit `ALL`).
+
+**Pre-trigger Buffer**: A small ring buffer (default 500 entries) that captures all incoming logs regardless of filters. Acts as a flight recorder — when a trigger fires, its contents are flushed to the LogStore, providing context around the event.
 
 **LogStore (trait)**: Abstraction over log storage. v1 implements `InMemoryStore` — a `VecDeque`-based ring buffer behind a `RwLock`. Max entries configurable (default 10,000). The trait allows swapping in SQLite or file-based persistence later.
 
@@ -174,6 +182,7 @@ When a log is buffered, the descriptions of all matching filters are recorded:
 struct LogEntry {
     // ... existing fields ...
     matched_filters: Vec<String>,  // descriptions of filters that matched this entry
+    source: LogSource,             // how this entry entered the store
 }
 ```
 
@@ -187,6 +196,34 @@ struct LogEntry {
 | `remove_filter` | `id` | Confirmation |
 
 To return to buffering everything, remove all filters (restores implicit `ALL` default).
+
+## Pre-trigger Buffer (Flight Recorder)
+
+A small rolling buffer that captures ALL incoming logs regardless of buffer filters. When a trigger fires, the pre-trigger buffer is flushed into the LogStore, providing context around the triggering event.
+
+### Purpose
+
+During normal operation with selective buffer filters, most logs are discarded. But when an error or panic occurs, the logs immediately preceding it — the ones that were being filtered out — are often the most valuable for understanding what went wrong. The pre-trigger buffer solves this by always keeping a recent window of all logs.
+
+### Behavior
+
+1. Every incoming log is appended to the pre-trigger buffer (regardless of buffer filters)
+2. The pre-trigger buffer is a fixed-size ring buffer — old entries are evicted as new ones arrive
+3. When a trigger fires:
+   - All entries in the pre-trigger buffer are flushed into the LogStore at their correct chronological positions
+   - Flushed entries are tagged with `source: "pre-trigger"` so Claude can distinguish them from actively filtered logs
+   - The pre-trigger buffer is cleared and continues recording
+4. Entries that are already in the LogStore (because they matched a buffer filter) are not duplicated during flush
+
+### Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GELF_PRE_TRIGGER_SIZE` | `500` | Max entries in pre-trigger buffer |
+
+Also available as CLI arg: `--pre-trigger-size 500`
+
+Set to 0 to disable the pre-trigger buffer.
 
 ## Trigger System
 
@@ -224,8 +261,12 @@ Default triggers are mutable — they can be edited or removed like any other tr
 For every incoming GELF message:
 
 1. Parse into LogEntry
-2. Evaluate all triggers — if matched, send MCP notification; if `auto_activate` and filters are defined, clear all filters (restoring implicit `ALL` — buffer everything)
-3. Evaluate buffer filters — if no filters defined or any filter matches, append to LogStore
+2. Append to pre-trigger buffer (always, regardless of filters)
+3. Evaluate all triggers — if matched:
+   a. Flush pre-trigger buffer into LogStore (tagged `source: pre-trigger`, skip duplicates already in store)
+   b. Send MCP notification to Claude
+   c. If `auto_activate` and filters are defined, clear all filters (restoring implicit `ALL`)
+4. Evaluate buffer filters — if no filters defined or any filter matches, append to LogStore (tagged `source: filter`)
 
 ## MCP Tools
 
@@ -308,13 +349,14 @@ When a trigger fires, Claude receives a notification containing:
 | `GELF_UDP_PORT` | — | Override port for UDP only |
 | `GELF_TCP_PORT` | — | Override port for TCP only |
 | `GELF_BUFFER_SIZE` | `10000` | Max log entries in ring buffer |
+| `GELF_PRE_TRIGGER_SIZE` | `500` | Max entries in pre-trigger buffer (0 to disable) |
 
 ### CLI Arguments
 
 Same options available as CLI args (take precedence over env vars):
 
 ```
-gelf-mcp-server [--port 12201] [--udp-port 12201] [--tcp-port 12201] [--buffer-size 10000]
+gelf-mcp-server [--port 12201] [--udp-port 12201] [--tcp-port 12201] [--buffer-size 10000] [--pre-trigger-size 500]
 ```
 
 `--port` sets both UDP and TCP. `--udp-port` and `--tcp-port` override individually.
