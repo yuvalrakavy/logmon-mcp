@@ -18,13 +18,18 @@ flush_tcp() {
 }
 
 send_gelf_udp() {
-    echo "$1" | nc -u -w0 "$HOST" "$PORT"
-    sleep 0.1
+    # nc -u -w0 is unreliable on macOS (closes before sending), use python3 instead
+    python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.sendto(b'''$1''', ('$HOST', $PORT))
+s.close()
+"
 }
 
 TCP_PAYLOAD=""
 
-echo "Sending test GELF messages to $HOST:$PORT via ${PROTO^^}..."
+echo "Sending test GELF messages to $HOST:$PORT via $PROTO..."
 
 MESSAGES=(
   '{"version":"1.1","host":"test-app","short_message":"Application started","level":6,"facility":"test::main","_request_id":"req-001"}'
