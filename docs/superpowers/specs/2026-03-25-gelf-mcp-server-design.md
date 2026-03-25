@@ -81,7 +81,7 @@ struct LogEntry {
 }
 ```
 
-GELF syslog levels are mapped to Rust-style levels: 0-3 → ERROR, 4 → WARN, 5-6 → INFO, 7 → DEBUG.
+GELF syslog levels are mapped to Rust-style levels: 0-3 → ERROR, 4 → WARN, 5-6 → INFO, 7 → DEBUG. GELF does not define a TRACE level; the `tracing-gelf` crate maps TRACE to syslog level 7 (DEBUG). To distinguish them, we use the `_level` additional field that `tracing-gelf` includes.
 
 ### LogStore Trait
 
@@ -172,6 +172,8 @@ Shipped out of the box:
 |----|-----------|---------------|-------------|
 | 1 | level >= ERROR | true | Error-level log detected |
 | 2 | pattern: `panic\|unwrap failed\|stack backtrace` | true | Panic or unwrap failure detected |
+
+Default triggers are mutable — they can be edited or removed like any other trigger.
 
 ### Trigger Evaluation Flow
 
@@ -310,3 +312,4 @@ gelf-mcp-server/
 - **Rate anomaly detection**: Trigger on sudden error rate spikes
 - **SSE transport**: For remote/multi-client scenarios
 - **Log export**: Dump buffer to file for sharing
+- **Chunked GELF**: Support reassembly of chunked UDP messages (for payloads exceeding UDP MTU)
