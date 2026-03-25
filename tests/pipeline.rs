@@ -1,4 +1,4 @@
-use gelf_mcp_server::engine::pipeline::{LogPipeline, PipelineEvent};
+use gelf_mcp_server::engine::pipeline::LogPipeline;
 use gelf_mcp_server::gelf::message::{LogEntry, Level, LogSource};
 use chrono::Utc;
 use std::collections::HashMap;

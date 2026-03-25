@@ -180,9 +180,8 @@ fn split_on_commas(input: &str) -> Result<Vec<String>, FilterParseError> {
 
 /// Parse a pattern string (could be a regex `/pattern/[i]` or a plain substring).
 fn parse_pattern(s: &str) -> Result<Pattern, FilterParseError> {
-    if s.starts_with('/') {
+    if let Some(inner) = s.strip_prefix('/') {
         // Regex: find the closing /
-        let inner = &s[1..];
         let (source, case_insensitive) = if let Some(pos) = inner.rfind('/') {
             let src = &inner[..pos];
             let flags = &inner[pos + 1..];

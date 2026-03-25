@@ -17,5 +17,8 @@ pub trait LogStore: Send + Sync {
     fn contains_seq(&self, seq: u64) -> bool;
     fn clear(&self);
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn stats(&self) -> StoreStats;
 }
