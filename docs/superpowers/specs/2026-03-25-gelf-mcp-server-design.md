@@ -98,6 +98,8 @@ struct LogEntry {
     full_message: Option<String>,              // GELF "full_message" (stack traces)
     host: String,                              // GELF "host" (source application)
     facility: Option<String>,                  // GELF "facility" (module path)
+    file: Option<String>,                      // GELF "file" (source file name)
+    line: Option<u32>,                         // GELF "line" (source line number)
     additional_fields: HashMap<String, Value>,  // GELF "_xxx" fields (structured data)
 }
 ```
@@ -154,6 +156,8 @@ Substring matches are case-insensitive because log messages mix cases constantly
 | `mfm` | message or full_message (matches if either contains the pattern) |
 | `h` | host |
 | `fa` | facility (module path) |
+| `fi` | file (source file name) |
+| `ln` | line (source line number, matched as string) |
 | `l` | level (special: supports `>=`, `<=`, `=` comparisons) |
 | `<other>` | Custom GELF additional field (`_xxx`) |
 
