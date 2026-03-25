@@ -132,6 +132,7 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 |----------|-------|
 | `m` | message (short_message) |
 | `fm` | full_message |
+| `mfm` | message or full_message (matches if either contains the pattern) |
 | `h` | host |
 | `fa` | facility (module path) |
 | `<other>` | Custom GELF additional field (`_xxx`) |
