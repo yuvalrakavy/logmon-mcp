@@ -134,15 +134,49 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 | `"connection refused",h=store_server` | Connection errors from store_server |
 | `"panic\|unwrap failed\|stack backtrace"` | Panic-related patterns |
 
-## Buffer Filter
+## Buffer Filters
 
-The buffer filter controls which logs are stored. It uses the same DSL as triggers:
+Buffer filters control which logs are stored. They follow the same pattern as triggers — a list of DSL expressions with OR semantics across them, AND within each expression.
 
-- `ALL` — store every log (full collection)
-- `NONE` — store nothing (monitoring only, triggers still evaluate)
-- Any DSL expression — selective collection
+### Semantics
 
-The buffer filter is orthogonal to triggers. Triggers always evaluate every incoming log regardless of the buffer filter.
+- **No filters defined** — everything is buffered (implicit `ALL`)
+- **One or more filters defined** — a log is buffered if ANY filter matches; if none match, the log is discarded
+- **Matched filter descriptions are attached to the stored LogEntry** — so Claude can see why each log was kept
+
+Buffer filters are orthogonal to triggers. Triggers always evaluate every incoming log regardless of buffer filters.
+
+### Filter Definition
+
+```rust
+struct BufferFilter {
+    id: u32,                        // auto-assigned
+    condition: ParsedFilter,        // uses the DSL
+    description: Option<String>,    // annotation (e.g., "MQTT debugging")
+}
+```
+
+### LogEntry Extension
+
+When a log is buffered, the descriptions of all matching filters are recorded:
+
+```rust
+struct LogEntry {
+    // ... existing fields ...
+    matched_filters: Vec<String>,  // descriptions of filters that matched this entry
+}
+```
+
+### Filter Management Tools
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `get_filters` | none | List of all buffer filters with id, filter, description |
+| `add_filter` | `filter` (DSL string), optional `description` | Created filter with assigned ID |
+| `edit_filter` | `id`, optional `filter`, optional `description` | Updated filter |
+| `remove_filter` | `id` | Confirmation |
+
+To return to buffering everything, remove all filters (restores implicit `ALL` default).
 
 ## Trigger System
 
@@ -180,8 +214,8 @@ Default triggers are mutable — they can be edited or removed like any other tr
 For every incoming GELF message:
 
 1. Parse into LogEntry
-2. Evaluate all triggers — if matched, send MCP notification; if `auto_activate` and buffer filter is `NONE`, switch to `ALL`
-3. Evaluate buffer filter — if matched, append to LogStore
+2. Evaluate all triggers — if matched, send MCP notification; if `auto_activate` and filters are defined, clear all filters (restoring implicit `ALL` — buffer everything)
+3. Evaluate buffer filters — if no filters defined or any filter matches, append to LogStore
 
 ## MCP Tools
 
@@ -197,16 +231,29 @@ For every incoming GELF message:
 - Returns: Array of LogEntry within the time window around the given timestamp
 - Useful for examining what happened around a specific event
 
-### Buffer & Status Tools
-
-**`set_filter`**
-- Parameters: `filter` (DSL string: `"ALL"`, `"NONE"`, or any DSL expression)
-- Returns: Confirmation + previous filter
-- Controls which logs are buffered
+### Status Tool
 
 **`get_status`**
 - Parameters: none
-- Returns: Current buffer filter, buffer size, trigger count, listener port, uptime
+- Returns: Active filter count, buffer size, trigger count, listener port, uptime
+
+### Buffer Filter Management Tools
+
+**`get_filters`**
+- Parameters: none
+- Returns: List of all buffer filters with id, filter, description
+
+**`add_filter`**
+- Parameters: `filter` (DSL string), optional `description`
+- Returns: Created filter with assigned ID
+
+**`edit_filter`**
+- Parameters: `id` (u32), optional `filter`, optional `description`
+- Returns: Updated filter definition
+
+**`remove_filter`**
+- Parameters: `id` (u32)
+- Returns: Confirmation
 
 ### Trigger Management Tools
 
@@ -237,7 +284,7 @@ When a trigger fires, Claude receives a notification containing:
     "filter": "panic|unwrap failed|stack backtrace",
     "matched_entry": { /* LogEntry */ },
     "buffer_size": 4523,
-    "buffer_filter": "ALL"
+    "active_filters": 0
 }
 ```
 
