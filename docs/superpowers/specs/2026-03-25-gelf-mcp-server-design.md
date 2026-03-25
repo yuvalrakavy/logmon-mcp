@@ -222,6 +222,12 @@ struct BufferFilter {
 When a log is buffered, the descriptions of all matching filters are recorded:
 
 ```rust
+enum LogSource {
+    Filter,      // matched a buffer filter
+    PreTrigger,  // flushed from pre-trigger buffer when a trigger fired
+    PostTrigger, // captured during post-trigger window
+}
+
 struct LogEntry {
     // ... existing fields ...
     matched_filters: Vec<String>,  // descriptions of filters that matched this entry
@@ -246,7 +252,7 @@ When a trigger fires, logs are captured in a window around the event, regardless
 
 ### Pre-trigger Buffer (Flight Recorder)
 
-A global rolling ring buffer that captures ALL incoming logs regardless of buffer filters. The buffer automatically sizes itself to `max(pre_window)` across all configured triggers. When a specific trigger fires, its `pre_window` entries are flushed into the LogStore at their correct chronological positions, tagged `source: pre-trigger`. Entries already in the LogStore (from buffer filters) are not duplicated. The buffer is cleared after flush and continues recording.
+A global rolling ring buffer that captures ALL incoming logs regardless of buffer filters. The buffer automatically sizes itself to `max(pre_window)` across all configured triggers. When a specific trigger fires, its `pre_window` entries are flushed into the LogStore at their correct chronological positions, tagged `source: pre-trigger`. Entries already in the LogStore (from buffer filters) are not duplicated. Only the flushed entries are removed from the buffer — remaining entries stay for potential future triggers. The buffer continues recording during and after flush.
 
 If all triggers have `pre_window: 0`, the pre-trigger buffer is disabled.
 
