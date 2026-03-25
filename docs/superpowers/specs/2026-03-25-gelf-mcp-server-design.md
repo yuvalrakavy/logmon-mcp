@@ -123,8 +123,15 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 
 | Form | Meaning |
 |------|---------|
-| `<pattern>` | Regex matched against all fields |
-| `<selector>=<regex>` | Regex matched against a specific field |
+| `<pattern>` | Matched against all fields |
+| `<selector>=<pattern>` | Matched against a specific field |
+
+### Pattern Types
+
+| Form | Meaning | Example |
+|------|---------|---------|
+| `text` | Substring match (contains), case-sensitive | `BUG` matches any field containing "BUG" |
+| `/regex/` | Full regex, delimited by slashes | `/^ERROR:.*timeout/` matches regex pattern |
 
 ### Selectors
 
@@ -150,10 +157,11 @@ A filter is a comma-separated list of qualifiers. All qualifiers must match (AND
 |--------|---------|
 | `ALL` | Match all logs |
 | `NONE` | Match no logs |
-| `"BUG",h=myapp` | "BUG" in any field AND host is myapp |
+| `BUG,h=myapp` | "BUG" substring in any field AND host contains "myapp" |
 | `fa=mqtt` | Facility contains "mqtt" |
-| `"connection refused",h=myapp` | Connection errors from a specific host |
-| `"panic\|unwrap failed\|stack backtrace"` | Panic-related patterns |
+| `connection refused,h=myapp` | "connection refused" substring from a specific host |
+| `/panic\|unwrap failed\|stack backtrace/` | Regex: panic-related patterns |
+| `mfm=/timeout.*retry/` | Regex on message or full_message |
 
 ## Buffer Filters
 
@@ -247,7 +255,7 @@ Shipped out of the box:
 | ID | Condition | Post-window | Description |
 |----|-----------|-------------|-------------|
 | 1 | level >= ERROR | 200 | Error-level log detected |
-| 2 | pattern: `panic\|unwrap failed\|stack backtrace` | 200 | Panic or unwrap failure detected |
+| 2 | pattern: `/panic\|unwrap failed\|stack backtrace/` | 200 | Panic or unwrap failure detected |
 
 Default triggers are mutable — they can be edited or removed like any other trigger.
 
@@ -334,7 +342,7 @@ When a trigger fires, Claude receives a notification containing:
 {
     "trigger_id": 2,
     "trigger_description": "Panic or unwrap failure detected",
-    "filter": "panic|unwrap failed|stack backtrace",
+    "filter": "/panic|unwrap failed|stack backtrace/",
     "matched_entry": { /* LogEntry */ },
     "pre_trigger_flushed": 500,
     "post_window_size": 200,
