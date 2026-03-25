@@ -1,6 +1,6 @@
 ---
 name: logmon
-description: Use when debugging applications that emit structured logs (GELF format), when you need to examine runtime behavior, error patterns, or investigate issues using live log data from the logmon MCP server.
+description: Use when debugging runtime behavior, investigating errors or crashes, examining log output, or when the user mentions logs, tracing, or asks you to check what happened. Also use when the logmon MCP server tools (get_recent_logs, get_triggers, etc.) are available. Covers any project that uses structured logging (GELF, tracing, syslog).
 ---
 
 # Using the GELF Log Collector
