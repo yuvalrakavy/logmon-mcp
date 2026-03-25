@@ -23,14 +23,14 @@ Single Rust binary with a storage trait abstraction for future persistence.
 │   Application A  │     │  Application B  │
 │  (GELF logging)  │     │  (GELF logging) │
 └────────┬────────┘     └────────┬────────┘
-         │ UDP GELF                │ UDP GELF
+         │ UDP/TCP GELF             │ UDP/TCP GELF
          └──────────┬─────────────┘
                     ▼
          ┌─────────────────────────────────┐
          │      gelf-mcp-server            │
          │                                 │
          │  ┌───────────┐  ┌────────────┐  │
-         │  │ UDP GELF  │  │  Trigger    │  │
+         │  │   GELF    │  │  Trigger    │  │
          │  │ Listener  │─▶│  Engine     │  │
          │  └─────┬─────┘  └─────┬──────┘  │
          │        │              │          │
@@ -55,7 +55,7 @@ Single Rust binary with a storage trait abstraction for future persistence.
 
 ### Component Responsibilities
 
-**UDP GELF Listener**: Binds to a configurable UDP port (default 12201, configurable via `GELF_PORT` env var or CLI arg). Receives GELF JSON messages, parses them into `LogEntry` structs, and forwards to the trigger engine and log store.
+**GELF Listener**: Listens for GELF messages on both UDP and TCP (default port 12201 for both, configurable). UDP receives individual JSON messages; TCP receives null-byte delimited JSON streams. Both are parsed into `LogEntry` structs and forwarded to the trigger engine and log store.
 
 **Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches, sends an MCP notification to Claude. If the trigger has `auto_activate` set and filters are defined, clears all filters (restoring implicit `ALL`).
 
@@ -235,7 +235,7 @@ For every incoming GELF message:
 
 **`get_status`**
 - Parameters: none
-- Returns: Active filter count, buffer size, trigger count, listener port, uptime
+- Returns: Active filter count, buffer size, trigger count, UDP port, TCP port, connected TCP clients, uptime
 
 ### Buffer Filter Management Tools
 
@@ -294,7 +294,9 @@ When a trigger fires, Claude receives a notification containing:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `GELF_PORT` | `12201` | UDP port to listen on |
+| `GELF_PORT` | `12201` | Port for both UDP and TCP listeners |
+| `GELF_UDP_PORT` | — | Override port for UDP only |
+| `GELF_TCP_PORT` | — | Override port for TCP only |
 | `GELF_BUFFER_SIZE` | `10000` | Max log entries in ring buffer |
 
 ### CLI Arguments
@@ -302,8 +304,10 @@ When a trigger fires, Claude receives a notification containing:
 Same options available as CLI args (take precedence over env vars):
 
 ```
-gelf-mcp-server [--port 12201] [--buffer-size 10000]
+gelf-mcp-server [--port 12201] [--udp-port 12201] [--tcp-port 12201] [--buffer-size 10000]
 ```
+
+`--port` sets both UDP and TCP. `--udp-port` and `--tcp-port` override individually.
 
 ### MCP Config (Claude Code settings)
 
@@ -332,7 +336,8 @@ gelf-mcp-server/
 │   ├── main.rs              # CLI entry, arg parsing, starts Tokio runtime
 │   ├── gelf/
 │   │   ├── mod.rs
-│   │   ├── listener.rs      # UDP socket, GELF parsing
+│   │   ├── udp.rs           # UDP listener
+│   │   ├── tcp.rs           # TCP listener (null-byte delimited)
 │   │   └── message.rs       # LogEntry struct, GELF → LogEntry conversion
 │   ├── store/
 │   │   ├── mod.rs
