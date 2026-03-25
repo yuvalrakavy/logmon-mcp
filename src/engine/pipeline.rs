@@ -7,6 +7,7 @@ use crate::store::memory::InMemoryStore;
 use crate::store::traits::{LogStore, StoreStats};
 use std::sync::{RwLock, atomic::{AtomicU32, AtomicU64, Ordering}};
 use thiserror::Error;
+use chrono;
 
 pub struct PipelineEvent {
     pub trigger_id: u32,
@@ -281,5 +282,25 @@ impl LogPipeline {
 
     pub fn list_triggers(&self) -> Vec<TriggerInfo> {
         self.triggers.list()
+    }
+
+    // --- Store helpers ---
+
+    pub fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry> {
+        self.store.context_by_seq(seq, before, after)
+    }
+
+    pub fn context_by_time(
+        &self,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        window: std::time::Duration,
+    ) -> Vec<LogEntry> {
+        self.store.context_by_time(timestamp, window)
+    }
+
+    pub fn clear_logs(&self) -> usize {
+        let count = self.store.len();
+        self.store.clear();
+        count
     }
 }
