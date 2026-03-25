@@ -1,2 +1,2 @@
 pub mod parser;
-// TODO: implement matcher in Task 4
+pub mod matcher;

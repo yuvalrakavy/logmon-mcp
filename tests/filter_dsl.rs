@@ -1,4 +1,25 @@
 use gelf_mcp_server::filter::parser::*;
+use gelf_mcp_server::filter::matcher::matches_entry;
+use gelf_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use chrono::Utc;
+use std::collections::HashMap;
+
+fn test_entry(level: Level, message: &str, host: &str) -> LogEntry {
+    LogEntry {
+        seq: 1,
+        timestamp: Utc::now(),
+        level,
+        message: message.to_string(),
+        full_message: None,
+        host: host.to_string(),
+        facility: Some("test::module".to_string()),
+        file: Some("test.rs".to_string()),
+        line: Some(42),
+        additional_fields: HashMap::new(),
+        matched_filters: Vec::new(),
+        source: LogSource::Filter,
+    }
+}
 
 #[test]
 fn test_parse_all() {
@@ -161,4 +182,106 @@ fn test_parse_file_and_line_selectors() {
     } else {
         panic!("expected Qualifiers");
     }
+}
+
+// --- Matcher tests ---
+
+#[test]
+fn test_match_all() {
+    let f = parse_filter("ALL").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Debug, "hello", "app")));
+}
+
+#[test]
+fn test_match_none() {
+    let f = parse_filter("NONE").unwrap();
+    assert!(!matches_entry(&f, &test_entry(Level::Debug, "hello", "app")));
+}
+
+#[test]
+fn test_match_substring_case_insensitive() {
+    let f = parse_filter("BUG").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "found a bug here", "app")));
+    assert!(matches_entry(&f, &test_entry(Level::Info, "BUG report", "app")));
+    assert!(!matches_entry(&f, &test_entry(Level::Info, "all good", "app")));
+}
+
+#[test]
+fn test_match_host_selector() {
+    let f = parse_filter("h=myapp").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "hello", "myapp")));
+    assert!(!matches_entry(&f, &test_entry(Level::Info, "hello", "other")));
+}
+
+#[test]
+fn test_match_level_gte() {
+    let f = parse_filter("l>=WARN").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Error, "err", "app")));
+    assert!(matches_entry(&f, &test_entry(Level::Warn, "warn", "app")));
+    assert!(!matches_entry(&f, &test_entry(Level::Info, "info", "app")));
+}
+
+#[test]
+fn test_match_combined_qualifiers() {
+    let f = parse_filter("timeout,h=myapp,l>=WARN").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Error, "connection timeout", "myapp")));
+    assert!(!matches_entry(&f, &test_entry(Level::Error, "connection timeout", "other")));
+    assert!(!matches_entry(&f, &test_entry(Level::Info, "connection timeout", "myapp")));
+    assert!(!matches_entry(&f, &test_entry(Level::Error, "success", "myapp")));
+}
+
+#[test]
+fn test_match_facility_selector() {
+    let f = parse_filter("fa=test").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "msg", "app")));
+}
+
+#[test]
+fn test_match_file_selector() {
+    let f = parse_filter("fi=test.rs").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "msg", "app")));
+}
+
+#[test]
+fn test_match_regex() {
+    let f = parse_filter("/^found.*bug/i").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "Found a Bug here", "app")));
+    assert!(!matches_entry(&f, &test_entry(Level::Info, "no match", "app")));
+}
+
+#[test]
+fn test_bare_substring_matches_all_fields() {
+    let f = parse_filter("myapp").unwrap();
+    // Should match host field too
+    assert!(matches_entry(&f, &test_entry(Level::Info, "something", "myapp")));
+}
+
+#[test]
+fn test_match_line_selector() {
+    let f = parse_filter("ln=42").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "msg", "app")));
+    let f2 = parse_filter("ln=99").unwrap();
+    assert!(!matches_entry(&f2, &test_entry(Level::Info, "msg", "app")));
+}
+
+#[test]
+fn test_match_level_eq() {
+    let f = parse_filter("l=INFO").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "msg", "app")));
+    assert!(!matches_entry(&f, &test_entry(Level::Warn, "msg", "app")));
+}
+
+#[test]
+fn test_match_level_lte() {
+    let f = parse_filter("l<=INFO").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "msg", "app")));
+    assert!(matches_entry(&f, &test_entry(Level::Debug, "msg", "app")));
+    assert!(!matches_entry(&f, &test_entry(Level::Warn, "msg", "app")));
+}
+
+#[test]
+fn test_match_mfm_selector() {
+    let f = parse_filter("mfm=timeout").unwrap();
+    assert!(matches_entry(&f, &test_entry(Level::Info, "connection timeout", "app")));
+    assert!(!matches_entry(&f, &test_entry(Level::Info, "success", "app")));
 }
