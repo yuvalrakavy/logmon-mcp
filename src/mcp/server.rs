@@ -249,6 +249,14 @@ impl GelfMcpServer {
         )]))
     }
 
+    #[rmcp::tool(description = "Get recent malformed messages that failed GELF parsing.")]
+    async fn get_malformed(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let entries = self.pipeline.get_malformed();
+        let json = serde_json::to_string_pretty(&entries)
+            .map_err(|e| rmcp::ErrorData::internal_error(format!("serialization error: {e}"), None))?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
     // ---- Filter Management Tools ----
 
     #[rmcp::tool(description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored.")]

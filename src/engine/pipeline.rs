@@ -5,7 +5,8 @@ use crate::filter::parser::{ParsedFilter, parse_filter, FilterParseError};
 use crate::gelf::message::{LogEntry, LogSource};
 use crate::store::memory::InMemoryStore;
 use crate::store::traits::{LogStore, StoreStats};
-use std::sync::{RwLock, atomic::{AtomicU32, AtomicU64, Ordering}};
+use std::collections::VecDeque;
+use std::sync::{Mutex, RwLock, atomic::{AtomicU32, AtomicU64, Ordering}};
 use thiserror::Error;
 use chrono;
 use tokio::sync::broadcast;
@@ -34,6 +35,12 @@ struct BufferFilterEntry {
     description: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct MalformedEntry {
+    pub error: String,
+    pub preview: String,
+}
+
 pub struct LogPipeline {
     store: InMemoryStore,
     pre_buffer: PreTriggerBuffer,
@@ -43,6 +50,7 @@ pub struct LogPipeline {
     next_filter_id: AtomicU32,
     seq_counter: AtomicU64,
     event_sender: broadcast::Sender<PipelineEvent>,
+    malformed_buffer: Mutex<VecDeque<MalformedEntry>>,
 }
 
 #[derive(Debug, Error)]
@@ -69,6 +77,7 @@ impl LogPipeline {
             next_filter_id: AtomicU32::new(1),
             seq_counter: AtomicU64::new(0),
             event_sender,
+            malformed_buffer: Mutex::new(VecDeque::with_capacity(20)),
         }
     }
 
@@ -80,8 +89,17 @@ impl LogPipeline {
         self.store.len()
     }
 
-    pub fn increment_malformed(&self) {
+    pub fn record_malformed(&self, error: String, preview: String) {
         self.store.increment_malformed();
+        let mut buf = self.malformed_buffer.lock().unwrap();
+        if buf.len() >= 20 {
+            buf.pop_front();
+        }
+        buf.push_back(MalformedEntry { error, preview });
+    }
+
+    pub fn get_malformed(&self) -> Vec<MalformedEntry> {
+        self.malformed_buffer.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn store_stats(&self) -> StoreStats {

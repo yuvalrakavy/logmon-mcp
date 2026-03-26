@@ -270,12 +270,18 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
 
     // Selector=pattern: look for the first `=` sign
     if let Some(eq_pos) = token.find('=') {
-        let lhs = &token[..eq_pos];
-        let rhs = &token[eq_pos + 1..];
+        let lhs = token[..eq_pos].trim();
+        let rhs = token[eq_pos + 1..].trim();
 
         // lhs must not be empty; if it's empty treat as bare substring
         if !lhs.is_empty() {
             let selector = parse_selector(lhs);
+            // Strip surrounding quotes from pattern value
+            let rhs = if rhs.starts_with('"') && rhs.ends_with('"') && rhs.len() >= 2 {
+                &rhs[1..rhs.len() - 1]
+            } else {
+                rhs
+            };
             let pattern = parse_pattern(rhs)?;
             return Ok(Qualifier::SelectorPattern(selector, pattern));
         }

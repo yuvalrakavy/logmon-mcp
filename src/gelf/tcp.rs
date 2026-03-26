@@ -73,8 +73,8 @@ pub async fn start_tcp_listener(
                                         pipeline.process(entry);
                                     }
                                     Err(e) => {
-                                        eprintln!("malformed GELF TCP: {e}");
-                                        pipeline.increment_malformed();
+                                        let preview = String::from_utf8_lossy(&buf[..buf.len().min(300)]).to_string();
+                                        pipeline.record_malformed(format!("TCP: {e}"), preview);
                                     }
                                 }
                             }

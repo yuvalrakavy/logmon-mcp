@@ -27,13 +27,18 @@ pub async fn start_udp_listener(
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
-                    if let Ok((len, _addr)) = result {
+                    if let Ok((len, addr)) = result {
                         let seq = pipeline.assign_seq();
-                        match parse_gelf_message(&buf[..len], seq) {
+                        // Strip trailing null bytes (some GELF libraries append TCP-style null delimiters to UDP)
+                        let mut end = len;
+                        while end > 0 && buf[end - 1] == 0 {
+                            end -= 1;
+                        }
+                        match parse_gelf_message(&buf[..end], seq) {
                             Ok(entry) => { pipeline.process(entry); }
                             Err(e) => {
-                                eprintln!("malformed GELF UDP: {e}");
-                                pipeline.increment_malformed();
+                                let preview = String::from_utf8_lossy(&buf[..len.min(300)]).to_string();
+                                pipeline.record_malformed(format!("UDP from {addr}: {e}"), preview);
                             }
                         }
                     }
