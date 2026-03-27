@@ -62,6 +62,12 @@ src/
 ```toml
 uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"                    # file locking (cross-platform)
+async-trait = "0.1"
+libc = "0.2"                   # Unix PID check (cfg(unix) only)
+tracing-appender = "0.2"       # daemon log file rotation
+
+[dev-dependencies]
+tempfile = "3"                 # temp dirs for persistence tests
 ```
 
 ---
@@ -491,10 +497,14 @@ async fn test_udp_listener_receives_gelf() {
 
 - [ ] **Step 4: Update TCP test similarly**
 
-- [ ] **Step 5: Run all tests**
+- [ ] **Step 5: Temporarily disable pipeline integration tests**
+
+The existing `tests/pipeline.rs` tests call `LogPipeline::process()` and other methods that will be removed in Task 6. Comment out or delete the tests that depend on `process()`, `add_filter()`, `add_trigger()`, etc. Keep only the `test_seq_counter` test and the `make_entry` helper. The full integration tests will be rewritten in Task 7 (log processor) and Task 14 (multi-session).
+
+- [ ] **Step 6: Run all tests**
 
 Run: `cargo test`
-Expected: All tests pass (pipeline tests may need adjustments — see Task 6)
+Expected: All tests pass (some pipeline tests removed, GELF tests updated)
 
 - [ ] **Step 6: Commit**
 
@@ -861,46 +871,136 @@ git commit -m "refactor: LogPipeline to shared infrastructure (store + pre-buffe
 
 - [ ] **Step 1: Write log processor tests**
 
-Test the core processing flow: channel receives entry → trigger evaluation across sessions → storage.
+Test the core processing flow using `process_entry` directly (not through the channel — that's tested in integration). Import `process_entry` as a public function for testability.
 
 ```rust
-#[tokio::test]
-async fn test_log_stored_when_no_filters() {
-    // Create pipeline, session registry with one anonymous session (no filters)
-    // Send entry via channel
-    // Verify entry is in store
+use logmon_mcp_server::daemon::log_processor::process_entry;
+use logmon_mcp_server::daemon::session::SessionRegistry;
+use logmon_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+fn make_entry(level: Level, msg: &str) -> LogEntry {
+    LogEntry {
+        seq: 0, // daemon assigns real seq
+        timestamp: Utc::now(), level,
+        message: msg.to_string(), full_message: None,
+        host: "test".into(), facility: Some("test::module".into()),
+        file: None, line: None,
+        additional_fields: HashMap::new(),
+        matched_filters: Vec::new(), source: LogSource::Filter,
+    }
 }
 
-#[tokio::test]
-async fn test_trigger_fires_and_flushes() {
-    // Create pipeline, session with default error trigger
-    // Send several INFO entries (go to pre-buffer only)
-    // Send ERROR entry
-    // Verify: pre-buffer entries flushed to store, event sent
+#[test]
+fn test_log_stored_when_no_filters() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let _sid = sessions.create_anonymous();
+
+    let mut entry = make_entry(Level::Info, "hello");
+    process_entry(&mut entry, &pipeline, &sessions);
+    assert_eq!(pipeline.store_len(), 1);
+    assert!(entry.seq > 0); // seq was assigned
 }
 
-#[tokio::test]
-async fn test_post_window_skips_triggers() {
-    // Create session with small post_window (2)
-    // Fire trigger (ERROR)
-    // Send 2 more entries — should bypass triggers
-    // Send 3rd — should evaluate triggers again
+#[test]
+fn test_trigger_fires_and_flushes_pre_buffer() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+    // Session has default error trigger (pre_window=500)
+
+    // Add a filter so INFO logs are NOT stored normally
+    sessions.add_filter(&sid, "l>=ERROR", Some("errors")).unwrap();
+
+    // Send 10 INFO entries — go to pre-buffer but not store
+    for _ in 0..10 {
+        let mut entry = make_entry(Level::Info, "background noise");
+        process_entry(&mut entry, &pipeline, &sessions);
+    }
+    assert_eq!(pipeline.store_len(), 0);
+
+    // Send ERROR — trigger fires, pre-buffer flushes
+    let mut error_entry = make_entry(Level::Error, "crash!");
+    process_entry(&mut error_entry, &pipeline, &sessions);
+    // Pre-buffer entries + triggering entry should be in store
+    assert!(pipeline.store_len() > 1);
 }
 
-#[tokio::test]
-async fn test_per_session_filters() {
-    // Session A: filter fa=mqtt
-    // Session B: filter l>=ERROR
-    // Send mqtt INFO log → stored (matches A)
-    // Send non-mqtt DEBUG log → not stored (matches neither)
-    // Send ERROR log → stored (matches B)
+#[test]
+fn test_post_window_skips_triggers() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+    // Edit trigger to have post_window=2
+    let triggers = sessions.list_triggers(&sid);
+    sessions.edit_trigger(&sid, triggers[0].id, None, None, Some(2), None, None).unwrap();
+
+    // Add filter to block INFO
+    sessions.add_filter(&sid, "l>=ERROR", None).unwrap();
+
+    // Fire trigger
+    let mut entry = make_entry(Level::Error, "crash");
+    process_entry(&mut entry, &pipeline, &sessions);
+    let after_trigger = pipeline.store_len();
+
+    // 2 post-window entries — stored despite filter
+    let mut p1 = make_entry(Level::Info, "post 1");
+    process_entry(&mut p1, &pipeline, &sessions);
+    let mut p2 = make_entry(Level::Info, "post 2");
+    process_entry(&mut p2, &pipeline, &sessions);
+    assert_eq!(pipeline.store_len(), after_trigger + 2);
+
+    // 3rd entry — post-window expired, filtered out
+    let mut p3 = make_entry(Level::Info, "filtered");
+    process_entry(&mut p3, &pipeline, &sessions);
+    assert_eq!(pipeline.store_len(), after_trigger + 2);
 }
 
-#[tokio::test]
-async fn test_notification_queued_for_disconnected_session() {
-    // Create named session, disconnect it
-    // Send ERROR log — trigger matches
-    // Verify notification is queued, not sent
+#[test]
+fn test_per_session_filters() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid_a = sessions.create_anonymous();
+    let sid_b = sessions.create_anonymous();
+
+    sessions.add_filter(&sid_a, "fa=mqtt", None).unwrap();
+    sessions.add_filter(&sid_b, "l>=ERROR", None).unwrap();
+
+    // MQTT INFO → stored (matches A's filter)
+    let mut e1 = make_entry(Level::Info, "mqtt msg");
+    e1.facility = Some("app::mqtt".into());
+    process_entry(&mut e1, &pipeline, &sessions);
+    assert_eq!(pipeline.store_len(), 1);
+
+    // Non-MQTT DEBUG → not stored
+    let mut e2 = make_entry(Level::Debug, "debug msg");
+    e2.facility = Some("app::http".into());
+    process_entry(&mut e2, &pipeline, &sessions);
+    assert_eq!(pipeline.store_len(), 1);
+
+    // ERROR → stored (matches B's filter)
+    let mut e3 = make_entry(Level::Error, "error msg");
+    e3.facility = Some("app::http".into());
+    process_entry(&mut e3, &pipeline, &sessions);
+    assert!(pipeline.store_len() > 1); // error + possible pre-buffer flush
+}
+
+#[test]
+fn test_notification_queued_for_disconnected_session() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_named("test-queue").unwrap();
+    sessions.disconnect(&sid);
+
+    let mut entry = make_entry(Level::Error, "crash while disconnected");
+    process_entry(&mut entry, &pipeline, &sessions);
+
+    let queued = sessions.drain_notifications(&sid);
+    assert_eq!(queued.len(), 1);
 }
 ```
 
@@ -930,22 +1030,89 @@ pub fn spawn_log_processor(
     })
 }
 
-fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &SessionRegistry) {
+pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &SessionRegistry) {
     // 1. Assign seq
     entry.seq = pipeline.assign_seq();
 
     // 2. Append to pre-trigger buffer
     pipeline.pre_buffer_append(entry.clone());
 
-    // 3. For each session (sorted by largest pre_window first):
-    //    a. Check post-window → skip triggers if active
-    //    b. Evaluate triggers → flush pre-buffer, send/queue notification, activate post-window
-    //    c. Track if any session has active post-window
+    // 3. Evaluate triggers per session
+    let mut any_post_window_active = false;
+    let mut trigger_matched_any = false;
 
-    // 4. Storage: if any post-window active → store unconditionally
-    //    Otherwise: union filters, store if any match (or no filters defined)
+    // Get session list sorted by largest pre_window first
+    let session_ids = sessions.active_session_ids_sorted_by_pre_window();
 
-    // Always store the triggering entry when a trigger matches
+    for sid in &session_ids {
+        // 3a. Check post-window
+        if sessions.decrement_post_window(sid) {
+            any_post_window_active = true;
+            continue;
+        }
+
+        // 3b. Evaluate triggers
+        let matches = sessions.evaluate_triggers(sid, entry);
+        if !matches.is_empty() {
+            trigger_matched_any = true;
+            let max_pre = matches.iter().map(|m| m.pre_window).max().unwrap_or(0);
+            let max_post = matches.iter().map(|m| m.post_window).max().unwrap_or(0);
+
+            // Always store the triggering entry
+            if !pipeline.contains_seq(entry.seq) {
+                let mut trigger_entry = entry.clone();
+                trigger_entry.source = LogSource::PreTrigger;
+                pipeline.append_to_store(trigger_entry);
+            }
+
+            // Copy pre_window entries from pre-buffer into store
+            let pre_entries = pipeline.pre_buffer_copy(max_pre as usize);
+            for mut pre_entry in pre_entries {
+                if !pipeline.contains_seq(pre_entry.seq) {
+                    pre_entry.source = LogSource::PreTrigger;
+                    pipeline.append_to_store(pre_entry);
+                }
+            }
+
+            // Activate post-window for this session
+            sessions.set_post_window(sid, max_post);
+            any_post_window_active = true;
+
+            // Build notification event and send/queue
+            for m in &matches {
+                let context_before = pipeline.store_context_before(entry.seq, m.notify_context as usize);
+                let event = PipelineEvent {
+                    trigger_id: m.id,
+                    trigger_description: m.description.clone(),
+                    filter_string: m.filter_string.clone(),
+                    matched_entry: entry.clone(),
+                    context_before,
+                    pre_trigger_flushed: max_pre as usize,
+                    post_window_size: m.post_window,
+                };
+                sessions.send_or_queue_notification(sid, event);
+            }
+        }
+    }
+
+    // 4. Buffer storage (if entry not already stored by trigger logic)
+    if !pipeline.contains_seq(entry.seq) {
+        if any_post_window_active {
+            // Post-window active — store unconditionally
+            let mut store_entry = entry.clone();
+            store_entry.source = LogSource::PostTrigger;
+            pipeline.append_to_store(store_entry);
+        } else {
+            // Evaluate union of all sessions' filters
+            let (should_store, matched_descriptions) = sessions.evaluate_filters(entry);
+            if should_store {
+                let mut store_entry = entry.clone();
+                store_entry.matched_filters = matched_descriptions;
+                store_entry.source = LogSource::Filter;
+                pipeline.append_to_store(store_entry);
+            }
+        }
+    }
 }
 ```
 
@@ -1076,10 +1243,15 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let config_dir = config_dir();
     std::fs::create_dir_all(&config_dir)?;
 
-    // Redirect tracing to daemon.log (max 10MB, rotate)
-    // Use tracing_appender::rolling or similar
-    let log_path = config_dir.join("daemon.log");
-    // Configure file-based tracing subscriber here
+    // Redirect tracing to daemon.log (daily rotation)
+    let file_appender = tracing_appender::rolling::daily(&config_dir, "daemon.log");
+    tracing_subscriber::fmt()
+        .with_writer(file_appender)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("logmon_mcp_server=info".parse().unwrap())
+        )
+        .init();
 
     // Load state
     let state = load_state(&config_dir.join("state.json"))?;
@@ -1133,13 +1305,35 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         eprintln!("Daemon listening on {:?}", sock_path);
 
         // Accept connections loop
-        accept_loop(listener, rpc_handler, sessions, pipeline, config, state).await?;
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            let handler = rpc_handler.clone();
+            let sessions = sessions.clone();
+            let pipeline = pipeline.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(stream, handler, sessions, pipeline).await {
+                    tracing::warn!("Connection error: {e}");
+                }
+            });
+        }
     }
 
     #[cfg(windows)]
     {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:12200").await?;
-        // Similar accept loop over TCP
+        loop {
+            let (stream, _addr) = listener.accept().await?;
+            let handler = rpc_handler.clone();
+            let sessions = sessions.clone();
+            let pipeline = pipeline.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(stream, handler, sessions, pipeline).await {
+                    tracing::warn!("Connection error: {e}");
+                }
+            });
+        }
     }
 
     // Cleanup
@@ -1151,18 +1345,74 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
 }
 ```
 
-Each accepted connection:
-1. Read `session.start` request
-2. Validate protocol version
-3. Create/reconnect session
-4. Spawn per-connection handler task:
-   - Loop: read RPC requests, dispatch to `rpc_handler.handle()`, write responses
-   - Also: listen for notifications from pipeline events for this session, forward as RPC notifications
-5. On connection close: disconnect session
+The `handle_connection` function (generic over the stream type using `AsyncRead + AsyncWrite`):
 
-Idle timeout: track last activity across all connections. If no connections and no named sessions for `idle_timeout_secs`, shut down.
+```rust
+async fn handle_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: S,
+    handler: Arc<RpcHandler>,
+    sessions: Arc<SessionRegistry>,
+    pipeline: Arc<LogPipeline>,
+) -> anyhow::Result<()> {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = tokio::io::BufReader::new(reader);
 
-State persistence: write state.json whenever a new seq block is reserved (every 1000 logs) and on shutdown.
+    // 1. Read session.start request
+    let start_req = transport::read_request(&mut reader).await?
+        .ok_or_else(|| anyhow::anyhow!("connection closed before session.start"))?;
+
+    if start_req.method != "session.start" {
+        let resp = RpcResponse::error(start_req.id, -32600, "first message must be session.start");
+        transport::write_message(&mut writer, &resp).await?;
+        return Ok(());
+    }
+
+    // 2. Validate protocol version
+    let params: SessionStartParams = serde_json::from_value(start_req.params)?;
+    if params.protocol_version != PROTOCOL_VERSION {
+        let resp = RpcResponse::error(start_req.id, -32600,
+            &format!("protocol version mismatch: expected {}, got {}", PROTOCOL_VERSION, params.protocol_version));
+        transport::write_message(&mut writer, &resp).await?;
+        return Ok(());
+    }
+
+    // 3. Create/reconnect session
+    let session_id = match &params.name {
+        Some(name) => {
+            if sessions.is_disconnected_named(name) {
+                sessions.reconnect_named(name)?
+            } else {
+                sessions.create_named(name)?
+            }
+        }
+        None => sessions.create_anonymous(),
+    };
+
+    // Send session.start response
+    let start_result = handler.build_session_start_result(&session_id);
+    let resp = RpcResponse::success(start_req.id, serde_json::to_value(&start_result)?);
+    transport::write_message(&mut writer, &resp).await?;
+
+    // 4. Drain queued notifications (for reconnected named sessions)
+    let queued = sessions.drain_notifications(&session_id);
+    for event in queued {
+        let notif = RpcNotification::new("trigger.fired", serde_json::to_value(&event)?);
+        transport::write_message(&mut writer, &notif).await?;
+    }
+
+    // 5. Main RPC loop
+    let event_rx = pipeline.subscribe_events();
+    // ... select between reading RPC requests and forwarding notifications
+    // On EOF or error: disconnect session
+
+    sessions.disconnect(&session_id);
+    Ok(())
+}
+```
+
+**Idle timeout** is implemented in the accept loop: the daemon tracks connected session count. When it reaches zero, a timer starts. If no new connections arrive within `idle_timeout_secs` and no named sessions have active triggers, the daemon breaks out of the accept loop and shuts down.
+
+**State persistence**: the log processor calls `pipeline.check_seq_block()` which returns true when a new block boundary is crossed. The daemon then writes state.json. Also written on clean shutdown.
 
 - [ ] **Step 2: Add `new_with_seq(buffer_size, initial_seq)` to LogPipeline**
 
@@ -1323,8 +1573,9 @@ use std::collections::HashMap;
 
 /// Bridge between shim and daemon
 /// Handles multiplexing: sends requests, matches responses by id, forwards notifications
+/// The writer is type-erased behind a trait object for platform independence.
 pub struct DaemonBridge {
-    writer: Mutex<WriteHalf<...>>,  // platform-specific
+    writer: Mutex<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>,
     next_id: AtomicU64,
     notification_tx: broadcast::Sender<RpcNotification>,
@@ -1358,7 +1609,7 @@ impl DaemonBridge {
 }
 
 /// Spawns reader loop that routes responses to pending requests and notifications to broadcast
-pub fn spawn_reader_loop(bridge: Arc<DaemonBridge>, reader: ReadHalf<...>) {
+pub fn spawn_reader_loop(bridge: Arc<DaemonBridge>, reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(reader);
         loop {
@@ -1405,6 +1656,60 @@ async fn get_recent_logs(&self, Parameters(params): Parameters<GetRecentLogsPara
 ```
 
 All tools follow the same pattern: serialize params → call bridge → return result.
+
+**Path resolution** for `export_logs`: the shim resolves relative paths before sending:
+```rust
+// In the export_logs tool handler, before calling bridge:
+if let Some(ref path) = params.path {
+    if !std::path::Path::new(path).is_absolute() {
+        params.path = Some(std::env::current_dir()?.join(path).to_string_lossy().to_string());
+    }
+}
+```
+
+**`run_shim` function** (called from main.rs):
+```rust
+pub async fn run_shim(conn: DaemonConnection, session_name: Option<String>) -> anyhow::Result<()> {
+    // Split the connection stream
+    let (reader, writer) = tokio::io::split(conn.stream);
+
+    // Create bridge
+    let (notification_tx, _) = broadcast::channel(100);
+    let bridge = Arc::new(DaemonBridge {
+        writer: Mutex::new(Box::new(writer)),
+        pending: Mutex::new(HashMap::new()),
+        next_id: AtomicU64::new(1),
+        notification_tx: notification_tx.clone(),
+    });
+
+    // Spawn reader loop
+    spawn_reader_loop(bridge.clone(), Box::new(reader));
+
+    // Send session.start
+    let start_result = bridge.call("session.start", serde_json::to_value(&SessionStartParams {
+        name: session_name,
+        protocol_version: PROTOCOL_VERSION,
+    })?).await?;
+
+    let session_info: SessionStartResult = serde_json::from_value(start_result)?;
+    eprintln!("Connected to daemon: session={}, new={}", session_info.session_id, session_info.is_new);
+
+    // Create MCP server with bridge
+    let server = GelfMcpServer::new_with_bridge(bridge.clone(), session_info);
+    let transport = (tokio::io::stdin(), tokio::io::stdout());
+    let running = server.serve(transport).await?;
+
+    // Forward daemon notifications to MCP
+    let notification_rx = bridge.subscribe_notifications();
+    spawn_notification_forwarder(notification_rx, running.peer().clone());
+
+    running.waiting().await?;
+
+    // Send session.stop
+    let _ = bridge.call("session.stop", serde_json::json!({})).await;
+    Ok(())
+}
+```
 
 - [ ] **Step 3: Modify notifications to forward from daemon RPC**
 
@@ -1561,49 +1866,110 @@ git commit -m "feat: get_sessions and drop_session MCP tools"
 
 - [ ] **Step 1: Write multi-session integration tests**
 
-These tests start a daemon, connect multiple shims, and verify:
+These tests use `process_entry` directly with the `SessionRegistry` and `LogPipeline` (avoiding socket/daemon startup complexity). The socket-level integration can be tested manually or in a dedicated E2E test later.
 
 ```rust
-#[tokio::test]
-async fn test_daemon_starts_and_accepts_connection() {
-    // Start daemon on random ports
-    // Connect via socket
-    // Send session.start
-    // Verify response
+use logmon_mcp_server::daemon::log_processor::process_entry;
+use logmon_mcp_server::daemon::session::SessionRegistry;
+use logmon_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use logmon_mcp_server::filter::parser::parse_filter;
+use logmon_mcp_server::filter::matcher::matches_entry;
+use chrono::Utc;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+fn make_entry(level: Level, msg: &str, facility: &str) -> LogEntry {
+    LogEntry {
+        seq: 0, timestamp: Utc::now(), level,
+        message: msg.to_string(), full_message: None,
+        host: "test".into(), facility: Some(facility.into()),
+        file: None, line: None,
+        additional_fields: HashMap::new(),
+        matched_filters: Vec::new(), source: LogSource::Filter,
+    }
 }
 
-#[tokio::test]
-async fn test_two_sessions_share_logs() {
-    // Start daemon
-    // Connect session A and session B
-    // Send GELF message
-    // Both sessions can query the log
+#[test]
+fn test_two_sessions_share_logs() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let _sid_a = sessions.create_anonymous();
+    let _sid_b = sessions.create_anonymous();
+
+    let mut entry = make_entry(Level::Info, "shared log", "app::main");
+    process_entry(&mut entry, &pipeline, &sessions);
+
+    // Both sessions can see the log
+    let filter = parse_filter("ALL").unwrap();
+    let logs = pipeline.recent_logs(10, Some(&filter));
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].message, "shared log");
 }
 
-#[tokio::test]
-async fn test_per_session_triggers() {
-    // Session A: add trigger fa=mqtt
-    // Session B: keep defaults
-    // Send mqtt ERROR → both get notification
-    // Send generic ERROR → only B gets notification
+#[test]
+fn test_per_session_filter_lens() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid_a = sessions.create_anonymous();
+    let sid_b = sessions.create_anonymous();
+
+    sessions.add_filter(&sid_a, "fa=mqtt", None).unwrap();
+    sessions.add_filter(&sid_b, "fa=http", None).unwrap();
+
+    // Send mqtt log and http log
+    let mut mqtt_entry = make_entry(Level::Info, "mqtt msg", "app::mqtt");
+    process_entry(&mut mqtt_entry, &pipeline, &sessions);
+    let mut http_entry = make_entry(Level::Info, "http msg", "app::http");
+    process_entry(&mut http_entry, &pipeline, &sessions);
+
+    // Both are stored (union of filters)
+    assert_eq!(pipeline.store_len(), 2);
+
+    // Session A's default lens sees only mqtt
+    let filter_a = parse_filter("fa=mqtt").unwrap();
+    let logs_a = pipeline.recent_logs(10, Some(&filter_a));
+    assert_eq!(logs_a.len(), 1);
+    assert_eq!(logs_a[0].message, "mqtt msg");
+
+    // Session B's default lens sees only http
+    let filter_b = parse_filter("fa=http").unwrap();
+    let logs_b = pipeline.recent_logs(10, Some(&filter_b));
+    assert_eq!(logs_b.len(), 1);
+    assert_eq!(logs_b[0].message, "http msg");
 }
 
-#[tokio::test]
-async fn test_named_session_reconnect() {
-    // Connect named session "test"
+#[test]
+fn test_named_session_survives_disconnect() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_named("persistent").unwrap();
+
     // Add custom trigger
+    sessions.add_trigger(&sid, "fa=special", 100, 50, 3, Some("custom")).unwrap();
+    let triggers_before = sessions.list_triggers(&sid);
+    assert_eq!(triggers_before.len(), 3); // 2 defaults + 1 custom
+
     // Disconnect
-    // Send ERROR logs → notifications queued
-    // Reconnect with same name
-    // Verify queued notifications received
-    // Verify custom trigger still exists
+    sessions.disconnect(&sid);
+    assert!(!sessions.is_connected(&sid));
+
+    // Triggers still exist
+    let triggers_after = sessions.list_triggers(&sid);
+    assert_eq!(triggers_after.len(), 3);
+
+    // Reconnect
+    sessions.reconnect(&sid).unwrap();
+    assert!(sessions.is_connected(&sid));
 }
 
-#[tokio::test]
-async fn test_anonymous_session_cleanup() {
-    // Connect anonymous
-    // Disconnect
-    // Verify session removed from registry
+#[test]
+fn test_anonymous_session_cleanup_on_disconnect() {
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+    assert_eq!(sessions.list().len(), 1);
+    sessions.disconnect(&sid);
+    assert_eq!(sessions.list().len(), 0);
 }
 ```
 
