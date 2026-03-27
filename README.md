@@ -1,11 +1,13 @@
 # logmon-mcp
 
-A log monitoring MCP server that collects structured logs (GELF format) from applications and exposes them to Claude Code via MCP tools. Multiple Claude sessions share a single log collector daemon.
+A log monitoring MCP server that collects structured logs (GELF format) from applications and exposes them to AI coding assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). Multiple sessions share a single log collector daemon.
+
+Works with any MCP-compatible client: Claude Code, Cursor, Windsurf, VS Code (Copilot), Gemini CLI, OpenAI Codex CLI, and more.
 
 ## Architecture
 
 ```
-Application(s)                Claude Code Sessions
+Application(s)                AI Coding Sessions
      |                          |           |
   GELF UDP/TCP              Shim (MCP)   Shim (MCP)
      |                          |           |
@@ -18,25 +20,158 @@ Application(s)                Claude Code Sessions
 ```
 
 - **Daemon**: Long-running process that collects logs, evaluates per-session triggers/filters, stores entries in a ring buffer, and serves RPC requests over a Unix socket.
-- **Shim**: Thin MCP bridge that auto-starts the daemon and translates MCP tool calls to daemon RPC. One shim per Claude session, all connected to the same daemon.
+- **Shim**: Thin MCP bridge that auto-starts the daemon and translates MCP tool calls to daemon RPC. One shim per AI session, all connected to the same daemon.
+
+## Prerequisites
+
+- [Rust toolchain](https://rustup.rs/) (for building from source)
+- An application that sends logs in [GELF format](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html) over UDP or TCP
 
 ## Installation
 
+### Build from source
+
 ```bash
-# Build
+git clone https://github.com/yuvalrakavy/logmon-mcp.git
+cd logmon-mcp
 cargo build --release
-
-# Register as MCP server in Claude Code (global)
-claude mcp add logmon --scope user -- \
-  /path/to/logmon-mcp/target/release/logmon-mcp-server
-
-# With a named session (persists triggers/filters across reconnects)
-claude mcp add logmon --scope user -- \
-  /path/to/logmon-mcp/target/release/logmon-mcp-server \
-  --session my-session
 ```
 
-The daemon starts automatically when Claude Code connects. No manual setup needed.
+The binary is at `target/release/logmon-mcp-server`. You can copy it to a directory on your PATH:
+
+```bash
+cp target/release/logmon-mcp-server ~/.local/bin/
+```
+
+### Configure your AI coding assistant
+
+The daemon starts automatically when the first MCP client connects. No manual setup needed.
+
+#### Claude Code
+
+```bash
+# Register globally (available in all projects)
+claude mcp add logmon --scope user -- logmon-mcp-server
+
+# Or with a named session (persists triggers/filters across reconnects)
+claude mcp add logmon --scope user -- logmon-mcp-server --session my-session
+
+# Or register for current project only
+claude mcp add logmon -- logmon-mcp-server
+```
+
+If the binary is not on your PATH, use the full path:
+
+```bash
+claude mcp add logmon --scope user -- /path/to/logmon-mcp-server
+```
+
+#### Cursor
+
+Add to your Cursor MCP settings (`.cursor/mcp.json` in your project or `~/.cursor/mcp.json` globally):
+
+```json
+{
+  "mcpServers": {
+    "logmon": {
+      "command": "logmon-mcp-server",
+      "args": []
+    }
+  }
+}
+```
+
+For a named session:
+
+```json
+{
+  "mcpServers": {
+    "logmon": {
+      "command": "logmon-mcp-server",
+      "args": ["--session", "my-session"]
+    }
+  }
+}
+```
+
+#### Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "logmon": {
+      "command": "logmon-mcp-server",
+      "args": []
+    }
+  }
+}
+```
+
+#### VS Code (GitHub Copilot)
+
+Add to your VS Code `settings.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "logmon": {
+        "command": "logmon-mcp-server",
+        "args": []
+      }
+    }
+  }
+}
+```
+
+Or add to `.vscode/mcp.json` in your project:
+
+```json
+{
+  "servers": {
+    "logmon": {
+      "command": "logmon-mcp-server",
+      "args": []
+    }
+  }
+}
+```
+
+#### Gemini CLI
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "logmon": {
+      "command": "logmon-mcp-server",
+      "args": []
+    }
+  }
+}
+```
+
+#### OpenAI Codex CLI
+
+Add to `~/.codex/config.json`:
+
+```json
+{
+  "mcpServers": {
+    "logmon": {
+      "command": "logmon-mcp-server",
+      "args": []
+    }
+  }
+}
+```
+
+#### Any MCP-compatible client
+
+logmon-mcp uses the standard MCP stdio transport. Configure your client to run `logmon-mcp-server` as a stdio MCP server. Optional argument: `--session <name>` for persistent sessions.
 
 ## Usage
 
@@ -48,11 +183,12 @@ Point your application's GELF output to `localhost:12201` (UDP or TCP). Most log
 - **Python**: `pygelf`
 - **Node.js**: `gelf-pro`
 - **Go**: `go-gelf`
+- **Java**: Logback `biz.paluch.logging:logstash-gelf`
 - **Docker**: `--log-driver=gelf --log-opt gelf-address=udp://localhost:12201`
 
-### Use from Claude Code
+### Use from your AI assistant
 
-Once logs are flowing, ask Claude:
+Once logs are flowing, ask your assistant:
 
 - "check the logs"
 - "show me recent errors"
@@ -63,7 +199,7 @@ Once logs are flowing, ask Claude:
 ### MCP Tools
 
 | Tool | Description |
-|------|-------------|
+| ---- | ----------- |
 | `get_recent_logs` | Fetch recent logs, optionally filtered |
 | `get_log_context` | Get logs surrounding a specific entry by seq number |
 | `export_logs` | Save logs to a file |
@@ -105,7 +241,7 @@ Triggers watch every incoming log and fire when a match occurs, capturing contex
 
 Default triggers are created for each session: `l>=ERROR` and `mfm=panic`.
 
-When a trigger fires, Claude receives a notification with the matched entry and surrounding context.
+When a trigger fires, the client receives a notification with the matched entry and surrounding context.
 
 ## Multi-Session
 
@@ -124,10 +260,10 @@ Config files are stored in `~/.config/logmon/`:
 ### CLI
 
 ```bash
-# Shim mode (default, used by Claude Code)
+# Shim mode (default, used by MCP clients)
 logmon-mcp-server [--session <name>]
 
-# Daemon mode (usually auto-started)
+# Daemon mode (usually auto-started by the shim)
 logmon-mcp-server daemon [--gelf-port 12201] [--buffer-size 10000]
 ```
 
