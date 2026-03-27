@@ -128,6 +128,7 @@ For every incoming log message:
 3. For each connected session + named disconnected sessions:
    a. If post-trigger window is active for this session: skip trigger evaluation, decrement counter, continue to next session
    b. Evaluate session's triggers — if matched:
+      - Always store the triggering entry itself (regardless of pre_window or filters)
       - Copy pre_window entries from pre-trigger buffer into LogStore (skip duplicates via seq). Note: entries are copied, not removed — other sessions may need the same context.
       - If session connected: send notification to shim → Claude
       - If session disconnected (named): queue notification (cap at max_queue_size)
@@ -184,6 +185,23 @@ JSON-RPC 2.0 over the socket. Each message is newline-delimited JSON.
 | `triggers.remove` | `remove_trigger` | `{ id }` |
 
 Session ID is implicit — the daemon associates each socket connection with a session.
+
+**`session.start` response:**
+
+```json
+{
+    "session_id": "store-debug",
+    "is_new": false,
+    "queued_notifications": 12,
+    "trigger_count": 3,
+    "filter_count": 1,
+    "daemon_uptime_secs": 3600,
+    "buffer_size": 8421,
+    "receivers": ["gelf (UDP:12201, TCP:12201)"]
+}
+```
+
+This is the shim's only opportunity to learn its identity and the daemon's state. For new sessions, `queued_notifications` is 0. For anonymous sessions, `session_id` is the assigned UUID.
 
 **Daemon → Shim (notifications):**
 
@@ -256,7 +274,7 @@ Daemon shuts down when ALL of:
 **state.json:**
 ```json
 {
-    "last_seq": 48523,
+    "seq_block": 49000,
     "named_sessions": {
         "store-debug": {
             "triggers": [ /* trigger definitions */ ],
@@ -266,7 +284,9 @@ Daemon shuts down when ALL of:
 }
 ```
 
-Named sessions (triggers and filters) are persisted so they survive daemon restarts. Notification queues are not persisted — only configuration. On daemon restart, named sessions are restored in disconnected state, ready for reconnection.
+**Seq counter persistence** uses block reservation to avoid overlap on crash. The daemon reserves blocks of 1000 seq numbers. `seq_block` is the start of the next unreserved block. On startup, the daemon begins assigning seqs from `seq_block` (and immediately reserves the next block by writing `seq_block + 1000`). If the daemon crashes mid-block, at most 1000 seq numbers are "wasted" but never reused. This means one `state.json` write per 1000 logs, not per log.
+
+Named sessions (triggers and filters) are persisted so they survive daemon restarts. Notification queues are not persisted — only configuration. On daemon restart, named sessions are restored in disconnected state, ready for reconnection. State is also written on clean shutdown (capturing the exact current seq, minimizing waste).
 
 **config.json** (daemon configuration):
 ```json
@@ -296,8 +316,9 @@ Abstraction for log input protocols. GELF is the first (and currently only) impl
 ```rust
 #[async_trait]
 trait LogReceiver: Send + Sync {
-    /// Start listening, feed logs into the pipeline
-    async fn start(config: &ReceiverConfig, pipeline: Arc<LogPipeline>) -> Result<Box<dyn LogReceiver>>
+    /// Start listening, send parsed LogEntries into the channel.
+    /// The daemon owns the receiving end and handles pipeline + session logic.
+    async fn start(config: &ReceiverConfig, sender: mpsc::Sender<LogEntry>) -> Result<Box<dyn LogReceiver>>
     where Self: Sized;
 
     /// Human-readable name ("gelf", "syslog", etc.)
@@ -311,7 +332,7 @@ trait LogReceiver: Send + Sync {
 }
 ```
 
-`GelfReceiver` wraps the existing UDP and TCP listeners. The daemon starts all configured receivers at launch.
+Receivers are fully decoupled — they parse their protocol and send `LogEntry`s into a channel. The daemon's main loop reads from the channel and runs the log processing flow (seq assignment, trigger evaluation, storage). `GelfReceiver` wraps the existing UDP and TCP listeners. The daemon starts all configured receivers at launch, all feeding into the same channel.
 
 `get_status` reports all active receivers and their listening addresses.
 
