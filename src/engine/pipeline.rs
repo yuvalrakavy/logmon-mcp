@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 
 /// Event emitted when a trigger fires (used by daemon's session logic)
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct PipelineEvent {
     pub trigger_id: u32,
     pub trigger_description: Option<String>,
