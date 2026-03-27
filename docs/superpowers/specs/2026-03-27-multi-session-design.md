@@ -55,9 +55,10 @@ Thin bridge between Claude's MCP (stdio) and the daemon (socket RPC). No busines
 
 1. Auto-start daemon if not running
 2. Connect to daemon, establish session (anonymous or named)
-3. Translate MCP tool calls → daemon RPC calls
+3. Translate MCP tool calls → daemon RPC calls (resolve relative paths to absolute before sending)
 4. Forward daemon notifications → MCP notifications to Claude
-5. On disconnect: daemon handles cleanup based on session type
+5. Detect daemon disconnection → notify Claude, attempt auto-restart and reconnect
+6. On disconnect: daemon handles cleanup based on session type
 
 ### CLI
 
@@ -204,7 +205,18 @@ Push notifications over the socket when a trigger fires:
 }
 ```
 
-On reconnect of a named session, queued notifications are sent immediately.
+On reconnect of a named session, queued notifications are drained in chronological order before any new notifications are forwarded. This prevents out-of-order events.
+
+### Shim Reconnection (Daemon Crash/Restart)
+
+If the shim detects a broken socket connection (daemon crashed or was killed):
+
+1. Send MCP notification to Claude: "logmon daemon disconnected, attempting restart"
+2. Follow the auto-start procedure (acquire lock, check PID, spawn if needed)
+3. Reconnect to daemon with the same session name (if named) or create new anonymous session
+4. For named sessions: state is restored from `state.json` — triggers and filters are preserved. Notification queue is lost (not persisted).
+5. For anonymous sessions: triggers and filters are lost — Claude is informed via notification
+6. Send MCP notification to Claude: "logmon daemon reconnected" (with session state summary)
 
 ## Daemon Lifecycle
 
@@ -234,6 +246,7 @@ Daemon shuts down when ALL of:
 - `config.json` — daemon configuration (ports, buffer size, options)
 - `daemon.pid` — daemon PID for auto-start detection
 - `daemon.lock` — file lock for auto-start race prevention
+- `daemon.log` — daemon log output (the daemon has no terminal; max size 10MB, rotated)
 - `state.json` — persistent state: seq counter + named session definitions (written periodically + on shutdown)
 - `logmon.sock` — Unix domain socket (Unix only)
 - `buffer.json` — optional log buffer export (if `persist_buffer_on_exit` enabled)
@@ -356,11 +369,19 @@ src/
 ```
 
 Key changes:
-- `shim/` — new, thin bridge
-- `daemon/` — new, manages sessions and socket server
+- `shim/` — new, thin bridge. Owns the `mcp/` layer (MCP tool definitions, stdio transport)
+- `daemon/` — new, manages sessions, socket server, RPC handlers
 - `receiver/` — new, LogReceiver trait + GelfReceiver
-- `engine/`, `filter/`, `store/`, `gelf/` — mostly unchanged, moved to daemon context
-- `mcp/` — tool handlers now RPC through shim instead of calling pipeline directly
+- `engine/`, `filter/`, `store/`, `gelf/` — mostly unchanged, used by daemon
+- `mcp/` — tool definitions unchanged (same parameters/descriptions), but implementations now serialize to RPC instead of calling pipeline directly
+
+## Implementation Notes
+
+- **Trigger IDs are session-scoped.** Session A's trigger 3 and session B's trigger 3 are unrelated. Tools operate on "my session's triggers" implicitly.
+- **Pre-trigger buffer resizing.** The daemon recalculates `max(pre_window across all sessions' triggers)` and calls `pre_buffer.resize()` whenever a session is added, removed, or has triggers edited.
+- **Socket → session mapping.** The daemon maintains a `HashMap<ConnectionId, SessionId>` to route RPC requests to the correct session. Each socket connection is associated with exactly one session.
+- **Path resolution.** The shim resolves relative file paths (e.g., in `export_logs`) to absolute paths before sending to the daemon, since the daemon's CWD differs from Claude's project directory.
+- **Post-trigger window and storage.** When any session has an active post-trigger window, the log is stored unconditionally. This means one session's trigger can cause logs to be stored that benefit other sessions — this is intentional and desirable.
 
 ## Future Work (Out of Scope)
 
