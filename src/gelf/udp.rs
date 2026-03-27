@@ -1,7 +1,6 @@
-use crate::engine::pipeline::LogPipeline;
-use crate::gelf::message::parse_gelf_message;
-use std::sync::Arc;
+use crate::gelf::message::{LogEntry, parse_gelf_message};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 pub struct UdpListenerHandle {
     port: u16,
@@ -16,7 +15,7 @@ impl UdpListenerHandle {
 
 pub async fn start_udp_listener(
     addr: &str,
-    pipeline: Arc<LogPipeline>,
+    sender: mpsc::Sender<LogEntry>,
 ) -> anyhow::Result<UdpListenerHandle> {
     let socket = UdpSocket::bind(addr).await?;
     let port = socket.local_addr()?.port();
@@ -27,19 +26,16 @@ pub async fn start_udp_listener(
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
-                    if let Ok((len, addr)) = result {
-                        let seq = pipeline.assign_seq();
+                    if let Ok((len, _addr)) = result {
                         // Strip trailing null bytes (some GELF libraries append TCP-style null delimiters to UDP)
                         let mut end = len;
                         while end > 0 && buf[end - 1] == 0 {
                             end -= 1;
                         }
-                        match parse_gelf_message(&buf[..end], seq) {
-                            Ok(entry) => { pipeline.process(entry); }
-                            Err(e) => {
-                                let preview = String::from_utf8_lossy(&buf[..len.min(300)]).to_string();
-                                pipeline.record_malformed(format!("UDP from {addr}: {e}"), preview);
-                            }
+                        // Parse with seq=0 — daemon assigns real seq later
+                        match parse_gelf_message(&buf[..end], 0) {
+                            Ok(entry) => { let _ = sender.send(entry).await; }
+                            Err(e) => { eprintln!("malformed GELF UDP: {e}"); }
                         }
                     }
                 }

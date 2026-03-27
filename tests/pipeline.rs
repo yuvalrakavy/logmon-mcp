@@ -1,5 +1,6 @@
 use logmon_mcp_server::engine::pipeline::LogPipeline;
 use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use logmon_mcp_server::filter::parser::parse_filter;
 use chrono::Utc;
 use std::collections::HashMap;
 
@@ -14,87 +15,6 @@ fn make_entry(seq: u64, level: Level, msg: &str) -> LogEntry {
 }
 
 #[test]
-fn test_normal_flow_no_filters_stores_everything() {
-    let pipeline = LogPipeline::new(1000);
-    let events = pipeline.process(make_entry(1, Level::Info, "hello"));
-    assert_eq!(pipeline.store_len(), 1);
-    assert!(events.is_empty());
-}
-
-#[test]
-fn test_buffer_filter_blocks_non_matching() {
-    let pipeline = LogPipeline::new(1000);
-    pipeline.add_filter("l>=ERROR", Some("errors only")).unwrap();
-    pipeline.process(make_entry(1, Level::Info, "hello"));
-    assert_eq!(pipeline.store_len(), 0);
-    pipeline.process(make_entry(2, Level::Error, "bad"));
-    assert_eq!(pipeline.store_len(), 1);
-}
-
-#[test]
-fn test_trigger_fires_and_flushes_pre_buffer() {
-    let pipeline = LogPipeline::new(1000);
-    // Add filter that blocks everything except errors
-    pipeline.add_filter("l>=ERROR", None).unwrap();
-
-    // Send 10 info messages (won't be stored due to filter, but go to pre-buffer)
-    for i in 1..=10 {
-        pipeline.process(make_entry(i, Level::Info, &format!("info {i}")));
-    }
-    assert_eq!(pipeline.store_len(), 0);
-
-    // Send an error — default trigger fires, pre-buffer flushes
-    let events = pipeline.process(make_entry(11, Level::Error, "crash!"));
-    assert!(!events.is_empty());
-    // Pre-buffer entries + the error itself should be in store
-    assert!(pipeline.store_len() > 1);
-}
-
-#[test]
-fn test_post_window_bypasses_filters_and_triggers() {
-    let pipeline = LogPipeline::new(1000);
-    pipeline.add_filter("l>=ERROR", None).unwrap();
-
-    // Trigger fires on error
-    pipeline.process(make_entry(1, Level::Error, "crash"));
-    let before = pipeline.store_len();
-
-    // Next entries during post-window should be stored despite filter
-    pipeline.process(make_entry(2, Level::Info, "recovery step 1"));
-    assert_eq!(pipeline.store_len(), before + 1);
-}
-
-#[test]
-fn test_post_window_expires() {
-    let pipeline = LogPipeline::new(1000);
-    pipeline.add_filter("l>=ERROR", None).unwrap();
-
-    // Edit default trigger to have post_window=2 for easy testing
-    pipeline.edit_trigger(1, None, None, Some(2), None, None).unwrap();
-
-    pipeline.process(make_entry(1, Level::Error, "crash"));
-    let after_trigger = pipeline.store_len();
-
-    // 2 post-window entries
-    pipeline.process(make_entry(2, Level::Info, "post 1"));
-    pipeline.process(make_entry(3, Level::Info, "post 2"));
-
-    // 3rd should be filtered normally (post-window expired)
-    pipeline.process(make_entry(4, Level::Info, "filtered out"));
-    assert_eq!(pipeline.store_len(), after_trigger + 2);
-}
-
-#[test]
-fn test_no_filters_means_store_everything() {
-    let pipeline = LogPipeline::new(1000);
-    // No filters = implicit ALL
-    for i in 1..=5 {
-        pipeline.process(make_entry(i, Level::Debug, "debug msg"));
-    }
-    assert_eq!(pipeline.store_len(), 5);
-}
-
-#[test]
 fn test_seq_counter() {
     let pipeline = LogPipeline::new(1000);
     assert_eq!(pipeline.assign_seq(), 1);
@@ -103,93 +23,74 @@ fn test_seq_counter() {
 }
 
 #[test]
-fn test_filter_crud() {
-    let pipeline = LogPipeline::new(1000);
-    let id = pipeline.add_filter("fa=mqtt", Some("MQTT")).unwrap();
-    assert_eq!(pipeline.list_filters().len(), 1);
-    pipeline.edit_filter(id, Some("fa=http"), Some("HTTP")).unwrap();
-    let filters = pipeline.list_filters();
-    assert_eq!(filters[0].description.as_deref(), Some("HTTP"));
-    pipeline.remove_filter(id).unwrap();
-    assert_eq!(pipeline.list_filters().len(), 0);
+fn test_new_with_seq() {
+    let pipeline = LogPipeline::new_with_seq(1000, 5000);
+    assert_eq!(pipeline.assign_seq(), 5001);
 }
 
 #[test]
-fn test_pipeline_event_has_context() {
+fn test_store_and_query() {
     let pipeline = LogPipeline::new(1000);
-    pipeline.add_filter("l>=ERROR", None).unwrap();
+    pipeline.append_to_store(make_entry(1, Level::Info, "hello"));
+    pipeline.append_to_store(make_entry(2, Level::Error, "bad"));
+    assert_eq!(pipeline.store_len(), 2);
 
-    // Send some info messages first
-    for i in 1..=5 {
-        pipeline.process(make_entry(i, Level::Info, &format!("info {i}")));
-    }
+    let all = pipeline.recent_logs(10, None);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].seq, 2); // newest first
 
-    // Error triggers — event should have context_before
-    let events = pipeline.process(make_entry(6, Level::Error, "crash!"));
-    assert!(!events.is_empty());
-    assert!(!events[0].context_before.is_empty());
+    let filter = parse_filter("l>=ERROR").unwrap();
+    let errors = pipeline.recent_logs(10, Some(&filter));
+    assert_eq!(errors.len(), 1);
 }
 
 #[test]
-fn test_matched_filter_descriptions_attached() {
+fn test_contains_seq() {
     let pipeline = LogPipeline::new(1000);
-    pipeline.add_filter("l>=WARN", Some("warnings+")).unwrap();
-
-    pipeline.process(make_entry(1, Level::Warn, "warning msg"));
-    let recent = pipeline.recent_logs(10, None);
-    assert!(!recent.is_empty());
-    assert!(recent[0].matched_filters.contains(&"warnings+".to_string()));
+    pipeline.append_to_store(make_entry(42, Level::Info, "hello"));
+    assert!(pipeline.contains_seq(42));
+    assert!(!pipeline.contains_seq(99));
 }
 
-use std::sync::Arc;
-use tokio::time::Duration;
-
-#[tokio::test]
-async fn test_end_to_end_udp_to_query() {
-    let pipeline = Arc::new(logmon_mcp_server::engine::pipeline::LogPipeline::new(1000));
-
-    let udp_handle = logmon_mcp_server::gelf::udp::start_udp_listener(
-        "127.0.0.1:0", pipeline.clone()
-    ).await.unwrap();
-
-    // Send various GELF messages via UDP
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    for i in 0..20u64 {
-        let level = if i % 5 == 0 { 3 } else { 6 }; // every 5th is ERROR (GELF level 3)
-        let msg = serde_json::json!({
-            "version": "1.1",
-            "host": "e2e-test",
-            "short_message": format!("message {i}"),
-            "level": level,
-            "facility": "test::e2e"
-        });
-        socket.send_to(
-            msg.to_string().as_bytes(),
-            format!("127.0.0.1:{}", udp_handle.port())
-        ).unwrap();
+#[test]
+fn test_pre_buffer() {
+    let pipeline = LogPipeline::new(1000);
+    pipeline.resize_pre_buffer(5);
+    for i in 1..=3 {
+        pipeline.pre_buffer_append(make_entry(i, Level::Info, &format!("msg {i}")));
     }
+    let copied = pipeline.pre_buffer_copy(2);
+    assert_eq!(copied.len(), 2);
+    assert_eq!(copied[0].seq, 2);
+    assert_eq!(copied[1].seq, 3);
+}
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Verify all received
-    assert_eq!(pipeline.store_len(), 20);
-
-    // Query with filter — only errors (GELF level 3 = ERROR)
-    let errors = pipeline.recent_logs(100, Some("l>=ERROR"));
-    assert_eq!(errors.len(), 4); // messages 0, 5, 10, 15
-
-    // Verify triggers fired for errors
-    let triggers = pipeline.list_triggers();
-    assert!(triggers[0].match_count > 0, "error trigger should have fired");
-
-    // Test context query
-    let all_logs = pipeline.recent_logs(100, None);
-    let some_seq = all_logs[10].seq;
-    let context = pipeline.context_by_seq(some_seq, 2, 2);
-    assert!(context.len() >= 3); // at least before + target + after
-
-    // Test clear
+#[test]
+fn test_clear_logs() {
+    let pipeline = LogPipeline::new(1000);
+    pipeline.append_to_store(make_entry(1, Level::Info, "hello"));
     let cleared = pipeline.clear_logs();
-    assert_eq!(cleared, 20);
+    assert_eq!(cleared, 1);
     assert_eq!(pipeline.store_len(), 0);
+}
+
+#[test]
+fn test_context_by_seq() {
+    let pipeline = LogPipeline::new(1000);
+    for i in 1..=10 {
+        pipeline.append_to_store(make_entry(i, Level::Info, &format!("msg {i}")));
+    }
+    let ctx = pipeline.context_by_seq(5, 2, 2);
+    assert_eq!(ctx.len(), 5);
+    assert_eq!(ctx[0].seq, 3);
+    assert_eq!(ctx[4].seq, 7);
+}
+
+#[test]
+fn test_increment_malformed() {
+    let pipeline = LogPipeline::new(1000);
+    pipeline.increment_malformed();
+    pipeline.increment_malformed();
+    let stats = pipeline.store_stats();
+    assert_eq!(stats.malformed_count, 2);
 }

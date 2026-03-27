@@ -1,9 +1,9 @@
-use crate::engine::pipeline::LogPipeline;
-use crate::gelf::message::parse_gelf_message;
+use crate::gelf::message::{LogEntry, parse_gelf_message};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 pub struct TcpListenerHandle {
     port: u16,
@@ -23,7 +23,7 @@ impl TcpListenerHandle {
 
 pub async fn start_tcp_listener(
     addr: &str,
-    pipeline: Arc<LogPipeline>,
+    sender: mpsc::Sender<LogEntry>,
 ) -> anyhow::Result<TcpListenerHandle> {
     let listener = TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
@@ -36,7 +36,7 @@ pub async fn start_tcp_listener(
             tokio::select! {
                 result = listener.accept() => {
                     if let Ok((stream, _addr)) = result {
-                        let pipeline = pipeline.clone();
+                        let sender = sender.clone();
                         let connected = connected_clone.clone();
                         connected.fetch_add(1, Ordering::Relaxed);
 
@@ -67,14 +67,13 @@ pub async fn start_tcp_listener(
                                     continue;
                                 }
 
-                                let seq = pipeline.assign_seq();
-                                match parse_gelf_message(&buf, seq) {
+                                // Parse with seq=0 — daemon assigns real seq later
+                                match parse_gelf_message(&buf, 0) {
                                     Ok(entry) => {
-                                        pipeline.process(entry);
+                                        let _ = sender.send(entry).await;
                                     }
                                     Err(e) => {
-                                        let preview = String::from_utf8_lossy(&buf[..buf.len().min(300)]).to_string();
-                                        pipeline.record_malformed(format!("TCP: {e}"), preview);
+                                        eprintln!("malformed GELF TCP: {e}");
                                     }
                                 }
                             }

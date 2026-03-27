@@ -75,6 +75,7 @@ struct ExportLogsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
 struct AddFilterParams {
     /// DSL filter expression
     filter: String,
@@ -83,6 +84,7 @@ struct AddFilterParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
 struct EditFilterParams {
     /// Filter ID to edit
     id: u32,
@@ -93,12 +95,14 @@ struct EditFilterParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
 struct RemoveFilterParams {
     /// Filter ID to remove
     id: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
 struct AddTriggerParams {
     /// DSL filter expression that activates the trigger
     filter: String,
@@ -113,6 +117,7 @@ struct AddTriggerParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
 struct EditTriggerParams {
     /// Trigger ID to edit
     id: u32,
@@ -129,6 +134,7 @@ struct EditTriggerParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
 struct RemoveTriggerParams {
     /// Trigger ID to remove
     id: u32,
@@ -141,13 +147,9 @@ impl GelfMcpServer {
     #[rmcp::tool(description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics")]
     async fn get_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let stats = self.pipeline.store_stats();
-        let triggers = self.pipeline.list_triggers();
-        let filters = self.pipeline.list_filters();
 
         let status = serde_json::json!({
             "buffer_size": self.pipeline.store_len(),
-            "filter_count": filters.len(),
-            "trigger_count": triggers.len(),
             "udp_port": self.udp_port,
             "tcp_port": self.tcp_port,
             "connected_tcp_clients": self.tcp_handle.connected_clients(),
@@ -170,7 +172,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetRecentLogsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let count = p.count.unwrap_or(100) as usize;
-        let entries = self.pipeline.recent_logs(count, p.filter.as_deref());
+        let entries = self.pipeline.recent_logs_str(count, p.filter.as_deref());
         let json = serde_json::to_string_pretty(&entries)
             .map_err(|e| rmcp::ErrorData::internal_error(format!("serialization error: {e}"), None))?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
@@ -212,7 +214,7 @@ impl GelfMcpServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let count = p.count.unwrap_or(u32::MAX) as usize;
         let format = p.format.as_deref().unwrap_or("json");
-        let entries = self.pipeline.recent_logs(count, p.filter.as_deref());
+        let entries = self.pipeline.recent_logs_str(count, p.filter.as_deref());
         let entry_count = entries.len();
 
         let content = match format {
@@ -251,175 +253,75 @@ impl GelfMcpServer {
 
     #[rmcp::tool(description = "Get recent malformed messages that failed GELF parsing.")]
     async fn get_malformed(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let entries = self.pipeline.get_malformed();
-        let json = serde_json::to_string_pretty(&entries)
-            .map_err(|e| rmcp::ErrorData::internal_error(format!("serialization error: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
-    // ---- Filter Management Tools ----
+    // ---- Filter Management Tools (stubbed — will be rewritten with daemon bridge) ----
 
     #[rmcp::tool(description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored.")]
     async fn get_filters(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let filters = self.pipeline.list_filters();
-        let json_filters: Vec<serde_json::Value> = filters
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "id": f.id,
-                    "filter": f.filter_string,
-                    "description": f.description,
-                })
-            })
-            .collect();
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json_filters).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
     #[rmcp::tool(description = "Add a new buffer filter. Logs matching this filter will be stored. Uses OR semantics with existing filters.")]
     async fn add_filter(
         &self,
+        #[allow(unused_variables)]
         Parameters(p): Parameters<AddFilterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let id = self
-            .pipeline
-            .add_filter(&p.filter, p.description.as_deref())
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("invalid filter: {e}"), None))?;
-        let result = serde_json::json!({
-            "id": id,
-            "filter": p.filter,
-            "description": p.description,
-        });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
     #[rmcp::tool(description = "Edit an existing buffer filter by ID.")]
     async fn edit_filter(
         &self,
+        #[allow(unused_variables)]
         Parameters(p): Parameters<EditFilterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let info = self
-            .pipeline
-            .edit_filter(p.id, p.filter.as_deref(), p.description.as_deref())
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("{e}"), None))?;
-        let result = serde_json::json!({
-            "id": info.id,
-            "filter": info.filter_string,
-            "description": info.description,
-        });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
     #[rmcp::tool(description = "Remove a buffer filter by ID.")]
     async fn remove_filter(
         &self,
+        #[allow(unused_variables)]
         Parameters(p): Parameters<RemoveFilterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.pipeline
-            .remove_filter(p.id)
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("{e}"), None))?;
-        let result = serde_json::json!({ "removed": p.id });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
-    // ---- Trigger Management Tools ----
+    // ---- Trigger Management Tools (stubbed — will be rewritten with daemon bridge) ----
 
     #[rmcp::tool(description = "List all triggers. Triggers capture a window of logs around matching entries and emit notifications.")]
     async fn get_triggers(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let triggers = self.pipeline.list_triggers();
-        let json_triggers: Vec<serde_json::Value> = triggers
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "id": t.id,
-                    "filter": t.filter_string,
-                    "pre_window": t.pre_window,
-                    "post_window": t.post_window,
-                    "notify_context": t.notify_context,
-                    "description": t.description,
-                    "match_count": t.match_count,
-                })
-            })
-            .collect();
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&json_triggers).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
     #[rmcp::tool(description = "Add a new trigger. When a log matches the filter, the pre/post windows are captured and a notification is emitted.")]
     async fn add_trigger(
         &self,
+        #[allow(unused_variables)]
         Parameters(p): Parameters<AddTriggerParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let pre_window = p.pre_window.unwrap_or(500);
-        let post_window = p.post_window.unwrap_or(200);
-        let notify_context = p.notify_context.unwrap_or(5);
-        let id = self
-            .pipeline
-            .add_trigger(&p.filter, pre_window, post_window, notify_context, p.description.as_deref())
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("invalid trigger: {e}"), None))?;
-        let result = serde_json::json!({
-            "id": id,
-            "filter": p.filter,
-            "pre_window": pre_window,
-            "post_window": post_window,
-            "notify_context": notify_context,
-            "description": p.description,
-        });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
     #[rmcp::tool(description = "Edit an existing trigger by ID. Only the provided fields are updated.")]
     async fn edit_trigger(
         &self,
+        #[allow(unused_variables)]
         Parameters(p): Parameters<EditTriggerParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let info = self
-            .pipeline
-            .edit_trigger(
-                p.id,
-                p.filter.as_deref(),
-                p.pre_window,
-                p.post_window,
-                p.notify_context,
-                p.description.as_deref(),
-            )
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("{e}"), None))?;
-        let result = serde_json::json!({
-            "id": info.id,
-            "filter": info.filter_string,
-            "pre_window": info.pre_window,
-            "post_window": info.post_window,
-            "notify_context": info.notify_context,
-            "description": info.description,
-            "match_count": info.match_count,
-        });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 
     #[rmcp::tool(description = "Remove a trigger by ID.")]
     async fn remove_trigger(
         &self,
+        #[allow(unused_variables)]
         Parameters(p): Parameters<RemoveTriggerParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.pipeline
-            .remove_trigger(p.id)
-            .map_err(|e| rmcp::ErrorData::invalid_params(format!("{e}"), None))?;
-        let result = serde_json::json!({ "removed": p.id });
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap(),
-        )]))
+        Err(rmcp::ErrorData::internal_error("not yet connected to daemon".to_string(), None))
     }
 }
 

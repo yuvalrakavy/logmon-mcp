@@ -1,6 +1,7 @@
 use clap::Parser;
 use logmon_mcp_server::config::Config;
 use logmon_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::gelf::message::LogEntry;
 use logmon_mcp_server::gelf::{udp, tcp};
 use logmon_mcp_server::mcp::server::GelfMcpServer;
 use logmon_mcp_server::mcp::notifications::spawn_notification_dispatcher;
@@ -22,14 +23,26 @@ async fn main() -> anyhow::Result<()> {
 
     let pipeline = Arc::new(LogPipeline::new(config.buffer_size));
 
+    // Create a channel for GELF listeners to send parsed entries
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogEntry>(10_000);
+
     // Start GELF listeners
     let udp_addr = format!("0.0.0.0:{}", config.udp_port());
     let tcp_addr = format!("0.0.0.0:{}", config.tcp_port());
 
-    let udp_handle = udp::start_udp_listener(&udp_addr, pipeline.clone()).await?;
-    let tcp_handle = tcp::start_tcp_listener(&tcp_addr, pipeline.clone()).await?;
+    let udp_handle = udp::start_udp_listener(&udp_addr, log_tx.clone()).await?;
+    let tcp_handle = tcp::start_tcp_listener(&tcp_addr, log_tx).await?;
 
     eprintln!("GELF listeners started: UDP={}, TCP={}", udp_handle.port(), tcp_handle.port());
+
+    // Spawn a task to receive log entries from GELF listeners and store them
+    let pipeline_recv = pipeline.clone();
+    tokio::spawn(async move {
+        while let Some(mut entry) = log_rx.recv().await {
+            entry.seq = pipeline_recv.assign_seq();
+            pipeline_recv.append_to_store(entry);
+        }
+    });
 
     // Subscribe to pipeline events for notifications
     let event_rx = pipeline.subscribe_events();
