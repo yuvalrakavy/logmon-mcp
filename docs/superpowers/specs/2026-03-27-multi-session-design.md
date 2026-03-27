@@ -122,17 +122,27 @@ No global triggers — each session can customize independently.
 For every incoming log message:
 
 1. Assign global seq number (atomic increment)
-2. Append to pre-trigger buffer (global)
+2. Append to pre-trigger buffer (global, read-only ring buffer — entries are only evicted by capacity, never by flush)
 3. For each connected session + named disconnected sessions:
-   a. Evaluate session's triggers — if matched:
-      - Flush pre_window entries from pre-trigger buffer into LogStore (skip duplicates)
+   a. If post-trigger window is active for this session: skip trigger evaluation, decrement counter, continue to next session
+   b. Evaluate session's triggers — if matched:
+      - Copy pre_window entries from pre-trigger buffer into LogStore (skip duplicates via seq). Note: entries are copied, not removed — other sessions may need the same context.
       - If session connected: send notification to shim → Claude
       - If session disconnected (named): queue notification (cap at max_queue_size)
       - Activate post-trigger window for this session
-   b. During active post-trigger window for a session: skip that session's trigger evaluation, decrement counter
-4. Evaluate buffer storage: union all sessions' filters. If no session has filters, store everything (implicit ALL). Otherwise, store the log if ANY session's filter matches it. This keeps the store manageable while ensuring no session misses data it asked for.
+4. Evaluate buffer storage:
+   a. If any session has an active post-trigger window: store unconditionally (post-window logs are valuable context for all sessions)
+   b. Otherwise: union all sessions' filters. If no session has filters, store everything (implicit ALL). If any session's filter matches, store the log.
 
-When a session queries via `get_recent_logs`, its own filters are applied to the stored data as an additional read-time filter. This means a session may see logs that matched another session's filter — this is acceptable since query-time filtering narrows the results.
+### Query-Time Filtering
+
+Session filters serve as a **default lens** for queries:
+
+- `get_recent_logs()` with no explicit filter → session's own filters are applied (the session sees its configured view)
+- `get_recent_logs(filter="l>=ERROR")` with explicit filter → overrides session filters (ad-hoc query across all stored data)
+- Session with no filters → sees everything in the store
+
+### Global Operations
 
 **`clear_logs`** clears the shared buffer for all sessions — it's a global operation. The tool response should warn that this affects all sessions.
 
@@ -200,11 +210,14 @@ On reconnect of a named session, queued notifications are sent immediately.
 
 ### Auto-start
 
-1. Shim starts, checks if daemon is running:
-   - Read `~/.config/logmon/daemon.pid`
-   - If PID file exists and process is alive: connect
-   - Otherwise: spawn `logmon-mcp-server daemon` as detached child, wait for socket/port to appear, connect
-2. Daemon writes PID file on startup, deletes on clean shutdown
+1. Shim acquires file lock (`~/.config/logmon/daemon.lock`) to prevent race conditions when multiple shims start simultaneously
+2. Read `~/.config/logmon/daemon.pid`:
+   - If PID file exists and process is alive: release lock, connect
+   - If PID file exists but process is dead (unclean shutdown): delete stale PID file and socket file, continue to step 3
+   - If no PID file: continue to step 3
+3. Spawn `logmon-mcp-server daemon` as detached child, wait for socket/port to appear
+4. Release lock, connect
+5. Daemon writes PID file on startup, deletes PID file and socket file on clean shutdown
 
 ### Shutdown
 
@@ -218,19 +231,41 @@ Daemon shuts down when ALL of:
 **Directory:** `~/.config/logmon/` (created on first run)
 
 **Files:**
+- `config.json` — daemon configuration (ports, buffer size, options)
 - `daemon.pid` — daemon PID for auto-start detection
-- `state.json` — persistent state (written periodically + on shutdown)
+- `daemon.lock` — file lock for auto-start race prevention
+- `state.json` — persistent state: seq counter + named session definitions (written periodically + on shutdown)
 - `logmon.sock` — Unix domain socket (Unix only)
 - `buffer.json` — optional log buffer export (if `persist_buffer_on_exit` enabled)
 
 **state.json:**
 ```json
 {
-    "last_seq": 48523
+    "last_seq": 48523,
+    "named_sessions": {
+        "store-debug": {
+            "triggers": [ /* trigger definitions */ ],
+            "filters": [ /* filter definitions */ ]
+        }
+    }
 }
 ```
 
-Extensible for future persistent state.
+Named sessions (triggers and filters) are persisted so they survive daemon restarts. Notification queues are not persisted — only configuration. On daemon restart, named sessions are restored in disconnected state, ready for reconnection.
+
+**config.json** (daemon configuration):
+```json
+{
+    "gelf_port": 12201,
+    "gelf_udp_port": null,
+    "gelf_tcp_port": null,
+    "buffer_size": 10000,
+    "persist_buffer_on_exit": false,
+    "idle_timeout_secs": 1800
+}
+```
+
+The daemon reads this file on startup. CLI args override file values. The shim does not need to know about daemon config — it just connects. This decouples shim configuration (session name) from daemon configuration (ports, buffer sizes).
 
 **buffer.json (optional):**
 - Config option `persist_buffer_on_exit` (default false)
@@ -265,7 +300,7 @@ trait LogReceiver: Send + Sync {
 
 ## MCP Tools
 
-All existing tools remain unchanged from Claude's perspective. New tools:
+All existing tools remain unchanged from Claude's perspective. `get_status` is extended to include: total sessions, connected sessions, current session name/id (so Claude knows its own identity). New tools:
 
 **`get_sessions`**
 - Parameters: none
