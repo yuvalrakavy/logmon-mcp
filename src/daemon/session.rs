@@ -335,6 +335,7 @@ impl SessionRegistry {
         Ok(state.triggers.add(filter, pre, post, ctx, desc)?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn edit_trigger(
         &self,
         id: &SessionId,
