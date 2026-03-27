@@ -81,17 +81,18 @@ logmon-mcp-server daemon [--gelf-port 12201] [--buffer-size 10000]  # daemon mod
 
 ### Session Lifecycle
 
-1. Shim connects → sends `session.start` with optional name
-2. Daemon looks up name:
+1. Shim connects → sends `session.start` with optional name and `protocol_version`
+2. Daemon checks protocol version — if mismatch, returns error. Shim should restart the daemon (kill old, start new) and retry.
+3. Daemon looks up name:
    - Found + disconnected: reconnect, drain queued notifications
    - Found + connected: error (session already in use)
    - Not found + named: create new session with default triggers, mark as persistent
    - Not found + anonymous: create new session with default triggers, mark as ephemeral
-3. Normal operation: shim relays MCP tool calls as RPC, daemon evaluates triggers and sends notifications
-4. Shim disconnects:
+4. Normal operation: shim relays MCP tool calls as RPC, daemon evaluates triggers and sends notifications
+5. Shim disconnects:
    - Anonymous: remove session from registry
    - Named: mark disconnected, keep state, start queuing notifications
-5. Named session TTL expires with no reconnect: auto-cleanup
+6. Named session TTL expires with no reconnect: auto-cleanup
 
 ### Session State
 
@@ -164,7 +165,7 @@ JSON-RPC 2.0 over the socket. Each message is newline-delimited JSON.
 
 | RPC Method | MCP Tool | Parameters |
 |---|---|---|
-| `session.start` | (on connect) | `{ name?: string }` |
+| `session.start` | (on connect) | `{ name?: string, protocol_version: u32 }` |
 | `session.stop` | (on disconnect) | `{}` |
 | `session.list` | `get_sessions` | `{}` |
 | `session.drop` | `drop_session` | `{ name: string }` |
@@ -227,9 +228,10 @@ If the shim detects a broken socket connection (daemon crashed or was killed):
    - If PID file exists and process is alive: release lock, connect
    - If PID file exists but process is dead (unclean shutdown): delete stale PID file and socket file, continue to step 3
    - If no PID file: continue to step 3
-3. Spawn `logmon-mcp-server daemon` as detached child, wait for socket/port to appear
+3. Spawn `logmon-mcp-server daemon` as detached child, wait for socket/port to appear (timeout: 10 seconds — if exceeded, report error to Claude and exit)
 4. Release lock, connect
-5. Daemon writes PID file on startup, deletes PID file and socket file on clean shutdown
+5. Daemon startup order: read config → read state → start receivers (bind ports) → only after receivers succeed: write PID file → listen on socket. If receiver fails (e.g., port in use by non-logmon process), daemon exits with clear error before writing PID file.
+6. Daemon deletes PID file and socket file on clean shutdown
 
 ### Shutdown
 
@@ -278,7 +280,9 @@ Named sessions (triggers and filters) are persisted so they survive daemon resta
 }
 ```
 
-The daemon reads this file on startup. CLI args override file values. The shim does not need to know about daemon config — it just connects. This decouples shim configuration (session name) from daemon configuration (ports, buffer sizes).
+The daemon reads this file on startup if it exists — all fields are optional with sensible defaults. CLI args override file values. The shim does not need to know about daemon config — it just connects. This decouples shim configuration (session name) from daemon configuration (ports, buffer sizes).
+
+Similarly, `state.json` is optional on first run — the daemon starts with `last_seq: 0` and no named sessions.
 
 **buffer.json (optional):**
 - Config option `persist_buffer_on_exit` (default false)
@@ -345,7 +349,7 @@ src/
 │   └── gelf.rs              # GelfReceiver (wraps existing UDP/TCP)
 ├── engine/
 │   ├── mod.rs
-│   ├── pipeline.rs          # LogPipeline (unchanged core logic)
+│   ├── pipeline.rs          # LogPipeline (refactored: shared infrastructure only)
 │   ├── pre_buffer.rs        # PreTriggerBuffer (unchanged)
 │   └── trigger.rs           # TriggerManager (unchanged, instantiated per-session)
 ├── filter/
@@ -372,16 +376,20 @@ Key changes:
 - `shim/` — new, thin bridge. Owns the `mcp/` layer (MCP tool definitions, stdio transport)
 - `daemon/` — new, manages sessions, socket server, RPC handlers
 - `receiver/` — new, LogReceiver trait + GelfReceiver
-- `engine/`, `filter/`, `store/`, `gelf/` — mostly unchanged, used by daemon
+- `engine/` — `LogPipeline` refactored to shared infrastructure (store + pre-buffer + seq counter); per-session trigger/filter iteration moves to daemon's log processing loop. `TriggerManager` and `PreTriggerBuffer` unchanged.
+- `filter/`, `store/`, `gelf/` — unchanged, used by daemon
 - `mcp/` — tool definitions unchanged (same parameters/descriptions), but implementations now serialize to RPC instead of calling pipeline directly
 
 ## Implementation Notes
 
+- **Session name validation.** Named session names must match `[a-zA-Z0-9_-]+` (alphanumeric, hyphens, underscores). Empty strings and names containing path separators or special characters are rejected.
 - **Trigger IDs are session-scoped.** Session A's trigger 3 and session B's trigger 3 are unrelated. Tools operate on "my session's triggers" implicitly.
 - **Pre-trigger buffer resizing.** The daemon recalculates `max(pre_window across all sessions' triggers)` and calls `pre_buffer.resize()` whenever a session is added, removed, or has triggers edited.
 - **Socket → session mapping.** The daemon maintains a `HashMap<ConnectionId, SessionId>` to route RPC requests to the correct session. Each socket connection is associated with exactly one session.
 - **Path resolution.** The shim resolves relative file paths (e.g., in `export_logs`) to absolute paths before sending to the daemon, since the daemon's CWD differs from Claude's project directory.
 - **Post-trigger window and storage.** When any session has an active post-trigger window, the log is stored unconditionally. This means one session's trigger can cause logs to be stored that benefit other sessions — this is intentional and desirable.
+- **`drop_session` restrictions.** Only named sessions can be dropped (anonymous have no name to reference). A session cannot drop itself — that's what disconnecting does.
+- **Pre-trigger flush optimization.** When multiple sessions' triggers match the same log, process sessions in order of largest `pre_window` first. The larger flush covers the smaller, reducing duplicate seq checks.
 
 ## Future Work (Out of Scope)
 
