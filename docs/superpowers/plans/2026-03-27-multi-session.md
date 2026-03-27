@@ -63,7 +63,6 @@ src/
 uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"                    # file locking (cross-platform)
 async-trait = "0.1"
-libc = "0.2"                   # Unix PID check (cfg(unix) only)
 tracing-appender = "0.2"       # daemon log file rotation
 
 [dev-dependencies]
@@ -1531,11 +1530,17 @@ async fn connect(dir: &PathBuf) -> anyhow::Result<DaemonConnection> {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 ```
 
-Note: `libc` crate needed for `kill(pid, 0)` on Unix. On Windows, use `winapi` or `sysinfo` crate. Add conditional dependencies.
+No `unsafe` or `libc` dependency — uses the `kill -0` command which works on macOS and Linux. On Windows, use `tasklist /FI "PID eq {pid}"` instead.
 
 - [ ] **Step 2: Verify compilation**
 
