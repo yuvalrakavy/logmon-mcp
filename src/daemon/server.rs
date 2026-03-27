@@ -87,7 +87,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
 
     #[cfg(unix)]
     {
-        let socket_path = dir.join("daemon.sock");
+        let socket_path = dir.join("logmon.sock");
         // Remove stale socket file if it exists
         let _ = std::fs::remove_file(&socket_path);
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
