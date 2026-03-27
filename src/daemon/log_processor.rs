@@ -17,22 +17,21 @@ pub fn spawn_log_processor(
     })
 }
 
+/// Call after adding/editing/removing triggers to resize the pre-buffer.
+pub fn sync_pre_buffer_size(pipeline: &LogPipeline, sessions: &SessionRegistry) {
+    let max_pre = sessions.max_pre_window() as usize;
+    pipeline.resize_pre_buffer(max_pre);
+}
+
 pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &SessionRegistry) {
     // 1. Assign seq
     entry.seq = pipeline.assign_seq();
 
-    // 2. Ensure pre-buffer is sized to hold the max pre_window across all sessions
-    let max_pre = sessions.max_pre_window() as usize;
-    if max_pre > 0 {
-        pipeline.resize_pre_buffer(max_pre);
-    }
-
-    // 3. Append to pre-trigger buffer
+    // 2. Append to pre-trigger buffer
     pipeline.pre_buffer_append(entry.clone());
 
-    // 4. Evaluate triggers per session
+    // 3. Evaluate triggers per session
     let mut any_post_window_active = false;
-    let mut _trigger_matched_any = false;
 
     let session_ids = sessions.active_session_ids_sorted_by_pre_window();
 
@@ -46,7 +45,6 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
         // 4b. Evaluate triggers
         let matches = sessions.evaluate_triggers(sid, entry);
         if !matches.is_empty() {
-            _trigger_matched_any = true;
             let trigger_max_pre = matches.iter().map(|m| m.pre_window).max().unwrap_or(0);
             let trigger_max_post = matches.iter().map(|m| m.post_window).max().unwrap_or(0);
 

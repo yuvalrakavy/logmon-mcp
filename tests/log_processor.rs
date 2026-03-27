@@ -1,4 +1,4 @@
-use logmon_mcp_server::daemon::log_processor::process_entry;
+use logmon_mcp_server::daemon::log_processor::{process_entry, sync_pre_buffer_size};
 use logmon_mcp_server::daemon::session::SessionRegistry;
 use logmon_mcp_server::engine::pipeline::LogPipeline;
 use logmon_mcp_server::gelf::message::{Level, LogEntry, LogSource};
@@ -28,6 +28,7 @@ fn test_log_stored_when_no_filters() {
     let pipeline = Arc::new(LogPipeline::new(1000));
     let sessions = Arc::new(SessionRegistry::new());
     let _sid = sessions.create_anonymous();
+    sync_pre_buffer_size(&pipeline, &sessions);
 
     let mut entry = make_entry(Level::Info, "hello");
     process_entry(&mut entry, &pipeline, &sessions);
@@ -44,6 +45,7 @@ fn test_trigger_fires_and_flushes_pre_buffer() {
 
     // Add a filter so INFO logs are NOT stored normally
     sessions.add_filter(&sid, "l>=ERROR", Some("errors")).unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
 
     // Send 10 INFO entries -- go to pre-buffer but not store
     for _ in 0..10 {
@@ -75,6 +77,7 @@ fn test_post_window_skips_triggers() {
 
     // Add filter to block INFO
     sessions.add_filter(&sid, "l>=ERROR", None).unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
 
     // Fire trigger
     let mut entry = make_entry(Level::Error, "crash");
@@ -103,6 +106,7 @@ fn test_per_session_filters() {
 
     sessions.add_filter(&sid_a, "fa=mqtt", None).unwrap();
     sessions.add_filter(&sid_b, "l>=ERROR", None).unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
 
     // MQTT INFO -> stored (matches A's filter)
     let mut e1 = make_entry(Level::Info, "mqtt msg");
@@ -128,6 +132,7 @@ fn test_notification_queued_for_disconnected_session() {
     let pipeline = Arc::new(LogPipeline::new(1000));
     let sessions = Arc::new(SessionRegistry::new());
     let sid = sessions.create_named("test-queue").unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
     sessions.disconnect(&sid);
 
     let mut entry = make_entry(Level::Error, "crash while disconnected");
