@@ -7,3 +7,4 @@ pub mod engine;
 pub mod mcp;
 pub mod rpc;
 pub mod receiver;
+pub mod shim;
