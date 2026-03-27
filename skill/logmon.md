@@ -23,6 +23,7 @@ You have access to a log collector MCP server that receives structured logs from
 - `/logmon unwatch` — call `get_filters`, then remove all filters
 - `/logmon sessions` — call `get_sessions` and summarize
 - `/logmon <any DSL filter>` — if the argument looks like a filter DSL expression (contains `=`, `>=`, `/regex/`, or known selectors like `fa=`, `l>=`, `h=`, `m=`), call `get_recent_logs` with that filter
+- `/logmon help` — print the Quick Commands list above (do NOT call any tools)
 
 ## Architecture
 
