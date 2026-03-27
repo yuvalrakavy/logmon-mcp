@@ -294,7 +294,7 @@ Extends the existing filter DSL with span-specific selectors. Same syntax, same 
 
 When `add_trigger` is called with a filter containing span selectors (`sn`, `sv`, `sk`, `d>=`, `d<=`), the system detects it as a span trigger and evaluates it against spans in the span processor. Filters containing only log selectors (`m`, `fm`, `fa`, `l>=`, etc.) evaluate against logs as before.
 
-If a filter mixes log and span selectors, it's a span trigger (span selectors are the more specific context).
+If a filter mixes log and span selectors, it's an error — reject with a clear message: "filter contains both log selectors (l, m, fm, fa, fi, ln) and span selectors (sn, sv, sk, d). Use separate triggers for logs and spans." This avoids silent confusion where half the filter is meaningless.
 
 ### Matcher Function
 
@@ -303,6 +303,8 @@ pub fn matches_span(filter: &ParsedFilter, span: &SpanEntry) -> bool
 ```
 
 Parallel to the existing `matches_entry(filter, entry) -> bool` for logs.
+
+**Parser note:** The `d>=` / `d<=` selector is parsed similarly to `l>=` / `l<=` (level comparison) but the value is a numeric duration in milliseconds (f64), not an enum. The parser recognizes `d` as a special duration selector. Examples: `d>=100`, `d<=50`, `d>=0.5` (sub-millisecond).
 
 ## Span Triggers
 
@@ -360,6 +362,8 @@ Log triggers and span triggers are completely independent:
 
 The notification does NOT include full linked logs inline (they could be large). The AI can call `get_trace_logs` if it needs them.
 
+**Incomplete traces:** When a span trigger fires, the trace may be incomplete — the root span or sibling spans may not have arrived yet (spans arrive as they complete, not in tree order). The `trace_summary` in the notification reflects what's available at that moment. Fields like `root_span_name` may be empty and `span_count` may be partial. This is expected and acceptable — the AI can call `get_trace` later for the complete picture.
+
 ### Span Tree Reconstruction
 
 SpanStore returns spans as a flat list sorted by start_time. Tree reconstruction (indenting by parent-child relationships) is done by the RPC handler when formatting `get_trace` responses. Algorithm: build a HashMap<span_id, Vec<children>>, then DFS from root spans (parent_span_id = None).
@@ -389,6 +393,8 @@ List recent traces, newest first.
 
 Returns list of TraceSummary. Traces with only logs (no spans) are included, marked as `[logs only]`.
 
+**Performance note:** Building TraceSummary requires `linked_log_count` from a cross-store lookup. This is computed lazily at query time using the LogStore's trace_id index (O(1) HashMap lookup per trace). For 20 traces, this is 20 lookups — fast enough.
+
 #### `get_trace`
 
 Full trace detail — span tree + linked logs.
@@ -399,7 +405,7 @@ Full trace detail — span tree + linked logs.
 | `include_logs` | bool | true | Include linked logs in output |
 | `filter` | String? | None | Filter spans within the trace |
 
-Returns span tree (indented by parent-child, sorted by start_time) with linked logs interleaved at their timestamp positions. When filter is set, non-matching spans are omitted but tree structure is preserved.
+Returns span tree (indented by parent-child, sorted by start_time) with linked logs interleaved at their timestamp positions. When filter is set, non-matching spans are omitted but tree structure is preserved — ancestor spans that don't match but have matching descendants are shown as abbreviated bridge nodes (name + duration only, no attributes) to maintain context.
 
 #### `get_trace_summary`
 
@@ -421,6 +427,8 @@ POST /api/presets/activate (520ms)
 
 Automatically identifies the bottleneck span. Highlights error paths.
 
+**Time accounting:** The breakdown shows each span's **self-time** (its duration minus the sum of its direct children's durations). This avoids double-counting when a parent span's duration includes its children. The "other" row captures time not attributed to any child span (framework overhead, gaps between spans). If self-time computation isn't possible (missing children spans), falls back to wall-clock duration with a note that times may overlap.
+
 #### `get_slow_spans`
 
 Find performance bottlenecks.
@@ -434,13 +442,15 @@ Find performance bottlenecks.
 
 Without grouping: individual slow spans with root request context (root span name, total duration, percentage).
 
-With `group_by="name"`:
+With `group_by="name"` (aggregated over all spans in SpanStore):
 
 ```
 Slow spans by operation (>100ms):
   query_database   avg=320ms  p95=450ms  count=12
   load_schema      avg=150ms  p95=200ms  count=3
 ```
+
+Percentiles are computed in-memory from matching spans in the buffer. With the default 10,000 span buffer this is fast (sub-millisecond).
 
 #### `get_span_context`
 
