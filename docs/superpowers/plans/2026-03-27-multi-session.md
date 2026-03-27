@@ -124,11 +124,21 @@ pub struct RpcNotification {
 }
 
 /// Envelope: either a response or a notification from daemon
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 pub enum DaemonMessage {
     Response(RpcResponse),
     Notification(RpcNotification),
+}
+
+/// Parse a daemon message by checking for `id` field presence.
+/// Do NOT use serde untagged — it's fragile and can silently misparse.
+pub fn parse_daemon_message_from_str(line: &str) -> anyhow::Result<DaemonMessage> {
+    let v: serde_json::Value = serde_json::from_str(line)?;
+    if v.get("id").is_some() {
+        Ok(DaemonMessage::Response(serde_json::from_value(v)?))
+    } else {
+        Ok(DaemonMessage::Notification(serde_json::from_value(v)?))
+    }
 }
 
 /// session.start parameters
@@ -208,7 +218,7 @@ pub async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Re
 /// Read and parse a DaemonMessage (response or notification)
 pub async fn read_daemon_message<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<DaemonMessage>> {
     match read_line(reader).await? {
-        Some(line) => Ok(Some(serde_json::from_str(&line)?)),
+        Some(line) => Ok(Some(super::types::parse_daemon_message_from_str(&line)?)),
         None => Ok(None),
     }
 }
@@ -755,13 +765,24 @@ pub struct SessionInfo {
 }
 ```
 
-`SessionRegistry` wraps `RwLock<HashMap<SessionId, SessionState>>`. Each `SessionState` has:
-- `TriggerManager` (initialized with defaults)
-- `Vec<BufferFilterEntry>` (from engine/pipeline.rs — may need to extract this type)
-- `VecDeque<PipelineEvent>` notification queue (max 1000)
-- `post_window_remaining: u32` (per-session post-window counter)
-- `connected: bool`
-- `last_seen: Instant`
+`SessionRegistry` wraps `RwLock<HashMap<SessionId, SessionState>>`. Each `SessionState` uses interior mutability for fields that change per-log (so `process_entry` can hold a read lock on the registry):
+
+```rust
+struct SessionState {
+    name: Option<String>,
+    triggers: TriggerManager,              // match_count uses AtomicU64 internally
+    filters: RwLock<Vec<BufferFilterEntry>>, // changed by RPC, read by process_entry
+    notification_queue: Mutex<VecDeque<PipelineEvent>>, // push from process_entry
+    max_queue_size: usize,                 // 1000, immutable after creation
+    post_window_remaining: AtomicU32,      // decremented per-log by process_entry
+    connected: AtomicBool,
+    last_seen: Mutex<Instant>,
+}
+```
+
+This design means `process_entry` holds a READ lock on the registry HashMap while writing to individual sessions via their interior mutability. No contention between sessions. RPC handlers that add/remove sessions take a WRITE lock on the HashMap (rare, fast).
+
+**Session-removal safety**: All `SessionRegistry` methods that operate on a session return `Option` or `Result`. `process_entry` must handle the case where a session is removed between getting the ID list and operating on it — skip silently, don't panic.
 
 Session name validation: `regex::Regex::new(r"^[a-zA-Z0-9_-]+$")`
 
@@ -1001,6 +1022,56 @@ fn test_notification_queued_for_disconnected_session() {
     let queued = sessions.drain_notifications(&sid);
     assert_eq!(queued.len(), 1);
 }
+
+#[test]
+fn test_zero_sessions_stores_everything() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    // No sessions at all
+
+    let mut entry = make_entry(Level::Debug, "nobody listening");
+    process_entry(&mut entry, &pipeline, &sessions);
+    // No filters from any session = implicit ALL
+    assert_eq!(pipeline.store_len(), 1);
+}
+
+#[test]
+fn test_trigger_with_pre_window_zero() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+    // Edit default trigger to pre_window=0
+    let triggers = sessions.list_triggers(&sid);
+    sessions.edit_trigger(&sid, triggers[0].id, None, Some(0), None, None, None).unwrap();
+
+    // Send some context then an error
+    for _ in 0..5 {
+        let mut e = make_entry(Level::Info, "context");
+        process_entry(&mut e, &pipeline, &sessions);
+    }
+    let mut error = make_entry(Level::Error, "crash");
+    process_entry(&mut error, &pipeline, &sessions);
+
+    // Triggering entry must be stored even with pre_window=0
+    let logs = pipeline.recent_logs(100, None);
+    assert!(logs.iter().any(|l| l.message == "crash"));
+}
+
+#[test]
+fn test_session_removed_during_processing_no_panic() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+
+    // Remove the session from another "thread" (simulated)
+    sessions.disconnect(&sid);
+
+    // This should not panic — process_entry skips missing sessions
+    let mut entry = make_entry(Level::Error, "nobody home");
+    process_entry(&mut entry, &pipeline, &sessions);
+    // Entry stored via "no sessions = no filters = store everything" path
+    assert_eq!(pipeline.store_len(), 1);
+}
 ```
 
 - [ ] **Step 2: Implement log processor**
@@ -1017,14 +1088,26 @@ use tokio::sync::mpsc;
 
 /// Spawns the main log processing loop.
 /// Reads LogEntries from the channel, assigns seq, evaluates triggers/filters, stores.
+/// Also handles seq block persistence — writes state.json when crossing a block boundary.
 pub fn spawn_log_processor(
     mut receiver: mpsc::Receiver<LogEntry>,
     pipeline: Arc<LogPipeline>,
     sessions: Arc<SessionRegistry>,
+    state_path: std::path::PathBuf,
+    state: Arc<Mutex<DaemonState>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(mut entry) = receiver.recv().await {
             process_entry(&mut entry, &pipeline, &sessions);
+
+            // Persist state when crossing a seq block boundary
+            if entry.seq > 0 && entry.seq % SEQ_BLOCK_SIZE == 0 {
+                let mut s = state.lock().unwrap();
+                s.seq_block = entry.seq + SEQ_BLOCK_SIZE;
+                if let Err(e) = save_state(&state_path, &s) {
+                    tracing::error!("Failed to persist state: {e}");
+                }
+            }
         }
     })
 }
