@@ -281,12 +281,14 @@ Extends the existing filter DSL with span-specific selectors. Same syntax, same 
 | -------- | ----- | ------- |
 | `sn` | span name | `sn=query_database` |
 | `sv` | service name | `sv=store_server` |
-| `st` | status | `st=error` |
-| `sk` | span kind | `sk=server` |
+| `st` | status | `st=error` (matches any Error), `st=ok`, `st=unset`, or `st=timeout` (substring match against error message) |
+| `sk` | span kind (case-insensitive) | `sk=server`, `sk=client`, `sk=internal`, `sk=producer`, `sk=consumer` |
 | `d>=` / `d<=` | duration (ms) | `d>=100` |
 | bare text | substring match against span name | `query` |
 | `/regex/` | regex against span name | `/copy_from\|query/` |
 | `key=value` | attribute match | `http.method=POST` |
+
+**Attribute matching:** Any `key=value` where `key` is not a recognized selector (`sn`, `sv`, `st`, `sk`, `d`) is treated as a span attribute match. The parser first checks against known selectors; if no match, it's an attribute lookup. This is the same approach as the log DSL where unrecognized selectors become additional_field matches.
 
 **Bare text and regex behavior:** When no selector is specified, bare text and `/regex/` match against the span `name` field only (not all attributes). This differs from log matching where bare patterns match against all fields — span attributes are key-value pairs that don't lend themselves to global text search. Use `key=value` syntax for attribute matching.
 
@@ -391,7 +393,7 @@ List recent traces, newest first.
 | `count` | u32 | 20 | Max traces to return |
 | `filter` | String? | None | Span filter DSL expression |
 
-Returns list of TraceSummary. Traces with only logs (no spans) are included, marked as `[logs only]`.
+Returns list of TraceSummary ordered by most recently received data (max seq across all spans/logs in the trace). Traces with only logs (no spans) are included, marked as `[logs only]`.
 
 **Performance note:** Building TraceSummary requires `linked_log_count` from a cross-store lookup. This is computed lazily at query time using the LogStore's trace_id index (O(1) HashMap lookup per trace). For 20 traces, this is 20 lookups — fast enough.
 
@@ -427,7 +429,9 @@ POST /api/presets/activate (520ms)
 
 Automatically identifies the bottleneck span. Highlights error paths.
 
-**Time accounting:** The breakdown shows each span's **self-time** (its duration minus the sum of its direct children's durations). This avoids double-counting when a parent span's duration includes its children. The "other" row captures time not attributed to any child span (framework overhead, gaps between spans). If self-time computation isn't possible (missing children spans), falls back to wall-clock duration with a note that times may overlap.
+**Depth:** The breakdown shows only **direct children of the root span**, not the full tree. For deeper investigation, use `get_trace`. This keeps the summary compact even for traces with many spans.
+
+**Time accounting:** The breakdown shows each child span's **self-time** (its duration minus the sum of its direct children's durations). This avoids double-counting when a parent span's duration includes its children. The "other" row captures time in the root span not attributed to any direct child (framework overhead, gaps between spans). If self-time computation isn't possible (missing children spans), falls back to wall-clock duration with a note that times may overlap.
 
 #### `get_slow_spans`
 
@@ -481,7 +485,19 @@ All logs linked to a trace.
 
 ## Trigger Notification Enhancement
 
-When a log trigger fires on a log entry that has a `trace_id`, the notification automatically includes the trace summary (root span name, total duration, span count). The AI gets the full request context without a follow-up tool call.
+When a log trigger fires on a log entry that has a `trace_id`, the notification automatically includes the trace summary. The existing `PipelineEvent` gains optional trace fields:
+
+```rust
+pub struct PipelineEvent {
+    // ... existing fields unchanged ...
+
+    // New: populated when the triggering entry has a trace_id
+    pub trace_id: Option<u128>,
+    pub trace_summary: Option<TraceSummary>,
+}
+```
+
+The AI gets the full request context without a follow-up tool call. If the triggering log has no trace_id, these fields are None and the notification is identical to today.
 
 ## Trace-Aware Pre-Buffer Flush
 
