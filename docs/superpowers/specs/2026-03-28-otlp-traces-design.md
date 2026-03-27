@@ -61,6 +61,7 @@ pub struct SpanEntry {
 }
 
 pub enum SpanKind {
+    Unspecified,   // OpenTelemetry default when kind is not set
     Internal,
     Server,
     Client,
@@ -98,7 +99,7 @@ pub struct TraceSummary {
 }
 ```
 
-For traces with no spans (logs-only, from GELF with trace context), `root_span_name` is empty and `total_duration_ms` is derived from the time range of linked logs.
+For traces with no spans (logs-only, from GELF with trace context), `root_span_name` is `"[logs only]"` and `total_duration_ms` is derived from the time range of linked logs: `max(timestamp) - min(timestamp)`. If only one log exists for the trace, duration is 0.
 
 ### LogEntry Changes
 
@@ -187,6 +188,20 @@ Both implement the same OTLP endpoints:
 | `resource.attributes["host.name"]` | `host` |
 | `attributes` (all others) | `additional_fields` |
 
+**Default values:**
+- If `resource.attributes["service.name"]` is missing: `facility` = `"unknown"`
+- If `resource.attributes["host.name"]` is missing: `host` = `"unknown"`
+- If `trace_id` or `span_id` is empty/zero: set to None (log is not part of a trace)
+- If `severity_number` is missing: default to Info
+
+### OTLP Error Handling
+
+Malformed OTLP data is handled the same way as malformed GELF:
+- Missing required fields: increment malformed counter, skip the entry
+- For log records: `body` is required. Everything else has defaults.
+- For spans: `trace_id`, `span_id`, and `name` are required. Missing any → skip and count as malformed.
+- Partially valid batches: process valid entries, skip malformed ones. Return success to the OTLP exporter (standard OTLP behavior — exporters don't retry on partial failure).
+
 ### OTLP Span → SpanEntry Mapping
 
 | OTLP field | SpanEntry field |
@@ -203,6 +218,11 @@ Both implement the same OTLP endpoints:
 | `resource.attributes["service.name"]` | `service_name` |
 | `attributes` | `attributes` |
 | `events` | `events` (Vec<SpanEvent>) |
+
+**Default values for spans:**
+- If `resource.attributes["service.name"]` is missing: `service_name` = `"unknown"`
+- If `status` is not set: `SpanStatus::Unset`
+- If `kind` is not set: `SpanKind::Unspecified`
 
 ### Receiver Structure
 
@@ -245,6 +265,12 @@ The link between logs and spans is the `trace_id` field. No explicit linking ste
 - **Log has trace_id but no spans exist:** Common with GELF-only setups. Tools return logs grouped by trace_id with "no spans found." Still useful.
 - **Spans evicted but logs remain (or vice versa):** Partial view is fine. No error.
 
+### Span Storage Rules
+
+Spans are stored unconditionally — session filters do NOT affect span storage. Rationale: spans are relatively few compared to logs (one span per operation vs potentially many log lines per operation), and filtering spans would break trace completeness. A trace with missing spans is misleading.
+
+Session triggers DO evaluate against spans (if they contain span selectors). But trigger evaluation is for notification, not storage gating.
+
 ## Span Filter DSL
 
 Extends the existing filter DSL with span-specific selectors. Same syntax, same parser, new matchers.
@@ -261,6 +287,8 @@ Extends the existing filter DSL with span-specific selectors. Same syntax, same 
 | bare text | substring match against span name | `query` |
 | `/regex/` | regex against span name | `/copy_from\|query/` |
 | `key=value` | attribute match | `http.method=POST` |
+
+**Bare text and regex behavior:** When no selector is specified, bare text and `/regex/` match against the span `name` field only (not all attributes). This differs from log matching where bare patterns match against all fields — span attributes are key-value pairs that don't lend themselves to global text search. Use `key=value` syntax for attribute matching.
 
 ### Auto-Detection
 
@@ -298,6 +326,43 @@ This is richer than log trigger notifications because the AI gets the full reque
 ### No Pre/Post Window for Spans
 
 Span triggers don't need pre/post windows. Spans are self-contained with timing — there's no equivalent of "capture logs before the error." The trace itself provides all the context. Span triggers fire immediately on match and include the trace summary.
+
+Log triggers and span triggers are completely independent:
+- A log post-trigger window does NOT suppress span trigger evaluation
+- A span trigger firing does NOT affect log trigger evaluation
+- They run in separate processors on separate channels
+
+### Span Trigger Notification Schema
+
+```json
+{
+  "type": "span_trigger",
+  "trigger_id": 3,
+  "trigger_description": "Slow database queries",
+  "filter_string": "sn=query_database,d>=500",
+  "matched_span": {
+    "name": "query_database",
+    "duration_ms": 612.5,
+    "status": "ok",
+    "service_name": "store_server",
+    "trace_id": "4bf92f3577b16e0f0000000000000001",
+    "span_id": "00f067aa0ba902b7"
+  },
+  "trace_summary": {
+    "root_span_name": "POST /api/presets/activate",
+    "total_duration_ms": 720.0,
+    "span_count": 5,
+    "has_errors": false
+  },
+  "linked_log_count": 3
+}
+```
+
+The notification does NOT include full linked logs inline (they could be large). The AI can call `get_trace_logs` if it needs them.
+
+### Span Tree Reconstruction
+
+SpanStore returns spans as a flat list sorted by start_time. Tree reconstruction (indenting by parent-child relationships) is done by the RPC handler when formatting `get_trace` responses. Algorithm: build a HashMap<span_id, Vec<children>>, then DFS from root spans (parent_span_id = None).
 
 ### Configuration
 
