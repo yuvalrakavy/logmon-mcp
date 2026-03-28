@@ -364,7 +364,7 @@ fn test_parse_gelf_with_trace_context() {
         "_trace_id": "4bf92f3577b16e0f0000000000000001",
         "_span_id": "00f067aa0ba902b7"
     }"#;
-    let entry = parse_gelf_message(json).unwrap();
+    let entry = parse_gelf_message(json.as_bytes(), 1).unwrap();
     assert_eq!(entry.trace_id, Some(0x4bf92f3577b16e0f0000000000000001_u128));
     assert_eq!(entry.span_id, Some(0x00f067aa0ba902b7_u64));
     // Extracted from additional_fields — should NOT be in the map
@@ -379,7 +379,7 @@ fn test_parse_gelf_without_trace_context() {
         "host": "app",
         "short_message": "plain log"
     }"#;
-    let entry = parse_gelf_message(json).unwrap();
+    let entry = parse_gelf_message(json.as_bytes(), 1).unwrap();
     assert_eq!(entry.trace_id, None);
     assert_eq!(entry.span_id, None);
 }
@@ -392,7 +392,7 @@ fn test_parse_gelf_invalid_trace_id() {
         "short_message": "bad trace",
         "_trace_id": "not-valid-hex"
     }"#;
-    let entry = parse_gelf_message(json).unwrap();
+    let entry = parse_gelf_message(json.as_bytes(), 1).unwrap();
     // Invalid hex → trace_id is None, not an error
     assert_eq!(entry.trace_id, None);
 }
@@ -468,15 +468,16 @@ pub struct SeqCounter {
 
 impl SeqCounter {
     pub fn new() -> Self {
-        Self { counter: AtomicU64::new(1) }
+        Self { counter: AtomicU64::new(0) }
     }
 
     pub fn new_with_initial(initial: u64) -> Self {
         Self { counter: AtomicU64::new(initial) }
     }
 
+    /// Returns the next sequence number (1-based). Matches existing LogPipeline::assign_seq() behavior.
     pub fn next(&self) -> u64 {
-        self.counter.fetch_add(1, Ordering::Relaxed)
+        self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn current(&self) -> u64 {
@@ -489,9 +490,14 @@ impl SeqCounter {
 
 In `src/engine/pipeline.rs`:
 - Remove the internal `AtomicU64` seq counter
-- Accept `Arc<SeqCounter>` in constructor
-- `assign_seq()` delegates to `seq_counter.next()`
-- Update `new()` and `new_with_seq()` to create/accept SeqCounter
+- Add field `seq_counter: Arc<SeqCounter>`
+- `assign_seq()` delegates to `self.seq_counter.next()`
+- Keep `new(capacity)` as convenience: creates internal `Arc<SeqCounter>`
+- Keep `new_with_seq(capacity, initial_seq)` as convenience: creates `Arc<SeqCounter>::new_with_initial(initial_seq)`
+- Add `new_with_seq_counter(capacity, seq_counter: Arc<SeqCounter>)` — used when sharing counter with SpanStore
+- Add `logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry>` — delegates to `self.store.logs_by_trace_id(trace_id)`
+- Add `count_by_trace_id(&self, trace_id: u128) -> usize` — delegates to `self.store.count_by_trace_id(trace_id)`
+- Add `pre_buffer_entries_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry>` — scans pre-buffer for matching entries
 
 Update `src/engine/mod.rs` to export the new module.
 
@@ -579,7 +585,7 @@ In `src/store/traits.rs`:
 pub trait LogStore: Send + Sync {
     // ... existing methods ...
 
-    fn logs_by_trace_id(&self, trace_id: u128) -> Vec<&LogEntry>;
+    fn logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry>;  // Returns clones (can't borrow through RwLock)
     fn count_by_trace_id(&self, trace_id: u128) -> usize;
 }
 ```
@@ -659,15 +665,11 @@ fn rand_id() -> u64 {
 #[test]
 fn test_insert_and_get_trace() {
     let seq = Arc::new(SeqCounter::new());
-    let store = SpanStore::new(100, seq.clone());
+    let store = SpanStore::new(100, seq);
     let trace_id = 0xabc_u128;
 
-    let mut s1 = make_span("root", trace_id, 100.0);
-    s1.seq = seq.next();
-    store.insert(s1);
-    let mut s2 = make_span("child", trace_id, 50.0);
-    s2.seq = seq.next();
-    store.insert(s2);
+    store.insert(make_span("root", trace_id, 100.0));
+    store.insert(make_span("child", trace_id, 50.0));
 
     let spans = store.get_trace(trace_id);
     assert_eq!(spans.len(), 2);
@@ -702,7 +704,7 @@ fn test_recent_traces() {
     store.insert(make_span("trace-a-root", 0xa_u128, 100.0));
     store.insert(make_span("trace-b-root", 0xb_u128, 200.0));
 
-    let recent = store.recent_traces(10, None, |_| 0); // linked_log_count callback returns 0
+    let recent = store.recent_traces(10, None, |_| 0u32); // linked_log_count callback returns 0
     assert_eq!(recent.len(), 2);
     // Most recently inserted first
     assert_eq!(recent[0].trace_id, 0xb_u128);
@@ -795,9 +797,10 @@ impl SpanStore {
         }
     }
 
-    /// Insert a span. Caller must assign seq before calling.
-    pub fn insert(&self, span: SpanEntry) {
-        debug_assert!(span.seq > 0, "seq must be assigned before insert");
+    /// Insert a span. Assigns seq from the shared counter.
+    pub fn insert(&self, mut span: SpanEntry) -> u64 {
+        span.seq = self.seq_counter.next();
+        let seq = span.seq;
         let mut inner = self.inner.write().unwrap();
 
         // Evict if at capacity
@@ -819,6 +822,7 @@ impl SpanStore {
             .push(span.seq);
 
         inner.buffer.push_back(span);
+        seq
     }
 
     pub fn get_trace(&self, trace_id: u128) -> Vec<SpanEntry> {
@@ -1079,6 +1083,7 @@ pub enum Qualifier {
     DurationFilter(DurationOp, f64),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DurationOp {
     Gte,
     Lte,
@@ -1088,6 +1093,10 @@ pub enum DurationOp {
 Update `parse_selector()` to recognize `sn`, `sv`, `st`, `sk`.
 
 Add duration parsing in `parse_token()` — detect `d>=` and `d<=` patterns.
+
+**CRITICAL: Update existing exhaustive matches in `src/filter/matcher.rs`:**
+- `matches_qualifier()`: add arm `Qualifier::DurationFilter(..) => false` (duration only applies to spans)
+- `matches_selector()`: add arms for `Selector::SpanName | Selector::ServiceName | Selector::SpanStatus | Selector::SpanKind => false` (span selectors don't match log entries)
 
 Add `is_span_filter()` public function that checks if any qualifier uses span selectors or duration.
 
@@ -1239,14 +1248,20 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
             match selector {
                 Selector::SpanName => matches_pattern(pattern, &span.name),
                 Selector::ServiceName => matches_pattern(pattern, &span.service_name),
-                Selector::SpanStatus => match &span.status {
-                    SpanStatus::Error(msg) => {
-                        let pat_str = pattern_as_str(pattern);
-                        pat_str == "error" || matches_pattern(pattern, msg)
+                Selector::SpanStatus => {
+                    // Extract the raw pattern string for keyword matching
+                    let pat_lower = match pattern {
+                        Pattern::Substring(s) => s.clone(), // already lowercase
+                        Pattern::Regex { source, .. } => source.to_lowercase(),
+                    };
+                    match &span.status {
+                        SpanStatus::Error(msg) => {
+                            pat_lower == "error" || matches_pattern(pattern, msg)
+                        }
+                        SpanStatus::Ok => pat_lower == "ok",
+                        SpanStatus::Unset => pat_lower == "unset",
                     }
-                    SpanStatus::Ok => pattern_as_str(pattern) == "ok",
-                    SpanStatus::Unset => pattern_as_str(pattern) == "unset",
-                },
+                }
                 Selector::SpanKind => {
                     let kind_str = format!("{:?}", span.kind).to_lowercase();
                     matches_pattern(pattern, &kind_str)
@@ -1265,7 +1280,7 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
                 DurationOp::Lte => span.duration_ms <= *threshold,
             }
         }
-        Qualifier::LevelFilter(_, _) => false, // log-only
+        Qualifier::LevelFilter { .. } => false, // log-only
     }
 }
 ```
@@ -1728,6 +1743,8 @@ git commit -m "feat: OtlpReceiver + rename LogReceiver → Receiver"
 
 ### Task 12: Span Processor
 
+**IMPORTANT: Implement Task 13 BEFORE this task.** Task 13 adds `active_session_ids()` and `send_or_queue_span_notification()` to SessionRegistry, which are required here.
+
 **Files:**
 - Create: `src/daemon/span_processor.rs`
 - Create: `tests/span_processor.rs`
@@ -1769,44 +1786,42 @@ fn make_span(name: &str, duration_ms: f64) -> SpanEntry {
 #[test]
 fn test_span_stored() {
     let seq = Arc::new(SeqCounter::new());
-    let store = Arc::new(SpanStore::new(100, seq.clone()));
+    let store = Arc::new(SpanStore::new(100, seq));
     let sessions = Arc::new(SessionRegistry::new());
 
-    let mut span = make_span("query", 100.0);
-    process_span(&mut span, &store, &sessions);
-    assert!(span.seq > 0);
+    let span = make_span("query", 100.0);
+    process_span(&span, &store, &sessions);
     assert_eq!(store.len(), 1);
 }
 
 #[test]
 fn test_span_trigger_fires() {
     let seq = Arc::new(SeqCounter::new());
-    let store = Arc::new(SpanStore::new(100, seq.clone()));
+    let store = Arc::new(SpanStore::new(100, seq));
     let sessions = Arc::new(SessionRegistry::new());
     let sid = sessions.create_anonymous();
 
     // Add a span trigger
     sessions.add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow span")).unwrap();
 
-    let mut span = make_span("slow_query", 600.0);
-    process_span(&mut span, &store, &sessions);
+    let span = make_span("slow_query", 600.0);
+    process_span(&span, &store, &sessions);
 
-    // Notification should be queued (anonymous session is connected,
-    // so it goes to the broadcast channel — check session has no queued notifs)
+    // Span stored, notification sent via broadcast (anonymous session is connected)
     assert_eq!(store.len(), 1);
 }
 
 #[test]
 fn test_span_trigger_no_match() {
     let seq = Arc::new(SeqCounter::new());
-    let store = Arc::new(SpanStore::new(100, seq.clone()));
+    let store = Arc::new(SpanStore::new(100, seq));
     let sessions = Arc::new(SessionRegistry::new());
     let sid = sessions.create_anonymous();
 
     sessions.add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow")).unwrap();
 
-    let mut span = make_span("fast_query", 10.0);
-    process_span(&mut span, &store, &sessions);
+    let span = make_span("fast_query", 10.0);
+    process_span(&span, &store, &sessions);
 
     // Span stored but no trigger fired
     assert_eq!(store.len(), 1);
@@ -1835,14 +1850,14 @@ pub fn spawn_span_processor(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(mut span) = receiver.recv().await {
-            span.seq = seq_counter.next();
+            // SpanStore.insert() assigns seq from the shared counter
             process_span(&mut span, &span_store, &sessions);
         }
     })
 }
 
-pub fn process_span(span: &mut SpanEntry, store: &SpanStore, sessions: &SessionRegistry) {
-    // 1. Store unconditionally
+pub fn process_span(span: &SpanEntry, store: &SpanStore, sessions: &SessionRegistry) {
+    // 1. Store unconditionally (SpanStore assigns seq)
     store.insert(span.clone());
 
     // 2. Evaluate span triggers for each session
@@ -2057,7 +2072,7 @@ if let Some(tid) = entry.trace_id {
 }
 ```
 
-This requires adding a `pre_buffer_entries_by_trace_id()` method to LogPipeline that scans the pre-buffer for matching entries.
+This uses `pipeline.pre_buffer_entries_by_trace_id(tid)` which was added in Task 3 (Step 2). It scans the pre-buffer's VecDeque for entries with matching trace_id and returns clones.
 
 - [ ] **Step 3: Enhance trigger notification with trace summary**
 
@@ -2360,7 +2375,7 @@ fn test_logs_and_spans_linked_by_trace_id() {
     let trace_id = 0xabc123_u128;
 
     // Insert a log with trace context
-    let mut log = make_log(Level::Info, "processing request");
+    let mut log = make_entry(Level::Info, "processing request");
     log.trace_id = Some(trace_id);
     process_entry(&mut log, &pipeline, &sessions);
 
@@ -2388,7 +2403,7 @@ fn test_shared_seq_counter_interleaves() {
     let sessions = Arc::new(SessionRegistry::new());
     sync_pre_buffer_size(&pipeline, &sessions);
 
-    let mut log = make_log(Level::Info, "first");
+    let mut log = make_entry(Level::Info, "first");
     process_entry(&mut log, &pipeline, &sessions);
     let log_seq = log.seq;
 
@@ -2396,7 +2411,7 @@ fn test_shared_seq_counter_interleaves() {
     span_store.insert(span.clone());
     // span.seq should be log_seq + 1
 
-    let mut log2 = make_log(Level::Info, "third");
+    let mut log2 = make_entry(Level::Info, "third");
     process_entry(&mut log2, &pipeline, &sessions);
     assert!(log2.seq > log_seq + 1); // seq counter shared
 }
