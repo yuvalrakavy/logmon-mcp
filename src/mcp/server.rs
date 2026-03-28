@@ -31,6 +31,8 @@ struct GetRecentLogsParams {
     count: Option<u32>,
     /// Optional DSL filter expression
     filter: Option<String>,
+    /// Filter logs by trace ID (32-char hex)
+    trace_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -121,6 +123,60 @@ struct DropSessionParams {
     name: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct GetRecentTracesParams {
+    /// Max traces to return (default: 20)
+    count: Option<u32>,
+    /// Span filter DSL expression
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetTraceParams {
+    /// 32-character hex trace ID
+    trace_id: String,
+    /// Include linked logs (default: true)
+    include_logs: Option<bool>,
+    /// Filter spans within the trace
+    filter: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetTraceSummaryParams {
+    /// 32-character hex trace ID
+    trace_id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetSlowSpansParams {
+    /// Duration threshold in milliseconds (default: 100)
+    min_duration_ms: Option<f64>,
+    /// Max results (default: 20)
+    count: Option<u32>,
+    /// Additional span filter
+    filter: Option<String>,
+    /// Group results by "name" or "service"
+    group_by: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetSpanContextParams {
+    /// Span sequence number
+    seq: u64,
+    /// Spans before (default: 5)
+    before: Option<u32>,
+    /// Spans after (default: 5)
+    after: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetTraceLogsParams {
+    /// 32-character hex trace ID
+    trace_id: String,
+    /// Additional log filter DSL
+    filter: Option<String>,
+}
+
 // ---- Tool router ----
 
 #[rmcp::tool_router]
@@ -151,6 +207,7 @@ impl GelfMcpServer {
                 serde_json::json!({
                     "count": p.count,
                     "filter": p.filter,
+                    "trace_id": p.trace_id,
                 }),
             )
             .await
@@ -409,6 +466,137 @@ impl GelfMcpServer {
                 "triggers.remove",
                 serde_json::json!({
                     "id": p.id,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    // ---- Trace Tools ----
+
+    #[rmcp::tool(description = "List recent traces with timing and error info")]
+    async fn get_recent_traces(
+        &self,
+        Parameters(p): Parameters<GetRecentTracesParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "traces.recent",
+                serde_json::json!({
+                    "count": p.count,
+                    "filter": p.filter,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Get full trace detail — span tree + linked logs")]
+    async fn get_trace(
+        &self,
+        Parameters(p): Parameters<GetTraceParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "traces.get",
+                serde_json::json!({
+                    "trace_id": p.trace_id,
+                    "include_logs": p.include_logs,
+                    "filter": p.filter,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Compact timing breakdown highlighting bottlenecks")]
+    async fn get_trace_summary(
+        &self,
+        Parameters(p): Parameters<GetTraceSummaryParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "traces.summary",
+                serde_json::json!({
+                    "trace_id": p.trace_id,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Find slow spans, optionally grouped by operation name")]
+    async fn get_slow_spans(
+        &self,
+        Parameters(p): Parameters<GetSlowSpansParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "traces.slow_spans",
+                serde_json::json!({
+                    "min_duration_ms": p.min_duration_ms,
+                    "count": p.count,
+                    "filter": p.filter,
+                    "group_by": p.group_by,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Get spans surrounding a specific span in time")]
+    async fn get_span_context(
+        &self,
+        Parameters(p): Parameters<GetSpanContextParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "traces.span_context",
+                serde_json::json!({
+                    "seq": p.seq,
+                    "before": p.before,
+                    "after": p.after,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Get all logs linked to a trace")]
+    async fn get_trace_logs(
+        &self,
+        Parameters(p): Parameters<GetTraceLogsParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "traces.logs",
+                serde_json::json!({
+                    "trace_id": p.trace_id,
+                    "filter": p.filter,
                 }),
             )
             .await
