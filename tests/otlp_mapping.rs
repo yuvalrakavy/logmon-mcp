@@ -47,7 +47,7 @@ fn test_bytes_to_span_id_empty() {
 
 #[test]
 fn test_nanos_to_datetime() {
-    let nanos = 1700000000_000_000_000u64; // 2023-11-14T22:13:20Z
+    let nanos = 1_700_000_000_000_000_000_u64; // 2023-11-14T22:13:20Z
     let dt = nanos_to_datetime(nanos);
     assert_eq!(dt.timestamp(), 1700000000);
 }
