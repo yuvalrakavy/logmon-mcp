@@ -18,6 +18,15 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+/// Send a UDP multicast beacon to notify tracing-init circuit breakers
+/// about OTel collector availability. Best-effort — failures are silently ignored.
+fn send_otel_beacon(message: &str) {
+    use std::net::UdpSocket;
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = socket.send_to(message.as_bytes(), "239.255.77.1:4399");
+    }
+}
+
 /// Run the logmon daemon. This function blocks until the daemon is shut down.
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     // 1. Create config dir
@@ -88,6 +97,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         let otlp_info = otlp_receiver.listening_on();
         info!(?otlp_info, "OTLP receiver started");
         all_receivers_info.extend(otlp_info);
+        send_otel_beacon("OTEL:ONLINE\n");
     }
 
     // 10. Write PID file
@@ -147,6 +157,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             }
         }
 
+        // Send offline beacon before stopping receivers
+        send_otel_beacon("OTEL:OFFLINE\n");
+
         // Cleanup
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&pid_path);
@@ -183,6 +196,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
                 }
             }
         }
+
+        // Send offline beacon before stopping receivers
+        send_otel_beacon("OTEL:OFFLINE\n");
 
         let _ = std::fs::remove_file(&pid_path);
     }
