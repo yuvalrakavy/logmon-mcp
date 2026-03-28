@@ -73,7 +73,7 @@ impl SpanStore {
         let inner = self.inner.read().unwrap();
         let mut matching: Vec<SpanEntry> = inner.buffer.iter()
             .filter(|s| s.duration_ms >= min_duration_ms)
-            .filter(|s| filter.map_or(true, |f| matches_span(f, s)))
+            .filter(|s| filter.is_none_or(|f| matches_span(f, s)))
             .cloned()
             .collect();
         matching.sort_by(|a, b| b.duration_ms.partial_cmp(&a.duration_ms).unwrap_or(std::cmp::Ordering::Equal));
@@ -87,7 +87,7 @@ impl SpanStore {
         let inner = self.inner.read().unwrap();
         let mut trace_max_seq: HashMap<u128, u64> = HashMap::new();
         for span in inner.buffer.iter() {
-            if filter.map_or(true, |f| matches_span(f, span)) {
+            if filter.is_none_or(|f| matches_span(f, span)) {
                 let entry = trace_max_seq.entry(span.trace_id).or_insert(0);
                 if span.seq > *entry { *entry = span.seq; }
             }
@@ -138,5 +138,9 @@ impl SpanStore {
 
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

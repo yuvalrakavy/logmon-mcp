@@ -5,6 +5,12 @@ pub struct SeqCounter {
     counter: AtomicU64,
 }
 
+impl Default for SeqCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SeqCounter {
     pub fn new() -> Self {
         Self { counter: AtomicU64::new(0) }
