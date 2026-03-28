@@ -326,7 +326,7 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
 pub fn is_span_filter(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| is_span_qualifier(q)),
+        ParsedFilter::Qualifiers(qs) => qs.iter().any(is_span_qualifier),
     }
 }
 
@@ -389,8 +389,8 @@ pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
     }
 
     // Validate: cannot mix log-specific and span-specific selectors
-    let has_span = qualifiers.iter().any(|q| is_span_qualifier(q));
-    let has_log = qualifiers.iter().any(|q| is_log_qualifier(q));
+    let has_span = qualifiers.iter().any(is_span_qualifier);
+    let has_log = qualifiers.iter().any(is_log_qualifier);
     if has_span && has_log {
         return Err(FilterParseError::MixedLogSpanSelectors);
     }

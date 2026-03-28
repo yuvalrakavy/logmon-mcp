@@ -160,7 +160,7 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
                 Selector::AdditionalField(key) => {
                     span.attributes.get(key)
                         .and_then(|v| v.as_str())
-                        .map_or(false, |v| matches_pattern(pattern, v))
+                        .is_some_and(|v| matches_pattern(pattern, v))
                 }
                 _ => false, // log selectors don't match spans
             }
