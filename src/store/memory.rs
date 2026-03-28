@@ -3,7 +3,7 @@ use crate::filter::parser::ParsedFilter;
 use crate::filter::matcher::matches_entry;
 use crate::store::traits::{LogStore, StoreStats};
 use chrono::{DateTime, Utc};
-use std::collections::{VecDeque, HashSet};
+use std::collections::{VecDeque, HashSet, HashMap};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,6 +11,7 @@ use std::time::Duration;
 pub struct InMemoryStore {
     entries: RwLock<VecDeque<LogEntry>>,
     seq_set: RwLock<HashSet<u64>>,
+    trace_index: RwLock<HashMap<u128, Vec<u64>>>,
     max_capacity: usize,
     total_stored: AtomicU64,
     total_received: AtomicU64,
@@ -22,6 +23,7 @@ impl InMemoryStore {
         Self {
             entries: RwLock::new(VecDeque::with_capacity(capacity)),
             seq_set: RwLock::new(HashSet::new()),
+            trace_index: RwLock::new(HashMap::new()),
             max_capacity: capacity,
             total_stored: AtomicU64::new(0),
             total_received: AtomicU64::new(0),
@@ -40,17 +42,30 @@ impl LogStore for InMemoryStore {
         self.total_stored.fetch_add(1, Ordering::Relaxed);
 
         let seq = entry.seq;
+        let trace_id = entry.trace_id;
         let mut entries = self.entries.write().unwrap();
         let mut seq_set = self.seq_set.write().unwrap();
+        let mut trace_index = self.trace_index.write().unwrap();
 
         if entries.len() >= self.max_capacity {
             if let Some(evicted) = entries.pop_front() {
                 seq_set.remove(&evicted.seq);
+                if let Some(evicted_trace) = evicted.trace_id {
+                    if let Some(seqs) = trace_index.get_mut(&evicted_trace) {
+                        seqs.retain(|&s| s != evicted.seq);
+                        if seqs.is_empty() {
+                            trace_index.remove(&evicted_trace);
+                        }
+                    }
+                }
             }
         }
 
         entries.push_back(entry);
         seq_set.insert(seq);
+        if let Some(tid) = trace_id {
+            trace_index.entry(tid).or_default().push(seq);
+        }
     }
 
     fn recent(&self, count: usize, filter: Option<&ParsedFilter>) -> Vec<LogEntry> {
@@ -106,9 +121,28 @@ impl LogStore for InMemoryStore {
         self.seq_set.read().unwrap().contains(&seq)
     }
 
+    fn logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
+        let trace_index = self.trace_index.read().unwrap();
+        let Some(seqs) = trace_index.get(&trace_id) else {
+            return Vec::new();
+        };
+        let seq_set: HashSet<u64> = seqs.iter().copied().collect();
+        let entries = self.entries.read().unwrap();
+        entries.iter()
+            .filter(|e| seq_set.contains(&e.seq))
+            .cloned()
+            .collect()
+    }
+
+    fn count_by_trace_id(&self, trace_id: u128) -> usize {
+        let trace_index = self.trace_index.read().unwrap();
+        trace_index.get(&trace_id).map_or(0, |seqs| seqs.len())
+    }
+
     fn clear(&self) {
         self.entries.write().unwrap().clear();
         self.seq_set.write().unwrap().clear();
+        self.trace_index.write().unwrap().clear();
     }
 
     fn len(&self) -> usize {

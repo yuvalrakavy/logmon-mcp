@@ -128,15 +128,13 @@ impl LogPipeline {
     }
 
     /// Return log entries from the store matching the given trace_id.
-    /// Stub: will be implemented when LogStore gains trace_id indexing (Task 4).
-    pub fn logs_by_trace_id(&self, _trace_id: u128) -> Vec<LogEntry> {
-        Vec::new()
+    pub fn logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
+        self.store.logs_by_trace_id(trace_id)
     }
 
     /// Return count of log entries in the store matching the given trace_id.
-    /// Stub: will be implemented when LogStore gains trace_id indexing (Task 4).
-    pub fn count_by_trace_id(&self, _trace_id: u128) -> usize {
-        0
+    pub fn count_by_trace_id(&self, trace_id: u128) -> usize {
+        self.store.count_by_trace_id(trace_id)
     }
 
     // --- Pre-buffer operations ---

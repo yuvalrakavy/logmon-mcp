@@ -115,3 +115,41 @@ fn test_stats() {
     let stats = store.stats();
     assert_eq!(stats.total_stored, 2);
 }
+
+#[test]
+fn test_logs_by_trace_id() {
+    let store = InMemoryStore::new(100);
+    let trace = 0xabc123_u128;
+
+    let mut e1 = make_entry(1, Level::Info, "first");
+    e1.trace_id = Some(trace);
+    store.append(e1);
+
+    let mut e2 = make_entry(2, Level::Info, "second");
+    e2.trace_id = Some(trace);
+    store.append(e2);
+
+    let e3 = make_entry(3, Level::Info, "unrelated");
+    store.append(e3);
+
+    let traced = store.logs_by_trace_id(trace);
+    assert_eq!(traced.len(), 2);
+    assert_eq!(store.count_by_trace_id(trace), 2);
+    assert_eq!(store.count_by_trace_id(0xdead_u128), 0);
+}
+
+#[test]
+fn test_trace_id_index_eviction() {
+    let store = InMemoryStore::new(3);
+    let trace = 0xabc_u128;
+
+    for i in 1..=4 {
+        let mut e = make_entry(i, Level::Info, &format!("msg {i}"));
+        e.trace_id = Some(trace);
+        store.append(e);
+    }
+
+    // Entry with seq=1 evicted, only 3 remain
+    let traced = store.logs_by_trace_id(trace);
+    assert_eq!(traced.len(), 3);
+}

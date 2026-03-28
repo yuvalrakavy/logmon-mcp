@@ -20,5 +20,7 @@ pub trait LogStore: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    fn logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry>;
+    fn count_by_trace_id(&self, trace_id: u128) -> usize;
     fn stats(&self) -> StoreStats;
 }
