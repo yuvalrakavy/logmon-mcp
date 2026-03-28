@@ -18,6 +18,8 @@ fn make_entry(level: Level, msg: &str) -> LogEntry {
         file: None,
         line: None,
         additional_fields: HashMap::new(),
+        trace_id: None,
+        span_id: None,
         matched_filters: Vec::new(),
         source: LogSource::Filter,
     }

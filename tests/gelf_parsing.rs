@@ -82,3 +82,28 @@ fn test_trace_level_from_additional_field() {
     let entry = parse_gelf_message(raw.to_string().as_bytes(), 1).unwrap();
     assert_eq!(entry.level, Level::Trace);
 }
+
+#[test]
+fn test_parse_gelf_with_trace_context() {
+    let json = r#"{"version":"1.1","host":"app","short_message":"traced log","_trace_id":"4bf92f3577b16e0f0000000000000001","_span_id":"00f067aa0ba902b7"}"#;
+    let entry = parse_gelf_message(json.as_bytes(), 1).unwrap();
+    assert_eq!(entry.trace_id, Some(0x4bf92f3577b16e0f0000000000000001_u128));
+    assert_eq!(entry.span_id, Some(0x00f067aa0ba902b7_u64));
+    assert!(!entry.additional_fields.contains_key("trace_id"));
+    assert!(!entry.additional_fields.contains_key("span_id"));
+}
+
+#[test]
+fn test_parse_gelf_without_trace_context() {
+    let json = r#"{"version":"1.1","host":"app","short_message":"plain log"}"#;
+    let entry = parse_gelf_message(json.as_bytes(), 1).unwrap();
+    assert_eq!(entry.trace_id, None);
+    assert_eq!(entry.span_id, None);
+}
+
+#[test]
+fn test_parse_gelf_invalid_trace_id() {
+    let json = r#"{"version":"1.1","host":"app","short_message":"bad trace","_trace_id":"not-valid-hex"}"#;
+    let entry = parse_gelf_message(json.as_bytes(), 1).unwrap();
+    assert_eq!(entry.trace_id, None);
+}

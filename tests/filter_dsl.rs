@@ -16,6 +16,8 @@ fn test_entry(level: Level, message: &str, host: &str) -> LogEntry {
         file: Some("test.rs".to_string()),
         line: Some(42),
         additional_fields: HashMap::new(),
+        trace_id: None,
+        span_id: None,
         matched_filters: Vec::new(),
         source: LogSource::Filter,
     }

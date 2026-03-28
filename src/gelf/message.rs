@@ -1,7 +1,37 @@
 use chrono::{DateTime, Utc, TimeZone};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use thiserror::Error;
+
+fn serialize_opt_trace_id<S: Serializer>(id: &Option<u128>, s: S) -> Result<S::Ok, S::Error> {
+    match id {
+        Some(v) => s.serialize_some(&format!("{:032x}", v)),
+        None => s.serialize_none(),
+    }
+}
+
+fn deserialize_opt_trace_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
+    let opt: Option<String> = Option::deserialize(d)?;
+    match opt {
+        Some(s) => u128::from_str_radix(&s, 16).map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
+
+fn serialize_opt_span_id<S: Serializer>(id: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+    match id {
+        Some(v) => s.serialize_some(&format!("{:016x}", v)),
+        None => s.serialize_none(),
+    }
+}
+
+fn deserialize_opt_span_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let opt: Option<String> = Option::deserialize(d)?;
+    match opt {
+        Some(s) => u64::from_str_radix(&s, 16).map(Some).map_err(serde::de::Error::custom),
+        None => Ok(None),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Level {
@@ -65,6 +95,12 @@ pub struct LogEntry {
     pub file: Option<String>,
     pub line: Option<u32>,
     pub additional_fields: HashMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_opt_trace_id", deserialize_with = "deserialize_opt_trace_id")]
+    pub trace_id: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_opt_span_id", deserialize_with = "deserialize_opt_span_id")]
+    pub span_id: Option<u64>,
     #[serde(default)]
     pub matched_filters: Vec<String>,
     #[serde(default = "default_source")]
@@ -122,10 +158,18 @@ pub fn parse_gelf_message(bytes: &[u8], seq: u64) -> Result<LogEntry, GelfParseE
     let line = obj.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
 
     // Collect additional fields (keys starting with _), strip the _ prefix
-    let additional_fields: HashMap<String, serde_json::Value> = obj.iter()
+    let mut additional_fields: HashMap<String, serde_json::Value> = obj.iter()
         .filter(|(k, _)| k.starts_with('_') && *k != "_level")
         .map(|(k, v)| (k[1..].to_string(), v.clone()))
         .collect();
+
+    let trace_id = additional_fields.remove("trace_id")
+        .and_then(|v| v.as_str().map(String::from))
+        .and_then(|s| u128::from_str_radix(&s, 16).ok());
+
+    let span_id = additional_fields.remove("span_id")
+        .and_then(|v| v.as_str().map(String::from))
+        .and_then(|s| u64::from_str_radix(&s, 16).ok());
 
     Ok(LogEntry {
         seq,
@@ -138,6 +182,8 @@ pub fn parse_gelf_message(bytes: &[u8], seq: u64) -> Result<LogEntry, GelfParseE
         file,
         line,
         additional_fields,
+        trace_id,
+        span_id,
         matched_filters: Vec::new(),
         source: LogSource::Filter,
     })

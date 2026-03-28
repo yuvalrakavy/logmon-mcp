@@ -10,6 +10,7 @@ fn make_entry(seq: u64, level: Level, msg: &str) -> LogEntry {
         message: msg.to_string(), full_message: None,
         host: "test".into(), facility: None, file: None, line: None,
         additional_fields: HashMap::new(),
+        trace_id: None, span_id: None,
         matched_filters: Vec::new(), source: LogSource::Filter,
     }
 }
