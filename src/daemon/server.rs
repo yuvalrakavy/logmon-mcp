@@ -4,9 +4,11 @@ use crate::daemon::persistence::{
 };
 use crate::daemon::rpc_handler::RpcHandler;
 use crate::daemon::session::{SessionId, SessionRegistry};
+use crate::daemon::span_processor::spawn_span_processor;
 use crate::engine::pipeline::LogPipeline;
 use crate::engine::seq_counter::SeqCounter;
 use crate::receiver::gelf::{GelfReceiver, GelfReceiverConfig};
+use crate::receiver::otlp::{OtlpReceiver, OtlpReceiverConfig};
 use crate::receiver::Receiver;
 use crate::rpc::transport::{read_request, write_message};
 use crate::rpc::types::*;
@@ -39,55 +41,75 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let state = load_state(&state_path)?;
     let initial_seq = state.seq_block;
 
-    // 4. Create pipeline with initial seq
-    let pipeline = Arc::new(LogPipeline::new_with_seq(config.buffer_size, initial_seq));
+    // 4. Create shared seq counter and pipeline
+    let seq_counter = Arc::new(SeqCounter::new_with_initial(initial_seq));
+    let pipeline = Arc::new(LogPipeline::new_with_seq_counter(
+        config.buffer_size,
+        seq_counter.clone(),
+    ));
 
-    // 5. Reserve next seq block and save
+    // 5. Create SpanStore with shared seq counter
+    let span_store = Arc::new(SpanStore::new(config.span_buffer_size, seq_counter.clone()));
+
+    // 6. Reserve next seq block and save
     let new_state = DaemonState {
         seq_block: initial_seq + SEQ_BLOCK_SIZE,
         named_sessions: state.named_sessions.clone(),
     };
     save_state(&state_path, &new_state)?;
 
-    // 6. Create SessionRegistry, restore named sessions from state
+    // 7. Create SessionRegistry, restore named sessions from state
     let sessions = Arc::new(SessionRegistry::new());
     for (name, persisted) in &state.named_sessions {
         sessions.restore_named(name, persisted);
     }
 
-    // 7. Start GELF receiver
+    // 8. Start GELF receiver
     let (log_tx, log_rx) = mpsc::channel(1024);
+    let (span_tx, span_rx) = mpsc::channel(1024);
     let udp_port = config.gelf_udp_port.unwrap_or(config.gelf_port);
     let tcp_port = config.gelf_tcp_port.unwrap_or(config.gelf_port);
     let gelf_config = GelfReceiverConfig {
         udp_addr: format!("0.0.0.0:{udp_port}"),
         tcp_addr: format!("0.0.0.0:{tcp_port}"),
     };
-    let receiver = GelfReceiver::start(gelf_config, log_tx).await?;
-    let receivers_info = receiver.listening_on();
-    info!(?receivers_info, "GELF receiver started");
+    let gelf_receiver = GelfReceiver::start(gelf_config, log_tx.clone()).await?;
+    let mut all_receivers_info = gelf_receiver.listening_on();
+    info!(?all_receivers_info, "GELF receiver started");
 
-    // 8. Write PID file
+    // 9. Start OTLP receiver (if enabled)
+    if config.otlp_grpc_port > 0 || config.otlp_http_port > 0 {
+        let otlp_config = OtlpReceiverConfig {
+            grpc_addr: format!("0.0.0.0:{}", config.otlp_grpc_port),
+            http_addr: format!("0.0.0.0:{}", config.otlp_http_port),
+        };
+        let otlp_receiver =
+            OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx).await?;
+        let otlp_info = otlp_receiver.listening_on();
+        info!(?otlp_info, "OTLP receiver started");
+        all_receivers_info.extend(otlp_info);
+    }
+
+    // 10. Write PID file
     let pid_path = dir.join("daemon.pid");
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
-    // 9. Start log processor
+    // 11. Start log processor and span processor
     let _processor_handle = spawn_log_processor(log_rx, pipeline.clone(), sessions.clone());
+    let _span_processor = spawn_span_processor(span_rx, span_store.clone(), sessions.clone());
 
-    // 10. Sync pre-buffer size after restoring sessions
+    // 12. Sync pre-buffer size after restoring sessions
     sync_pre_buffer_size(&pipeline, &sessions);
 
-    // 11. Create RpcHandler
-    let dummy_seq = Arc::new(SeqCounter::new());
-    let span_store = Arc::new(SpanStore::new(config.buffer_size, dummy_seq));
+    // 13. Create RpcHandler
     let handler = Arc::new(RpcHandler::new(
         pipeline.clone(),
-        span_store,
+        span_store.clone(),
         sessions.clone(),
-        receivers_info,
+        all_receivers_info,
     ));
 
-    // 12. Listen on Unix socket (unix) or TCP (windows)
+    // 14. Listen on Unix socket (unix) or TCP (windows)
     info!("daemon ready, listening for connections");
 
     #[cfg(unix)]

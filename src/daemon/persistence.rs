@@ -47,6 +47,12 @@ pub struct DaemonConfig {
     pub persist_buffer_on_exit: bool,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    #[serde(default = "default_otlp_grpc_port")]
+    pub otlp_grpc_port: u16,
+    #[serde(default = "default_otlp_http_port")]
+    pub otlp_http_port: u16,
+    #[serde(default = "default_span_buffer_size")]
+    pub span_buffer_size: usize,
 }
 
 fn default_gelf_port() -> u16 {
@@ -58,6 +64,15 @@ fn default_buffer_size() -> usize {
 fn default_idle_timeout() -> u64 {
     1800
 }
+fn default_otlp_grpc_port() -> u16 {
+    4317
+}
+fn default_otlp_http_port() -> u16 {
+    4318
+}
+fn default_span_buffer_size() -> usize {
+    10000
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -68,6 +83,9 @@ impl Default for DaemonConfig {
             buffer_size: 10000,
             persist_buffer_on_exit: false,
             idle_timeout_secs: 1800,
+            otlp_grpc_port: 4317,
+            otlp_http_port: 4318,
+            span_buffer_size: 10000,
         }
     }
 }

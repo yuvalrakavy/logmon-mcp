@@ -15,6 +15,9 @@ async fn main() -> anyhow::Result<()> {
             gelf_udp_port,
             gelf_tcp_port,
             buffer_size,
+            otlp_grpc_port,
+            otlp_http_port,
+            span_buffer_size,
         }) => {
             // Daemon mode: load config file, apply CLI overrides
             let mut config = load_config(&config_dir().join("config.json"))?;
@@ -26,6 +29,9 @@ async fn main() -> anyhow::Result<()> {
                 config.gelf_tcp_port = Some(p);
             }
             config.buffer_size = buffer_size;
+            config.otlp_grpc_port = otlp_grpc_port;
+            config.otlp_http_port = otlp_http_port;
+            config.span_buffer_size = span_buffer_size;
             run_daemon(config).await
         }
         None => {

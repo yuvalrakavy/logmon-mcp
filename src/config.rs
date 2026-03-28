@@ -28,5 +28,14 @@ pub enum Commands {
         /// Max log entries in ring buffer
         #[arg(long, default_value = "10000")]
         buffer_size: usize,
+        /// OTLP gRPC port (0 to disable)
+        #[arg(long, default_value = "4317")]
+        otlp_grpc_port: u16,
+        /// OTLP HTTP/JSON port (0 to disable)
+        #[arg(long, default_value = "4318")]
+        otlp_http_port: u16,
+        /// Max spans in ring buffer
+        #[arg(long, default_value = "10000")]
+        span_buffer_size: usize,
     },
 }
