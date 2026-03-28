@@ -64,6 +64,17 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
                 }
             }
 
+            // Additionally, copy logs from the same trace_id
+            if let Some(tid) = entry.trace_id {
+                let trace_entries = pipeline.pre_buffer_entries_by_trace_id(tid);
+                for mut trace_entry in trace_entries {
+                    if !pipeline.contains_seq(trace_entry.seq) {
+                        trace_entry.source = LogSource::PreTrigger;
+                        pipeline.append_to_store(trace_entry);
+                    }
+                }
+            }
+
             // Activate post-window for this session
             sessions.set_post_window(sid, trigger_max_post);
             any_post_window_active = true;

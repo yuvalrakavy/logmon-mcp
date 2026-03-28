@@ -197,3 +197,32 @@ fn test_session_removed_during_processing_no_panic() {
     // Entry stored via "no sessions = no filters = store everything" path
     assert_eq!(pipeline.store_len(), 1);
 }
+
+#[test]
+fn test_trace_aware_prebuffer_flush() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+    sessions.add_filter(&sid, "l>=ERROR", None).unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
+
+    let trace = 0xabc_u128;
+
+    // Send INFO logs with trace context — not stored (filter blocks INFO)
+    for i in 0..5 {
+        let mut e = make_entry(Level::Info, &format!("step {i}"));
+        e.trace_id = Some(trace);
+        process_entry(&mut e, &pipeline, &sessions);
+    }
+    assert_eq!(pipeline.store_len(), 0);
+
+    // Send ERROR with same trace_id — trigger fires
+    let mut error = make_entry(Level::Error, "crash");
+    error.trace_id = Some(trace);
+    process_entry(&mut error, &pipeline, &sessions);
+
+    // Pre-buffer flush + trace-aware flush should include the traced INFO logs
+    let logs = pipeline.recent_logs(100, None);
+    let traced_logs: Vec<_> = logs.iter().filter(|l| l.trace_id == Some(trace)).collect();
+    assert!(traced_logs.len() > 1); // error + at least some context
+}
