@@ -22,7 +22,10 @@ You have access to a log collector MCP server that receives structured logs from
 - `/logmon watch <filter>` — call `add_filter` with the given DSL filter expression
 - `/logmon unwatch` — call `get_filters`, then remove all filters
 - `/logmon sessions` — call `get_sessions` and summarize
-- `/logmon <any DSL filter>` — if the argument looks like a filter DSL expression (contains `=`, `>=`, `/regex/`, or known selectors like `fa=`, `l>=`, `h=`, `m=`), call `get_recent_logs` with that filter
+- `/logmon traces` — call `get_recent_traces` and summarize
+- `/logmon slow` — call `get_slow_spans` with default threshold and summarize bottlenecks
+- `/logmon trace <trace_id>` — call `get_trace` for a specific trace ID
+- `/logmon <any DSL filter>` — if the argument looks like a filter DSL expression (contains `=`, `>=`, `/regex/`, or known selectors like `fa=`, `l>=`, `h=`, `m=`, `sn=`, `sv=`, `d>=`), call `get_recent_logs` (for log selectors) or `get_slow_spans` (for span selectors) with that filter
 - `/logmon help` — print the Quick Commands list above (do NOT call any tools)
 
 ## Architecture
@@ -61,6 +64,15 @@ Multiple Claude sessions share the same daemon and log buffer. Each session has 
 
 - **get_sessions** — List all sessions connected to the daemon.
 - **drop_session** — Remove a named session and all its triggers/filters.
+
+### Traces
+
+- **get_recent_traces** — List recent traces with timing and error info. Use `count` and `filter` (span DSL).
+- **get_trace** — Full trace detail: span tree + linked logs for a given `trace_id`.
+- **get_trace_summary** — Compact timing breakdown highlighting bottlenecks for a trace.
+- **get_slow_spans** — Find slow spans exceeding a duration threshold. Supports `group_by="name"`.
+- **get_span_context** — Get spans surrounding a specific span by `seq` number.
+- **get_trace_logs** — Get all logs linked to a trace by `trace_id`.
 
 ### Status
 
@@ -118,6 +130,17 @@ Filters use a comma-separated qualifier syntax (AND semantics within a filter):
 2. Named sessions (`--session debug`) let you keep triggers/filters across reconnects
 3. Use `drop_session` to clean up stale named sessions
 
+### Investigating slowness
+1. `get_slow_spans` to find bottleneck spans
+2. `get_trace_summary` on the affected trace for timing breakdown
+3. `get_trace` for the full span tree with linked logs
+4. To compare: `get_recent_traces` to find a fast trace for the same endpoint, compare both summaries
+
+### Following a request through the system
+1. Find the request in `get_recent_traces`
+2. `get_trace` to see the full span tree with logs interleaved
+3. `get_trace_logs` with a filter to focus on specific log types within the trace
+
 ### When you receive a trigger notification
 
 The notification includes `context_before` entries and the matched log. Use `get_log_context` with the matched entry's `seq` to get more surrounding context if needed.
@@ -128,5 +151,21 @@ The notification includes `context_before` entries and the matched log. Use `get
 - The pre-trigger buffer captures ALL logs regardless of filters — when a trigger fires, you get unfiltered context before the event
 - Post-trigger windows also bypass filters, capturing the aftermath
 - Logs during a post-trigger window skip trigger evaluation (prevents cascading)
-- The daemon listens on GELF UDP and TCP (default port 12201)
+- The daemon listens on GELF UDP/TCP (default port 12201) and OTLP gRPC/HTTP (default ports 4317/4318)
+- Applications can send telemetry via GELF or OpenTelemetry (OTLP)
+- OTLP provides both logs and traces (spans) — enabling request-level debugging
 - Config is stored in `~/.config/logmon/`
+
+## Span Filter DSL
+
+Span filters use the same comma-separated syntax but with span-specific selectors:
+
+| Selector | Field | Example |
+| -------- | ----- | ------- |
+| `sn` | span name | `sn=query_database` |
+| `sv` | service name | `sv=store_server` |
+| `st` | status | `st=error` |
+| `sk` | span kind | `sk=server` |
+| `d>=` / `d<=` | duration (ms) | `d>=100` |
+
+Cannot mix log selectors and span selectors in the same filter.
