@@ -14,6 +14,13 @@ pub enum Qualifier {
     BarePattern(Pattern),
     SelectorPattern(Selector, Pattern),
     LevelFilter { op: LevelOp, level: Level },
+    DurationFilter(DurationOp, f64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DurationOp {
+    Gte,
+    Lte,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +133,10 @@ pub enum Selector {
     Facility,                  // fa
     File,                      // fi
     Line,                      // ln
+    SpanName,                  // sn
+    ServiceName,               // sv
+    SpanStatus,                // st
+    SpanKind,                  // sk
     AdditionalField(String),   // anything else
 }
 
@@ -148,6 +159,8 @@ pub enum FilterParseError {
     InvalidLevelSyntax(String),
     #[error("unclosed quote")]
     UnclosedQuote,
+    #[error("cannot mix log and span selectors in the same filter")]
+    MixedLogSpanSelectors,
 }
 
 /// Split the input on commas, but respect double-quoted strings (don't split inside quotes).
@@ -220,6 +233,10 @@ fn parse_selector(s: &str) -> Selector {
         "fa" => Selector::Facility,
         "fi" => Selector::File,
         "ln" => Selector::Line,
+        "sn" => Selector::SpanName,
+        "sv" => Selector::ServiceName,
+        "st" => Selector::SpanStatus,
+        "sk" => Selector::SpanKind,
         other => Selector::AdditionalField(other.to_string()),
     }
 }
@@ -252,6 +269,18 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
             op: LevelOp::Eq,
             level,
         });
+    }
+
+    // Duration filter: d>=N, d<=N
+    if let Some(rest) = token.strip_prefix("d>=") {
+        let value: f64 = rest.parse()
+            .map_err(|_| FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest)))?;
+        return Ok(Qualifier::DurationFilter(DurationOp::Gte, value));
+    }
+    if let Some(rest) = token.strip_prefix("d<=") {
+        let value: f64 = rest.parse()
+            .map_err(|_| FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest)))?;
+        return Ok(Qualifier::DurationFilter(DurationOp::Lte, value));
     }
 
     // Quoted bare pattern: "..."
@@ -293,6 +322,42 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
     )))
 }
 
+/// Returns true if the filter uses span-specific selectors or duration filters.
+pub fn is_span_filter(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| is_span_qualifier(q)),
+    }
+}
+
+fn is_span_qualifier(q: &Qualifier) -> bool {
+    match q {
+        Qualifier::SelectorPattern(sel, _) => matches!(
+            sel,
+            Selector::SpanName | Selector::ServiceName | Selector::SpanStatus | Selector::SpanKind
+        ),
+        Qualifier::DurationFilter(..) => true,
+        _ => false,
+    }
+}
+
+fn is_log_qualifier(q: &Qualifier) -> bool {
+    match q {
+        Qualifier::SelectorPattern(sel, _) => matches!(
+            sel,
+            Selector::Message
+                | Selector::FullMessage
+                | Selector::MessageOrFull
+                | Selector::Host
+                | Selector::Facility
+                | Selector::File
+                | Selector::Line
+        ),
+        Qualifier::LevelFilter { .. } => true,
+        _ => false,
+    }
+}
+
 pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
     let input = input.trim();
 
@@ -321,6 +386,13 @@ pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
 
     if qualifiers.is_empty() {
         return Err(FilterParseError::Empty);
+    }
+
+    // Validate: cannot mix log-specific and span-specific selectors
+    let has_span = qualifiers.iter().any(|q| is_span_qualifier(q));
+    let has_log = qualifiers.iter().any(|q| is_log_qualifier(q));
+    if has_span && has_log {
+        return Err(FilterParseError::MixedLogSpanSelectors);
     }
 
     Ok(ParsedFilter::Qualifiers(qualifiers))

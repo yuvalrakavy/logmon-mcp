@@ -16,6 +16,7 @@ fn matches_qualifier(qualifier: &Qualifier, entry: &LogEntry) -> bool {
         Qualifier::BarePattern(pattern) => matches_any_field(pattern, entry),
         Qualifier::SelectorPattern(selector, pattern) => matches_selector(selector, pattern, entry),
         Qualifier::LevelFilter { op, level } => matches_level(*op, *level, entry.level),
+        Qualifier::DurationFilter(..) => false, // duration only applies to spans
     }
 }
 
@@ -100,6 +101,7 @@ fn matches_selector(selector: &Selector, pattern: &Pattern, entry: &LogEntry) ->
                 matches_pattern(pattern, &s)
             })
             .unwrap_or(false),
+        Selector::SpanName | Selector::ServiceName | Selector::SpanStatus | Selector::SpanKind => false,
     }
 }
 
@@ -118,7 +120,57 @@ fn matches_level(op: LevelOp, filter_level: crate::gelf::message::Level, entry_l
     }
 }
 
-/// Stub: matches a span against a parsed filter. Full implementation in Task 7.
-pub fn matches_span(_filter: &ParsedFilter, _span: &SpanEntry) -> bool {
-    true
+/// Check if a SpanEntry matches a ParsedFilter
+pub fn matches_span(filter: &ParsedFilter, span: &SpanEntry) -> bool {
+    match filter {
+        ParsedFilter::All => true,
+        ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qualifiers) => {
+            qualifiers.iter().all(|q| matches_span_qualifier(q, span))
+        }
+    }
+}
+
+fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
+    match qualifier {
+        Qualifier::BarePattern(pattern) => {
+            matches_pattern(pattern, &span.name)
+        }
+        Qualifier::SelectorPattern(selector, pattern) => {
+            match selector {
+                Selector::SpanName => matches_pattern(pattern, &span.name),
+                Selector::ServiceName => matches_pattern(pattern, &span.service_name),
+                Selector::SpanStatus => {
+                    let pat_lower = match pattern {
+                        Pattern::Substring(s) => s.clone(),
+                        Pattern::Regex { source, .. } => source.to_lowercase(),
+                    };
+                    match &span.status {
+                        crate::span::types::SpanStatus::Error(msg) => {
+                            pat_lower == "error" || matches_pattern(pattern, msg)
+                        }
+                        crate::span::types::SpanStatus::Ok => pat_lower == "ok",
+                        crate::span::types::SpanStatus::Unset => pat_lower == "unset",
+                    }
+                }
+                Selector::SpanKind => {
+                    let kind_str = format!("{:?}", span.kind).to_lowercase();
+                    matches_pattern(pattern, &kind_str)
+                }
+                Selector::AdditionalField(key) => {
+                    span.attributes.get(key)
+                        .and_then(|v| v.as_str())
+                        .map_or(false, |v| matches_pattern(pattern, v))
+                }
+                _ => false, // log selectors don't match spans
+            }
+        }
+        Qualifier::DurationFilter(op, threshold) => {
+            match op {
+                DurationOp::Gte => span.duration_ms >= *threshold,
+                DurationOp::Lte => span.duration_ms <= *threshold,
+            }
+        }
+        Qualifier::LevelFilter { .. } => false, // log-only
+    }
 }
