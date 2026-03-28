@@ -17,6 +17,8 @@ pub struct PipelineEvent {
     pub context_before: Vec<LogEntry>,
     pub pre_trigger_flushed: usize,
     pub post_window_size: u32,
+    pub trace_id: Option<u128>,
+    pub trace_summary: Option<crate::span::types::TraceSummary>,
 }
 
 /// Buffer filter info (used by session registry)

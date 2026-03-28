@@ -133,6 +133,8 @@ fn test_notification_queue() {
         context_before: vec![],
         pre_trigger_flushed: 0,
         post_window_size: 0,
+        trace_id: None,
+        trace_summary: None,
     };
     registry.queue_notification(&id, event);
     let queued = registry.drain_notifications(&id);

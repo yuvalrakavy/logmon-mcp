@@ -80,6 +80,8 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
                     context_before,
                     pre_trigger_flushed: trigger_max_pre as usize,
                     post_window_size: m.post_window,
+                    trace_id: entry.trace_id,
+                    trace_summary: None,
                 };
                 sessions.send_or_queue_notification(sid, event);
             }

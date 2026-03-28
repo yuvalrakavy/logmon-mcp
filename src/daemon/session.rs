@@ -2,7 +2,8 @@ use crate::engine::pipeline::PipelineEvent;
 use crate::engine::trigger::{TriggerError, TriggerInfo, TriggerManager, TriggerMatch};
 use crate::filter::matcher::matches_entry;
 use crate::filter::parser::{parse_filter, FilterParseError, ParsedFilter};
-use crate::gelf::message::LogEntry;
+use crate::gelf::message::{Level, LogEntry, LogSource};
+use crate::span::types::{SpanEntry, SpanStatus, TraceSummary};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -600,6 +601,55 @@ impl SessionRegistry {
                 queue.push_back(event);
             }
         }
+    }
+
+    // --- Span trigger notifications ---
+
+    /// Send or queue a span trigger notification.
+    pub fn send_or_queue_span_notification(
+        &self,
+        id: &SessionId,
+        span: &SpanEntry,
+        trigger: &TriggerInfo,
+        trace_summary: Option<TraceSummary>,
+    ) {
+        let event = PipelineEvent {
+            trigger_id: trigger.id,
+            trigger_description: trigger.description.clone(),
+            filter_string: trigger.filter_string.clone(),
+            matched_entry: LogEntry {
+                seq: span.seq,
+                timestamp: span.start_time,
+                level: if matches!(span.status, SpanStatus::Error(_)) {
+                    Level::Error
+                } else {
+                    Level::Info
+                },
+                message: format!("[span] {} ({}ms)", span.name, span.duration_ms),
+                full_message: None,
+                host: span.service_name.clone(),
+                facility: Some(span.service_name.clone()),
+                file: None,
+                line: None,
+                additional_fields: HashMap::new(),
+                matched_filters: vec![],
+                source: LogSource::Filter,
+                trace_id: Some(span.trace_id),
+                span_id: Some(span.span_id),
+            },
+            context_before: vec![],
+            pre_trigger_flushed: 0,
+            post_window_size: 0,
+            trace_id: Some(span.trace_id),
+            trace_summary,
+        };
+        self.send_or_queue_notification(id, event);
+    }
+
+    /// Get all session IDs (connected + disconnected named sessions).
+    pub fn active_session_ids(&self) -> Vec<SessionId> {
+        let sessions = self.sessions.read().unwrap();
+        sessions.keys().cloned().collect()
     }
 
     // --- Persistence helpers ---
