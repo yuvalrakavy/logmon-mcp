@@ -2,11 +2,13 @@ use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
 use crate::rpc::types::*;
+use crate::span::store::SpanStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub struct RpcHandler {
     pipeline: Arc<LogPipeline>,
+    span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
@@ -15,11 +17,13 @@ pub struct RpcHandler {
 impl RpcHandler {
     pub fn new(
         pipeline: Arc<LogPipeline>,
+        span_store: Arc<SpanStore>,
         sessions: Arc<SessionRegistry>,
         receivers_info: Vec<String>,
     ) -> Self {
         Self {
             pipeline,
+            span_store,
             sessions,
             start_time: std::time::Instant::now(),
             receivers_info,
@@ -44,6 +48,12 @@ impl RpcHandler {
             "triggers.remove" => self.handle_triggers_remove(session_id, &request.params),
             "session.list" => self.handle_session_list(),
             "session.drop" => self.handle_session_drop(&request.params),
+            "traces.recent" => self.handle_traces_recent(&request.params),
+            "traces.get" => self.handle_traces_get(&request.params),
+            "traces.summary" => self.handle_traces_summary(&request.params),
+            "traces.slow" => self.handle_traces_slow(&request.params),
+            "traces.logs" => self.handle_traces_logs(&request.params),
+            "spans.context" => self.handle_spans_context(&request.params),
             _ => Err(format!("unknown method: {}", request.method)),
         };
 
@@ -74,6 +84,15 @@ impl RpcHandler {
     fn handle_logs_recent(&self, params: &Value) -> Result<Value, String> {
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let filter = params.get("filter").and_then(|v| v.as_str());
+
+        // Optional trace_id filter
+        if let Some(trace_id_hex) = params.get("trace_id").and_then(|v| v.as_str()) {
+            let trace_id = u128::from_str_radix(trace_id_hex, 16)
+                .map_err(|_| "invalid trace_id")?;
+            let logs = self.pipeline.logs_by_trace_id(trace_id);
+            return Ok(json!({ "logs": logs, "count": logs.len() }));
+        }
+
         let entries = self.pipeline.recent_logs_str(count, filter);
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
@@ -305,6 +324,204 @@ impl RpcHandler {
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size(&self.pipeline, &self.sessions);
         Ok(json!({ "removed": trigger_id }))
+    }
+
+    // -----------------------------------------------------------------------
+    // traces.* / spans.*
+    // -----------------------------------------------------------------------
+
+    fn handle_traces_recent(&self, params: &Value) -> Result<Value, String> {
+        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let filter = filter_str.and_then(|s| crate::filter::parser::parse_filter(s).ok());
+
+        let pipeline = &self.pipeline;
+        let summaries = self.span_store.recent_traces(
+            count,
+            filter.as_ref(),
+            |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
+        );
+        Ok(json!({ "traces": summaries, "count": summaries.len() }))
+    }
+
+    fn handle_traces_get(&self, params: &Value) -> Result<Value, String> {
+        let trace_id_hex = params
+            .get("trace_id")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required parameter: trace_id")?;
+        let trace_id = u128::from_str_radix(trace_id_hex, 16)
+            .map_err(|_| "invalid trace_id: must be 32-char hex")?;
+        let include_logs = params
+            .get("include_logs")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let spans = self.span_store.get_trace(trace_id);
+        let logs = if include_logs {
+            self.pipeline.logs_by_trace_id(trace_id)
+        } else {
+            vec![]
+        };
+
+        Ok(json!({
+            "trace_id": trace_id_hex,
+            "spans": spans,
+            "logs": logs,
+            "span_count": spans.len(),
+            "log_count": logs.len(),
+        }))
+    }
+
+    fn handle_traces_summary(&self, params: &Value) -> Result<Value, String> {
+        let trace_id_hex = params
+            .get("trace_id")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required parameter: trace_id")?;
+        let trace_id =
+            u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
+
+        let spans = self.span_store.get_trace(trace_id);
+        if spans.is_empty() {
+            return Err(format!("no spans found for trace {trace_id_hex}"));
+        }
+
+        // Find root span and compute self-time breakdown for direct children
+        let root = spans.iter().find(|s| s.parent_span_id.is_none());
+        let root_duration = root.map_or(0.0, |r| r.duration_ms);
+        let root_name = root.map_or("[no root]", |r| r.name.as_str());
+        let root_span_id = root.map(|r| r.span_id);
+
+        // Direct children of root
+        let children: Vec<_> = spans
+            .iter()
+            .filter(|s| s.parent_span_id == root_span_id)
+            .collect();
+
+        let mut breakdown: Vec<Value> = children
+            .iter()
+            .map(|child| {
+                // Self-time = child duration - sum of its direct children's durations
+                let grandchildren_time: f64 = spans
+                    .iter()
+                    .filter(|s| s.parent_span_id == Some(child.span_id))
+                    .map(|s| s.duration_ms)
+                    .sum();
+                let self_time = (child.duration_ms - grandchildren_time).max(0.0);
+                let pct = if root_duration > 0.0 {
+                    (self_time / root_duration * 100.0).round()
+                } else {
+                    0.0
+                };
+                json!({
+                    "name": child.name,
+                    "self_time_ms": self_time,
+                    "total_time_ms": child.duration_ms,
+                    "percentage": pct,
+                    "is_error": matches!(child.status, crate::span::types::SpanStatus::Error(_)),
+                })
+            })
+            .collect();
+
+        // Sort by self_time descending
+        breakdown.sort_by(|a, b| {
+            b["self_time_ms"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .partial_cmp(&a["self_time_ms"].as_f64().unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // "other" time
+        let accounted: f64 = breakdown
+            .iter()
+            .map(|b| b["self_time_ms"].as_f64().unwrap_or(0.0))
+            .sum();
+        let other = (root_duration - accounted).max(0.0);
+
+        Ok(json!({
+            "root_span": root_name,
+            "total_duration_ms": root_duration,
+            "breakdown": breakdown,
+            "other_ms": other,
+            "span_count": spans.len(),
+        }))
+    }
+
+    fn handle_traces_slow(&self, params: &Value) -> Result<Value, String> {
+        let min_duration = params
+            .get("min_duration_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(100.0);
+        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let filter = filter_str.and_then(|s| crate::filter::parser::parse_filter(s).ok());
+        let group_by = params.get("group_by").and_then(|v| v.as_str());
+
+        let slow = self
+            .span_store
+            .slow_spans(min_duration, count, filter.as_ref());
+
+        match group_by {
+            Some("name") => {
+                // Group by span name, compute aggregates
+                let mut groups: std::collections::HashMap<String, Vec<f64>> =
+                    std::collections::HashMap::new();
+                for s in &slow {
+                    groups.entry(s.name.clone()).or_default().push(s.duration_ms);
+                }
+                let mut result: Vec<Value> = groups
+                    .iter()
+                    .map(|(name, durations)| {
+                        let mut sorted = durations.clone();
+                        sorted.sort_by(|a, b| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+                        let p95_idx =
+                            ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
+                        json!({
+                            "name": name,
+                            "avg_ms": (avg * 10.0).round() / 10.0,
+                            "p95_ms": sorted[p95_idx],
+                            "count": sorted.len(),
+                        })
+                    })
+                    .collect();
+                result.sort_by(|a, b| {
+                    b["avg_ms"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a["avg_ms"].as_f64().unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                Ok(json!({ "grouped_by": "name", "groups": result }))
+            }
+            _ => Ok(json!({ "spans": slow, "count": slow.len() })),
+        }
+    }
+
+    fn handle_traces_logs(&self, params: &Value) -> Result<Value, String> {
+        let trace_id_hex = params
+            .get("trace_id")
+            .and_then(|v| v.as_str())
+            .ok_or("missing required parameter: trace_id")?;
+        let trace_id =
+            u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
+
+        let logs = self.pipeline.logs_by_trace_id(trace_id);
+        Ok(json!({ "logs": logs, "count": logs.len() }))
+    }
+
+    fn handle_spans_context(&self, params: &Value) -> Result<Value, String> {
+        let seq = params
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing required parameter: seq")?;
+        let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let after = params.get("after").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+        let spans = self.span_store.context_by_seq(seq, before, after);
+        Ok(json!({ "spans": spans, "count": spans.len() }))
     }
 
     // -----------------------------------------------------------------------

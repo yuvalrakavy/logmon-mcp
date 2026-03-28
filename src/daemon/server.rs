@@ -5,10 +5,12 @@ use crate::daemon::persistence::{
 use crate::daemon::rpc_handler::RpcHandler;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
+use crate::engine::seq_counter::SeqCounter;
 use crate::receiver::gelf::{GelfReceiver, GelfReceiverConfig};
 use crate::receiver::Receiver;
 use crate::rpc::transport::{read_request, write_message};
 use crate::rpc::types::*;
+use crate::span::store::SpanStore;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
@@ -76,8 +78,11 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     sync_pre_buffer_size(&pipeline, &sessions);
 
     // 11. Create RpcHandler
+    let dummy_seq = Arc::new(SeqCounter::new());
+    let span_store = Arc::new(SpanStore::new(config.buffer_size, dummy_seq));
     let handler = Arc::new(RpcHandler::new(
         pipeline.clone(),
+        span_store,
         sessions.clone(),
         receivers_info,
     ));
