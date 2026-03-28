@@ -31,7 +31,7 @@ pub fn process_span(span: &SpanEntry, store: &SpanStore, sessions: &SessionRegis
                 if let Ok(filter) = parse_filter(&trigger.filter_string) {
                     if matches_span(&filter, span) {
                         let trace_summary = build_trace_summary(span.trace_id, store);
-                        sessions.send_or_queue_span_notification(sid, span, &trigger, trace_summary);
+                        sessions.send_or_queue_span_notification(sid, span, trigger, trace_summary);
                     }
                 }
             }
