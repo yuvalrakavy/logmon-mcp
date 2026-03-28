@@ -440,7 +440,10 @@ Ensure no regressions. All existing tests must pass — the new fields default t
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/gelf/message.rs tests/gelf_parsing.rs
+# All files that construct LogEntry need updating for the new fields:
+git add src/gelf/message.rs tests/gelf_parsing.rs \
+  tests/log_processor.rs tests/memory_store.rs tests/pipeline.rs \
+  tests/multi_session.rs src/engine/trigger.rs
 git commit -m "feat: add trace_id/span_id to LogEntry with GELF extraction"
 ```
 
@@ -1844,14 +1847,13 @@ use tokio::sync::mpsc;
 
 pub fn spawn_span_processor(
     mut receiver: mpsc::Receiver<SpanEntry>,
-    seq_counter: Arc<SeqCounter>,
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(mut span) = receiver.recv().await {
+        while let Some(span) = receiver.recv().await {
             // SpanStore.insert() assigns seq from the shared counter
-            process_span(&mut span, &span_store, &sessions);
+            process_span(&span, &span_store, &sessions);
         }
     })
 }
@@ -1901,7 +1903,7 @@ fn build_trace_summary(trace_id: u128, store: &SpanStore) -> Option<crate::span:
 }
 ```
 
-Note: The `send_or_queue_span_notification` method needs to be added to SessionRegistry (Task 13 handles session extensions). For now, this can call the existing `send_or_queue_notification` with a PipelineEvent variant, or a new method. The implementer should check what exists and adapt.
+Note: `send_or_queue_span_notification` and `active_session_ids` are defined in Task 13 (implement Task 13 first).
 
 Add to `src/daemon/mod.rs`:
 
@@ -1941,7 +1943,7 @@ pub struct PipelineEvent {
 }
 ```
 
-Update all places that construct PipelineEvent to set these to None.
+Update the one place that constructs PipelineEvent — `src/daemon/log_processor.rs:75` — to set `trace_id: entry.trace_id, trace_summary: None`.
 
 - [ ] **Step 2: Add span notification methods to SessionRegistry**
 
@@ -1984,19 +1986,15 @@ pub fn send_or_queue_span_notification(
     self.send_or_queue_notification(id, event);
 }
 
-/// Get session IDs (not sorted by pre_window — that's log-specific).
+/// Get all session IDs (connected + disconnected named sessions).
+/// Disconnected named sessions need trigger evaluation to queue notifications.
 pub fn active_session_ids(&self) -> Vec<SessionId> {
     let sessions = self.sessions.read().unwrap();
-    sessions.keys()
-        .filter(|id| {
-            sessions.get(*id).map_or(false, |s| s.connected.load(Ordering::Relaxed))
-        })
-        .cloned()
-        .collect()
+    sessions.keys().cloned().collect()
 }
 ```
 
-The implementer will need to decide whether to extend `PipelineEvent` to carry span data or create a separate `SpanTriggerEvent` type. The simplest approach: reuse `PipelineEvent` with the new optional trace fields, and set `matched_entry` to a synthetic LogEntry with the span info. The alternative (cleaner but more work) is an enum `TriggerEvent { Log(PipelineEvent), Span(SpanTriggerEvent) }`.
+The approach: reuse `PipelineEvent` with the new optional trace fields, and set `matched_entry` to a synthetic LogEntry with span info (as shown above).
 
 - [ ] **Step 3: Run all tests**
 
@@ -2281,6 +2279,10 @@ pub struct DaemonConfig {
 fn default_otlp_grpc_port() -> u16 { 4317 }
 fn default_otlp_http_port() -> u16 { 4318 }
 fn default_span_buffer_size() -> usize { 10000 }
+
+// IMPORTANT: Also update the manual `impl Default for DaemonConfig` at line 62-73
+// of persistence.rs to include the three new fields with their defaults.
+// Also update main.rs Daemon destructuring to include new CLI args.
 ```
 
 In `src/config.rs`, add to the Daemon subcommand:
@@ -2363,6 +2365,35 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+fn make_entry(level: Level, msg: &str) -> LogEntry {
+    LogEntry {
+        seq: 0, timestamp: Utc::now(), level,
+        message: msg.to_string(), full_message: None,
+        host: "test".into(), facility: Some("test".into()),
+        file: None, line: None,
+        additional_fields: HashMap::new(),
+        matched_filters: Vec::new(), source: LogSource::Filter,
+        trace_id: None, span_id: None,
+    }
+}
+
+fn make_span(name: &str, trace_id: u128, duration_ms: f64) -> SpanEntry {
+    let now = Utc::now();
+    SpanEntry {
+        seq: 0, trace_id,
+        span_id: 0xdef_u64,
+        parent_span_id: None,
+        start_time: now, end_time: now,
+        duration_ms,
+        name: name.to_string(),
+        kind: SpanKind::Internal,
+        service_name: "test".to_string(),
+        status: SpanStatus::Ok,
+        attributes: HashMap::new(),
+        events: vec![],
+    }
+}
+
 #[test]
 fn test_logs_and_spans_linked_by_trace_id() {
     let seq = Arc::new(SeqCounter::new());
@@ -2407,9 +2438,9 @@ fn test_shared_seq_counter_interleaves() {
     process_entry(&mut log, &pipeline, &sessions);
     let log_seq = log.seq;
 
-    let mut span = make_span("second", 1, 10.0);
-    span_store.insert(span.clone());
-    // span.seq should be log_seq + 1
+    let span = make_span("second", 1, 10.0);
+    let span_seq = span_store.insert(span); // returns assigned seq
+    // span_seq should be log_seq + 1
 
     let mut log2 = make_entry(Level::Info, "third");
     process_entry(&mut log2, &pipeline, &sessions);
