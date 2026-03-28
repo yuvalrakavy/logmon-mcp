@@ -6,7 +6,7 @@ use crate::daemon::rpc_handler::RpcHandler;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
 use crate::receiver::gelf::{GelfReceiver, GelfReceiverConfig};
-use crate::receiver::LogReceiver;
+use crate::receiver::Receiver;
 use crate::rpc::transport::{read_request, write_message};
 use crate::rpc::types::*;
 use std::sync::Arc;

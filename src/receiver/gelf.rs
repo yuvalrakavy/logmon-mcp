@@ -1,4 +1,4 @@
-use super::LogReceiver;
+use super::Receiver;
 use crate::gelf::message::LogEntry;
 use crate::gelf::{tcp, udp};
 use async_trait::async_trait;
@@ -37,7 +37,7 @@ impl GelfReceiver {
 }
 
 #[async_trait]
-impl LogReceiver for GelfReceiver {
+impl Receiver for GelfReceiver {
     fn name(&self) -> &str {
         "gelf"
     }
