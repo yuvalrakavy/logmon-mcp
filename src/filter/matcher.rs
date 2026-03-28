@@ -1,5 +1,6 @@
 use crate::filter::parser::*;
 use crate::gelf::message::LogEntry;
+use crate::span::types::SpanEntry;
 
 /// Check if a LogEntry matches a ParsedFilter
 pub fn matches_entry(filter: &ParsedFilter, entry: &LogEntry) -> bool {
@@ -115,4 +116,9 @@ fn matches_level(op: LevelOp, filter_level: crate::gelf::message::Level, entry_l
         LevelOp::Gte => entry_level >= filter_level,
         LevelOp::Lte => entry_level <= filter_level,
     }
+}
+
+/// Stub: matches a span against a parsed filter. Full implementation in Task 7.
+pub fn matches_span(_filter: &ParsedFilter, _span: &SpanEntry) -> bool {
+    true
 }
