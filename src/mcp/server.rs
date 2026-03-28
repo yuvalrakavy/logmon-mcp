@@ -548,7 +548,7 @@ impl GelfMcpServer {
         let result = self
             .bridge
             .call(
-                "traces.slow_spans",
+                "traces.slow",
                 serde_json::json!({
                     "min_duration_ms": p.min_duration_ms,
                     "count": p.count,
@@ -571,7 +571,7 @@ impl GelfMcpServer {
         let result = self
             .bridge
             .call(
-                "traces.span_context",
+                "spans.context",
                 serde_json::json!({
                     "seq": p.seq,
                     "before": p.before,
