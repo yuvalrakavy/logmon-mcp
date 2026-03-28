@@ -1,4 +1,5 @@
 pub mod gelf;
+pub mod otlp;
 
 use async_trait::async_trait;
 
