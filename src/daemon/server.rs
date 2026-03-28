@@ -87,7 +87,9 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     info!(?all_receivers_info, "GELF receiver started");
 
     // 9. Start OTLP receiver (if enabled)
-    if config.otlp_grpc_port > 0 || config.otlp_http_port > 0 {
+    // Must be held alive for daemon lifetime — dropping it closes the shutdown channel
+    // which signals the gRPC/HTTP servers to stop.
+    let _otlp_receiver = if config.otlp_grpc_port > 0 || config.otlp_http_port > 0 {
         let otlp_config = OtlpReceiverConfig {
             grpc_addr: format!("0.0.0.0:{}", config.otlp_grpc_port),
             http_addr: format!("0.0.0.0:{}", config.otlp_http_port),
@@ -98,7 +100,10 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         info!(?otlp_info, "OTLP receiver started");
         all_receivers_info.extend(otlp_info);
         send_otel_beacon("OTEL:ONLINE\n");
-    }
+        Some(otlp_receiver)
+    } else {
+        None
+    };
 
     // 10. Write PID file
     let pid_path = dir.join("daemon.pid");
