@@ -8,3 +8,4 @@ pub mod mcp;
 pub mod rpc;
 pub mod receiver;
 pub mod shim;
+pub mod span;
