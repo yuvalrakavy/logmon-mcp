@@ -1,9 +1,10 @@
 use crate::engine::pre_buffer::PreTriggerBuffer;
+use crate::engine::seq_counter::SeqCounter;
 use crate::filter::parser::{ParsedFilter, parse_filter};
 use crate::gelf::message::LogEntry;
 use crate::store::memory::InMemoryStore;
 use crate::store::traits::{LogStore, StoreStats};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Event emitted when a trigger fires (used by daemon's session logic)
@@ -30,7 +31,7 @@ pub struct FilterInfo {
 pub struct LogPipeline {
     store: InMemoryStore,
     pre_buffer: PreTriggerBuffer,
-    seq_counter: AtomicU64,
+    seq_counter: Arc<SeqCounter>,
     event_sender: broadcast::Sender<PipelineEvent>,
 }
 
@@ -40,7 +41,7 @@ impl LogPipeline {
         Self {
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(0),
-            seq_counter: AtomicU64::new(0),
+            seq_counter: Arc::new(SeqCounter::new()),
             event_sender,
         }
     }
@@ -50,13 +51,23 @@ impl LogPipeline {
         Self {
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(0),
-            seq_counter: AtomicU64::new(initial_seq),
+            seq_counter: Arc::new(SeqCounter::new_with_initial(initial_seq)),
+            event_sender,
+        }
+    }
+
+    pub fn new_with_seq_counter(store_capacity: usize, seq_counter: Arc<SeqCounter>) -> Self {
+        let (event_sender, _) = broadcast::channel(100);
+        Self {
+            store: InMemoryStore::new(store_capacity),
+            pre_buffer: PreTriggerBuffer::new(0),
+            seq_counter,
             event_sender,
         }
     }
 
     pub fn assign_seq(&self) -> u64 {
-        self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
+        self.seq_counter.next()
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
@@ -116,6 +127,18 @@ impl LogPipeline {
         self.store.context_by_time(timestamp, window)
     }
 
+    /// Return log entries from the store matching the given trace_id.
+    /// Stub: will be implemented when LogStore gains trace_id indexing (Task 4).
+    pub fn logs_by_trace_id(&self, _trace_id: u128) -> Vec<LogEntry> {
+        Vec::new()
+    }
+
+    /// Return count of log entries in the store matching the given trace_id.
+    /// Stub: will be implemented when LogStore gains trace_id indexing (Task 4).
+    pub fn count_by_trace_id(&self, _trace_id: u128) -> usize {
+        0
+    }
+
     // --- Pre-buffer operations ---
 
     pub fn pre_buffer_append(&self, entry: LogEntry) {
@@ -128,5 +151,10 @@ impl LogPipeline {
 
     pub fn resize_pre_buffer(&self, size: usize) {
         self.pre_buffer.resize(size);
+    }
+
+    /// Return copies of pre-buffer entries matching the given trace_id.
+    pub fn pre_buffer_entries_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
+        self.pre_buffer.entries_by_trace_id(trace_id)
     }
 }

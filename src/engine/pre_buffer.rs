@@ -58,4 +58,13 @@ impl PreTriggerBuffer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Return copies of entries matching the given trace_id.
+    pub fn entries_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
+        let entries = self.entries.lock().unwrap();
+        entries.iter()
+            .filter(|e| e.trace_id == Some(trace_id))
+            .cloned()
+            .collect()
+    }
 }
