@@ -156,4 +156,53 @@ impl LogStore for InMemoryStore {
             malformed_count: self.malformed_count.load(Ordering::Relaxed),
         }
     }
+
+    fn oldest_timestamp(&self) -> Option<DateTime<Utc>> {
+        self.entries.read().unwrap().front().map(|e| e.timestamp)
+    }
+}
+
+#[cfg(test)]
+mod oldest_ts_tests {
+    use super::*;
+    use crate::gelf::message::{LogEntry, Level, LogSource};
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn entry(seq: u64) -> LogEntry {
+        LogEntry {
+            seq,
+            timestamp: Utc::now(),
+            level: Level::Info,
+            message: "m".to_string(),
+            full_message: None,
+            host: "h".to_string(),
+            facility: None,
+            file: None,
+            line: None,
+            additional_fields: HashMap::new(),
+            trace_id: None,
+            span_id: None,
+            matched_filters: Vec::new(),
+            source: LogSource::Filter,
+        }
+    }
+
+    #[test]
+    fn oldest_timestamp_empty_store_returns_none() {
+        let store = InMemoryStore::new(10);
+        assert!(store.oldest_timestamp().is_none());
+    }
+
+    #[test]
+    fn oldest_timestamp_returns_front_entry_timestamp() {
+        let store = InMemoryStore::new(10);
+        let mut e1 = entry(1);
+        e1.timestamp = Utc::now() - chrono::Duration::seconds(60);
+        let mut e2 = entry(2);
+        e2.timestamp = Utc::now();
+        store.append(e1.clone());
+        store.append(e2);
+        assert_eq!(store.oldest_timestamp(), Some(e1.timestamp));
+    }
 }

@@ -124,6 +124,27 @@ struct DropSessionParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct AddBookmarkParams {
+    /// Bookmark name (alphanumerics, '-', '_'; max 64 chars). Will be qualified
+    /// with the calling session's name automatically.
+    name: String,
+    /// If true, overwrite an existing bookmark with the same qualified name.
+    replace: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ListBookmarksParams {
+    /// Optional: filter to bookmarks created by this session name.
+    session: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveBookmarkParams {
+    /// Bare name (resolved against current session) or qualified "session/name".
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct GetRecentTracesParams {
     /// Max traces to return (default: 20)
     count: Option<u32>,
@@ -598,6 +619,65 @@ impl GelfMcpServer {
                     "trace_id": p.trace_id,
                     "filter": p.filter,
                 }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    // ---- Bookmark Tools ----
+
+    #[rmcp::tool(description = "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs.")]
+    async fn add_bookmark(
+        &self,
+        Parameters(p): Parameters<AddBookmarkParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "bookmarks.add",
+                serde_json::json!({
+                    "name": p.name,
+                    "replace": p.replace,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "List all live bookmarks across all sessions, newest first. Optionally filter by session name.")]
+    async fn list_bookmarks(
+        &self,
+        Parameters(p): Parameters<ListBookmarksParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "bookmarks.list",
+                serde_json::json!({ "session": p.session }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Remove a bookmark by name. Bare name resolves to the current session; use 'session/name' to remove a bookmark from another session.")]
+    async fn remove_bookmark(
+        &self,
+        Parameters(p): Parameters<RemoveBookmarkParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "bookmarks.remove",
+                serde_json::json!({ "name": p.name }),
             )
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;

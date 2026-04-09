@@ -204,6 +204,9 @@ Once logs are flowing, ask your assistant:
 | `get_log_context` | Get logs surrounding a specific entry by seq number |
 | `export_logs` | Save logs to a file |
 | `clear_logs` | Clear the log buffer |
+| `add_bookmark` | Set a named timestamp anchor at the current moment (global, qualified by session name) |
+| `list_bookmarks` | List all live bookmarks, newest first |
+| `remove_bookmark` | Remove a bookmark (bare name = current session; `session/name` reaches another session) |
 | `get_status` | Server status and statistics |
 | `get_filters` | List buffer filters for this session |
 | `add_filter` | Add a buffer filter (OR semantics across filters) |
@@ -230,6 +233,22 @@ connection refused,h=myapp   # substring match + host filter
 **Selectors:** `m` (message), `fm` (full_message), `mfm` (message or full_message), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level)
 
 **Special filters:** `ALL` (match everything), `NONE` (match nothing)
+
+### Bookmarks
+
+Bookmarks let you scope queries to a time range without destructively clearing logs. Set one before an operation, another after, and query the range:
+
+```
+add_bookmark("before")
+# run the operation
+add_bookmark("after")
+get_recent_logs(filter="b>=before, b<=after, l>=warn")
+get_recent_traces(filter="b>=before, b<=after, d>=100")
+```
+
+Bookmarks are global across sessions and qualified by the creating session (`session/name`). Bare names in tool calls and DSL expressions resolve to the current session. Bookmarks auto-evict when both the log and span buffers have rolled past their timestamp — they cannot outlive the data they point at.
+
+`b>=` / `b<=` are usable only in query tools, not in registered filters or triggers.
 
 ## Triggers
 

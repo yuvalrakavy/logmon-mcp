@@ -10,6 +10,7 @@ pub struct RpcHandler {
     pipeline: Arc<LogPipeline>,
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
+    bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
 }
@@ -19,12 +20,14 @@ impl RpcHandler {
         pipeline: Arc<LogPipeline>,
         span_store: Arc<SpanStore>,
         sessions: Arc<SessionRegistry>,
+        bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
         receivers_info: Vec<String>,
     ) -> Self {
         Self {
             pipeline,
             span_store,
             sessions,
+            bookmarks,
             start_time: std::time::Instant::now(),
             receivers_info,
         }
@@ -33,9 +36,9 @@ impl RpcHandler {
     /// Handle an RPC request for a given session.
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         let result = match request.method.as_str() {
-            "logs.recent" => self.handle_logs_recent(&request.params),
+            "logs.recent" => self.handle_logs_recent(session_id, &request.params),
             "logs.context" => self.handle_logs_context(&request.params),
-            "logs.export" => self.handle_logs_export(&request.params),
+            "logs.export" => self.handle_logs_export(session_id, &request.params),
             "logs.clear" => self.handle_logs_clear(),
             "status.get" => self.handle_status(session_id),
             "filters.list" => self.handle_filters_list(session_id),
@@ -48,12 +51,15 @@ impl RpcHandler {
             "triggers.remove" => self.handle_triggers_remove(session_id, &request.params),
             "session.list" => self.handle_session_list(),
             "session.drop" => self.handle_session_drop(&request.params),
-            "traces.recent" => self.handle_traces_recent(&request.params),
-            "traces.get" => self.handle_traces_get(&request.params),
+            "traces.recent" => self.handle_traces_recent(session_id, &request.params),
+            "traces.get" => self.handle_traces_get(session_id, &request.params),
             "traces.summary" => self.handle_traces_summary(&request.params),
-            "traces.slow" => self.handle_traces_slow(&request.params),
-            "traces.logs" => self.handle_traces_logs(&request.params),
+            "traces.slow" => self.handle_traces_slow(session_id, &request.params),
+            "traces.logs" => self.handle_traces_logs(session_id, &request.params),
             "spans.context" => self.handle_spans_context(&request.params),
+            "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
+            "bookmarks.list" => self.handle_bookmarks_list(&request.params),
+            "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
             _ => Err(format!("unknown method: {}", request.method)),
         };
 
@@ -81,11 +87,42 @@ impl RpcHandler {
     // logs.*
     // -----------------------------------------------------------------------
 
-    fn handle_logs_recent(&self, params: &Value) -> Result<Value, String> {
-        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-        let filter = params.get("filter").and_then(|v| v.as_str());
+    /// Parse a filter string and resolve any bookmark qualifiers against the
+    /// bookmark store using `session_id` as the current session.
+    /// Returns `Ok(None)` if the input is `None` or an empty/whitespace-only
+    /// string — this matches the previous `recent_logs_str` behavior, which
+    /// silently treated empty/parse-failed filters as "no filter".
+    /// Real parse errors and resolution errors are surfaced (this is a
+    /// behavior change from the old `.ok()`-swallowing path, but a desirable
+    /// one — bookmark errors must be visible).
+    fn parse_and_resolve_filter(
+        &self,
+        filter_str: Option<&str>,
+        session_id: &SessionId,
+    ) -> Result<Option<crate::filter::parser::ParsedFilter>, String> {
+        let Some(s) = filter_str else { return Ok(None) };
+        if s.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
+        let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
+            parsed,
+            &self.bookmarks,
+            &session_id.to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(resolved))
+    }
 
-        // Optional trace_id filter
+    fn handle_logs_recent(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let filter_str = params.get("filter").and_then(|v| v.as_str());
+
+        // Optional trace_id filter (unchanged)
         if let Some(trace_id_hex) = params.get("trace_id").and_then(|v| v.as_str()) {
             let trace_id = u128::from_str_radix(trace_id_hex, 16)
                 .map_err(|_| "invalid trace_id")?;
@@ -93,7 +130,8 @@ impl RpcHandler {
             return Ok(json!({ "logs": logs, "count": logs.len() }));
         }
 
-        let entries = self.pipeline.recent_logs_str(count, filter);
+        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let entries = self.pipeline.recent_logs(count, resolved.as_ref());
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
 
@@ -108,13 +146,18 @@ impl RpcHandler {
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
 
-    fn handle_logs_export(&self, params: &Value) -> Result<Value, String> {
+    fn handle_logs_export(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let count = params
             .get("count")
             .and_then(|v| v.as_u64())
             .unwrap_or(u64::MAX) as usize;
-        let filter = params.get("filter").and_then(|v| v.as_str());
-        let entries = self.pipeline.recent_logs_str(count, filter);
+        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let entries = self.pipeline.recent_logs(count, resolved.as_ref());
         Ok(json!({ "logs": entries, "count": entries.len(), "format": "json" }))
     }
 
@@ -179,6 +222,15 @@ impl RpcHandler {
             .get("filter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
+        // Reject bookmark filters in registered (long-lived) filters.
+        let parsed = crate::filter::parser::parse_filter(filter)
+            .map_err(|e| e.to_string())?;
+        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
+            return Err(
+                "bookmarks (b>=, b<=) are not allowed in registered filters/triggers — use them only in query tools"
+                    .to_string(),
+            );
+        }
         let desc = params.get("description").and_then(|v| v.as_str());
         let id = self
             .sessions
@@ -260,6 +312,15 @@ impl RpcHandler {
             .get("filter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
+        // Reject bookmark filters in registered (long-lived) triggers.
+        let parsed = crate::filter::parser::parse_filter(filter)
+            .map_err(|e| e.to_string())?;
+        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
+            return Err(
+                "bookmarks (b>=, b<=) are not allowed in registered filters/triggers — use them only in query tools"
+                    .to_string(),
+            );
+        }
         let pre = params.get("pre_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let post = params.get("post_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let ctx = params
@@ -330,21 +391,29 @@ impl RpcHandler {
     // traces.* / spans.*
     // -----------------------------------------------------------------------
 
-    fn handle_traces_recent(&self, params: &Value) -> Result<Value, String> {
+    fn handle_traces_recent(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let filter = filter_str.and_then(|s| crate::filter::parser::parse_filter(s).ok());
+        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
 
         let pipeline = &self.pipeline;
         let summaries = self.span_store.recent_traces(
             count,
-            filter.as_ref(),
+            resolved.as_ref(),
             |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
         );
         Ok(json!({ "traces": summaries, "count": summaries.len() }))
     }
 
-    fn handle_traces_get(&self, params: &Value) -> Result<Value, String> {
+    fn handle_traces_get(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
@@ -356,7 +425,14 @@ impl RpcHandler {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let spans = self.span_store.get_trace(trace_id);
+        // Resolve filter (used to filter spans within the trace below)
+        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+
+        let mut spans = self.span_store.get_trace(trace_id);
+        if let Some(f) = resolved.as_ref() {
+            spans.retain(|s| crate::filter::matcher::matches_span(f, s));
+        }
         let logs = if include_logs {
             self.pipeline.logs_by_trace_id(trace_id)
         } else {
@@ -447,19 +523,23 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_slow(&self, params: &Value) -> Result<Value, String> {
+    fn handle_traces_slow(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let min_duration = params
             .get("min_duration_ms")
             .and_then(|v| v.as_f64())
             .unwrap_or(100.0);
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let filter = filter_str.and_then(|s| crate::filter::parser::parse_filter(s).ok());
+        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
         let group_by = params.get("group_by").and_then(|v| v.as_str());
 
         let slow = self
             .span_store
-            .slow_spans(min_duration, count, filter.as_ref());
+            .slow_spans(min_duration, count, resolved.as_ref());
 
         match group_by {
             Some("name") => {
@@ -500,7 +580,11 @@ impl RpcHandler {
         }
     }
 
-    fn handle_traces_logs(&self, params: &Value) -> Result<Value, String> {
+    fn handle_traces_logs(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
@@ -508,7 +592,13 @@ impl RpcHandler {
         let trace_id =
             u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
-        let logs = self.pipeline.logs_by_trace_id(trace_id);
+        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+
+        let mut logs = self.pipeline.logs_by_trace_id(trace_id);
+        if let Some(f) = resolved.as_ref() {
+            logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
+        }
         Ok(json!({ "logs": logs, "count": logs.len() }))
     }
 
@@ -556,5 +646,85 @@ impl RpcHandler {
             .drop_session(name)
             .map_err(|e| e.to_string())?;
         Ok(json!({ "dropped": name }))
+    }
+
+    // -----------------------------------------------------------------------
+    // bookmarks.*
+    // -----------------------------------------------------------------------
+
+    fn handle_bookmarks_add(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing required parameter: name".to_string())?;
+        let replace = params
+            .get("replace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Sweep before adding so the store stays tidy.
+        self.sweep_bookmarks();
+
+        let session = session_id.to_string();
+        let (bookmark, replaced) = self
+            .bookmarks
+            .add(&session, name, replace)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "qualified_name": bookmark.qualified_name,
+            "timestamp": bookmark.timestamp,
+            "replaced": replaced,
+        }))
+    }
+
+    fn handle_bookmarks_list(&self, params: &Value) -> Result<Value, String> {
+        self.sweep_bookmarks();
+        let session_filter = params.get("session").and_then(|v| v.as_str());
+
+        let now = chrono::Utc::now();
+        let items: Vec<Value> = self
+            .bookmarks
+            .list()
+            .into_iter()
+            .filter(|b| session_filter.is_none_or(|s| b.session == s))
+            .map(|b| {
+                let age = (now - b.timestamp).num_seconds().max(0);
+                json!({
+                    "qualified_name": b.qualified_name,
+                    "name": b.name,
+                    "session": b.session,
+                    "timestamp": b.timestamp,
+                    "age_secs": age,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "bookmarks": items, "count": items.len() }))
+    }
+
+    fn handle_bookmarks_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing required parameter: name".to_string())?;
+        let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
+        self.bookmarks
+            .remove(&qualified)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": qualified }))
+    }
+
+    fn sweep_bookmarks(&self) {
+        let oldest_log = self.pipeline.oldest_log_timestamp();
+        let oldest_span = self.span_store.oldest_timestamp();
+        self.bookmarks.sweep(oldest_log, oldest_span);
     }
 }

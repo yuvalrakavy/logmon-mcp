@@ -143,4 +143,21 @@ impl SpanStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn oldest_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.inner.read().unwrap().buffer.front().map(|s| s.start_time)
+    }
+}
+
+#[cfg(test)]
+mod oldest_ts_tests {
+    use super::*;
+    use crate::engine::seq_counter::SeqCounter;
+    use std::sync::Arc;
+
+    #[test]
+    fn empty_span_store_returns_none() {
+        let store = SpanStore::new(10, Arc::new(SeqCounter::new()));
+        assert!(store.oldest_timestamp().is_none());
+    }
 }

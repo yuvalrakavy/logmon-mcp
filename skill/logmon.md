@@ -107,6 +107,48 @@ Filters use a comma-separated qualifier syntax (AND semantics within a filter):
 - `connection refused,h=myapp` — connection errors from myapp
 - `/panic|unwrap failed/` — regex for panics
 
+## Bookmarks
+
+Use bookmarks instead of `clear_logs` when you want a clear before/after boundary for an operation but still need the prior history.
+
+**When to reach for bookmarks:**
+
+- Before starting a flaky operation you want to inspect — you can query just that range later instead of wading through everything.
+- When comparing two attempts of the same operation — bookmark each attempt's start, then query the two ranges side by side.
+- Whenever you'd otherwise reach for `clear_logs` to "see only what happens next" — bookmarks give you the same scoping without losing history.
+
+**Tools:**
+
+- `add_bookmark(name)` — drops a bookmark at the current moment. Pass `replace: true` to overwrite an existing bookmark with the same name.
+- `list_bookmarks()` — shows all live bookmarks, newest first. Optional `session` param to filter.
+- `remove_bookmark(name)` — removes a bookmark. Bare name = current session; `session/name` for cross-session.
+
+**DSL operators:**
+
+Bookmarks plug into the filter DSL as comparison qualifiers, just like `l>=warn` and `d>=100`:
+
+- `b>=name` — entries at or after the bookmark's timestamp
+- `b<=name` — entries at or before
+- `b>=other-session/name` — reach into another session's bookmarks
+
+Combine freely:
+
+```
+get_recent_logs(filter="b>=before, b<=after, l>=warn")
+get_recent_traces(filter="b>=before, d>=100")
+get_trace_logs(trace_id="...", filter="b>=before")
+```
+
+**Naming and lifetime:**
+
+Bookmarks are global across sessions and stored as `{session_name}/{name}`. Two sessions can both have a bookmark called `before` — they're stored as `A/before` and `B/before` and don't collide. Inside *your* session, a bare `before` means `your-session/before`.
+
+Bookmarks auto-evict when both the log buffer *and* the span buffer have rolled past their timestamp. You cannot end up with a stale bookmark pointing at data that no longer exists.
+
+**Restrictions:**
+
+`b>=` and `b<=` are query-only — they're rejected by `add_filter` and `add_trigger`. Bookmarks are timestamps frozen at creation time, so they don't make sense in long-lived registered filters.
+
 ## Workflow Tips
 
 ### Debugging a specific component
