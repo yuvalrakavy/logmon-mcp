@@ -112,6 +112,10 @@ impl LogPipeline {
         self.store.recent(count, filter)
     }
 
+    pub fn oldest_log_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.store.oldest_timestamp()
+    }
+
     pub fn recent_logs_str(&self, count: usize, filter_str: Option<&str>) -> Vec<LogEntry> {
         let parsed = filter_str.and_then(|s| parse_filter(s).ok());
         self.store.recent(count, parsed.as_ref())
