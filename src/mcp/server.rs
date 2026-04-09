@@ -124,6 +124,15 @@ struct DropSessionParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct AddBookmarkParams {
+    /// Bookmark name (alphanumerics, '-', '_'; max 64 chars). Will be qualified
+    /// with the calling session's name automatically.
+    name: String,
+    /// If true, overwrite an existing bookmark with the same qualified name.
+    replace: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct GetRecentTracesParams {
     /// Max traces to return (default: 20)
     count: Option<u32>,
@@ -597,6 +606,29 @@ impl GelfMcpServer {
                 serde_json::json!({
                     "trace_id": p.trace_id,
                     "filter": p.filter,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    // ---- Bookmark Tools ----
+
+    #[rmcp::tool(description = "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs.")]
+    async fn add_bookmark(
+        &self,
+        Parameters(p): Parameters<AddBookmarkParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "bookmarks.add",
+                serde_json::json!({
+                    "name": p.name,
+                    "replace": p.replace,
                 }),
             )
             .await

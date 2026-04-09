@@ -10,7 +10,6 @@ pub struct RpcHandler {
     pipeline: Arc<LogPipeline>,
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
-    #[allow(dead_code)]
     bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
@@ -58,6 +57,7 @@ impl RpcHandler {
             "traces.slow" => self.handle_traces_slow(&request.params),
             "traces.logs" => self.handle_traces_logs(&request.params),
             "spans.context" => self.handle_spans_context(&request.params),
+            "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
             _ => Err(format!("unknown method: {}", request.method)),
         };
 
@@ -560,5 +560,44 @@ impl RpcHandler {
             .drop_session(name)
             .map_err(|e| e.to_string())?;
         Ok(json!({ "dropped": name }))
+    }
+
+    // -----------------------------------------------------------------------
+    // bookmarks.*
+    // -----------------------------------------------------------------------
+
+    fn handle_bookmarks_add(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing required parameter: name".to_string())?;
+        let replace = params
+            .get("replace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Sweep before adding so the store stays tidy.
+        self.sweep_bookmarks();
+
+        let session = session_id.to_string();
+        let (bookmark, replaced) = self
+            .bookmarks
+            .add(&session, name, replace)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "qualified_name": bookmark.qualified_name,
+            "timestamp": bookmark.timestamp,
+            "replaced": replaced,
+        }))
+    }
+
+    fn sweep_bookmarks(&self) {
+        let oldest_log = self.pipeline.oldest_log_timestamp();
+        let oldest_span = self.span_store.oldest_timestamp();
+        self.bookmarks.sweep(oldest_log, oldest_span);
     }
 }
