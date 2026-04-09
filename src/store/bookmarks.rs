@@ -63,8 +63,8 @@ pub fn should_evict(
     oldest_log_ts: Option<DateTime<Utc>>,
     oldest_span_ts: Option<DateTime<Utc>>,
 ) -> bool {
-    let log_evicted = oldest_log_ts.map_or(false, |t| t > bookmark_ts);
-    let span_evicted = oldest_span_ts.map_or(false, |t| t > bookmark_ts);
+    let log_evicted = oldest_log_ts.is_some_and(|t| t > bookmark_ts);
+    let span_evicted = oldest_span_ts.is_some_and(|t| t > bookmark_ts);
     log_evicted && span_evicted
 }
 

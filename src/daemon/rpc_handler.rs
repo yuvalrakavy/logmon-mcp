@@ -690,7 +690,7 @@ impl RpcHandler {
             .bookmarks
             .list()
             .into_iter()
-            .filter(|b| session_filter.map_or(true, |s| b.session == s))
+            .filter(|b| session_filter.is_none_or(|s| b.session == s))
             .map(|b| {
                 let age = (now - b.timestamp).num_seconds().max(0);
                 json!({
