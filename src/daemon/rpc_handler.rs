@@ -60,6 +60,7 @@ impl RpcHandler {
             "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
             "bookmarks.list" => self.handle_bookmarks_list(&request.params),
             "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
+            "bookmarks.clear" => self.handle_bookmarks_clear(session_id, &request.params),
             _ => Err(format!("unknown method: {}", request.method)),
         };
 
@@ -720,6 +721,21 @@ impl RpcHandler {
             .remove(&qualified)
             .map_err(|e| e.to_string())?;
         Ok(json!({ "removed": qualified }))
+    }
+
+    fn handle_bookmarks_clear(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        // Default to the calling session if no explicit session is given.
+        let session = params
+            .get("session")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| session_id.to_string());
+        let removed_count = self.bookmarks.clear_session(&session);
+        Ok(json!({ "removed_count": removed_count, "session": session }))
     }
 
     fn sweep_bookmarks(&self) {

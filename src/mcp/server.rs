@@ -145,6 +145,14 @@ struct RemoveBookmarkParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct ClearBookmarksParams {
+    /// Optional session name to clear. Defaults to the calling session.
+    /// Use to clear another session's bookmarks (no nuclear "clear all" — call
+    /// once per session if you want to wipe multiple).
+    session: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct GetRecentTracesParams {
     /// Max traces to return (default: 20)
     count: Option<u32>,
@@ -678,6 +686,24 @@ impl GelfMcpServer {
             .call(
                 "bookmarks.remove",
                 serde_json::json!({ "name": p.name }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Clear all bookmarks for a session at once. Defaults to the calling session. Useful for iterative debugging workflows: wipe all bookmarks, re-add fresh ones, repeat. Pass an explicit session name to clear another session's bookmarks.")]
+    async fn clear_bookmarks(
+        &self,
+        Parameters(p): Parameters<ClearBookmarksParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .bridge
+            .call(
+                "bookmarks.clear",
+                serde_json::json!({ "session": p.session }),
             )
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;

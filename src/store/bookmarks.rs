@@ -134,6 +134,15 @@ impl BookmarkStore {
         map.retain(|_, b| !should_evict(b.timestamp, oldest_log_ts, oldest_span_ts));
     }
 
+    /// Remove every bookmark whose `session` field equals `session`.
+    /// Returns the number of bookmarks removed.
+    pub fn clear_session(&self, session: &str) -> usize {
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        let before = map.len();
+        map.retain(|_, b| b.session != session);
+        before - map.len()
+    }
+
     /// Look up a bookmark by qualified name. Returns the bookmark if it exists.
     pub fn get(&self, qualified_name: &str) -> Option<Bookmark> {
         self.bookmarks
@@ -276,6 +285,28 @@ mod tests {
         // Oldest log is older than the bookmark — data still covers it.
         let oldest = b.timestamp - chrono::Duration::seconds(10);
         store.sweep(Some(oldest), Some(oldest));
+        assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn clear_session_removes_only_matching_session() {
+        let store = BookmarkStore::new();
+        store.add("A", "one", false).unwrap();
+        store.add("A", "two", false).unwrap();
+        store.add("B", "one", false).unwrap();
+        let removed = store.clear_session("A");
+        assert_eq!(removed, 2);
+        let remaining = store.list();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].qualified_name, "B/one");
+    }
+
+    #[test]
+    fn clear_session_empty_session_returns_zero() {
+        let store = BookmarkStore::new();
+        store.add("A", "x", false).unwrap();
+        let removed = store.clear_session("nonexistent");
+        assert_eq!(removed, 0);
         assert_eq!(store.list().len(), 1);
     }
 }
