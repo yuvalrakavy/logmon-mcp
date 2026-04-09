@@ -155,13 +155,13 @@ The sweep predicate for one bookmark is:
 
 ```rust
 fn should_evict(b: &Bookmark, oldest_log_ts: Option<DateTime<Utc>>, oldest_span_ts: Option<DateTime<Utc>>) -> bool {
-    let log_gone  = oldest_log_ts.map_or(true, |t| t > b.timestamp);
-    let span_gone = oldest_span_ts.map_or(true, |t| t > b.timestamp);
-    log_gone && span_gone
+    let log_evicted  = oldest_log_ts.map_or(false, |t| t > b.timestamp);
+    let span_evicted = oldest_span_ts.map_or(false, |t| t > b.timestamp);
+    log_evicted && span_evicted
 }
 ```
 
-A bookmark is removed when **both** stores have evicted past its timestamp. If a store is empty, that side counts as "evicted past everything" — so a bookmark created when both stores are empty stays alive until logs/spans arrive, at which point the predicate naturally evaluates against the new oldest timestamp.
+A bookmark is removed when **both** stores have *positively confirmed* eviction past its timestamp — i.e. each store has at least one entry AND its oldest entry is newer than the bookmark. An empty store does **not** confirm eviction (it could simply have not received data yet), so a bookmark created when both stores are empty stays alive until enough data has flowed through both stores to roll past it. This guarantees a bookmark cannot outlive its data, but also cannot be killed by the absence of data.
 
 The sweep runs at:
 
@@ -237,9 +237,10 @@ In `tests/`, against a running daemon (matching the existing integration test st
 7. `get_recent_traces(filter="b>=before, b<=after")` — assert the trace appears.
 8. Connect a second session "B"; call `get_recent_logs(filter="b>=A/before, b<=A/after")` — assert visible cross-session.
 9. `add_bookmark("before", replace=true)` from session A — assert the timestamp moved.
-10. `clear_logs`, then `list_bookmarks` — assert both bookmarks were swept (because both stores are now empty *and* the oldest-timestamp predicate trivially holds).
-11. Resolution failure: `get_recent_logs(filter="b>=ghost")` returns a clear `bookmark not found: ghost` error.
-12. Registration guard: `add_filter(filter="b>=before")` returns the guard error.
+10. `list_bookmarks` — both bookmarks are still alive (data still covers them); confirms the sweep doesn't over-evict.
+11. `remove_bookmark("before")` then `list_bookmarks` — only "after" remains.
+12. Resolution failure: `get_recent_logs(filter="b>=ghost")` returns a clear `bookmark not found: A/ghost` error.
+13. Registration guard: `add_filter(filter="b>=before")` returns the guard error.
 
 ## Documentation deliverables
 
