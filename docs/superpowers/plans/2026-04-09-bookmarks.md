@@ -107,10 +107,11 @@ mod tests {
     #[test]
     fn add_then_list_returns_bookmark() {
         let store = BookmarkStore::new();
-        let b = store.add("A", "before", false).unwrap();
+        let (b, replaced) = store.add("A", "before", false).unwrap(); // returns (Bookmark, bool); ignored here
         assert_eq!(b.qualified_name, "A/before");
         assert_eq!(b.session, "A");
         assert_eq!(b.name, "before");
+        assert!(!replaced);
         let all = store.list();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].qualified_name, "A/before");
@@ -125,12 +126,21 @@ mod tests {
     }
 
     #[test]
-    fn add_duplicate_with_replace_overwrites_timestamp() {
+    fn add_duplicate_with_replace_overwrites_timestamp_and_reports_replaced() {
         let store = BookmarkStore::new();
-        let first = store.add("A", "x", false).unwrap();
+        let (first, replaced1) = store.add("A", "x", false).unwrap();
+        assert!(!replaced1);
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = store.add("A", "x", true).unwrap();
+        let (second, replaced2) = store.add("A", "x", true).unwrap();
+        assert!(replaced2);
         assert!(second.timestamp > first.timestamp);
+    }
+
+    #[test]
+    fn add_with_replace_on_fresh_name_reports_not_replaced() {
+        let store = BookmarkStore::new();
+        let (_, replaced) = store.add("A", "fresh", true).unwrap();
+        assert!(!replaced, "replace=true on a non-existent name is not a replace");
     }
 
     #[test]
@@ -194,7 +204,15 @@ pub fn qualify(name: &str, current_session: &str) -> String {
 }
 
 impl BookmarkStore {
-    pub fn add(&self, session: &str, name: &str, replace: bool) -> Result<Bookmark, BookmarkError> {
+    /// Add a bookmark. Returns `(bookmark, replaced)` where `replaced` is true
+    /// if a bookmark with the same qualified name already existed and was
+    /// overwritten (only possible when `replace == true`).
+    pub fn add(
+        &self,
+        session: &str,
+        name: &str,
+        replace: bool,
+    ) -> Result<(Bookmark, bool), BookmarkError> {
         if !is_valid_bookmark_name(name) {
             return Err(BookmarkError::InvalidName(name.to_string()));
         }
@@ -208,11 +226,12 @@ impl BookmarkStore {
             created_at: now,
         };
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        if map.contains_key(&qualified_name) && !replace {
+        let existed = map.contains_key(&qualified_name);
+        if existed && !replace {
             return Err(BookmarkError::AlreadyExists(qualified_name));
         }
         map.insert(qualified_name, bookmark.clone());
-        Ok(bookmark)
+        Ok((bookmark, existed))
     }
 
     pub fn list(&self) -> Vec<Bookmark> {
@@ -291,10 +310,20 @@ Add to the `tests` module in `src/store/bookmarks.rs`:
     }
 
     #[test]
-    fn empty_store_counts_as_past() {
-        // Both empty: bookmark should be evicted (no data behind it).
+    fn empty_stores_keep_bookmark_alive() {
+        // Both stores empty: bookmark survives. The "no data yet" case must
+        // not look like "data rolled past."
         let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
-        assert!(should_evict(bookmark_ts, None, None));
+        assert!(!should_evict(bookmark_ts, None, None));
+    }
+
+    #[test]
+    fn one_empty_store_keeps_bookmark_alive() {
+        // Only the side that has data and rolled past is "confirmed gone."
+        // If either side has no data, we can't confirm — keep alive.
+        let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
+        let oldest_log = Some(Utc::now()); // log rolled past
+        assert!(!should_evict(bookmark_ts, oldest_log, None));
     }
 
     #[test]
@@ -303,8 +332,8 @@ Add to the `tests` module in `src/store/bookmarks.rs`:
         store.add("A", "old", false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         store.add("A", "new", false).unwrap();
-        // Pretend both stores have evicted everything older than just-now,
-        // so both bookmarks count as past — both should be removed.
+        // Pretend both stores have data, all of which is newer than the
+        // newest bookmark — both bookmarks should be removed.
         let cutoff = Utc::now() + chrono::Duration::seconds(1);
         store.sweep(Some(cutoff), Some(cutoff));
         assert!(store.list().is_empty());
@@ -313,7 +342,7 @@ Add to the `tests` module in `src/store/bookmarks.rs`:
     #[test]
     fn sweep_keeps_bookmarks_with_data_behind_them() {
         let store = BookmarkStore::new();
-        let b = store.add("A", "x", false).unwrap();
+        let (b, _) = store.add("A", "x", false).unwrap();
         // Oldest log is older than the bookmark — data still covers it.
         let oldest = b.timestamp - chrono::Duration::seconds(10);
         store.sweep(Some(oldest), Some(oldest));
@@ -332,17 +361,24 @@ Add to `src/store/bookmarks.rs` (free function alongside `qualify`, plus method 
 
 ```rust
 /// Predicate: should this bookmark be auto-evicted?
-/// True when *both* the log store and the span store have evicted past the
-/// bookmark's timestamp (i.e. the oldest entry in each store is newer than
-/// the bookmark, or the store is empty).
+///
+/// True only when **both** stores have *positively confirmed* eviction past
+/// the bookmark's timestamp. A store "confirms eviction" when it has at least
+/// one entry AND its oldest entry is newer than the bookmark.
+///
+/// An empty store does NOT confirm eviction — it could simply have not
+/// received any data yet. This means a bookmark created when both stores are
+/// empty stays alive until enough data has flowed through both stores to roll
+/// past it. This matches the spec intent: bookmarks cannot outlive their data,
+/// but cannot be killed by absence of data either.
 pub fn should_evict(
     bookmark_ts: DateTime<Utc>,
     oldest_log_ts: Option<DateTime<Utc>>,
     oldest_span_ts: Option<DateTime<Utc>>,
 ) -> bool {
-    let log_gone = oldest_log_ts.map_or(true, |t| t > bookmark_ts);
-    let span_gone = oldest_span_ts.map_or(true, |t| t > bookmark_ts);
-    log_gone && span_gone
+    let log_evicted = oldest_log_ts.map_or(false, |t| t > bookmark_ts);
+    let span_evicted = oldest_span_ts.map_or(false, |t| t > bookmark_ts);
+    log_evicted && span_evicted
 }
 ```
 
@@ -391,24 +427,26 @@ Add to the existing `#[cfg(test)] mod tests` in `src/store/memory.rs` (if no tes
 #[cfg(test)]
 mod oldest_ts_tests {
     use super::*;
-    use crate::gelf::message::{LogEntry, Level};
+    use crate::gelf::message::{LogEntry, Level, LogSource};
     use chrono::Utc;
+    use std::collections::HashMap;
 
     fn entry(seq: u64) -> LogEntry {
         LogEntry {
             seq,
             timestamp: Utc::now(),
             level: Level::Info,
-            host: "h".to_string(),
             message: "m".to_string(),
             full_message: None,
+            host: "h".to_string(),
             facility: None,
             file: None,
             line: None,
-            additional_fields: Default::default(),
-            source: crate::gelf::message::LogSource::Gelf,
+            additional_fields: HashMap::new(),
             trace_id: None,
             span_id: None,
+            matched_filters: Vec::new(),
+            source: LogSource::Filter,
         }
     }
 
@@ -432,7 +470,7 @@ mod oldest_ts_tests {
 }
 ```
 
-Note: if `LogEntry` has fields not listed above, copy them from the existing struct definition in `src/gelf/message.rs` and supply default-ish values. Run a quick `grep -n "pub struct LogEntry" src/gelf/message.rs` to confirm field list.
+The field list above matches `src/gelf/message.rs:87-108` exactly: `seq, timestamp, level, message, full_message, host, facility, file, line, additional_fields, trace_id, span_id, matched_filters, source`. The canonical reference is the `make_entry` helper in `tests/multi_session.rs:10-20` — copy that pattern if anything looks off.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -446,6 +484,8 @@ Edit `src/store/traits.rs`, add to the `LogStore` trait (after `stats`):
 ```rust
     fn oldest_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>>;
 ```
+
+Note: `InMemoryStore` is the only implementor of `LogStore` in the repo. Adding a method without a default body is safe — Step 4 supplies the impl. If you discover another implementor (e.g. a mock added since this plan was written), add it there too with the same body.
 
 - [ ] **Step 4: Implement `oldest_timestamp` on `InMemoryStore`**
 
@@ -650,7 +690,7 @@ Add to `FilterParseError`:
 
 - [ ] **Step 4: Add `b>=` / `b<=` parsing in `parse_token`**
 
-Edit `src/filter/parser.rs`. Inside `parse_token`, add these branches *immediately after* the existing duration branches (so they take precedence over the generic `selector=value` rule):
+Edit `src/filter/parser.rs`. Inside `parse_token`, add these branches **after the duration branches and before the `if let Some(eq_pos) = token.find('=')` block** (around line 300). This ordering is critical: the `=` in `b>=name` would otherwise be picked up by the generic `selector=value` rule and parse as a selector named `b>` with value `name`.
 
 ```rust
     // Bookmark filter: b>=NAME, b<=NAME
@@ -696,16 +736,9 @@ fn is_valid_bookmark_token(name: &str) -> bool {
 }
 ```
 
-- [ ] **Step 5: Update `is_log_qualifier` and `is_span_qualifier`**
+- [ ] **Step 5: Verify `is_log_qualifier` and `is_span_qualifier` need no edit**
 
-Both helpers in `src/filter/parser.rs` already return `false` for unmatched variants, so the `BookmarkFilter` and `TimestampFilter` cases automatically fall through to `false` — meaning they're classified as neither log nor span and won't trip the "cannot mix" check. **Confirm this by reading both functions** and verifying neither has a wildcard `_` arm that maps to `true`. (They should have explicit arms returning `false` or be unchanged.)
-
-If either function uses an exhaustive match without a wildcard, add explicit `false` arms:
-
-```rust
-        Qualifier::BookmarkFilter { .. } => false,
-        Qualifier::TimestampFilter { .. } => false,
-```
+Both helpers in `src/filter/parser.rs:333-359` already use a `_ => false` wildcard arm. The new `BookmarkFilter` and `TimestampFilter` variants will fall through to `false` automatically, meaning they're classified as neither log nor span and won't trip the "cannot mix" check. **No edit is needed in this step** — just open `src/filter/parser.rs` and confirm both functions still end with `_ => false`. Do NOT add explicit `BookmarkFilter` arms here; that would trigger an `unreachable_patterns` warning (and Task 15 builds with `-D warnings`).
 
 - [ ] **Step 6: Run parser tests, verify they pass**
 
@@ -744,22 +777,24 @@ mod timestamp_tests {
     use crate::filter::parser::*;
     use crate::gelf::message::{LogEntry, Level, LogSource};
     use chrono::Utc;
+    use std::collections::HashMap;
 
     fn log_entry_at(ts: chrono::DateTime<chrono::Utc>) -> LogEntry {
         LogEntry {
             seq: 1,
             timestamp: ts,
             level: Level::Info,
-            host: "h".into(),
             message: "m".into(),
             full_message: None,
+            host: "h".into(),
             facility: None,
             file: None,
             line: None,
-            additional_fields: Default::default(),
-            source: LogSource::Gelf,
+            additional_fields: HashMap::new(),
             trace_id: None,
             span_id: None,
+            matched_filters: Vec::new(),
+            source: LogSource::Filter,
         }
     }
 
@@ -811,7 +846,7 @@ Edit `src/filter/matcher.rs`. Inside `matches_qualifier`, add:
         },
 ```
 
-You'll need to import `BookmarkOp` at the top of the file (it's re-exported via `crate::filter::parser::*` already if that's how the file imports things — check the top of `matcher.rs`).
+No import change needed: `src/filter/matcher.rs:1` does `use crate::filter::parser::*;`, so `BookmarkOp` is already in scope as soon as Task 4 lands.
 
 - [ ] **Step 4: Add the new arms in `matches_span_qualifier`**
 
@@ -883,7 +918,7 @@ mod tests {
     #[test]
     fn bare_name_resolves_against_current_session() {
         let store = BookmarkStore::new();
-        store.add("A", "before", false).unwrap();
+        store.add("A", "before", false).unwrap(); // returns (Bookmark, bool); ignored here
         let filter = parse_filter("b>=before").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved {
@@ -1131,11 +1166,10 @@ Add at the bottom of the `impl RpcHandler` block in `src/daemon/rpc_handler.rs`:
         self.sweep_bookmarks();
 
         let session = session_id.to_string();
-        let bookmark = self
+        let (bookmark, replaced) = self
             .bookmarks
             .add(&session, name, replace)
             .map_err(|e| e.to_string())?;
-        let replaced = replace; // we only know "user asked for replace"; the store-level distinction isn't needed by the caller
         Ok(json!({
             "qualified_name": bookmark.qualified_name,
             "timestamp": bookmark.timestamp,
@@ -1350,20 +1384,30 @@ git commit -m "feat(mcp): add list_bookmarks and remove_bookmark tools"
 
 The query handlers currently take a `filter: Option<&str>`, parse it inside the helper, and pass it to the store/span methods. We need to insert a resolution step between parse and execute, which means each handler needs to: parse the filter string here, resolve it against the bookmark store using the calling session's name, then call into the store with a `Option<&ParsedFilter>`.
 
+**Note:** Steps 1 and 2 in this task should land in a single commit — the helper added in Step 1 has no callers until Step 2 wires up `handle_logs_recent`. Don't run `cargo build` in between (you'll get a dead-code warning).
+
 - [ ] **Step 1: Add a helper on `RpcHandler` to parse-and-resolve a filter string**
 
 Add inside `impl RpcHandler` in `src/daemon/rpc_handler.rs` (next to `sweep_bookmarks`):
 
 ```rust
     /// Parse a filter string and resolve any bookmark qualifiers against the
-    /// bookmark store using `session_id` as the current session. Returns
-    /// `Ok(None)` if the input is `None`.
+    /// bookmark store using `session_id` as the current session.
+    /// Returns `Ok(None)` if the input is `None` or an empty/whitespace-only
+    /// string — this matches the previous `recent_logs_str` behavior, which
+    /// silently treated empty/parse-failed filters as "no filter".
+    /// Real parse errors and resolution errors are surfaced (this is a
+    /// behavior change from the old `.ok()`-swallowing path, but a desirable
+    /// one — bookmark errors must be visible).
     fn parse_and_resolve_filter(
         &self,
         filter_str: Option<&str>,
         session_id: &SessionId,
     ) -> Result<Option<crate::filter::parser::ParsedFilter>, String> {
         let Some(s) = filter_str else { return Ok(None) };
+        if s.trim().is_empty() {
+            return Ok(None);
+        }
         let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
         let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
             parsed,
@@ -1708,129 +1752,210 @@ git commit -m "feat(daemon): reject bookmark filters in registered filters/trigg
 
 ---
 
-## Task 12: Integration test against running daemon
+## Task 12: In-process integration test exercising the full request path
 
 **Files:**
 
-- Create or modify: `tests/bookmarks.rs` (or extend an existing integration test file if one already covers MCP/RPC end-to-end — check `ls tests/` first)
+- Create: `tests/bookmarks.rs`
 
-- [ ] **Step 1: Inspect the existing integration test setup**
+**Important context:** the existing integration tests under `tests/` (e.g. `tests/multi_session.rs`, `tests/pipeline.rs`) are **in-process**: they `use logmon_mcp_server::...` directly and exercise `LogPipeline`, `SessionRegistry`, etc. There is no Unix-socket / daemon-binary test harness in the repo, and no `tests/common.rs`. We follow the existing in-process pattern.
 
-Run: `ls tests/ && head -40 tests/*.rs | head -100`
-Expected: identifies the harness used to spin up a daemon and connect a session. Reuse it. If no harness exists, follow the patterns from the existing tests under `tests/` (the README mentions `test-gelf.sh`, but Rust integration tests should be in `tests/`).
+To exercise the bookmark resolution path end-to-end without an MCP transport, we construct an `RpcHandler` directly and call its public `handle` method with `RpcRequest` values. That covers the full parse → resolve → match → return pipeline.
 
-If a harness exists, the rest of this task uses it. If only `test-gelf.sh` exists, write the integration test as a Rust test that spawns the daemon binary the same way `test-gelf.sh` does and communicates via the Unix socket — *do not invent a new harness style*; mirror the existing test pattern exactly.
+- [ ] **Step 1: Make `RpcHandler::handle` callable from integration tests**
+
+`RpcHandler::handle` is already `pub` (`src/daemon/rpc_handler.rs:34`). `RpcRequest` and `RpcResponse` are in `src/rpc/types.rs` — confirm both are `pub` by reading the file. If they aren't, mark them `pub` (no other code change required).
+
+Run: `grep -n "pub struct RpcRequest\|pub struct RpcResponse" src/rpc/types.rs`
+Expected: both shown as `pub struct ...`.
 
 - [ ] **Step 2: Write the integration test**
 
-Create `tests/bookmarks.rs` (adapting the harness call signatures to whatever the existing tests use — the code below is the *logical* shape, with placeholder helper names that you should rename to match the existing harness):
+Create `tests/bookmarks.rs`:
 
 ```rust
 //! Integration test for the bookmarks feature.
-//! Spins up a daemon, connects a named session, drops bookmarks, and exercises
-//! the DSL b>= / b<= operators end-to-end.
+//! Constructs the daemon's in-process pieces directly (no socket transport)
+//! and exercises the full RPC path: parse → resolve bookmarks → match → return.
 
+use chrono::Utc;
+use logmon_mcp_server::daemon::log_processor::process_entry;
+use logmon_mcp_server::daemon::rpc_handler::RpcHandler;
+use logmon_mcp_server::daemon::session::SessionRegistry;
+use logmon_mcp_server::engine::pipeline::LogPipeline;
+use logmon_mcp_server::engine::seq_counter::SeqCounter;
+use logmon_mcp_server::gelf::message::{Level, LogEntry, LogSource};
+use logmon_mcp_server::rpc::types::RpcRequest;
+use logmon_mcp_server::span::store::SpanStore;
+use logmon_mcp_server::store::bookmarks::BookmarkStore;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
 
-mod common; // assume an existing common harness module under tests/common.rs
+fn make_entry(level: Level, msg: &str) -> LogEntry {
+    LogEntry {
+        seq: 0,
+        timestamp: Utc::now(),
+        level,
+        message: msg.to_string(),
+        full_message: None,
+        host: "test".into(),
+        facility: Some("app".into()),
+        file: None,
+        line: None,
+        additional_fields: HashMap::new(),
+        trace_id: None,
+        span_id: None,
+        matched_filters: Vec::new(),
+        source: LogSource::Filter,
+    }
+}
 
-#[tokio::test]
-async fn bookmarks_end_to_end() {
-    let daemon = common::start_daemon().await;
-    let session_a = daemon.connect_named("A").await;
+fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) {
+    let seq = Arc::new(SeqCounter::new());
+    let pipeline = Arc::new(LogPipeline::new_with_seq_counter(1000, seq.clone()));
+    let span_store = Arc::new(SpanStore::new(1000, seq));
+    let sessions = Arc::new(SessionRegistry::new());
+    let bookmarks = Arc::new(BookmarkStore::new());
+    let handler = Arc::new(RpcHandler::new(
+        pipeline.clone(),
+        span_store,
+        sessions.clone(),
+        bookmarks,
+        vec!["test".into()],
+    ));
+    (handler, pipeline, sessions)
+}
 
-    // 1. Send a batch of logs (timestamp T0)
-    common::send_log(&daemon, "info", "first batch line 1").await;
-    common::send_log(&daemon, "info", "first batch line 2").await;
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+fn call(
+    handler: &RpcHandler,
+    session: &logmon_mcp_server::daemon::session::SessionId,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let req = RpcRequest::new(1, method, params);
+    let resp = handler.handle(session, &req);
+    if let Some(err) = resp.error {
+        Err(err.message)
+    } else {
+        Ok(resp.result.unwrap_or(Value::Null))
+    }
+}
+
+#[test]
+fn bookmarks_end_to_end() {
+    let (handler, pipeline, sessions) = build_handler();
+    let sid_a = sessions.create_named("A").expect("create session A");
+
+    // 1. First batch of logs (before the bookmark)
+    let mut e1 = make_entry(Level::Info, "first batch line 1");
+    process_entry(&mut e1, &pipeline, &sessions);
+    let mut e2 = make_entry(Level::Info, "first batch line 2");
+    process_entry(&mut e2, &pipeline, &sessions);
+    std::thread::sleep(std::time::Duration::from_millis(20));
 
     // 2. Set bookmark "before"
-    let r = session_a
-        .call("bookmarks.add", json!({ "name": "before" }))
-        .await
-        .unwrap();
+    let r = call(&handler, &sid_a, "bookmarks.add", json!({ "name": "before" })).unwrap();
     assert_eq!(r["qualified_name"], "A/before");
     assert_eq!(r["replaced"], false);
+    std::thread::sleep(std::time::Duration::from_millis(20));
 
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-    // 3. Send a second batch of logs (timestamp T1, after the bookmark)
-    common::send_log(&daemon, "warn", "second batch line 1").await;
-    common::send_log(&daemon, "error", "second batch line 2").await;
+    // 3. Second batch of logs (after the bookmark)
+    let mut e3 = make_entry(Level::Warning, "second batch line 1");
+    process_entry(&mut e3, &pipeline, &sessions);
+    let mut e4 = make_entry(Level::Error, "second batch line 2");
+    process_entry(&mut e4, &pipeline, &sessions);
+    std::thread::sleep(std::time::Duration::from_millis(20));
 
     // 4. Set bookmark "after"
-    let r = session_a
-        .call("bookmarks.add", json!({ "name": "after" }))
-        .await
-        .unwrap();
+    let r = call(&handler, &sid_a, "bookmarks.add", json!({ "name": "after" })).unwrap();
     assert_eq!(r["qualified_name"], "A/after");
 
-    // 5. Query: between bookmarks, expect only the second batch.
-    let r = session_a
-        .call(
-            "logs.recent",
-            json!({ "filter": "b>=before, b<=after", "count": 100 }),
-        )
-        .await
-        .unwrap();
+    // 5. Query: between bookmarks, expect exactly the second batch.
+    let r = call(
+        &handler,
+        &sid_a,
+        "logs.recent",
+        json!({ "filter": "b>=before, b<=after", "count": 100 }),
+    )
+    .unwrap();
     let logs = r["logs"].as_array().unwrap();
-    assert_eq!(logs.len(), 2, "expected exactly the second-batch entries");
+    assert_eq!(logs.len(), 2, "expected only the second-batch entries; got {logs:?}");
     let messages: Vec<&str> = logs.iter().map(|l| l["message"].as_str().unwrap()).collect();
     assert!(messages.iter().any(|m| m.contains("second batch line 1")));
     assert!(messages.iter().any(|m| m.contains("second batch line 2")));
 
     // 6. Cross-session access from a second session
-    let session_b = daemon.connect_named("B").await;
-    let r = session_b
-        .call(
-            "logs.recent",
-            json!({ "filter": "b>=A/before, b<=A/after", "count": 100 }),
-        )
-        .await
-        .unwrap();
+    let sid_b = sessions.create_named("B").expect("create session B");
+    let r = call(
+        &handler,
+        &sid_b,
+        "logs.recent",
+        json!({ "filter": "b>=A/before, b<=A/after", "count": 100 }),
+    )
+    .unwrap();
     assert_eq!(r["logs"].as_array().unwrap().len(), 2);
 
-    // 7. Replace flag updates the timestamp
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    let r = session_a
-        .call("bookmarks.add", json!({ "name": "before", "replace": true }))
-        .await
-        .unwrap();
+    // 7. Replace flag actually overwrites
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let r = call(
+        &handler,
+        &sid_a,
+        "bookmarks.add",
+        json!({ "name": "before", "replace": true }),
+    )
+    .unwrap();
     assert_eq!(r["replaced"], true);
 
     // 8. Resolution failure returns a clear error
-    let err = session_a
-        .call("logs.recent", json!({ "filter": "b>=ghost", "count": 10 }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err}").contains("bookmark not found"));
+    let err = call(
+        &handler,
+        &sid_a,
+        "logs.recent",
+        json!({ "filter": "b>=ghost", "count": 10 }),
+    )
+    .unwrap_err();
+    assert!(err.contains("bookmark not found"), "got: {err}");
 
-    // 9. Registration guard
-    let err = session_a
-        .call("filters.add", json!({ "filter": "b>=before" }))
-        .await
-        .unwrap_err();
-    assert!(format!("{err}").contains("not allowed in registered filters"));
+    // 9. Registration guard rejects bookmark filters
+    let err = call(
+        &handler,
+        &sid_a,
+        "filters.add",
+        json!({ "filter": "b>=before" }),
+    )
+    .unwrap_err();
+    assert!(err.contains("not allowed in registered filters"), "got: {err}");
 
-    // 10. clear_logs followed by list_bookmarks → both bookmarks swept
-    session_a.call("logs.clear", json!({})).await.unwrap();
-    let r = session_a.call("bookmarks.list", json!({})).await.unwrap();
-    assert_eq!(r["count"], 0);
+    // 10. list_bookmarks shows both bookmarks alive (data still covers them).
+    let r = call(&handler, &sid_a, "bookmarks.list", json!({})).unwrap();
+    assert_eq!(r["count"], 2);
 
-    daemon.shutdown().await;
+    // 11. remove_bookmark by bare name works
+    call(
+        &handler,
+        &sid_a,
+        "bookmarks.remove",
+        json!({ "name": "before" }),
+    )
+    .unwrap();
+    let r = call(&handler, &sid_a, "bookmarks.list", json!({})).unwrap();
+    assert_eq!(r["count"], 1);
 }
 ```
+
+Note on the harness: the helper names in `build_handler` (`LogPipeline::new_with_seq_counter`, `SpanStore::new`, `SessionRegistry::create_named`) are taken from the actual code at `src/engine/pipeline.rs:61`, `src/span/store.rs:26`, `src/daemon/session.rs:182`. The `process_entry` helper is at `src/daemon/log_processor.rs` and is the same one used by `tests/multi_session.rs`. The `RpcRequest` and `RpcResponse` types are at `src/rpc/types.rs` — read that file once if any field name is wrong (`id`, `method`, `params`, `error.message`, `result`). If `RpcResponse` uses different field names, adapt the `call` helper.
 
 - [ ] **Step 3: Run the integration test**
 
 Run: `cargo test -p logmon-mcp --test bookmarks -- --nocapture`
-Expected: PASS. If the harness function names differ from `connect_named`, `send_log`, `call`, etc., adapt the calls — the test logic is what matters.
+Expected: PASS.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add tests/bookmarks.rs
-git commit -m "test(bookmarks): end-to-end integration test"
+git commit -m "test(bookmarks): in-process end-to-end test of bookmark RPC path"
 ```
 
 ---

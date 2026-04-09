@@ -87,7 +87,7 @@ This walks the filter and replaces each `BookmarkFilter { op, name }` with a `Ti
 
 - A bare name (no `/`) is looked up as `"{current_session}/{name}"`.
 - A qualified name (contains `/`) is looked up directly.
-- If the bookmark does not exist → `BookmarkResolutionError::NotFound(name)`. The error bubbles through the RPC handler back to the MCP caller as `bookmark not found: <name>`.
+- If the bookmark does not exist → `BookmarkResolutionError::NotFound(qualified_name)`. The error carries the **qualified** form (e.g. `A/ghost`, not `ghost`) so the user can tell which session was searched. It bubbles through the RPC handler back to the MCP caller as `bookmark not found: <qualified_name>`.
 
 `TimestampFilter` is an internal-only variant. It is never produced by the parser and never serialized — it exists purely as the post-resolution form passed to the matcher.
 
