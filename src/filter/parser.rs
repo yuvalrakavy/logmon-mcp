@@ -15,10 +15,20 @@ pub enum Qualifier {
     SelectorPattern(Selector, Pattern),
     LevelFilter { op: LevelOp, level: Level },
     DurationFilter(DurationOp, f64),
+    BookmarkFilter { op: BookmarkOp, name: String },
+    /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`.
+    /// Never emitted by the parser, never serialized.
+    TimestampFilter { op: BookmarkOp, ts: chrono::DateTime<chrono::Utc> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DurationOp {
+    Gte,
+    Lte,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum BookmarkOp {
     Gte,
     Lte,
 }
@@ -161,6 +171,20 @@ pub enum FilterParseError {
     UnclosedQuote,
     #[error("cannot mix log and span selectors in the same filter")]
     MixedLogSpanSelectors,
+    #[error("empty bookmark name")]
+    EmptyBookmarkName,
+    #[error("invalid bookmark name: {0}")]
+    InvalidBookmarkName(String),
+}
+
+/// Validate a bookmark name as it appears inside a DSL filter token.
+/// Allowed: ASCII alphanumerics, '-', '_', '/'. The '/' enables qualified
+/// names like "session-A/before".
+fn is_valid_bookmark_token(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'/')
 }
 
 /// Split the input on commas, but respect double-quoted strings (don't split inside quotes).
@@ -283,6 +307,34 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
         return Ok(Qualifier::DurationFilter(DurationOp::Lte, value));
     }
 
+    // Bookmark filter: b>=NAME, b<=NAME
+    if let Some(rest) = token.strip_prefix("b>=") {
+        let name = rest.trim();
+        if name.is_empty() {
+            return Err(FilterParseError::EmptyBookmarkName);
+        }
+        if !is_valid_bookmark_token(name) {
+            return Err(FilterParseError::InvalidBookmarkName(name.to_string()));
+        }
+        return Ok(Qualifier::BookmarkFilter {
+            op: BookmarkOp::Gte,
+            name: name.to_string(),
+        });
+    }
+    if let Some(rest) = token.strip_prefix("b<=") {
+        let name = rest.trim();
+        if name.is_empty() {
+            return Err(FilterParseError::EmptyBookmarkName);
+        }
+        if !is_valid_bookmark_token(name) {
+            return Err(FilterParseError::InvalidBookmarkName(name.to_string()));
+        }
+        return Ok(Qualifier::BookmarkFilter {
+            op: BookmarkOp::Lte,
+            name: name.to_string(),
+        });
+    }
+
     // Quoted bare pattern: "..."
     if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
         let inner = &token[1..token.len() - 1];
@@ -396,4 +448,86 @@ pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
     }
 
     Ok(ParsedFilter::Qualifiers(qualifiers))
+}
+
+#[cfg(test)]
+mod bookmark_tests {
+    use super::*;
+
+    fn parse_one(s: &str) -> Qualifier {
+        match parse_filter(s).unwrap() {
+            ParsedFilter::Qualifiers(mut qs) => qs.remove(0),
+            _ => panic!("expected qualifiers"),
+        }
+    }
+
+    #[test]
+    fn parses_bookmark_gte_bare_name() {
+        match parse_one("b>=before") {
+            Qualifier::BookmarkFilter { op: BookmarkOp::Gte, name } => {
+                assert_eq!(name, "before");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bookmark_lte_bare_name() {
+        match parse_one("b<=after") {
+            Qualifier::BookmarkFilter { op: BookmarkOp::Lte, name } => {
+                assert_eq!(name, "after");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_bookmark_qualified_name() {
+        match parse_one("b>=session-A/before") {
+            Qualifier::BookmarkFilter { op: BookmarkOp::Gte, name } => {
+                assert_eq!(name, "session-A/before");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_bookmark_name_errors() {
+        let err = parse_filter("b>=").unwrap_err();
+        assert!(matches!(err, FilterParseError::EmptyBookmarkName));
+    }
+
+    #[test]
+    fn invalid_bookmark_char_errors() {
+        let err = parse_filter("b>=foo bar").unwrap_err();
+        assert!(matches!(err, FilterParseError::InvalidBookmarkName(_)));
+    }
+
+    #[test]
+    fn bookmark_combines_with_log_qualifier_without_mix_error() {
+        let parsed = parse_filter("b>=before, l>=warn").unwrap();
+        if let ParsedFilter::Qualifiers(qs) = parsed {
+            assert_eq!(qs.len(), 2);
+        } else {
+            panic!("expected qualifiers");
+        }
+    }
+
+    #[test]
+    fn bookmark_combines_with_span_qualifier_without_mix_error() {
+        let parsed = parse_filter("b>=before, d>=100").unwrap();
+        if let ParsedFilter::Qualifiers(qs) = parsed {
+            assert_eq!(qs.len(), 2);
+        } else {
+            panic!("expected qualifiers");
+        }
+    }
+
+    #[test]
+    fn bookmark_whitespace_around_name_trimmed() {
+        match parse_one("b>=  before  ") {
+            Qualifier::BookmarkFilter { name, .. } => assert_eq!(name, "before"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
 }
