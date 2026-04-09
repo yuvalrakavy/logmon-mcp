@@ -58,6 +58,8 @@ impl RpcHandler {
             "traces.logs" => self.handle_traces_logs(&request.params),
             "spans.context" => self.handle_spans_context(&request.params),
             "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
+            "bookmarks.list" => self.handle_bookmarks_list(&request.params),
+            "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
             _ => Err(format!("unknown method: {}", request.method)),
         };
 
@@ -593,6 +595,47 @@ impl RpcHandler {
             "timestamp": bookmark.timestamp,
             "replaced": replaced,
         }))
+    }
+
+    fn handle_bookmarks_list(&self, params: &Value) -> Result<Value, String> {
+        self.sweep_bookmarks();
+        let session_filter = params.get("session").and_then(|v| v.as_str());
+
+        let now = chrono::Utc::now();
+        let items: Vec<Value> = self
+            .bookmarks
+            .list()
+            .into_iter()
+            .filter(|b| session_filter.map_or(true, |s| b.session == s))
+            .map(|b| {
+                let age = (now - b.timestamp).num_seconds().max(0);
+                json!({
+                    "qualified_name": b.qualified_name,
+                    "name": b.name,
+                    "session": b.session,
+                    "timestamp": b.timestamp,
+                    "age_secs": age,
+                })
+            })
+            .collect();
+
+        Ok(json!({ "bookmarks": items, "count": items.len() }))
+    }
+
+    fn handle_bookmarks_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing required parameter: name".to_string())?;
+        let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
+        self.bookmarks
+            .remove(&qualified)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "removed": qualified }))
     }
 
     fn sweep_bookmarks(&self) {
