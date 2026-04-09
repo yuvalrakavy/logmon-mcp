@@ -530,4 +530,34 @@ mod bookmark_tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+
+    #[test]
+    fn contains_bookmark_qualifier_detects_b_gte() {
+        let parsed = parse_filter("b>=foo, l>=warn").unwrap();
+        assert!(contains_bookmark_qualifier(&parsed));
+    }
+
+    #[test]
+    fn contains_bookmark_qualifier_false_for_plain_filter() {
+        let parsed = parse_filter("l>=warn").unwrap();
+        assert!(!contains_bookmark_qualifier(&parsed));
+    }
+
+    #[test]
+    fn contains_bookmark_qualifier_handles_all_and_none() {
+        assert!(!contains_bookmark_qualifier(&ParsedFilter::All));
+        assert!(!contains_bookmark_qualifier(&ParsedFilter::None));
+    }
+}
+
+/// Returns true if any qualifier in the filter is a `BookmarkFilter`.
+/// Used by registration guards to reject bookmark filters in long-lived
+/// registered filters/triggers.
+pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs
+            .iter()
+            .any(|q| matches!(q, Qualifier::BookmarkFilter { .. })),
+    }
 }

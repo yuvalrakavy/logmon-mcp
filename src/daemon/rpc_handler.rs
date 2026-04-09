@@ -222,6 +222,15 @@ impl RpcHandler {
             .get("filter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
+        // Reject bookmark filters in registered (long-lived) filters.
+        let parsed = crate::filter::parser::parse_filter(filter)
+            .map_err(|e| e.to_string())?;
+        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
+            return Err(
+                "bookmarks (b>=, b<=) are not allowed in registered filters/triggers — use them only in query tools"
+                    .to_string(),
+            );
+        }
         let desc = params.get("description").and_then(|v| v.as_str());
         let id = self
             .sessions
@@ -303,6 +312,15 @@ impl RpcHandler {
             .get("filter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
+        // Reject bookmark filters in registered (long-lived) triggers.
+        let parsed = crate::filter::parser::parse_filter(filter)
+            .map_err(|e| e.to_string())?;
+        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
+            return Err(
+                "bookmarks (b>=, b<=) are not allowed in registered filters/triggers — use them only in query tools"
+                    .to_string(),
+            );
+        }
         let pre = params.get("pre_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let post = params.get("post_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let ctx = params
