@@ -116,11 +116,15 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     // 12. Sync pre-buffer size after restoring sessions
     sync_pre_buffer_size(&pipeline, &sessions);
 
+    // 13a. Create BookmarkStore (in-memory only, not persisted)
+    let bookmark_store = Arc::new(crate::store::bookmarks::BookmarkStore::new());
+
     // 13. Create RpcHandler
     let handler = Arc::new(RpcHandler::new(
         pipeline.clone(),
         span_store.clone(),
         sessions.clone(),
+        bookmark_store.clone(),
         all_receivers_info,
     ));
 

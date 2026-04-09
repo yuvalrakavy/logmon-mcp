@@ -10,6 +10,8 @@ pub struct RpcHandler {
     pipeline: Arc<LogPipeline>,
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
+    #[allow(dead_code)]
+    bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
 }
@@ -19,12 +21,14 @@ impl RpcHandler {
         pipeline: Arc<LogPipeline>,
         span_store: Arc<SpanStore>,
         sessions: Arc<SessionRegistry>,
+        bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
         receivers_info: Vec<String>,
     ) -> Self {
         Self {
             pipeline,
             span_store,
             sessions,
+            bookmarks,
             start_time: std::time::Instant::now(),
             receivers_info,
         }
