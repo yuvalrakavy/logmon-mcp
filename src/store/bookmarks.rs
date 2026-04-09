@@ -47,6 +47,27 @@ pub fn is_valid_bookmark_name(name: &str) -> bool {
     name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Predicate: should this bookmark be auto-evicted?
+///
+/// True only when **both** stores have *positively confirmed* eviction past
+/// the bookmark's timestamp. A store "confirms eviction" when it has at least
+/// one entry AND its oldest entry is newer than the bookmark.
+///
+/// An empty store does NOT confirm eviction — it could simply have not
+/// received any data yet. This means a bookmark created when both stores are
+/// empty stays alive until enough data has flowed through both stores to roll
+/// past it. This matches the spec intent: bookmarks cannot outlive their data,
+/// but cannot be killed by absence of data either.
+pub fn should_evict(
+    bookmark_ts: DateTime<Utc>,
+    oldest_log_ts: Option<DateTime<Utc>>,
+    oldest_span_ts: Option<DateTime<Utc>>,
+) -> bool {
+    let log_evicted = oldest_log_ts.map_or(false, |t| t > bookmark_ts);
+    let span_evicted = oldest_span_ts.map_or(false, |t| t > bookmark_ts);
+    log_evicted && span_evicted
+}
+
 /// Resolve a name (bare or already-qualified) into a qualified name.
 /// Bare names get prefixed with `{current_session}/`.
 /// Qualified names (containing `/`) are returned unchanged.
@@ -101,6 +122,16 @@ impl BookmarkStore {
         map.remove(qualified_name)
             .map(|_| ())
             .ok_or_else(|| BookmarkError::NotFound(qualified_name.to_string()))
+    }
+
+    /// Remove every bookmark whose data has been evicted from both stores.
+    pub fn sweep(
+        &self,
+        oldest_log_ts: Option<DateTime<Utc>>,
+        oldest_span_ts: Option<DateTime<Utc>>,
+    ) {
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        map.retain(|_, b| !should_evict(b.timestamp, oldest_log_ts, oldest_span_ts));
     }
 
     /// Look up a bookmark by qualified name. Returns the bookmark if it exists.
@@ -182,5 +213,69 @@ mod tests {
     fn qualify_helper() {
         assert_eq!(qualify("foo", "A"), "A/foo");
         assert_eq!(qualify("B/foo", "A"), "B/foo");
+    }
+
+    #[test]
+    fn should_evict_when_both_stores_past_timestamp() {
+        let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
+        let oldest_log = Some(Utc::now() - chrono::Duration::seconds(10));
+        let oldest_span = Some(Utc::now() - chrono::Duration::seconds(5));
+        assert!(should_evict(bookmark_ts, oldest_log, oldest_span));
+    }
+
+    #[test]
+    fn should_not_evict_when_log_store_still_covers() {
+        let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
+        let oldest_log = Some(Utc::now() - chrono::Duration::seconds(120));
+        let oldest_span = Some(Utc::now() - chrono::Duration::seconds(5));
+        assert!(!should_evict(bookmark_ts, oldest_log, oldest_span));
+    }
+
+    #[test]
+    fn should_not_evict_when_span_store_still_covers() {
+        let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
+        let oldest_log = Some(Utc::now() - chrono::Duration::seconds(10));
+        let oldest_span = Some(Utc::now() - chrono::Duration::seconds(120));
+        assert!(!should_evict(bookmark_ts, oldest_log, oldest_span));
+    }
+
+    #[test]
+    fn empty_stores_keep_bookmark_alive() {
+        // Both stores empty: bookmark survives. The "no data yet" case must
+        // not look like "data rolled past."
+        let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
+        assert!(!should_evict(bookmark_ts, None, None));
+    }
+
+    #[test]
+    fn one_empty_store_keeps_bookmark_alive() {
+        // Only the side that has data and rolled past is "confirmed gone."
+        // If either side has no data, we can't confirm — keep alive.
+        let bookmark_ts = Utc::now() - chrono::Duration::seconds(60);
+        let oldest_log = Some(Utc::now()); // log rolled past
+        assert!(!should_evict(bookmark_ts, oldest_log, None));
+    }
+
+    #[test]
+    fn sweep_removes_evictable_bookmarks() {
+        let store = BookmarkStore::new();
+        store.add("A", "old", false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.add("A", "new", false).unwrap();
+        // Pretend both stores have data, all of which is newer than the
+        // newest bookmark — both bookmarks should be removed.
+        let cutoff = Utc::now() + chrono::Duration::seconds(1);
+        store.sweep(Some(cutoff), Some(cutoff));
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_bookmarks_with_data_behind_them() {
+        let store = BookmarkStore::new();
+        let (b, _) = store.add("A", "x", false).unwrap();
+        // Oldest log is older than the bookmark — data still covers it.
+        let oldest = b.timestamp - chrono::Duration::seconds(10);
+        store.sweep(Some(oldest), Some(oldest));
+        assert_eq!(store.list().len(), 1);
     }
 }
