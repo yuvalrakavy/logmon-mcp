@@ -16,7 +16,7 @@ Bookmarks are named timestamps the user can drop into the log/span timeline, the
 
 Example workflow:
 
-```
+```text
 add_bookmark("before")
 # ... run a flaky operation that produces logs/traces ...
 add_bookmark("after")
@@ -62,7 +62,7 @@ pub enum BookmarkOp { Gte, Lte }
 
 ### Parsing
 
-Two new tokens, recognised in `parse_token` before the generic `selector=value` rule:
+Two new tokens, recognized in `parse_token` before the generic `selector=value` rule:
 
 - `b>=NAME` → `BookmarkFilter { Gte, name }`
 - `b<=NAME` → `BookmarkFilter { Lte, name }`
@@ -153,7 +153,7 @@ A small helper function `qualify(name, current_session) -> String` is shared by 
 
 The sweep predicate for one bookmark is:
 
-```
+```rust
 fn should_evict(b: &Bookmark, oldest_log_ts: Option<DateTime<Utc>>, oldest_span_ts: Option<DateTime<Utc>>) -> bool {
     let log_gone  = oldest_log_ts.map_or(true, |t| t > b.timestamp);
     let span_gone = oldest_span_ts.map_or(true, |t| t > b.timestamp);
@@ -165,8 +165,8 @@ A bookmark is removed when **both** stores have evicted past its timestamp. If a
 
 The sweep runs at:
 
-- The start of `bookmarks.add` (cheap; keeps the store from accumulating cruft)
-- The start of `bookmarks.list` (so what the user sees is current)
+- The start of `bookmarks.add` (cheap; keeps the store from accumulating cruft).
+- The start of `bookmarks.list` (so what the user sees is current).
 
 It does **not** run on every log/span append — that would add overhead to the hot path for negligible benefit.
 
@@ -191,24 +191,27 @@ pub enum BookmarkError {
 ### Unit tests
 
 **Parser** (`filter/parser.rs` test module):
+
 - `b>=name` and `b<=name` parse to the right qualifier.
 - `b>=other/name` parses with the qualified form intact.
 - `b>=` (empty name) returns `EmptyBookmarkName`.
 - Charset rejection: `b>=foo bar` (space inside the name).
 - Mixing with other qualifiers: `b>=mark, l>=warn` parses without tripping the log/span mix check.
 - Mixing with span qualifiers: `b>=mark, d>=100` parses similarly.
-- Whitespace tolerance: `b>= mark `.
+- Whitespace tolerance around the bookmark name.
 
 **BookmarkStore** (`store/bookmarks.rs` test module):
+
 - Add → list returns it.
 - Add duplicate without `replace` → `AlreadyExists`.
 - Add duplicate with `replace: true` → timestamp updated.
 - Remove existing → ok.
 - Remove missing → `NotFound`.
 - Auto-eviction: feed mock oldest timestamps, assert correct bookmarks survive/die for all four combinations of (log past?, span past?).
-- Empty-store edge case: bookmark created with no logs/spans yet, then both stores receive newer entries — bookmark should now be evictable.
+- Empty-store edge case: bookmark created with no logs/spans yet, then both stores receive newer entries — bookmark should now be removable by the sweep.
 
 **Resolver:**
+
 - Bare name resolves against the supplied current session.
 - Qualified name passes through unchanged.
 - Not-found returns `BookmarkResolutionError::NotFound`.
@@ -216,6 +219,7 @@ pub enum BookmarkError {
 - Resolution leaves non-bookmark qualifiers untouched.
 
 **Registration guard:**
+
 - `add_filter` with a filter containing `b>=foo` returns the guard error.
 - `add_trigger` likewise.
 - `add_filter` with no bookmark qualifier still works.
@@ -236,6 +240,13 @@ In `tests/`, against a running daemon (matching the existing integration test st
 10. `clear_logs`, then `list_bookmarks` — assert both bookmarks were swept (because both stores are now empty *and* the oldest-timestamp predicate trivially holds).
 11. Resolution failure: `get_recent_logs(filter="b>=ghost")` returns a clear `bookmark not found: ghost` error.
 12. Registration guard: `add_filter(filter="b>=before")` returns the guard error.
+
+## Documentation deliverables
+
+Two user-facing docs need updates as part of the implementation:
+
+- **`README.md`** — Add bookmarks to the feature list and tool overview. Include a short usage example mirroring the workflow from the "User-facing model" section above (set bookmark before an operation, set another after, query the range with `b>=before, b<=after`).
+- **`skill/logmon.md`** — Add a "Bookmarks" section explaining when to reach for bookmarks (instead of `clear_logs`), the three tools (`add_bookmark`, `list_bookmarks`, `remove_bookmark`), the DSL operators (`b>=`, `b<=`), bare-vs-qualified naming, the auto-eviction lifetime rule, and that bookmarks cannot be used in registered filters/triggers.
 
 ## Out of scope
 
