@@ -112,7 +112,12 @@ fn matches_selector(selector: &Selector, pattern: &Pattern, entry: &LogEntry) ->
 
 fn matches_pattern(pattern: &Pattern, text: &str) -> bool {
     match pattern {
-        Pattern::Substring(s) => text.to_lowercase().contains(s.as_str()),
+        // Lowercase both sides: the DSL string parser (parser.rs:246)
+        // already lowercases substrings, but the JSON deserializer path
+        // (parser.rs:107) does not, so any programmatic `add_filter` call
+        // with an uppercase character would silently never match.
+        // Lowercasing here makes the invariant hold for all call sites.
+        Pattern::Substring(s) => text.to_lowercase().contains(&s.to_lowercase()),
         Pattern::Regex { compiled, .. } => compiled.is_match(text),
     }
 }
