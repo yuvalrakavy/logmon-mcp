@@ -1,0 +1,21 @@
+[package]
+name = "logmon-broker-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+logmon-broker-protocol = { path = "../protocol" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
+tempfile.workspace = true
+logmon-broker-core = { path = "../core", features = ["test-support"] }

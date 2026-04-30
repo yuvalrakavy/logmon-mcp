@@ -855,6 +855,88 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "logmon-broker"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "logmon-broker-core",
+ "logmon-broker-protocol",
+ "sd-notify",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "logmon-broker-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.8",
+ "chrono",
+ "fs2",
+ "logmon-broker-protocol",
+ "opentelemetry-proto",
+ "prost",
+ "regex",
+ "serde",
+ "serde_json",
+ "socket2 0.5.10",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tonic",
+ "tracing",
+ "tracing-appender",
+ "uuid",
+]
+
+[[package]]
+name = "logmon-broker-protocol"
+version = "0.2.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "logmon-broker-sdk"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fs2",
+ "logmon-broker-core",
+ "logmon-broker-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "logmon-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fs2",
+ "logmon-broker-protocol",
+ "logmon-broker-sdk",
+ "rmcp",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "logmon-mcp-server"
 version = "0.1.0"
 dependencies = [
@@ -1327,6 +1409,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sd-notify"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b943eadf71d8b69e661330cb0e2656e31040acf21ee7708e2c238a0ec6af2bf4"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "semver"
@@ -2201,6 +2292,17 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "xtask"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "logmon-broker-protocol",
+ "schemars",
+ "serde_json",
 ]
 
 [[package]]
