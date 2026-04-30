@@ -898,6 +898,7 @@ dependencies = [
 name = "logmon-broker-protocol"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
  "schemars",
  "serde",
  "serde_json",
@@ -946,6 +947,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
+ "logmon-broker-protocol",
  "opentelemetry-proto",
  "prost",
  "regex",
