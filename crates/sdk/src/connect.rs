@@ -211,10 +211,15 @@ fn map_bridge_error(err: BridgeError) -> BrokerError {
 }
 
 pub(crate) fn default_socket_path() -> PathBuf {
+    // Must match the broker daemon's `core::daemon::persistence::config_dir()`
+    // location, which is `$HOME/.config/logmon/` on every Unix (including macOS,
+    // where `dirs::config_dir()` would otherwise return `~/Library/Application
+    // Support/`). Hard-code `.config/logmon/` so the SDK and broker agree on
+    // every platform without the SDK depending on `core`.
     #[cfg(unix)]
     {
-        let dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        dir.join("logmon").join("logmon.sock")
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".config").join("logmon").join("logmon.sock")
     }
     #[cfg(windows)]
     {
