@@ -8,6 +8,11 @@ pub const SEQ_BLOCK_SIZE: u64 = 1000;
 pub struct PersistedSession {
     pub triggers: Vec<PersistedTrigger>,
     pub filters: Vec<PersistedFilter>,
+    /// Caller-supplied identity blob from the most recent `session.start`.
+    /// `#[serde(default)]` so existing `state.json` files (written before
+    /// client_info landed) load with `None`.
+    #[serde(default)]
+    pub client_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

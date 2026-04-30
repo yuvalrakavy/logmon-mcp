@@ -198,6 +198,10 @@ pub struct SessionInfo {
     pub filter_count: usize,
     pub queue_size: usize,
     pub last_seen_secs_ago: u64,
+    /// Caller-supplied identity blob from the most recent `session.start`.
+    /// Omitted from the wire when never set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_info: Option<Value>,
 }
 
 /// Pipeline buffer / receive statistics. Embedded in `status.get`.

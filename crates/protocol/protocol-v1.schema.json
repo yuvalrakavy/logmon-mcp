@@ -2268,6 +2268,9 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "client_info": {
+              "description": "Caller-supplied identity blob from the most recent `session.start`.\nOmitted from the wire when never set."
             }
           },
           "required": [
@@ -2383,6 +2386,9 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "client_info": {
+              "description": "Caller-supplied identity blob from the most recent `session.start`.\nOmitted from the wire when never set."
             }
           },
           "required": [
@@ -3279,6 +3285,9 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "client_info": {
+          "description": "Caller-supplied identity blob from the most recent `session.start`.\nOmitted from the wire when never set."
         }
       },
       "required": [

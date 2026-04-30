@@ -25,6 +25,7 @@ fn test_state_roundtrip() {
             filter: "fa=mqtt".to_string(),
             description: Some("mqtt only".to_string()),
         }],
+        client_info: None,
     });
     save_state(&path, &state).unwrap();
     let loaded = load_state(&path).unwrap();
@@ -51,6 +52,7 @@ fn test_persisted_trigger_roundtrip_with_oneshot() {
                 oneshot: true,
             }],
             filters: vec![],
+            client_info: None,
         },
     );
     save_state(&path, &state).unwrap();

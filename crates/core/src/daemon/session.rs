@@ -4,6 +4,7 @@ use crate::filter::matcher::matches_entry;
 use crate::filter::parser::{parse_filter, FilterParseError, ParsedFilter};
 use crate::gelf::message::{Level, LogEntry, LogSource};
 use crate::span::types::{SpanEntry, SpanStatus, TraceSummary};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -38,6 +39,10 @@ pub struct SessionInfo {
     pub filter_count: usize,
     pub queue_size: usize,
     pub last_seen_secs_ago: u64,
+    /// Caller-supplied identity blob from the most recent `session.start`
+    /// (validated to be ≤ 4 KB serialized). `None` if no client_info was
+    /// ever set on this session.
+    pub client_info: Option<Value>,
 }
 
 /// Buffer filter entry (per-session).
@@ -82,6 +87,9 @@ struct SessionState {
     post_window_remaining: AtomicU32,
     connected: AtomicBool,
     last_seen: Mutex<Instant>,
+    /// Caller-supplied identity/metadata blob from `session.start`. The
+    /// daemon validates a ≤ 4 KB cap before writing here.
+    client_info: RwLock<Option<Value>>,
 }
 
 impl SessionState {
@@ -96,6 +104,7 @@ impl SessionState {
             post_window_remaining: AtomicU32::new(0),
             connected: AtomicBool::new(true),
             last_seen: Mutex::new(Instant::now()),
+            client_info: RwLock::new(None),
         }
     }
 
@@ -110,6 +119,7 @@ impl SessionState {
             post_window_remaining: AtomicU32::new(0),
             connected: AtomicBool::new(true),
             last_seen: Mutex::new(Instant::now()),
+            client_info: RwLock::new(None),
         }
     }
 
@@ -132,6 +142,11 @@ impl SessionState {
                 .expect("queue lock poisoned")
                 .len(),
             last_seen_secs_ago: now.duration_since(last).as_secs(),
+            client_info: self
+                .client_info
+                .read()
+                .expect("client_info lock poisoned")
+                .clone(),
         }
     }
 
@@ -240,6 +255,18 @@ impl SessionRegistry {
                     state.touch();
                 }
             }
+        }
+    }
+
+    /// Replace the session's `client_info` blob. Caller is responsible for
+    /// validating the 4 KB size cap before invoking. No-op if `id` is unknown.
+    pub fn set_client_info(&self, id: &SessionId, info: Option<Value>) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        if let Some(state) = sessions.get(id) {
+            *state
+                .client_info
+                .write()
+                .expect("client_info lock poisoned") = info;
         }
     }
 
@@ -706,10 +733,70 @@ impl SessionRegistry {
             }
         }
 
+        // Restore client_info
+        if let Some(ci) = &persisted.client_info {
+            *state
+                .client_info
+                .write()
+                .expect("client_info lock poisoned") = Some(ci.clone());
+        }
+
         self.sessions
             .write()
             .expect("sessions lock poisoned")
             .insert(id, state);
+    }
+
+    /// Build a snapshot of all named sessions suitable for persistence to
+    /// `state.json`. Anonymous sessions are skipped. Captures the live
+    /// triggers, filters, and `client_info` for each named session.
+    pub fn snapshot_named_for_persistence(
+        &self,
+    ) -> std::collections::HashMap<String, crate::daemon::persistence::PersistedSession> {
+        use crate::daemon::persistence::{PersistedFilter, PersistedSession, PersistedTrigger};
+
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let mut out = std::collections::HashMap::new();
+        for (id, state) in sessions.iter() {
+            let SessionId::Named(name) = id else { continue };
+            let triggers: Vec<PersistedTrigger> = state
+                .triggers
+                .list()
+                .into_iter()
+                .map(|t| PersistedTrigger {
+                    filter: t.filter_string,
+                    pre_window: t.pre_window,
+                    post_window: t.post_window,
+                    notify_context: t.notify_context,
+                    description: t.description,
+                    oneshot: t.oneshot,
+                })
+                .collect();
+            let filters: Vec<PersistedFilter> = state
+                .filters
+                .read()
+                .expect("filters lock poisoned")
+                .iter()
+                .map(|f| PersistedFilter {
+                    filter: f.filter_string.clone(),
+                    description: f.description.clone(),
+                })
+                .collect();
+            let client_info = state
+                .client_info
+                .read()
+                .expect("client_info lock poisoned")
+                .clone();
+            out.insert(
+                name.clone(),
+                PersistedSession {
+                    triggers,
+                    filters,
+                    client_info,
+                },
+            );
+        }
+        out
     }
 }
 

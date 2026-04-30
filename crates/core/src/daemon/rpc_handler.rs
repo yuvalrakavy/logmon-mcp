@@ -183,6 +183,7 @@ impl RpcHandler {
                 "filter_count": s.filter_count,
                 "queue_size": s.queue_size,
                 "last_seen_secs_ago": s.last_seen_secs_ago,
+                "client_info": s.client_info,
             })),
             "daemon_uptime_secs": self.start_time.elapsed().as_secs(),
             "receivers": self.receivers_info,
@@ -639,6 +640,7 @@ impl RpcHandler {
                     "filter_count": s.filter_count,
                     "queue_size": s.queue_size,
                     "last_seen_secs_ago": s.last_seen_secs_ago,
+                    "client_info": s.client_info,
                 })
             })
             .collect();

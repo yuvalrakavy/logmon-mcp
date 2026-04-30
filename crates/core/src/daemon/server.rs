@@ -142,8 +142,9 @@ pub async fn run_with_overrides(
     let span_store = Arc::new(SpanStore::new(config.span_buffer_size, seq_counter.clone()));
 
     // 6. Reserve next seq block and save
+    let reserved_seq_block = initial_seq + SEQ_BLOCK_SIZE;
     let new_state = DaemonState {
-        seq_block: initial_seq + SEQ_BLOCK_SIZE,
+        seq_block: reserved_seq_block,
         named_sessions: state.named_sessions.clone(),
     };
     save_state(&state_path, &new_state)?;
@@ -312,6 +313,18 @@ pub async fn run_with_overrides(
         // Send offline beacon before stopping receivers
         send_otel_beacon("OTEL:OFFLINE\n");
 
+        // Persist live named-session state (triggers, filters, client_info)
+        // before tearing down. Best-effort: failures are logged but do not
+        // block shutdown.
+        let snapshot = sessions.snapshot_named_for_persistence();
+        let final_state = DaemonState {
+            seq_block: reserved_seq_block,
+            named_sessions: snapshot,
+        };
+        if let Err(e) = save_state(&state_path, &final_state) {
+            warn!("failed to save state on shutdown: {e}");
+        }
+
         // Cleanup
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&pid_path);
@@ -368,6 +381,18 @@ pub async fn run_with_overrides(
         // Send offline beacon before stopping receivers
         send_otel_beacon("OTEL:OFFLINE\n");
 
+        // Persist live named-session state (triggers, filters, client_info)
+        // before tearing down. Best-effort: failures are logged but do not
+        // block shutdown.
+        let snapshot = sessions.snapshot_named_for_persistence();
+        let final_state = DaemonState {
+            seq_block: reserved_seq_block,
+            named_sessions: snapshot,
+        };
+        if let Err(e) = save_state(&state_path, &final_state) {
+            warn!("failed to save state on shutdown: {e}");
+        }
+
         let _ = std::fs::remove_file(&pid_path);
     }
 
@@ -421,6 +446,21 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         return Ok(());
     }
 
+    // 2b. Validate client_info size (≤ 4 KB serialized) BEFORE creating the
+    //     session, so an oversize payload doesn't pollute the registry.
+    if let Some(ci) = &params.client_info {
+        let serialized = serde_json::to_string(ci).unwrap_or_default();
+        if serialized.len() > 4096 {
+            let resp = RpcResponse::error(
+                first_request.id,
+                -32602,
+                "client_info exceeds 4 KB limit",
+            );
+            write_message(&mut writer, &resp).await?;
+            return Ok(());
+        }
+    }
+
     // 3. Create/reconnect session
     let (session_id, is_new) = match &params.name {
         Some(name) => {
@@ -449,6 +489,12 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             (id, true)
         }
     };
+
+    // 3b. Store client_info on the session if provided. On reconnect with no
+    //     client_info, prior value is preserved.
+    if params.client_info.is_some() {
+        sessions.set_client_info(&session_id, params.client_info.clone());
+    }
 
     info!(?session_id, is_new, "session started");
 
