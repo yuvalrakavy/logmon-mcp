@@ -1,6 +1,12 @@
 pub mod methods;
 pub mod notifications;
 
+pub use methods::*;
+// `notifications` is currently empty; the re-export is wired so that when
+// notification payload types land they're accessible at the crate root.
+#[allow(unused_imports)]
+pub use notifications::*;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
