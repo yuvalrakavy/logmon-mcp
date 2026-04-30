@@ -947,6 +947,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
+ "logmon-broker-core",
  "logmon-broker-protocol",
  "opentelemetry-proto",
  "prost",

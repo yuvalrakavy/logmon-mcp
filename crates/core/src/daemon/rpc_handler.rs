@@ -1,7 +1,7 @@
 use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
-use crate::rpc::types::*;
+use logmon_broker_protocol::*;
 use crate::span::store::SpanStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
