@@ -1,4 +1,5 @@
 use crate::transport;
+use crate::Notification;
 use logmon_broker_protocol::*;
 use std::collections::HashMap;
 use std::io;
@@ -28,16 +29,18 @@ pub struct DaemonBridge {
     writer: Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
     next_id: AtomicU64,
-    notification_tx: broadcast::Sender<RpcNotification>,
+    notification_tx: broadcast::Sender<Notification>,
 }
 
 impl DaemonBridge {
     /// Splits `stream` into reader/writer halves, spawns the reader loop, and
-    /// returns a bridge that routes calls and forwards notifications onto
-    /// `notification_tx`.
+    /// returns a bridge that routes calls and forwards typed
+    /// [`Notification`]s onto `notification_tx`. Unparseable notification
+    /// frames are logged and dropped — subscribers only see well-formed
+    /// events.
     pub async fn spawn<S>(
         stream: S,
-        notification_tx: broadcast::Sender<RpcNotification>,
+        notification_tx: broadcast::Sender<Notification>,
     ) -> Result<Self, BridgeError>
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
@@ -83,18 +86,20 @@ impl DaemonBridge {
         }
     }
 
-    /// Subscribe to daemon-originated notifications.
-    pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
+    /// Subscribe to daemon-originated typed notifications.
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<Notification> {
         self.notification_tx.subscribe()
     }
 }
 
-/// Reader loop: routes responses to the pending-call map and broadcasts
-/// notifications. Exits cleanly on EOF or transport error.
+/// Reader loop: routes responses to the pending-call map and converts wire
+/// notifications into typed [`Notification`]s before broadcasting. Unparseable
+/// or unknown frames are logged and dropped. Exits cleanly on EOF or transport
+/// error.
 fn spawn_reader_loop<R>(
     mut reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
-    notification_tx: broadcast::Sender<RpcNotification>,
+    notification_tx: broadcast::Sender<Notification>,
 ) where
     R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
 {
@@ -107,7 +112,9 @@ fn spawn_reader_loop<R>(
                     }
                 }
                 Ok(Some(DaemonMessage::Notification(notif))) => {
-                    let _ = notification_tx.send(notif);
+                    if let Some(typed) = notification_from_wire(&notif) {
+                        let _ = notification_tx.send(typed);
+                    }
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -117,4 +124,28 @@ fn spawn_reader_loop<R>(
             }
         }
     });
+}
+
+/// Convert a wire [`RpcNotification`] into the SDK's typed [`Notification`].
+/// Returns `None` for unknown methods or malformed payloads (logged at warn /
+/// debug level so subscribers don't see noise).
+fn notification_from_wire(notif: &RpcNotification) -> Option<Notification> {
+    match notif.method.as_str() {
+        // Underscore form is what the daemon currently emits
+        // (`core::daemon::server::TRIGGER_FIRED_METHOD`); accept the dotted
+        // form too for robustness against future renames.
+        "trigger_fired" | "notifications/trigger_fired" | "trigger.fired" => {
+            match serde_json::from_value::<TriggerFiredPayload>(notif.params.clone()) {
+                Ok(payload) => Some(Notification::TriggerFired(payload)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to parse trigger_fired payload");
+                    None
+                }
+            }
+        }
+        other => {
+            tracing::debug!(method = %other, "ignoring unknown notification");
+            None
+        }
+    }
 }

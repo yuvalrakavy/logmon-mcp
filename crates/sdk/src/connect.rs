@@ -6,10 +6,8 @@ use serde_json::Value;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::bridge::{BridgeError, DaemonBridge};
-use crate::BrokerError;
-use logmon_broker_protocol::{
-    RpcNotification, SessionStartParams, SessionStartResult, PROTOCOL_VERSION,
-};
+use crate::{BrokerError, Notification};
+use logmon_broker_protocol::{SessionStartParams, SessionStartResult, PROTOCOL_VERSION};
 
 /// Builder for [`Broker`] connections. Use [`Broker::connect`] to obtain one
 /// with default settings, then chain builder methods before calling
@@ -155,7 +153,7 @@ pub(crate) struct Inner {
     pub(crate) is_new_session: bool,
     pub(crate) capabilities: Vec<String>,
     pub(crate) daemon_uptime: Duration,
-    pub(crate) notification_tx: broadcast::Sender<RpcNotification>,
+    pub(crate) notification_tx: broadcast::Sender<Notification>,
     #[allow(dead_code)] // consumed by reconnect machinery in Task 16
     pub(crate) config: Arc<BrokerBuilder>,
 }
@@ -182,9 +180,11 @@ impl Broker {
         self.inner.daemon_uptime
     }
 
-    /// Subscribe to broker-originated notifications. Each subscriber gets its
-    /// own broadcast receiver; lagged subscribers see [`broadcast::error::RecvError::Lagged`].
-    pub fn subscribe_notifications(&self) -> broadcast::Receiver<RpcNotification> {
+    /// Subscribe to broker-originated typed notifications. Each subscriber
+    /// gets its own broadcast receiver; lagged subscribers see
+    /// [`broadcast::error::RecvError::Lagged`]. Unparseable wire notifications
+    /// are dropped before reaching subscribers.
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<Notification> {
         self.inner.notification_tx.subscribe()
     }
 
