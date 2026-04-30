@@ -80,21 +80,49 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
             any_post_window_active = true;
 
             // Build notification event and send/queue
+            let mut any_oneshot_removed = false;
             for m in &matches {
                 let context_before =
                     pipeline.context_by_seq(entry.seq, m.pre_window as usize, 0);
                 let event = PipelineEvent {
+                    session_id: sid.to_string(),
                     trigger_id: m.id,
                     trigger_description: m.description.clone(),
                     filter_string: m.filter_string.clone(),
                     matched_entry: entry.clone(),
                     context_before,
                     pre_trigger_flushed: trigger_max_pre as usize,
+                    pre_window: m.pre_window,
                     post_window_size: m.post_window,
+                    notify_context: m.notify_context,
+                    oneshot: m.oneshot,
                     trace_id: entry.trace_id,
                     trace_summary: None,
                 };
-                sessions.send_or_queue_notification(sid, event);
+                // Queue for disconnected named sessions (no-op for connected)
+                // and broadcast to all live subscribers; the per-connection
+                // task in `daemon::server` filters the broadcast by
+                // `session_id` before writing to its socket.
+                sessions.send_or_queue_notification(sid, event.clone());
+                pipeline.send_event(event);
+
+                // Auto-remove oneshot triggers after dispatch. The trigger may
+                // already have been removed by an earlier match in this same
+                // evaluation (shouldn't happen in practice — one trigger fires
+                // once per evaluation — but the remove returns NotFound rather
+                // than panicking either way).
+                if m.oneshot {
+                    let _ = sessions.remove_trigger(sid, m.id);
+                    any_oneshot_removed = true;
+                }
+            }
+
+            // If we removed a oneshot trigger whose pre_window was the
+            // session-wide max, the pre-buffer can shrink. sync_pre_buffer_size
+            // computes the new max across all sessions so this is correct
+            // regardless of which session/trigger was the previous max.
+            if any_oneshot_removed {
+                sync_pre_buffer_size(pipeline, sessions);
             }
         }
     }

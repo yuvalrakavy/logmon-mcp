@@ -181,6 +181,10 @@ pub struct TriggerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub match_count: u64,
+    /// When `true`, the trigger auto-removes after its first match. Always
+    /// serialized (no `skip_serializing_if`) so clients see the explicit value.
+    #[serde(default)]
+    pub oneshot: bool,
 }
 
 /// One entry in a `session.list` or `status.get` response.
@@ -347,6 +351,10 @@ pub struct TriggersAdd {
     pub notify_context: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// When `true`, the trigger auto-removes after its first match. Defaults
+    /// to `false`; old clients without this field continue to deserialize.
+    #[serde(default)]
+    pub oneshot: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -367,6 +375,8 @@ pub struct TriggersEdit {
     pub notify_context: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oneshot: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -379,6 +389,8 @@ pub struct TriggersEditResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub match_count: u64,
+    #[serde(default)]
+    pub oneshot: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

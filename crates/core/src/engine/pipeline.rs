@@ -7,16 +7,40 @@ use crate::store::traits::{LogStore, StoreStats};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-/// Event emitted when a trigger fires (used by daemon's session logic)
+/// Event emitted when a trigger fires (used by daemon's session logic).
+///
+/// Fields here include both the engine-internal observability data
+/// (`pre_trigger_flushed`, `trace_id`, `trace_summary`) and the data needed
+/// to construct the wire-level [`logmon_broker_protocol::TriggerFiredPayload`]
+/// (`pre_window`, `notify_context`, `oneshot`). The wire conversion happens at
+/// the serialization site in `daemon::server`; this struct is not serialized
+/// directly to clients.
+///
+/// The `session_id` field tags every event with the session it belongs to.
+/// This is the single broadcast for all connected clients, so each
+/// connection filters by `session_id` before forwarding to its socket.
 #[derive(Clone, serde::Serialize)]
 pub struct PipelineEvent {
+    /// The session this event belongs to, as the daemon-internal string form
+    /// of [`crate::daemon::session::SessionId`]. Used for fan-out filtering.
+    pub session_id: String,
     pub trigger_id: u32,
     pub trigger_description: Option<String>,
     pub filter_string: String,
     pub matched_entry: LogEntry,
     pub context_before: Vec<LogEntry>,
+    /// The actual count flushed from the pre-buffer for this match
+    /// (`min(pre_window, available)`). Engine-internal; not on the wire.
     pub pre_trigger_flushed: usize,
+    /// The trigger's configured `pre_window`, propagated to the wire payload.
+    pub pre_window: u32,
     pub post_window_size: u32,
+    /// The trigger's configured `notify_context`, propagated to the wire payload.
+    pub notify_context: u32,
+    /// The trigger's configured `oneshot` flag. The log/span processor uses
+    /// this to decide whether to remove the trigger after dispatch; the wire
+    /// payload also carries it so clients can know this is the last fire.
+    pub oneshot: bool,
     pub trace_id: Option<u128>,
     pub trace_summary: Option<crate::span::types::TraceSummary>,
 }

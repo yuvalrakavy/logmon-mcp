@@ -19,6 +19,7 @@ fn test_state_roundtrip() {
             filter: "l>=ERROR".to_string(),
             pre_window: 500, post_window: 200, notify_context: 5,
             description: Some("error trigger".to_string()),
+            oneshot: false,
         }],
         filters: vec![PersistedFilter {
             filter: "fa=mqtt".to_string(),
@@ -31,6 +32,56 @@ fn test_state_roundtrip() {
     assert_eq!(loaded.named_sessions.len(), 1);
     assert_eq!(loaded.named_sessions["test"].triggers.len(), 1);
     assert_eq!(loaded.named_sessions["test"].filters.len(), 1);
+}
+
+#[test]
+fn test_persisted_trigger_roundtrip_with_oneshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let mut state = DaemonState::default();
+    state.named_sessions.insert(
+        "named".to_string(),
+        PersistedSession {
+            triggers: vec![PersistedTrigger {
+                filter: "l>=ERROR".to_string(),
+                pre_window: 0,
+                post_window: 0,
+                notify_context: 0,
+                description: None,
+                oneshot: true,
+            }],
+            filters: vec![],
+        },
+    );
+    save_state(&path, &state).unwrap();
+    let loaded = load_state(&path).unwrap();
+    assert!(loaded.named_sessions["named"].triggers[0].oneshot);
+}
+
+#[test]
+fn test_persisted_trigger_oneshot_serde_default() {
+    // state.json files written before oneshot landed must still load with
+    // oneshot defaulting to false.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.json");
+    let legacy = r#"{
+        "seq_block": 0,
+        "named_sessions": {
+            "named": {
+                "triggers": [{
+                    "filter": "l>=ERROR",
+                    "pre_window": 0,
+                    "post_window": 0,
+                    "notify_context": 0,
+                    "description": null
+                }],
+                "filters": []
+            }
+        }
+    }"#;
+    std::fs::write(&path, legacy).unwrap();
+    let loaded = load_state(&path).unwrap();
+    assert!(!loaded.named_sessions["named"].triggers[0].oneshot);
 }
 
 #[test]

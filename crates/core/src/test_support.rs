@@ -84,6 +84,14 @@ impl TestDaemonHandle {
         Self::spawn_in_dir(tempdir, default_test_config()).await
     }
 
+    /// Spawn an in-process daemon reusing a caller-provided tempdir. Lets a
+    /// test pre-populate `state.json` (or other config files) inside the
+    /// tempdir before the daemon boots — used to verify load-from-disk paths
+    /// like persisted-trigger restoration.
+    pub async fn spawn_in_tempdir(tempdir: Arc<TempDir>) -> Self {
+        Self::spawn_in_dir(tempdir, default_test_config()).await
+    }
+
     /// Spawn an in-process daemon reusing an existing tempdir. Used by
     /// [`Self::restart`] and [`Self::wipe_state_and_restart`] to preserve (or
     /// drop and rebuild) `state.json`.

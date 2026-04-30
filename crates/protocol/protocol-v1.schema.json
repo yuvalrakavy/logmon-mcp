@@ -718,6 +718,11 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "oneshot": {
+              "description": "When `true`, the trigger auto-removes after its first match. Always\nserialized (no `skip_serializing_if`) so clients see the explicit value.",
+              "type": "boolean",
+              "default": false
             }
           },
           "required": [
@@ -768,6 +773,11 @@
             "string",
             "null"
           ]
+        },
+        "oneshot": {
+          "description": "When `true`, the trigger auto-removes after its first match. Defaults\nto `false`; old clients without this field continue to deserialize.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -834,6 +844,12 @@
             "string",
             "null"
           ]
+        },
+        "oneshot": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "required": [
@@ -878,6 +894,10 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "oneshot": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -3206,6 +3226,11 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "oneshot": {
+          "description": "When `true`, the trigger auto-removes after its first match. Always\nserialized (no `skip_serializing_if`) so clients see the explicit value.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [

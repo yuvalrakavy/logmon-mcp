@@ -320,6 +320,7 @@ impl SessionRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_trigger(
         &self,
         id: &SessionId,
@@ -328,12 +329,13 @@ impl SessionRegistry {
         post: u32,
         ctx: u32,
         desc: Option<&str>,
+        oneshot: bool,
     ) -> Result<u32, SessionError> {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         let state = sessions
             .get(id)
             .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
-        Ok(state.triggers.add(filter, pre, post, ctx, desc)?)
+        Ok(state.triggers.add(filter, pre, post, ctx, desc, oneshot)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -346,12 +348,15 @@ impl SessionRegistry {
         post: Option<u32>,
         ctx: Option<u32>,
         desc: Option<&str>,
+        oneshot: Option<bool>,
     ) -> Result<TriggerInfo, SessionError> {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         let state = sessions
             .get(id)
             .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
-        Ok(state.triggers.edit(trigger_id, filter, pre, post, ctx, desc)?)
+        Ok(state
+            .triggers
+            .edit(trigger_id, filter, pre, post, ctx, desc, oneshot)?)
     }
 
     pub fn remove_trigger(&self, id: &SessionId, trigger_id: u32) -> Result<(), SessionError> {
@@ -605,15 +610,17 @@ impl SessionRegistry {
 
     // --- Span trigger notifications ---
 
-    /// Send or queue a span trigger notification.
-    pub fn send_or_queue_span_notification(
-        &self,
+    /// Build a [`PipelineEvent`] for a span match. The caller is responsible
+    /// for both queueing it (via [`Self::send_or_queue_notification`]) and
+    /// broadcasting it (via [`crate::engine::pipeline::LogPipeline::send_event`]).
+    pub fn build_span_event(
         id: &SessionId,
         span: &SpanEntry,
         trigger: &TriggerInfo,
         trace_summary: Option<TraceSummary>,
-    ) {
-        let event = PipelineEvent {
+    ) -> PipelineEvent {
+        PipelineEvent {
+            session_id: id.to_string(),
             trigger_id: trigger.id,
             trigger_description: trigger.description.clone(),
             filter_string: trigger.filter_string.clone(),
@@ -639,11 +646,13 @@ impl SessionRegistry {
             },
             context_before: vec![],
             pre_trigger_flushed: 0,
+            pre_window: trigger.pre_window,
             post_window_size: 0,
+            notify_context: trigger.notify_context,
+            oneshot: trigger.oneshot,
             trace_id: Some(span.trace_id),
             trace_summary,
-        };
-        self.send_or_queue_notification(id, event);
+        }
     }
 
     /// Get all session IDs (connected + disconnected named sessions).
@@ -677,6 +686,7 @@ impl SessionRegistry {
                 pt.post_window,
                 pt.notify_context,
                 pt.description.as_deref(),
+                pt.oneshot,
             );
         }
 

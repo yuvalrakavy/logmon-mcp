@@ -6,7 +6,7 @@ use crate::daemon::rpc_handler::RpcHandler;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::daemon::span_processor::spawn_span_processor;
 use crate::daemon::transport::{read_request, write_message};
-use crate::engine::pipeline::LogPipeline;
+use crate::engine::pipeline::{LogPipeline, PipelineEvent};
 use crate::engine::seq_counter::SeqCounter;
 use crate::gelf::message::LogEntry;
 use crate::receiver::gelf::{GelfReceiver, GelfReceiverConfig};
@@ -20,6 +20,35 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
+
+/// Notification method name for fired triggers. Underscore form matches
+/// `notifications/<name>` rationalization (vs the legacy dot form).
+const TRIGGER_FIRED_METHOD: &str = "trigger_fired";
+
+/// Convert an internal [`PipelineEvent`] (engine-side observability struct)
+/// into a wire-shape JSON value matching
+/// [`logmon_broker_protocol::TriggerFiredPayload`].
+///
+/// Engine-only fields (`pre_trigger_flushed`, `trace_id`, `trace_summary`)
+/// are intentionally dropped — the v1 protocol payload does not include them.
+/// The JSON shape of the embedded `LogEntry` matches the protocol's
+/// `LogEntry` (gelf hex-encodes `trace_id`/`span_id` to strings via custom
+/// serde, so the wire bytes are identical).
+fn pipeline_event_to_trigger_fired(
+    ev: &PipelineEvent,
+) -> Result<serde_json::Value, serde_json::Error> {
+    Ok(serde_json::json!({
+        "trigger_id": ev.trigger_id,
+        "description": ev.trigger_description,
+        "filter_string": ev.filter_string,
+        "pre_window": ev.pre_window,
+        "post_window": ev.post_window_size,
+        "notify_context": ev.notify_context,
+        "oneshot": ev.oneshot,
+        "matched_entry": serde_json::to_value(&ev.matched_entry)?,
+        "context_before": serde_json::to_value(&ev.context_before)?,
+    }))
+}
 
 /// Send a UDP multicast beacon to notify tracing-init circuit breakers
 /// about OTel collector availability. Best-effort — failures are silently ignored.
@@ -136,8 +165,12 @@ pub async fn run_with_overrides(
             // exit cleanly when its recv() returns None.
             let (_span_tx, span_rx_idle) = mpsc::channel::<crate::span::types::SpanEntry>(1);
             drop(_span_tx);
-            let _idle_span_processor =
-                spawn_span_processor(span_rx_idle, span_store.clone(), sessions.clone());
+            let _idle_span_processor = spawn_span_processor(
+                span_rx_idle,
+                span_store.clone(),
+                sessions.clone(),
+                pipeline.clone(),
+            );
             (rx, None, Vec::<String>::new())
         }
         None => {
@@ -176,8 +209,12 @@ pub async fn run_with_overrides(
                 None
             };
             // Spawn span processor with the real span channel.
-            let _span_processor =
-                spawn_span_processor(span_rx_real, span_store.clone(), sessions.clone());
+            let _span_processor = spawn_span_processor(
+                span_rx_real,
+                span_store.clone(),
+                sessions.clone(),
+                pipeline.clone(),
+            );
             (log_rx, otlp_receiver, all_receivers_info)
         }
     };
@@ -424,7 +461,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // 5. Drain queued notifications and send each as RPC notification
     let queued = sessions.drain_notifications(&session_id);
     for event in queued {
-        let notification = RpcNotification::new("trigger.fired", serde_json::to_value(&event)?);
+        let payload = pipeline_event_to_trigger_fired(&event)?;
+        let notification = RpcNotification::new(TRIGGER_FIRED_METHOD, payload);
         write_message(&mut writer, &notification).await?;
     }
 
@@ -454,9 +492,15 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             event_result = event_rx.recv() => {
                 match event_result {
                     Ok(event) => {
+                        // The broadcast carries events for ALL sessions; only
+                        // forward those tagged with our session_id.
+                        if event.session_id != session_id.to_string() {
+                            continue;
+                        }
+                        let payload = pipeline_event_to_trigger_fired(&event)?;
                         let notification = RpcNotification::new(
-                            "trigger.fired",
-                            serde_json::to_value(&event)?,
+                            TRIGGER_FIRED_METHOD,
+                            payload,
                         );
                         if let Err(e) = write_message(&mut writer, &notification).await {
                             warn!(?session_id, "write error sending notification: {e}");

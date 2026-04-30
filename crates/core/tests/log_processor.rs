@@ -73,7 +73,7 @@ fn test_post_window_skips_triggers() {
     // Edit both default triggers to post_window=2
     for t in &triggers {
         sessions
-            .edit_trigger(&sid, t.id, None, None, Some(2), None, None)
+            .edit_trigger(&sid, t.id, None, None, Some(2), None, None, None)
             .unwrap();
     }
 
@@ -165,7 +165,7 @@ fn test_trigger_with_pre_window_zero() {
     let triggers = sessions.list_triggers(&sid);
     for t in &triggers {
         sessions
-            .edit_trigger(&sid, t.id, None, Some(0), None, None, None)
+            .edit_trigger(&sid, t.id, None, Some(0), None, None, None, None)
             .unwrap();
     }
 

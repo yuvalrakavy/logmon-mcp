@@ -126,13 +126,17 @@ fn test_notification_queue() {
     registry.disconnect(&id);
 
     let event = PipelineEvent {
+        session_id: id.to_string(),
         trigger_id: 1,
         trigger_description: None,
         filter_string: "l>=ERROR".to_string(),
         matched_entry: make_entry(Level::Error, "test", None),
         context_before: vec![],
         pre_trigger_flushed: 0,
+        pre_window: 0,
         post_window_size: 0,
+        notify_context: 0,
+        oneshot: false,
         trace_id: None,
         trace_summary: None,
     };
@@ -188,7 +192,7 @@ fn test_max_pre_window() {
     // Default triggers have pre_window=500
     assert_eq!(registry.max_pre_window(), 500);
     registry
-        .add_trigger(&id, "fa=test", 1000, 200, 5, None)
+        .add_trigger(&id, "fa=test", 1000, 200, 5, None, false)
         .unwrap();
     assert_eq!(registry.max_pre_window(), 1000);
 }

@@ -14,6 +14,11 @@ pub struct TriggerInfo {
     pub notify_context: u32,
     pub description: Option<String>,
     pub match_count: u64,
+    /// When `true`, the trigger is removed by the log/span processor after
+    /// it dispatches a single notification. The engine itself does not
+    /// remove it — that's the caller's responsibility, since removal needs
+    /// pre-buffer resync.
+    pub oneshot: bool,
 }
 
 /// A trigger match result
@@ -24,6 +29,7 @@ pub struct TriggerMatch {
     pub pre_window: u32,
     pub post_window: u32,
     pub notify_context: u32,
+    pub oneshot: bool,
 }
 
 struct Trigger {
@@ -34,6 +40,7 @@ struct Trigger {
     post_window: u32,
     notify_context: u32,
     description: Option<String>,
+    oneshot: bool,
     match_count: AtomicU64,
 }
 
@@ -47,6 +54,7 @@ impl Trigger {
             notify_context: self.notify_context,
             description: self.description.clone(),
             match_count: self.match_count.load(Ordering::Relaxed),
+            oneshot: self.oneshot,
         }
     }
 }
@@ -74,6 +82,7 @@ impl TriggerManager {
             post_window: 200,
             notify_context: 5,
             description: Some("Error-level log detected".to_string()),
+            oneshot: false,
             match_count: AtomicU64::new(0),
         };
 
@@ -86,6 +95,7 @@ impl TriggerManager {
             post_window: 200,
             notify_context: 5,
             description: Some("Panic or unwrap failure detected".to_string()),
+            oneshot: false,
             match_count: AtomicU64::new(0),
         };
 
@@ -113,6 +123,7 @@ impl TriggerManager {
             .map(|t| t.to_info())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add(
         &self,
         filter_str: &str,
@@ -120,6 +131,7 @@ impl TriggerManager {
         post_window: u32,
         notify_context: u32,
         description: Option<&str>,
+        oneshot: bool,
     ) -> Result<u32, TriggerError> {
         let condition = parse_filter(filter_str)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -131,6 +143,7 @@ impl TriggerManager {
             post_window,
             notify_context,
             description: description.map(String::from),
+            oneshot,
             match_count: AtomicU64::new(0),
         };
         self.triggers
@@ -140,6 +153,7 @@ impl TriggerManager {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn edit(
         &self,
         id: u32,
@@ -148,6 +162,7 @@ impl TriggerManager {
         post_window: Option<u32>,
         notify_context: Option<u32>,
         description: Option<&str>,
+        oneshot: Option<bool>,
     ) -> Result<TriggerInfo, TriggerError> {
         // Parse filter first (before acquiring write lock) to fail fast on bad input
         let new_condition = match filter {
@@ -176,6 +191,9 @@ impl TriggerManager {
         }
         if let Some(desc) = description {
             trigger.description = Some(desc.to_string());
+        }
+        if let Some(os) = oneshot {
+            trigger.oneshot = os;
         }
 
         Ok(trigger.to_info())
@@ -215,6 +233,7 @@ impl TriggerManager {
                         pre_window: t.pre_window,
                         post_window: t.post_window,
                         notify_context: t.notify_context,
+                        oneshot: t.oneshot,
                     })
                 } else {
                     None
@@ -260,9 +279,19 @@ mod tests {
     #[test]
     fn test_add_trigger() {
         let mgr = TriggerManager::new();
-        let id = mgr.add("fa=mqtt", 500, 200, 5, Some("MQTT watch")).unwrap();
+        let id = mgr
+            .add("fa=mqtt", 500, 200, 5, Some("MQTT watch"), false)
+            .unwrap();
         assert_eq!(id, 3);
         assert_eq!(mgr.list().len(), 3);
+    }
+
+    #[test]
+    fn test_add_oneshot_trigger() {
+        let mgr = TriggerManager::new();
+        let id = mgr.add("fa=once", 0, 0, 0, None, true).unwrap();
+        let info = mgr.get(id).unwrap();
+        assert!(info.oneshot);
     }
 
     #[test]
@@ -276,18 +305,38 @@ mod tests {
     #[test]
     fn test_edit_trigger() {
         let mgr = TriggerManager::new();
-        let result = mgr.edit(1, Some("l>=WARN"), Some(100), Some(50), Some(3), Some("edited")).unwrap();
+        let result = mgr
+            .edit(
+                1,
+                Some("l>=WARN"),
+                Some(100),
+                Some(50),
+                Some(3),
+                Some("edited"),
+                None,
+            )
+            .unwrap();
         assert_eq!(result.pre_window, 100);
         assert_eq!(result.post_window, 50);
         assert_eq!(result.notify_context, 3);
         assert_eq!(result.description.as_deref(), Some("edited"));
+        assert!(!result.oneshot);
+    }
+
+    #[test]
+    fn test_edit_trigger_oneshot() {
+        let mgr = TriggerManager::new();
+        let result = mgr
+            .edit(1, None, None, None, None, None, Some(true))
+            .unwrap();
+        assert!(result.oneshot);
     }
 
     #[test]
     fn test_max_pre_window() {
         let mgr = TriggerManager::new();
         assert_eq!(mgr.max_pre_window(), 500); // default triggers have 500
-        mgr.add("fa=test", 1000, 200, 5, None).unwrap();
+        mgr.add("fa=test", 1000, 200, 5, None, false).unwrap();
         assert_eq!(mgr.max_pre_window(), 1000);
     }
 

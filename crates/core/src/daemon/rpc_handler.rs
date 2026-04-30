@@ -298,6 +298,7 @@ impl RpcHandler {
                     "notify_context": t.notify_context,
                     "description": t.description,
                     "match_count": t.match_count,
+                    "oneshot": t.oneshot,
                 })
             })
             .collect();
@@ -329,9 +330,13 @@ impl RpcHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         let desc = params.get("description").and_then(|v| v.as_str());
+        let oneshot = params
+            .get("oneshot")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let id = self
             .sessions
-            .add_trigger(session_id, filter, pre, post, ctx, desc)
+            .add_trigger(session_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size(&self.pipeline, &self.sessions);
         Ok(json!({ "id": id }))
@@ -355,9 +360,10 @@ impl RpcHandler {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
         let desc = params.get("description").and_then(|v| v.as_str());
+        let oneshot = params.get("oneshot").and_then(|v| v.as_bool());
         let info = self
             .sessions
-            .edit_trigger(session_id, trigger_id, filter, pre, post, ctx, desc)
+            .edit_trigger(session_id, trigger_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size(&self.pipeline, &self.sessions);
         Ok(json!({
@@ -368,6 +374,7 @@ impl RpcHandler {
             "notify_context": info.notify_context,
             "description": info.description,
             "match_count": info.match_count,
+            "oneshot": info.oneshot,
         }))
     }
 

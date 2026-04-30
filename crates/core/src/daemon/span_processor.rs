@@ -1,4 +1,6 @@
+use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::SessionRegistry;
+use crate::engine::pipeline::LogPipeline;
 use crate::filter::matcher::matches_span;
 use crate::filter::parser::{is_span_filter, parse_filter};
 use crate::span::store::SpanStore;
@@ -10,20 +12,27 @@ pub fn spawn_span_processor(
     mut receiver: mpsc::Receiver<SpanEntry>,
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
+    pipeline: Arc<LogPipeline>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(span) = receiver.recv().await {
-            process_span(&span, &span_store, &sessions);
+            process_span(&span, &span_store, &sessions, &pipeline);
         }
     })
 }
 
-pub fn process_span(span: &SpanEntry, store: &SpanStore, sessions: &SessionRegistry) {
+pub fn process_span(
+    span: &SpanEntry,
+    store: &SpanStore,
+    sessions: &SessionRegistry,
+    pipeline: &LogPipeline,
+) {
     // 1. Store unconditionally (SpanStore assigns seq)
     store.insert(span.clone());
 
     // 2. Evaluate span triggers for each session
     let session_ids = sessions.active_session_ids();
+    let mut any_oneshot_removed = false;
     for sid in &session_ids {
         let triggers = sessions.list_triggers(sid);
         for trigger in &triggers {
@@ -31,11 +40,28 @@ pub fn process_span(span: &SpanEntry, store: &SpanStore, sessions: &SessionRegis
                 if let Ok(filter) = parse_filter(&trigger.filter_string) {
                     if matches_span(&filter, span) {
                         let trace_summary = build_trace_summary(span.trace_id, store);
-                        sessions.send_or_queue_span_notification(sid, span, trigger, trace_summary);
+                        let event = SessionRegistry::build_span_event(
+                            sid,
+                            span,
+                            trigger,
+                            trace_summary,
+                        );
+                        sessions.send_or_queue_notification(sid, event.clone());
+                        pipeline.send_event(event);
+                        if trigger.oneshot {
+                            let _ = sessions.remove_trigger(sid, trigger.id);
+                            any_oneshot_removed = true;
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Pre-buffer size is driven by triggers' max pre_window across all sessions,
+    // so we resync if any oneshot trigger was just auto-removed.
+    if any_oneshot_removed {
+        sync_pre_buffer_size(pipeline, sessions);
     }
 }
 

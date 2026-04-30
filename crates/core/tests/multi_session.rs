@@ -73,7 +73,7 @@ fn test_named_session_survives_disconnect() {
     let sessions = Arc::new(SessionRegistry::new());
     let sid = sessions.create_named("persistent").unwrap();
 
-    sessions.add_trigger(&sid, "fa=special", 100, 50, 3, Some("custom")).unwrap();
+    sessions.add_trigger(&sid, "fa=special", 100, 50, 3, Some("custom"), false).unwrap();
     let triggers_before = sessions.list_triggers(&sid);
     assert_eq!(triggers_before.len(), 3); // 2 defaults + 1 custom
 

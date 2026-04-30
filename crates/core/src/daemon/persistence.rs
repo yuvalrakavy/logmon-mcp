@@ -17,6 +17,10 @@ pub struct PersistedTrigger {
     pub post_window: u32,
     pub notify_context: u32,
     pub description: Option<String>,
+    /// `#[serde(default)]` so existing `state.json` files (written before
+    /// oneshot landed) load with `false`.
+    #[serde(default)]
+    pub oneshot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
