@@ -22,4 +22,6 @@ pub mod test_support;
 pub use daemon::persistence::DaemonConfig;
 
 #[cfg(feature = "test-support")]
-pub use test_support::{spawn_test_daemon, TestClient, TestDaemonHandle};
+pub use test_support::{
+    spawn_test_daemon, spawn_test_daemon_for_sdk, TestClient, TestDaemonHandle,
+};

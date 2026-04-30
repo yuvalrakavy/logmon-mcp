@@ -189,7 +189,7 @@ impl Broker {
     }
 
     /// Untyped JSON-RPC call — convenience pass-through used by the MCP shim
-    /// until the typed dispatch layer (Task 13) lands.
+    /// and by [`Broker::call_typed`].
     pub async fn call(
         &self,
         method: &str,
@@ -197,6 +197,20 @@ impl Broker {
     ) -> Result<Value, BrokerError> {
         let bridge = self.inner.bridge.lock().await;
         bridge.call(method, params).await.map_err(map_bridge_error)
+    }
+
+    /// Typed JSON-RPC dispatch helper. Serializes `params` to JSON, sends the
+    /// request through the bridge, then deserializes the result into `R`. The
+    /// per-method wrappers in [`crate::methods`] all delegate here.
+    pub async fn call_typed<P, R>(&self, method: &str, params: P) -> Result<R, BrokerError>
+    where
+        P: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        let value =
+            serde_json::to_value(&params).map_err(|e| BrokerError::Protocol(e.to_string()))?;
+        let result_value = self.call(method, value).await?;
+        serde_json::from_value(result_value).map_err(|e| BrokerError::Protocol(e.to_string()))
     }
 }
 

@@ -516,3 +516,10 @@ impl TestClient {
 pub async fn spawn_test_daemon() -> TestDaemonHandle {
     TestDaemonHandle::spawn().await
 }
+
+/// Alias used by the SDK's integration tests. Identical to
+/// [`spawn_test_daemon`]; the rename keeps the SDK-facing call site
+/// self-documenting ("for sdk") without forking the harness implementation.
+pub async fn spawn_test_daemon_for_sdk() -> TestDaemonHandle {
+    spawn_test_daemon().await
+}

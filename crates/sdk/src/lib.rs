@@ -7,6 +7,7 @@
 
 pub mod bridge;
 pub mod connect;
+mod methods;
 pub mod transport;
 
 pub use connect::{Broker, BrokerBuilder};
