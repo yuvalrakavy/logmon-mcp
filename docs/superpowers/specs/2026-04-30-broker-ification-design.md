@@ -303,7 +303,8 @@ let broker = Broker::connect()
         "run_id":  "abc",
     }))
     .reconnect_max_attempts(10)                    // optional, default 10
-    .reconnect_max_backoff(Duration::from_secs(30))
+    .reconnect_max_backoff(Duration::from_secs(30)) // optional, default 30s
+    .call_timeout(Duration::from_secs(60))          // optional; per-call cap during reconnect window
     .open()                                        // performs session.start
     .await?;
 ```
@@ -369,6 +370,13 @@ while let Ok(notif) = sub.recv().await {
 
 `subscribe_notifications()` returns a `tokio::sync::broadcast::Receiver<Notification>`. `Notification` is a `#[non_exhaustive]` enum — clients match on known variants and treat unknowns as no-op. Buffered queue size configurable on the builder (default 100). Lagging consumers see `RecvError::Lagged(n)` per the broadcast contract.
 
+The broadcast channel stays alive across disconnect/reconnect cycles (subscribers do not need to re-subscribe). When the SDK permanently gives up — reconnect retries exhausted, or `SessionLost` (anonymous reconnect or resurrection) — the SDK drops the sender side and all subscribers see `RecvError::Closed` on their next `recv()`. Subscriber contract:
+
+- `Ok(Notification::TriggerFired(_))` — normal event.
+- `Ok(Notification::Reconnected)` — broker came back; the next events are drained-queue from the disconnect window, then live again.
+- `Err(RecvError::Lagged(n))` — subscriber fell behind; `n` events were dropped from this subscriber's view.
+- `Err(RecvError::Closed)` — broker is permanently gone (reconnect failed); handle at the application level (the Broker handle's RPC methods will also be erroring with `Disconnected` or `SessionLost`).
+
 ### Errors
 
 Single `BrokerError` enum:
@@ -417,7 +425,7 @@ Dropping the `Broker` closes the connection. Anonymous sessions disappear server
 
 - **In-flight RPCs** (request was on the wire when disconnect happened) error with `BrokerError::Disconnected`. The SDK does not auto-retry, because not all methods are idempotent (`triggers.add`, `bookmarks.add(replace=false)` etc. would double-fire). The caller decides whether to retry per call.
 - **New RPCs issued during the disconnect/reconnect window** block on their `await` until reconnect succeeds and the call dispatches normally, OR until the per-call timeout expires (configurable on the builder via `.call_timeout(Duration)`, default: `reconnect_max_attempts × reconnect_max_backoff`), in which case the call errors with `BrokerError::Disconnected`. This makes transient broker restarts invisible to clients — they see at most a brief latency bump.
-- If the reconnect cycle exhausts retries or fails with `SessionLost`, all blocked calls error.
+- If the reconnect cycle terminates unsuccessfully, all blocked calls error with the propagated cause: `BrokerError::SessionLost` when resurrection (`is_new: true` on reconnect) or anonymous-session reconnect was the cause; `BrokerError::Disconnected` when reconnect attempts were exhausted without successful handshake. The notification broadcast channel closes in either case (see §Notifications).
 
 #### Notification ordering across reconnect
 
