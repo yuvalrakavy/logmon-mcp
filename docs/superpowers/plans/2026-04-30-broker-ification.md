@@ -80,15 +80,14 @@ The goal of this phase is to land a working workspace with all 21 existing tests
 ### Task 1: Set up Cargo workspace skeleton
 
 **Files:**
-- Modify: `Cargo.toml` (root) — convert from single-package to workspace manifest
-- Create: `crates/protocol/Cargo.toml`
-- Create: `crates/core/Cargo.toml`
-- Create: `crates/broker/Cargo.toml`
-- Create: `crates/sdk/Cargo.toml`
-- Create: `crates/mcp/Cargo.toml`
-- Create: `crates/xtask/Cargo.toml`
+- Move: `src/` → `crates/_legacy/src/`
+- Move: `tests/` → `crates/_legacy/tests/`
+- Move: existing top-level `Cargo.toml` `[package]` / `[dependencies]` / `[dev-dependencies]` sections → `crates/_legacy/Cargo.toml`
+- Modify: root `Cargo.toml` — replace with virtual workspace manifest
+- Create: `crates/{protocol,core,broker,sdk,mcp,xtask}/Cargo.toml`
 - Create: `crates/{protocol,core,broker,sdk,mcp,xtask}/src/lib.rs` (placeholder — empty stubs)
-- Move: existing `src/main.rs` content remains, but in this task we just add the workspace shell around it; src/ continues to compile as the legacy crate temporarily
+
+The legacy crate is preserved verbatim during Phase 1 (compiles + tests pass) and progressively emptied in Tasks 2–5. It's deleted in Task 5.
 
 - [ ] **Step 1: Snapshot existing test count for regression baseline**
 
@@ -98,14 +97,48 @@ cargo test 2>&1 | tail -20
 
 Record passing count. Should match what we see at end of Phase 1.
 
-- [ ] **Step 2: Convert root Cargo.toml to workspace**
+- [ ] **Step 2: Move legacy crate into workspace member directory**
 
-Rewrite `Cargo.toml` to:
+```bash
+mkdir -p crates/_legacy
+git mv src crates/_legacy/src
+git mv tests crates/_legacy/tests
+```
+
+Move the package definition into `crates/_legacy/Cargo.toml`. Copy from the current root `Cargo.toml` everything inside `[package]`, `[dependencies]`, `[dev-dependencies]`. The package name (`logmon-mcp-server`) does not collide with the new `logmon-mcp` crate, so it stays.
+
+```toml
+# crates/_legacy/Cargo.toml
+[package]
+name = "logmon-mcp-server"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server that collects structured logs and exposes them to Claude (legacy crate, deleted in Task 5)"
+
+[dependencies]
+# (verbatim copy of existing root [dependencies])
+
+[dev-dependencies]
+# (verbatim copy of existing root [dev-dependencies])
+```
+
+The legacy `Cargo.toml` should specify the existing binary target explicitly (since it's no longer at the workspace root):
+
+```toml
+[[bin]]
+name = "logmon-mcp-server"
+path = "src/main.rs"
+```
+
+- [ ] **Step 3: Convert root Cargo.toml to virtual workspace**
+
+Rewrite root `Cargo.toml` to:
 
 ```toml
 [workspace]
 resolver = "2"
 members = [
+    "crates/_legacy",
     "crates/protocol",
     "crates/core",
     "crates/broker",
@@ -147,11 +180,14 @@ rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
 tokio-test = "0.4"
 tempfile = "3"
 sd-notify = "0.4"
+which = "6"
+dirs = "5"
+rand = "0.8"
 ```
 
-Delete the `[package]`, `[dependencies]`, `[dev-dependencies]` sections from root Cargo.toml.
+The root `Cargo.toml` now contains only `[workspace]` + `[workspace.package]` + `[workspace.dependencies]`. No `[package]` section.
 
-- [ ] **Step 3: Create empty member crate manifests**
+- [ ] **Step 4: Create empty member crate manifests**
 
 Each `crates/*/Cargo.toml` is a minimal placeholder so workspace resolves. Example for `crates/protocol/Cargo.toml`:
 
@@ -249,7 +285,7 @@ fs2.workspace = true
 [dev-dependencies]
 tokio-test.workspace = true
 tempfile.workspace = true
-logmon-broker-core = { path = "../core" }   # for spinning up an in-process broker in integration tests
+logmon-broker-core = { path = "../core", features = ["test-support"] }   # in-process broker for integration tests
 ```
 
 For `crates/mcp/Cargo.toml`:
@@ -294,7 +330,7 @@ clap.workspace = true
 anyhow.workspace = true
 ```
 
-- [ ] **Step 4: Create empty stub `lib.rs` / `main.rs` for each crate**
+- [ ] **Step 5: Create empty stub `lib.rs` / `main.rs` for each crate**
 
 ```rust
 // crates/protocol/src/lib.rs
@@ -332,21 +368,29 @@ fn main() {
 }
 ```
 
-- [ ] **Step 5: Verify workspace + legacy crate both compile**
+- [ ] **Step 6: Verify workspace + legacy crate both compile**
 
 ```
 cargo check --workspace
 ```
 
-Expected: clean. Legacy `src/` still in tree as the original crate; workspace has stubs alongside. Both compile.
+Expected: clean. Legacy crate at `crates/_legacy/` builds with verbatim source; new stubs alongside compile as empty crates.
 
-The original src/ will be progressively emptied as Tasks 2–5 migrate code into the new crates.
+Legacy crate will be progressively emptied as Tasks 2–5 migrate code into the new crates, then deleted in Task 5.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Run existing tests against legacy crate**
+
+```
+cargo test -p logmon-mcp-server
+```
+
+Expected: passing count matches Step 1 baseline.
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add Cargo.toml crates/
-git commit -m "chore(workspace): scaffold five-crate workspace + xtask"
+git add -A
+git commit -m "chore(workspace): scaffold five-crate workspace + xtask; preserve legacy crate"
 ```
 
 ---
@@ -354,15 +398,15 @@ git commit -m "chore(workspace): scaffold five-crate workspace + xtask"
 ### Task 2: Move protocol types to `logmon-broker-protocol`
 
 **Files:**
-- Move: `src/rpc/types.rs` → `crates/protocol/src/lib.rs` (with module split)
+- Move: `crates/_legacy/src/rpc/types.rs` content → `crates/protocol/src/lib.rs` (with module split)
 - Create: `crates/protocol/src/methods.rs` (typed method payload structs — empty for now; populated in Task 7)
 - Create: `crates/protocol/src/notifications.rs` (typed notification payload structs — empty for now; populated in Task 7)
-- Modify: `src/lib.rs` (legacy) — re-export from `logmon-broker-protocol` so existing `crate::rpc::types::*` paths keep resolving during migration
-- Modify: legacy `Cargo.toml` (the old src/ crate) — add `logmon-broker-protocol` as a path dep
+- Modify: `crates/_legacy/src/rpc/types.rs` — replace with re-export shim so existing `crate::rpc::types::*` paths in legacy code keep resolving
+- Modify: `crates/_legacy/Cargo.toml` — add `logmon-broker-protocol = { path = "../protocol" }` as a path dep
 
 - [ ] **Step 1: Copy types into new crate**
 
-Copy the content of `src/rpc/types.rs` into `crates/protocol/src/lib.rs`. Keep the existing types unchanged for now (RpcRequest, RpcResponse, RpcError, RpcNotification, DaemonMessage, parse_daemon_message_from_str, SessionStartParams, SessionStartResult, PROTOCOL_VERSION).
+Copy the content of `crates/_legacy/src/rpc/types.rs` into `crates/protocol/src/lib.rs`. Keep the existing types unchanged for now (RpcRequest, RpcResponse, RpcError, RpcNotification, DaemonMessage, parse_daemon_message_from_str, SessionStartParams, SessionStartResult, PROTOCOL_VERSION).
 
 Add module declarations at the top:
 
@@ -383,15 +427,15 @@ pub mod notifications;
 // Typed notification payload structs land here in Task 7.
 ```
 
-- [ ] **Step 3: Re-export from legacy `src/rpc/types.rs`**
+- [ ] **Step 3: Re-export from legacy `crates/_legacy/src/rpc/types.rs`**
 
-Replace `src/rpc/types.rs` with a re-export shim:
+Replace `crates/_legacy/src/rpc/types.rs` with a re-export shim:
 
 ```rust
 pub use logmon_broker_protocol::*;
 ```
 
-Keep `src/rpc/mod.rs` (and `src/rpc/transport.rs`) as-is — `transport.rs` will move in Task 5.
+Keep `crates/_legacy/src/rpc/mod.rs` (and `crates/_legacy/src/rpc/transport.rs`) as-is — `transport.rs` will move in Task 5.
 
 - [ ] **Step 4: Run all existing tests**
 
@@ -404,7 +448,7 @@ Expected: same passing count as Task 1 Step 1 baseline. No tests broke.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/protocol src/rpc/types.rs Cargo.toml
+git add -A
 git commit -m "refactor(protocol): extract logmon-broker-protocol crate"
 ```
 
@@ -413,31 +457,31 @@ git commit -m "refactor(protocol): extract logmon-broker-protocol crate"
 ### Task 3: Move engine code to `logmon-broker-core`
 
 **Files:**
-- Move: `src/engine/`, `src/filter/`, `src/gelf/`, `src/receiver/`, `src/span/`, `src/store/` → `crates/core/src/`
-- Move: `src/daemon/log_processor.rs`, `src/daemon/span_processor.rs`, `src/daemon/persistence.rs`, `src/daemon/session.rs`, `src/daemon/rpc_handler.rs` → `crates/core/src/daemon/`
+- Move: `crates/_legacy/src/{engine,filter,gelf,receiver,span,store}/` → `crates/core/src/`
+- Move: `crates/_legacy/src/daemon/{log_processor,span_processor,persistence,session,rpc_handler}.rs` → `crates/core/src/daemon/`
 - Modify: `crates/core/src/lib.rs` — declare modules + re-exports
-- Modify: legacy `src/lib.rs` — re-export from `logmon-broker-core`
-- Modify: legacy crate's `Cargo.toml` — add `logmon-broker-core` as path dep, drop deps that moved
+- Modify: `crates/_legacy/src/lib.rs` — re-export from `logmon-broker-core`
+- Modify: `crates/_legacy/Cargo.toml` — add `logmon-broker-core` path dep, drop deps that moved
 
 - [ ] **Step 1: Bulk move directories with git**
 
 ```bash
-git mv src/engine crates/core/src/engine
-git mv src/filter crates/core/src/filter
-git mv src/gelf crates/core/src/gelf
-git mv src/receiver crates/core/src/receiver
-git mv src/span crates/core/src/span
-git mv src/store crates/core/src/store
+git mv crates/_legacy/src/engine   crates/core/src/engine
+git mv crates/_legacy/src/filter   crates/core/src/filter
+git mv crates/_legacy/src/gelf     crates/core/src/gelf
+git mv crates/_legacy/src/receiver crates/core/src/receiver
+git mv crates/_legacy/src/span     crates/core/src/span
+git mv crates/_legacy/src/store    crates/core/src/store
 
 mkdir -p crates/core/src/daemon
-git mv src/daemon/log_processor.rs crates/core/src/daemon/log_processor.rs
-git mv src/daemon/span_processor.rs crates/core/src/daemon/span_processor.rs
-git mv src/daemon/persistence.rs crates/core/src/daemon/persistence.rs
-git mv src/daemon/session.rs crates/core/src/daemon/session.rs
-git mv src/daemon/rpc_handler.rs crates/core/src/daemon/rpc_handler.rs
+git mv crates/_legacy/src/daemon/log_processor.rs crates/core/src/daemon/log_processor.rs
+git mv crates/_legacy/src/daemon/span_processor.rs crates/core/src/daemon/span_processor.rs
+git mv crates/_legacy/src/daemon/persistence.rs   crates/core/src/daemon/persistence.rs
+git mv crates/_legacy/src/daemon/session.rs       crates/core/src/daemon/session.rs
+git mv crates/_legacy/src/daemon/rpc_handler.rs   crates/core/src/daemon/rpc_handler.rs
 ```
 
-`src/daemon/server.rs` and `src/daemon/mod.rs` stay (they move in Task 4).
+`crates/_legacy/src/daemon/server.rs` and `crates/_legacy/src/daemon/mod.rs` stay (they move in Task 4).
 
 - [ ] **Step 2: Author `crates/core/src/lib.rs`**
 
@@ -485,31 +529,44 @@ with:
 use logmon_broker_protocol::{...};
 ```
 
-- [ ] **Step 4: Re-export from legacy `src/lib.rs`**
+- [ ] **Step 4: Re-export from `crates/_legacy/src/lib.rs`**
 
-Replace `src/lib.rs` with re-exports so legacy callers keep compiling:
+Replace `crates/_legacy/src/lib.rs` with re-exports so legacy callers keep compiling:
 
 ```rust
-pub use logmon_broker_core::*;
+// All engine/filter/store/etc. now live in logmon-broker-core; re-export at
+// the same paths so internal `use crate::engine::pipeline::...` calls inside
+// _legacy/src/ keep resolving.
+pub use logmon_broker_core::engine;
+pub use logmon_broker_core::filter;
+pub use logmon_broker_core::gelf;
+pub use logmon_broker_core::receiver;
+pub use logmon_broker_core::span;
+pub use logmon_broker_core::store;
+
 pub mod rpc {
     pub use logmon_broker_protocol::*;
     pub mod types {
         pub use logmon_broker_protocol::*;
     }
-    pub mod transport;  // still in src/rpc/transport.rs until Task 5
+    pub mod transport;  // still in _legacy/src/rpc/transport.rs until Task 5
 }
 
-pub mod config;       // still in src/config.rs until Task 4
-pub mod shim;         // still in src/shim/ until Task 5
-pub mod mcp;          // still in src/mcp/ until Task 5
+pub mod config;         // still in _legacy/src/config.rs until Task 4
+pub mod shim;           // still in _legacy/src/shim/ until Task 5
+pub mod mcp;            // still in _legacy/src/mcp/ until Task 5
+
 pub mod daemon {
-    pub use logmon_broker_core::daemon::*;
-    pub mod server;   // still in src/daemon/server.rs until Task 4
-    pub mod mod_reexport;
+    pub use logmon_broker_core::daemon::log_processor;
+    pub use logmon_broker_core::daemon::span_processor;
+    pub use logmon_broker_core::daemon::persistence;
+    pub use logmon_broker_core::daemon::session;
+    pub use logmon_broker_core::daemon::rpc_handler;
+    pub mod server;     // still in _legacy/src/daemon/server.rs until Task 4
 }
 ```
 
-(Adjust to whatever module structure the legacy crate currently exposes — the goal is "no public path becomes broken.")
+The goal: no public path inside the legacy crate becomes broken. `cargo check -p logmon-mcp-server` still succeeds.
 
 - [ ] **Step 5: Run all tests**
 
@@ -522,7 +579,7 @@ Expected: same passing count. Most tests now run against `logmon-broker-core` pa
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/core src/lib.rs Cargo.toml
+git add -A
 git commit -m "refactor(core): extract logmon-broker-core (engine + filter + receiver + stores + daemon plumbing)"
 ```
 
@@ -531,18 +588,30 @@ git commit -m "refactor(core): extract logmon-broker-core (engine + filter + rec
 ### Task 4: Move daemon binary to `logmon-broker`
 
 **Files:**
-- Move: `src/daemon/server.rs` → `crates/broker/src/server.rs`
-- Move: `src/daemon/mod.rs` → delete (its contents are now in `crates/core/src/daemon/`)
-- Move: `src/main.rs` Daemon arm → `crates/broker/src/main.rs`
-- Move: `src/config.rs` Cli/Commands::Daemon → `crates/broker/src/main.rs` (the daemon-specific CLI)
+- Move: `crates/_legacy/src/daemon/server.rs` → `crates/broker/src/server.rs`
+- Move: `crates/_legacy/src/main.rs` Daemon arm logic → `crates/broker/src/main.rs`
+- Move: `crates/_legacy/src/config.rs` Cli/Commands::Daemon → `crates/broker/src/main.rs`
+
+The legacy crate's `src/main.rs`, `src/config.rs`, and shim code remain unchanged — `logmon-mcp-server` continues to operate as before, calling its own functions through the re-export shim. Both binaries (legacy `logmon-mcp-server` and new `logmon-broker`) compile concurrently.
 
 - [ ] **Step 1: Move server.rs**
 
 ```bash
-git mv src/daemon/server.rs crates/broker/src/server.rs
+git mv crates/_legacy/src/daemon/server.rs crates/broker/src/server.rs
 ```
 
-Update its imports (`use crate::...` → `use logmon_broker_core::...` or `use logmon_broker_protocol::...` as appropriate).
+In the new location, update imports inside `server.rs`: change `use crate::daemon::log_processor::...` style to `use logmon_broker_core::daemon::log_processor::...`. Same for engine/pipeline/store/etc.
+
+In `crates/_legacy/src/lib.rs`, replace the `pub mod daemon::server` line with a re-export:
+
+```rust
+pub mod daemon {
+    pub use logmon_broker_core::daemon::*;
+    // server.rs moved to logmon-broker — legacy crate no longer exposes it.
+    // If any internal _legacy code calls run_daemon, route via logmon-broker-core's
+    // run_in_process entry point or remove the call (legacy main.rs is the only caller).
+}
+```
 
 - [ ] **Step 2: Author `crates/broker/src/main.rs`**
 
@@ -615,33 +684,11 @@ async fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 3: Move `src/config.rs` daemon parts**
+- [ ] **Step 3: `crates/_legacy/src/config.rs` cleanup**
 
-`src/config.rs` currently defines `Cli` and `Commands::Daemon`. Replace those with the new shape. The shim Cli moves to `crates/mcp/src/main.rs` in Task 5. Delete `src/config.rs` once both are migrated; until then, keep a stripped-down version that only exposes types still used by legacy `src/main.rs`.
+`crates/_legacy/src/config.rs` defines `Cli` and `Commands::Daemon`. Leave the legacy file unchanged — its `Cli` keeps driving the legacy `logmon-mcp-server` binary through Phase 1. The new broker has its own clap struct (Step 2 above) — they coexist.
 
-- [ ] **Step 4: Update `src/main.rs` to invoke the new broker (temporary bridge)**
-
-Until Task 5 lands, the old `logmon-mcp-server` binary still exists in legacy `src/`. Make it a thin shim that calls into the new code paths:
-
-```rust
-// src/main.rs (temporary)
-fn main() -> anyhow::Result<()> {
-    // Detect 'daemon' subcommand to preserve old behavior during migration
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("daemon") {
-        // Defer to logmon-broker entry — but until that's the install target,
-        // call into the daemon code path directly here:
-        // ... (mirror the new logic during transition)
-    }
-    // Otherwise, run the legacy shim
-    // ...
-    Ok(())
-}
-```
-
-This keeps the legacy crate working through Task 5. It will be deleted at the end of Task 5.
-
-- [ ] **Step 5: Build the new broker binary**
+- [ ] **Step 4: Build the new broker binary**
 
 ```
 cargo build -p logmon-broker
@@ -649,7 +696,7 @@ cargo build -p logmon-broker
 
 Expected: clean. The binary compiles even without the install-service subcommands (those land in Tasks 18, 23).
 
-- [ ] **Step 6: Run all existing tests**
+- [ ] **Step 5: Run all existing tests**
 
 ```
 cargo test --workspace
@@ -657,10 +704,10 @@ cargo test --workspace
 
 Expected: same passing count.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add crates/broker src/main.rs src/daemon
+git add -A
 git commit -m "refactor(broker): extract logmon-broker daemon binary"
 ```
 
@@ -669,24 +716,66 @@ git commit -m "refactor(broker): extract logmon-broker daemon binary"
 ### Task 5: Move SDK + shim code to `logmon-broker-sdk` + `logmon-mcp`
 
 **Files:**
-- Move: `src/rpc/transport.rs` → `crates/sdk/src/transport.rs`
-- Move: `src/shim/bridge.rs` → `crates/sdk/src/bridge.rs`
+- Move: `crates/_legacy/src/rpc/transport.rs` → `crates/sdk/src/transport.rs`
+- Move: `crates/_legacy/src/shim/bridge.rs` → `crates/sdk/src/bridge.rs`
 - Create: `crates/sdk/src/lib.rs` — public API surface
 - Create: `crates/sdk/src/connect.rs` — Broker handle + builder
-- Move: `src/shim/auto_start.rs` → `crates/mcp/src/auto_start.rs`
-- Move: `src/mcp/server.rs` → `crates/mcp/src/server.rs`
-- Move: `src/mcp/notifications.rs` → `crates/mcp/src/notifications.rs`
-- Move: `src/main.rs` shim arm → `crates/mcp/src/main.rs`
-- Delete: legacy `src/`, legacy `Cargo.toml` package section, legacy `tests/` directory (tests follow their owning code in subsequent moves)
+- Move: `crates/_legacy/src/shim/auto_start.rs` → `crates/mcp/src/auto_start.rs`
+- Move: `crates/_legacy/src/mcp/server.rs` → `crates/mcp/src/server.rs`
+- Move: `crates/_legacy/src/mcp/notifications.rs` → `crates/mcp/src/notifications.rs`
+- Move: `crates/_legacy/src/main.rs` shim arm → `crates/mcp/src/main.rs`
+- Delete: `crates/_legacy/` directory entirely once migrations complete (Step 7)
 
 - [ ] **Step 1: Move transport + bridge into SDK**
 
 ```bash
-git mv src/rpc/transport.rs crates/sdk/src/transport.rs
-git mv src/shim/bridge.rs crates/sdk/src/bridge.rs
+git mv crates/_legacy/src/rpc/transport.rs crates/sdk/src/transport.rs
+git mv crates/_legacy/src/shim/bridge.rs   crates/sdk/src/bridge.rs
 ```
 
 Update imports inside both files: `use crate::rpc::types::*` → `use logmon_broker_protocol::*`.
+
+**Refactor `bridge.rs` to use a typed `BridgeError` enum** so the SDK's typed dispatch (Task 13) can distinguish transport errors from RPC method errors without string parsing. Replace the existing `anyhow::Error` returns from `DaemonBridge::call` with:
+
+```rust
+// crates/sdk/src/bridge.rs (new error type at module top)
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeError {
+    #[error("transport: {0}")]
+    Transport(#[from] std::io::Error),
+    #[error("rpc error {code}: {message}")]
+    Rpc { code: i32, message: String },
+    #[error("response channel closed")]
+    Closed,
+    #[error("protocol: {0}")]
+    Protocol(String),
+}
+
+impl DaemonBridge {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, BridgeError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = RpcRequest::new(id, method, params);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        {
+            let mut writer = self.writer.lock().await;
+            transport::write_message(&mut *writer, &request).await
+                .map_err(|e| BridgeError::Transport(io::Error::new(io::ErrorKind::Other, e)))?;
+        }
+        let response = rx.await.map_err(|_| BridgeError::Closed)?;
+        match response.error {
+            Some(err) => Err(BridgeError::Rpc { code: err.code, message: err.message }),
+            None => Ok(response.result.unwrap_or(serde_json::Value::Null)),
+        }
+    }
+}
+```
+
+This typed enum is what the SDK's `call_typed` (Task 13) maps to `BrokerError` cleanly.
 
 - [ ] **Step 2: Author `crates/sdk/src/lib.rs`**
 
@@ -737,7 +826,7 @@ pub struct BrokerBuilder {
     reconnect_max_attempts: u32,
     reconnect_max_backoff: Duration,
     reconnect_initial_backoff: Duration,
-    call_timeout: Duration,
+    call_timeout: Option<Duration>,                       // None = compute dynamically from reconnect knobs
     notification_buffer: usize,
 }
 
@@ -750,7 +839,7 @@ impl Default for BrokerBuilder {
             reconnect_max_attempts: 10,
             reconnect_max_backoff: Duration::from_secs(30),
             reconnect_initial_backoff: Duration::from_millis(100),
-            call_timeout: Duration::from_secs(60),
+            call_timeout: None,                           // resolved lazily; default = max_attempts × max_backoff
             notification_buffer: 100,
         }
     }
@@ -762,7 +851,16 @@ impl BrokerBuilder {
     pub fn socket_path(mut self, p: PathBuf) -> Self { self.socket_path = Some(p); self }
     pub fn reconnect_max_attempts(mut self, n: u32) -> Self { self.reconnect_max_attempts = n; self }
     pub fn reconnect_max_backoff(mut self, d: Duration) -> Self { self.reconnect_max_backoff = d; self }
-    pub fn call_timeout(mut self, d: Duration) -> Self { self.call_timeout = d; self }
+    pub fn call_timeout(mut self, d: Duration) -> Self { self.call_timeout = Some(d); self }
+
+    /// Returns the explicit call_timeout if set, otherwise reconnect_max_attempts × reconnect_max_backoff.
+    pub(crate) fn resolved_call_timeout(&self) -> Duration {
+        self.call_timeout.unwrap_or_else(|| {
+            self.reconnect_max_backoff
+                .checked_mul(self.reconnect_max_attempts)
+                .unwrap_or_else(|| Duration::from_secs(300))
+        })
+    }
 
     pub async fn open(self) -> Result<Broker, BrokerError> {
         // Resolve socket path — env > builder > default
@@ -861,9 +959,9 @@ Add `dirs = "5"` to `crates/sdk/Cargo.toml`.
 - [ ] **Step 4: Move MCP shim files**
 
 ```bash
-git mv src/shim/auto_start.rs crates/mcp/src/auto_start.rs
-git mv src/mcp/server.rs crates/mcp/src/server.rs
-git mv src/mcp/notifications.rs crates/mcp/src/notifications.rs
+git mv crates/_legacy/src/shim/auto_start.rs   crates/mcp/src/auto_start.rs
+git mv crates/_legacy/src/mcp/server.rs        crates/mcp/src/server.rs
+git mv crates/_legacy/src/mcp/notifications.rs crates/mcp/src/notifications.rs
 ```
 
 Update imports in each: bridge/transport now in `logmon_broker_sdk`; protocol types in `logmon_broker_protocol`.
@@ -955,15 +1053,15 @@ Add `which = "6"` to `crates/mcp/Cargo.toml`.
 
 In the spawn path, replace `Command::new(current_exe).arg("daemon")` with `Command::new(locate_broker_binary()?)` (no subcommand argument).
 
-- [ ] **Step 7: Delete legacy src/ and legacy package**
+- [ ] **Step 7: Delete legacy crate**
 
-Once everything compiles, remove the legacy crate:
+Once everything compiles and tests pass, remove the legacy crate entirely:
 
 ```bash
-git rm -r src/
+git rm -r crates/_legacy
 ```
 
-Remove any leftover legacy `[package]`/`[dependencies]` sections from root Cargo.toml (they should already be gone from Task 1). The root is now pure `[workspace]`.
+Update root `Cargo.toml` workspace `members` array — drop `"crates/_legacy"`. The workspace is now exactly the five new crates + xtask.
 
 - [ ] **Step 8: Build everything**
 
@@ -1562,6 +1660,421 @@ git commit -m "feat(xtask): verify-schema subcommand for schema-drift guard"
 
 ---
 
+### Task 9.5: Build test-support harness in `logmon-broker-core`
+
+This task is a prerequisite for every integration test in Phases 3, 4 (Tasks 10–17). It builds an in-process daemon harness that lets test code spin up a daemon on a tempdir socket, inject synthetic logs, kill/restart the daemon, and connect a low-level RPC client. ~250 LOC.
+
+**Files:**
+- Create: `crates/core/src/test_support.rs` (gated behind `test-support` feature)
+- Modify: `crates/core/src/lib.rs` — gate the module + re-export
+- Modify: `crates/core/Cargo.toml` — add `test-support` feature
+- Create: `crates/broker/src/lib.rs` (was binary-only; add a tiny lib so test_support can call into it)
+
+The harness reuses the broker daemon's existing entry point. The cleanest way is to expose a `pub async fn run_in_process(config, socket_path) -> Handle` from `crates/broker/src/lib.rs` that the daemon binary's main also uses internally. The harness spawns this on a tokio task per test.
+
+- [ ] **Step 1: Promote broker entry to a library function**
+
+Refactor `crates/broker/src/server.rs` so that `run_daemon(config)` accepts an optional explicit socket path:
+
+```rust
+// crates/broker/src/server.rs
+pub struct DaemonHandle {
+    pub socket_path: PathBuf,
+    pub config_dir: PathBuf,
+    pub log_inject: tokio::sync::mpsc::Sender<crate::core_reexport::LogEntry>,
+    pub shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
+    run_with_overrides(config, None).await
+}
+
+pub async fn run_with_overrides(
+    config: DaemonConfig,
+    socket_path_override: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    // existing logic, with socket path = override.unwrap_or_else(default)
+}
+```
+
+Add `crates/broker/src/lib.rs`:
+
+```rust
+pub mod server;
+pub mod process;
+pub use server::{run_daemon, run_with_overrides, DaemonHandle};
+```
+
+Update `crates/broker/Cargo.toml` to declare both lib and bin:
+
+```toml
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "logmon-broker"
+path = "src/main.rs"
+```
+
+- [ ] **Step 2: Author `crates/core/src/test_support.rs`**
+
+```rust
+//! In-process daemon harness for integration tests.
+//! Gated behind `test-support` feature.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tempfile::TempDir;
+use tokio::net::UnixStream;
+use tokio::io::{BufReader, AsyncWriteExt};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use serde_json::{json, Value};
+
+use logmon_broker_protocol::{
+    RpcRequest, RpcResponse, RpcNotification, DaemonMessage,
+    SessionStartParams, SessionStartResult, PROTOCOL_VERSION,
+    parse_daemon_message_from_str,
+};
+use crate::daemon::persistence::DaemonConfig;
+use crate::gelf::message::{LogEntry, Level};
+
+pub struct TestDaemonHandle {
+    pub socket_path: PathBuf,
+    pub tempdir: Arc<TempDir>,
+    pub config: DaemonConfig,
+    pub log_tx: mpsc::Sender<LogEntry>,
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+    accept_paused: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TestDaemonHandle {
+    /// Spawn an in-process daemon on a tempdir socket.
+    /// Test creates one of these per test.
+    pub async fn spawn() -> Self {
+        let tempdir = TempDir::new().unwrap();
+        let socket_path = tempdir.path().join("test.sock");
+        let config = DaemonConfig {
+            // Use port 0 to disable real GELF/OTLP receivers — test injects directly
+            gelf_port: 0,
+            gelf_udp_port: None,
+            gelf_tcp_port: None,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
+            buffer_size: 10_000,
+            span_buffer_size: 1_000,
+        };
+        let (log_tx, log_rx) = mpsc::channel(1024);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let accept_paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Spawn daemon
+        let socket_path_clone = socket_path.clone();
+        let config_clone = config.clone();
+        let log_rx_for_daemon = log_rx;
+        let accept_paused_clone = accept_paused.clone();
+        tokio::spawn(async move {
+            // Call into broker's run_with_overrides — the daemon binds the socket and
+            // accepts connections. log_rx feeds the daemon's pipeline directly,
+            // bypassing GELF receivers (which are disabled with port=0).
+            let _ = crate::run_in_process(
+                config_clone,
+                socket_path_clone,
+                log_rx_for_daemon,
+                shutdown_rx,
+                accept_paused_clone,
+            ).await;
+        });
+
+        // Wait briefly for the socket to appear
+        for _ in 0..50 {
+            if socket_path.exists() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(socket_path.exists(), "test daemon socket never appeared");
+
+        Self {
+            socket_path,
+            tempdir: Arc::new(tempdir),
+            config,
+            log_tx,
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            accept_paused,
+        }
+    }
+
+    pub async fn inject_log(&self, level: &str, message: &str) {
+        let entry = LogEntry::synthetic(level.parse().unwrap_or(Level::Info), message);
+        self.log_tx.send(entry).await.ok();
+    }
+
+    pub async fn pause_accept(&self) {
+        self.accept_paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub async fn resume_accept(&self) {
+        self.accept_paused.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Kill + restart the daemon, preserving `state.json`.
+    pub async fn restart(&mut self) {
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            tx.send(()).ok();
+        }
+        // Wait for socket to disappear
+        for _ in 0..50 {
+            if !self.socket_path.exists() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Re-spawn with same tempdir → state.json preserved
+        let new = Self::spawn_in_dir(self.tempdir.clone(), self.config.clone()).await;
+        self.shutdown_tx = new.shutdown_tx;
+        self.log_tx = new.log_tx;
+    }
+
+    pub async fn wipe_state_and_restart(&mut self) {
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            tx.send(()).ok();
+        }
+        let state_path = self.tempdir.path().join("state.json");
+        let _ = std::fs::remove_file(&state_path);
+        for _ in 0..50 {
+            if !self.socket_path.exists() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let new = Self::spawn_in_dir(self.tempdir.clone(), self.config.clone()).await;
+        self.shutdown_tx = new.shutdown_tx;
+        self.log_tx = new.log_tx;
+    }
+
+    async fn spawn_in_dir(tempdir: Arc<TempDir>, config: DaemonConfig) -> Self { /* same as spawn but reuses tempdir */ todo!() }
+
+    pub async fn connect_anon(&self) -> TestClient {
+        TestClient::connect(&self.socket_path, None, None).await
+    }
+
+    pub async fn connect_named(&self, name: &str, client_info: Option<Value>) -> TestClient {
+        TestClient::connect(&self.socket_path, Some(name.to_string()), client_info).await
+    }
+
+    pub async fn try_connect_named(&self, name: &str, client_info: Option<Value>) -> anyhow::Result<TestClient> {
+        TestClient::try_connect(&self.socket_path, Some(name.to_string()), client_info).await
+    }
+
+    pub async fn session_start(&self, name: Option<&str>, client_info: Option<Value>) -> anyhow::Result<SessionStartResult> {
+        TestClient::session_start_only(&self.socket_path, name.map(String::from), client_info).await
+    }
+}
+
+pub struct TestClient {
+    writer: tokio::io::WriteHalf<UnixStream>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
+    notification_rx: mpsc::UnboundedReceiver<RpcNotification>,
+    next_id: AtomicU64,
+}
+
+impl TestClient {
+    pub async fn connect(socket_path: &PathBuf, name: Option<String>, client_info: Option<Value>) -> Self {
+        Self::try_connect(socket_path, name, client_info).await.unwrap()
+    }
+
+    pub async fn try_connect(
+        socket_path: &PathBuf,
+        name: Option<String>,
+        client_info: Option<Value>,
+    ) -> anyhow::Result<Self> {
+        let stream = UnixStream::connect(socket_path).await?;
+        let (reader, mut writer) = tokio::io::split(stream);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let (notif_tx, notif_rx) = mpsc::unbounded_channel();
+
+        // Spawn reader task
+        let pending_for_reader = pending.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(reader);
+            loop {
+                use crate::rpc::transport::read_daemon_message;  // exported by core via re-export, see Step 3
+                match read_daemon_message(&mut reader).await {
+                    Ok(Some(DaemonMessage::Response(resp))) => {
+                        if let Some(tx) = pending_for_reader.lock().await.remove(&resp.id) {
+                            let _ = tx.send(resp);
+                        }
+                    }
+                    Ok(Some(DaemonMessage::Notification(notif))) => {
+                        let _ = notif_tx.send(notif);
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        });
+
+        // Send session.start
+        let req = RpcRequest::new(0, "session.start", serde_json::to_value(SessionStartParams {
+            name,
+            protocol_version: PROTOCOL_VERSION,
+            client_info,
+        })?);
+        let json = serde_json::to_string(&req)?;
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        // Read first response (the handshake)
+        // Implementation note: the reader task already runs; but session.start must complete
+        // before further calls. Pre-register pending entry id=0 before sending.
+
+        Ok(Self {
+            writer,
+            pending,
+            notification_rx: notif_rx,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    pub async fn session_start_only(
+        socket_path: &PathBuf,
+        name: Option<String>,
+        client_info: Option<Value>,
+    ) -> anyhow::Result<SessionStartResult> {
+        let client = Self::try_connect(socket_path, name, client_info).await?;
+        // First response was the session.start result; capture it via a direct flow.
+        // Pragmatic: refactor try_connect to return (Self, SessionStartResult).
+        todo!("refactor try_connect to expose handshake result")
+    }
+
+    pub async fn call<R: serde::de::DeserializeOwned>(&mut self, method: &str, params: Value) -> anyhow::Result<R> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let req = RpcRequest::new(id, method, params);
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, tx);
+        let json = serde_json::to_string(&req)?;
+        self.writer.write_all(json.as_bytes()).await?;
+        self.writer.write_all(b"\n").await?;
+        self.writer.flush().await?;
+        let response = rx.await?;
+        match response.error {
+            Some(err) => anyhow::bail!("rpc error {}: {}", err.code, err.message),
+            None => Ok(serde_json::from_value(response.result.unwrap_or(Value::Null))?),
+        }
+    }
+
+    pub async fn expect_trigger_fired(&mut self, trigger_id: u32) -> RpcNotification {
+        let timeout = Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.notification_rx.recv()).await {
+                Ok(Some(notif)) if notif.method.contains("trigger_fired") => {
+                    if notif.params.get("trigger_id").and_then(|v| v.as_u64()) == Some(trigger_id as u64) {
+                        return notif;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                _ => panic!("did not receive trigger_fired for id {trigger_id} within {timeout:?}"),
+            }
+        }
+    }
+
+    pub async fn try_recv_notification(&mut self, timeout: Duration) -> Option<RpcNotification> {
+        tokio::time::timeout(timeout, self.notification_rx.recv()).await.ok().flatten()
+    }
+}
+
+/// Helper used by Phase 4 SDK integration tests — same as TestDaemonHandle but
+/// returned from a function the SDK crate can import.
+pub async fn spawn_test_daemon() -> TestDaemonHandle {
+    TestDaemonHandle::spawn().await
+}
+
+pub async fn spawn_test_daemon_for_sdk() -> TestDaemonHandle {
+    TestDaemonHandle::spawn().await
+}
+```
+
+The two `todo!()` placeholders (`spawn_in_dir`, `session_start_only`) are pragmatic stubs the engineer fills in by composing the existing `spawn()` + `try_connect()` logic — see comments inline.
+
+- [ ] **Step 3: Add `run_in_process` entry to broker crate**
+
+```rust
+// crates/broker/src/lib.rs
+pub mod server;
+pub mod process;
+pub use server::{run_daemon, run_with_overrides};
+
+/// Test-support entry: run the daemon on a caller-provided socket path,
+/// with a custom log_rx (bypasses GELF/OTLP receivers when those ports are 0).
+#[cfg(feature = "test-support")]
+pub async fn run_in_process(
+    config: logmon_broker_core::daemon::persistence::DaemonConfig,
+    socket_path: std::path::PathBuf,
+    log_rx: tokio::sync::mpsc::Receiver<logmon_broker_core::gelf::message::LogEntry>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    accept_paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    server::run_with_test_harness(config, socket_path, log_rx, shutdown_rx, accept_paused).await
+}
+```
+
+Add the `test-support` feature to `crates/broker/Cargo.toml`:
+
+```toml
+[features]
+test-support = []
+```
+
+And to the core feature in `crates/core/Cargo.toml`:
+
+```toml
+[features]
+test-support = ["dep:tempfile"]
+```
+
+(Add `tempfile` to `[dependencies]` as optional.)
+
+- [ ] **Step 4: Verify harness compiles**
+
+```
+cargo build -p logmon-broker-core --features test-support
+cargo build -p logmon-broker --features test-support
+```
+
+Expected: clean.
+
+- [ ] **Step 5: Smoke test — spawn daemon, do a trivial query**
+
+Add a smoke test at `crates/core/tests/harness_smoke.rs`:
+
+```rust
+#[tokio::test]
+#[cfg(feature = "test-support")]
+async fn harness_starts_and_status_responds() {
+    use logmon_broker_core::test_support::*;
+    use logmon_broker_protocol::StatusGetResult;
+    use serde_json::json;
+
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let _result: StatusGetResult = client.call("status.get", json!({})).await.unwrap();
+}
+```
+
+```
+cargo test -p logmon-broker-core --features test-support --test harness_smoke
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "feat(core): test-support harness — in-process daemon, GELF injection, RPC test client"
+```
+
+---
+
 ## Phase 3 — Three additive extensions
 
 ### Task 10: Add `oneshot` to `triggers.add`
@@ -1637,75 +2150,7 @@ async fn non_oneshot_trigger_persists() {
 
 The `spawn_test_daemon` helper, `connect_anon`, `inject_log`, `expect_trigger_fired`, `try_recv_notification` belong in a new test-support module — `crates/core/src/test_support.rs` (gated `#[cfg(any(test, feature = "test-support"))]`). Skeleton in Step 2.
 
-- [ ] **Step 2: Add test_support module**
-
-Create `crates/core/src/test_support.rs`:
-
-```rust
-//! In-process daemon harness for integration tests.
-
-use std::path::PathBuf;
-use std::sync::Arc;
-use tempfile::TempDir;
-use tokio::net::UnixStream;
-use tokio::io::{BufReader, AsyncBufReadExt, AsyncWriteExt};
-use serde_json::{json, Value};
-use logmon_broker_protocol::{RpcRequest, RpcResponse, RpcNotification, DaemonMessage, parse_daemon_message_from_str};
-
-pub struct TestDaemonHandle {
-    pub socket_path: PathBuf,
-    pub _tempdir: TempDir,
-    pub log_inject: tokio::sync::mpsc::Sender<crate::gelf::message::LogEntry>,
-}
-
-impl TestDaemonHandle {
-    pub async fn inject_log(&self, level: &str, message: &str) { /* push synthetic LogEntry */ }
-    pub async fn connect_anon(&self) -> TestClient { /* ... */ }
-}
-
-pub struct TestClient {
-    /* writer, reader task, pending map, etc. */
-}
-
-impl TestClient {
-    pub async fn call<R: serde::de::DeserializeOwned>(&mut self, method: &str, params: Value) -> anyhow::Result<R> { /* ... */ }
-    pub async fn expect_trigger_fired(&mut self, trigger_id: u32) -> RpcNotification { /* ... */ }
-    pub async fn try_recv_notification(&mut self, timeout: std::time::Duration) -> Option<RpcNotification> { /* ... */ }
-}
-
-pub async fn spawn_test_daemon() -> TestDaemonHandle {
-    let tempdir = TempDir::new().unwrap();
-    let socket_path = tempdir.path().join("test.sock");
-    // Spawn an in-process daemon on socket_path with synthetic GELF/log injection
-    // (Use the same plumbing as crates/broker but with overrides for paths/ports)
-    todo!("flesh out — invoke crates/broker's run_daemon with overridden config")
-}
-```
-
-Implement the harness sufficient for the tests above. The daemon's accept loop and RPC handler are in `logmon-broker-core` already (after Task 4 moved server.rs to broker, the accept loop is in broker — re-export the inner `handle_connection` function from broker as a library function or move it back to core). Pragmatic choice: expose a `pub async fn run_in_process(config, socket_path) -> ...` from `logmon-broker-core` that broker also uses.
-
-Adjust `crates/core/src/lib.rs` to export this entry point:
-
-```rust
-pub fn run_in_process_args() -> /* … */ { /* … */ }
-
-#[cfg(feature = "test-support")]
-pub mod test_support;
-```
-
-Add `[features]` section to `crates/core/Cargo.toml`:
-
-```toml
-[features]
-test-support = ["dep:tempfile"]
-```
-
-And to dev-dependencies in core:
-```toml
-tempfile.workspace = true
-```
-
-- [ ] **Step 3: Run failing test**
+- [ ] **Step 2: Run failing test**
 
 ```
 cargo test -p logmon-broker-core --features test-support --test oneshot_triggers
@@ -1713,7 +2158,7 @@ cargo test -p logmon-broker-core --features test-support --test oneshot_triggers
 
 Expected: FAIL — `oneshot` field handling not implemented in pipeline.
 
-- [ ] **Step 4: Implement oneshot in trigger machinery**
+- [ ] **Step 3: Implement oneshot in trigger machinery**
 
 Modify `crates/core/src/engine/trigger.rs` — add `oneshot: bool` to `TriggerSpec` and `TriggerInfo`:
 
@@ -1754,7 +2199,7 @@ Modify `handle_triggers_list` to include `oneshot` in result.
 
 Modify `crates/core/src/daemon/persistence.rs::PersistedTrigger` to add `#[serde(default)] oneshot: bool` (existing state.json files load with `false` default).
 
-- [ ] **Step 5: Run test, expect pass**
+- [ ] **Step 4: Run test, expect pass**
 
 ```
 cargo test -p logmon-broker-core --features test-support --test oneshot_triggers
@@ -1762,7 +2207,7 @@ cargo test -p logmon-broker-core --features test-support --test oneshot_triggers
 
 Expected: PASS — both `oneshot_trigger_removes_after_first_match` and `non_oneshot_trigger_persists`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -2344,7 +2789,7 @@ git commit -m "feat(sdk): typed Notification enum (TriggerFired with full payloa
 
 ```rust
 // crates/sdk/tests/filter_builder.rs
-use logmon_broker_sdk::{Filter, Level, SpanStatus, SpanKind};
+use logmon_broker_sdk::{Filter, Level, FilterSpanStatus, FilterSpanKind};
 
 #[test]
 fn level_at_least() {
@@ -2356,7 +2801,7 @@ fn level_at_least() {
 fn multiple_qualifiers_comma_joined() {
     let f = Filter::builder()
         .level_at_least(Level::Error)
-        .field_eq_in_message("started", false)
+        .message("started")
         .build();
     assert!(f.contains("l>=ERROR"));
     assert!(f.contains("m=started"));
@@ -2382,7 +2827,7 @@ fn additional_field_substring() {
 #[test]
 fn span_status_typed_enum() {
     let f = Filter::builder()
-        .span_status(SpanStatus::Error)
+        .span_status(FilterSpanStatus::Error)
         .build();
     assert_eq!(f, "st=error");
 }
@@ -2439,7 +2884,7 @@ async fn builder_strings_parse_in_broker() {
 cargo test -p logmon-broker-sdk --test filter_builder
 ```
 
-Expected: FAIL — `Filter`, `Level`, `SpanStatus`, `SpanKind` not defined.
+Expected: FAIL — `Filter`, `Level`, `FilterSpanStatus`, `FilterSpanKind` not defined.
 
 - [ ] **Step 3: Author filter.rs**
 
@@ -2466,24 +2911,28 @@ impl Level {
     }
 }
 
+// Filter-builder enums — distinct from `logmon_broker_protocol::SpanStatus`
+// (which carries a String payload on Error). Filters operate on the *category*,
+// so the SDK uses payload-free enums named with the `Filter` prefix to avoid
+// import shadowing across the protocol crate.
 #[derive(Debug, Clone, Copy)]
-pub enum SpanStatus { Ok, Error, Unset }
-impl SpanStatus {
+pub enum FilterSpanStatus { Ok, Error, Unset }
+impl FilterSpanStatus {
     fn as_str(self) -> &'static str {
-        match self { SpanStatus::Ok => "ok", SpanStatus::Error => "error", SpanStatus::Unset => "unset" }
+        match self { FilterSpanStatus::Ok => "ok", FilterSpanStatus::Error => "error", FilterSpanStatus::Unset => "unset" }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum SpanKind { Server, Client, Producer, Consumer, Internal }
-impl SpanKind {
+pub enum FilterSpanKind { Server, Client, Producer, Consumer, Internal }
+impl FilterSpanKind {
     fn as_str(self) -> &'static str {
         match self {
-            SpanKind::Server   => "server",
-            SpanKind::Client   => "client",
-            SpanKind::Producer => "producer",
-            SpanKind::Consumer => "consumer",
-            SpanKind::Internal => "internal",
+            FilterSpanKind::Server   => "server",
+            FilterSpanKind::Client   => "client",
+            FilterSpanKind::Producer => "producer",
+            FilterSpanKind::Consumer => "consumer",
+            FilterSpanKind::Internal => "internal",
         }
     }
 }
@@ -2558,8 +3007,8 @@ impl FilterBuilder {
     pub fn span_name_regex(mut self, r: &str, ci: bool) -> Self { self.qualifiers.push(format!("sn={}", regex_lit(r, ci))); self }
     pub fn service(mut self, sub: &str) -> Self        { self.qualifiers.push(format!("sv={}", esc(sub))); self }
     pub fn service_regex(mut self, r: &str, ci: bool) -> Self { self.qualifiers.push(format!("sv={}", regex_lit(r, ci))); self }
-    pub fn span_status(mut self, s: SpanStatus) -> Self { self.qualifiers.push(format!("st={}", s.as_str())); self }
-    pub fn span_kind(mut self, k: SpanKind) -> Self    { self.qualifiers.push(format!("sk={}", k.as_str())); self }
+    pub fn span_status(mut self, s: FilterSpanStatus) -> Self { self.qualifiers.push(format!("st={}", s.as_str())); self }
+    pub fn span_kind(mut self, k: FilterSpanKind) -> Self     { self.qualifiers.push(format!("sk={}", k.as_str())); self }
     pub fn duration_at_least_ms(mut self, ms: u32) -> Self { self.qualifiers.push(format!("d>={}", ms)); self }
     pub fn duration_at_most_ms(mut self, ms: u32) -> Self  { self.qualifiers.push(format!("d<={}", ms)); self }
 
@@ -2581,10 +3030,10 @@ Re-export from `crates/sdk/src/lib.rs`:
 
 ```rust
 pub mod filter;
-pub use filter::{Filter, FilterBuilder, Level, SpanStatus, SpanKind};
+pub use filter::{Filter, FilterBuilder, Level, FilterSpanStatus, FilterSpanKind};
 ```
 
-I omitted one helper used in tests — let me sync: `field_eq_in_message` was placeholder. Use `.message(...)` instead. Update test accordingly.
+The filter enums are deliberately NOT named `SpanStatus`/`SpanKind` — those names are taken by `logmon_broker_protocol` for payload types, and importing both would force ugly disambiguation at every call site.
 
 - [ ] **Step 4: Run test, expect pass**
 
@@ -2598,7 +3047,7 @@ Expected: ALL PASS, including `builder_strings_parse_in_broker` integration test
 
 ```bash
 git add -A
-git commit -m "feat(sdk): typed filter builder — methods per selector, typed Level/SpanStatus/SpanKind enums"
+git commit -m "feat(sdk): typed filter builder — methods per selector, typed Level/FilterSpanStatus/FilterSpanKind enums"
 ```
 
 ---
@@ -3839,6 +4288,7 @@ Spec sections → tasks:
 |---|---|
 | Workspace and crate layout | 1, 2, 3, 4, 5 |
 | Source-tree mapping | 1–5 |
+| Test-support harness (prerequisite for integration tests) | 9.5 |
 | Method inventory frozen | 7 (typed structs); no behavior change |
 | `triggers.add` `oneshot` | 10 |
 | `session.start` `client_info` | 11 |
