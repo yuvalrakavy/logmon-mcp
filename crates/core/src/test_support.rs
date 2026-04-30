@@ -145,8 +145,10 @@ impl TestDaemonHandle {
         let _ = self.log_tx.send(entry).await;
     }
 
-    /// Pause the accept loop. New `connect_*` calls will block at the
-    /// kernel level until [`Self::resume_accept`] is called.
+    /// Pause the accept loop. While paused, the daemon skips the `accept()`
+    /// call and yields for 50 ms per tick; the listener stays bound, so new
+    /// `connect_*` calls queue in the kernel backlog and complete once
+    /// [`Self::resume_accept`] is called.
     pub async fn pause_accept(&self) {
         self.accept_paused.store(true, Ordering::SeqCst);
     }
@@ -158,12 +160,26 @@ impl TestDaemonHandle {
 
     /// Shut down the daemon and wait for its task to finish. Subsequent
     /// methods that rely on a running daemon will fail.
+    ///
+    /// The await on the daemon's `JoinHandle` is bounded by a 5 s timeout. If
+    /// the task hasn't resolved by then we abort it and proceed — a hung
+    /// shutdown must not deadlock the test runner. A `tracing::warn!` fires on
+    /// abort so flaky-test triage has a signal.
     pub async fn shutdown(&self) {
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(());
         }
         if let Some(handle) = self.join_handle.lock().await.take() {
-            let _ = handle.await;
+            let abort_handle = handle.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "test daemon did not shut down within 5s; aborting task"
+                );
+                abort_handle.abort();
+            }
         }
         // Wait for the socket to disappear (best-effort).
         for _ in 0..SOCKET_WAIT_TICKS {
@@ -405,6 +421,10 @@ impl TestClient {
 
     /// Call a method, await the response, and deserialize the result into
     /// `R`. Returns `Err` if the daemon returned a JSON-RPC error.
+    ///
+    /// On any error between inserting the pending entry and receiving the
+    /// response, the entry is removed from the `pending` map so it doesn't
+    /// leak across the connection's lifetime.
     pub async fn call<R: serde::de::DeserializeOwned>(
         &mut self,
         method: &str,
@@ -414,16 +434,30 @@ impl TestClient {
         let req = RpcRequest::new(id, method, params);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        let json = serde_json::to_string(&req)?;
-        self.writer.write_all(json.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
-        let response = rx.await?;
-        match response.error {
-            Some(err) => anyhow::bail!("rpc error {}: {}", err.code, err.message),
-            None => Ok(serde_json::from_value(
-                response.result.unwrap_or(Value::Null),
-            )?),
+
+        let result: anyhow::Result<RpcResponse> = async {
+            let json = serde_json::to_string(&req)?;
+            self.writer.write_all(json.as_bytes()).await?;
+            self.writer.write_all(b"\n").await?;
+            self.writer.flush().await?;
+            rx.await
+                .map_err(|e| anyhow::anyhow!("response channel closed: {e}"))
+        }
+        .await;
+
+        match result {
+            Ok(response) => match response.error {
+                Some(err) => {
+                    anyhow::bail!("rpc error {}: {}", err.code, err.message)
+                }
+                None => Ok(serde_json::from_value(
+                    response.result.unwrap_or(Value::Null),
+                )?),
+            },
+            Err(e) => {
+                self.pending.lock().await.remove(&id);
+                Err(e)
+            }
         }
     }
 
@@ -449,8 +483,11 @@ impl TestClient {
                     }
                 }
                 Ok(Some(_)) => continue,
-                _ => panic!(
-                    "did not receive trigger.fired for id {trigger_id} within {timeout:?}"
+                Ok(None) => panic!(
+                    "notification channel closed before trigger.fired for id {trigger_id} (daemon disconnected?)"
+                ),
+                Err(_) => panic!(
+                    "timeout waiting for trigger.fired for id {trigger_id} (waited {timeout:?})"
                 ),
             }
         }
