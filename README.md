@@ -6,21 +6,28 @@ Works with any MCP-compatible client: Claude Code, Cursor, Windsurf, VS Code (Co
 
 ## Architecture
 
+logmon is a **broker** for structured logs and OTLP traces. A long-lived daemon ingests via GELF (UDP+TCP) and OTLP (gRPC+HTTP), and serves multiple clients over a Unix domain socket using JSON-RPC 2.0.
+
 ```
-Application(s)                AI Coding Sessions
-     |                          |           |
-  GELF UDP/TCP              Shim (MCP)   Shim (MCP)
-     |                          |           |
-     v                          v           v
-  +------------------------------------------+
-  |              logmon daemon               |
-  |  GELF Receivers -> Log Processor -> Store|
-  |  Per-session: triggers, filters, notifs  |
-  +------------------------------------------+
+Application(s)        AI Sessions / Test Harnesses / Other Clients
+     |                        |          |          |
+  GELF UDP/TCP           logmon-mcp   logmon-mcp   SDK consumer
+  OTLP gRPC/HTTP             |          |          |
+     |                       v          v          v
+     v                ┌───────────────────────────────┐
+                      │       logmon-broker           │
+                      │   (long-lived daemon, UDS)    │
+                      │  Receivers → Pipeline → Store │
+                      │  Per-session triggers/filters │
+                      └───────────────────────────────┘
 ```
 
-- **Daemon**: Long-running process that collects logs, evaluates per-session triggers/filters, stores entries in a ring buffer, and serves RPC requests over a Unix socket.
-- **Shim**: Thin MCP bridge that auto-starts the daemon and translates MCP tool calls to daemon RPC. One shim per AI session, all connected to the same daemon.
+**Binaries:**
+
+- `logmon-broker` — the daemon. Run as a system service (launchd / systemd) for always-on availability.
+- `logmon-mcp` — MCP shim. Exposes broker tools to Claude Code / Cursor / etc. Auto-starts the broker if no service is installed.
+
+**Other clients:** anything depending on the public `logmon-broker-sdk` Rust crate, or speaking JSON-RPC against the documented protocol (`crates/protocol/protocol-v1.schema.json`).
 
 ## Prerequisites
 
@@ -37,33 +44,47 @@ cd logmon-mcp
 cargo build --release
 ```
 
-The binary is at `target/release/logmon-mcp-server`. You can copy it to a directory on your PATH:
+The binaries are at `target/release/logmon-broker` and `target/release/logmon-mcp`. You can copy them to a directory on your PATH:
 
 ```bash
-cp target/release/logmon-mcp-server ~/.local/bin/
+cp target/release/logmon-broker target/release/logmon-mcp ~/.local/bin/
 ```
+
+Or install via cargo:
+
+```bash
+cargo install --path crates/broker --path crates/mcp
+```
+
+### Run the broker as a system service (recommended)
+
+```bash
+logmon-broker install-service --scope user
+```
+
+Boots the broker via launchd (macOS) or systemd (Linux). Starts at login, restarts on crash. To uninstall: `logmon-broker uninstall-service --scope user`.
 
 ### Configure your AI coding assistant
 
-The daemon starts automatically when the first MCP client connects. No manual setup needed.
+If a system service is installed, the broker is already running. Otherwise the MCP shim auto-starts it on the first client connection. No manual setup needed.
 
 #### Claude Code
 
 ```bash
 # Register globally (available in all projects)
-claude mcp add logmon --scope user -- logmon-mcp-server
+claude mcp add logmon --scope user -- logmon-mcp
 
 # Or with a named session (persists triggers/filters across reconnects)
-claude mcp add logmon --scope user -- logmon-mcp-server --session my-session
+claude mcp add logmon --scope user -- logmon-mcp --session my-session
 
 # Or register for current project only
-claude mcp add logmon -- logmon-mcp-server
+claude mcp add logmon -- logmon-mcp
 ```
 
 If the binary is not on your PATH, use the full path:
 
 ```bash
-claude mcp add logmon --scope user -- /path/to/logmon-mcp-server
+claude mcp add logmon --scope user -- /path/to/logmon-mcp
 ```
 
 #### Cursor
@@ -74,7 +95,7 @@ Add to your Cursor MCP settings (`.cursor/mcp.json` in your project or `~/.curso
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -87,7 +108,7 @@ For a named session:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": ["--session", "my-session"]
     }
   }
@@ -102,7 +123,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -118,7 +139,7 @@ Add to your VS Code `settings.json`:
   "mcp": {
     "servers": {
       "logmon": {
-        "command": "logmon-mcp-server",
+        "command": "logmon-mcp",
         "args": []
       }
     }
@@ -132,7 +153,7 @@ Or add to `.vscode/mcp.json` in your project:
 {
   "servers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -147,7 +168,7 @@ Add to `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -162,7 +183,7 @@ Add to `~/.codex/config.json`:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -171,7 +192,7 @@ Add to `~/.codex/config.json`:
 
 #### Any MCP-compatible client
 
-logmon-mcp uses the standard MCP stdio transport. Configure your client to run `logmon-mcp-server` as a stdio MCP server. Optional argument: `--session <name>` for persistent sessions.
+logmon-mcp uses the standard MCP stdio transport. Configure your client to run `logmon-mcp` as a stdio MCP server. Optional argument: `--session <name>` for persistent sessions.
 
 ## Usage
 
@@ -279,12 +300,22 @@ Config files are stored in `~/.config/logmon/`:
 ### CLI
 
 ```bash
-# Shim mode (default, used by MCP clients)
-logmon-mcp-server [--session <name>]
+# MCP shim — used by MCP clients
+logmon-mcp [--session <name>]
 
-# Daemon mode (usually auto-started by the shim)
-logmon-mcp-server daemon [--gelf-port 12201] [--buffer-size 10000]
+# Broker daemon — usually run as a service, but you can run it directly
+logmon-broker [--gelf-port 12201] [--buffer-size 10000]
+
+# Broker subcommands
+logmon-broker status                    # query daemon status
+logmon-broker install-service [--scope user|system]
+logmon-broker uninstall-service [--scope user|system]
 ```
+
+### Environment variable overrides
+
+- `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (defeats PATH lookup).
+- `LOGMON_BROKER_SOCKET` — explicit broker socket path (used by tests; defaults to `~/.config/logmon/logmon.sock`).
 
 ## Testing
 
@@ -296,6 +327,12 @@ cargo test
 ./test-gelf.sh              # TCP (default)
 ./test-gelf.sh 12201 udp    # UDP
 ```
+
+## Embedding via SDK
+
+For non-MCP consumers (test harnesses, archival workers, dashboards), use the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). It speaks JSON-RPC 2.0 against the broker's UDS, returns typed `Result<R, BrokerError>` for every method, supports named-session reconnection across daemon restarts, and emits typed `Notification` events (TriggerFired, Reconnected) on a broadcast channel.
+
+The first SDK consumer outside this repo is `store-test` — see [`docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md`](docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md) for the integration brief.
 
 ## Manual smoke tests
 
