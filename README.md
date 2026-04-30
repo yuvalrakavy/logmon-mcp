@@ -297,6 +297,94 @@ cargo test
 ./test-gelf.sh 12201 udp    # UDP
 ```
 
+## Manual smoke tests
+
+These are not run in CI; verify locally before tagging a release. Each
+section is independent — run only what's relevant to your platform.
+
+### Build + binaries
+
+```bash
+cargo build --workspace
+ls -lh target/debug/logmon-broker target/debug/logmon-mcp
+```
+
+Expected: both binaries exist; no warnings.
+
+### Auto-start path (shim spawns broker)
+
+```bash
+target/debug/logmon-mcp --session smoke <<'EOF'
+EOF
+```
+
+Expected: shim exits cleanly; `daemon.pid` and `logmon.sock` created in
+`~/.config/logmon/`.
+
+### Status subcommand
+
+```bash
+target/debug/logmon-broker status
+```
+
+Expected:
+- with no daemon running: prints `not running` and exits 1.
+- with a daemon running: prints `running pid=<N> socket=<path>` and exits 0.
+
+### Stale-pid recovery
+
+```bash
+target/debug/logmon-broker &
+PID1=$!
+sleep 1
+kill -9 $PID1                  # leave stale pid + socket
+target/debug/logmon-broker &
+PID2=$!
+sleep 1
+kill -TERM $PID2
+wait
+```
+
+Expected: second start succeeds; `daemon.log` shows
+"removing stale pid file from previous run"; clean exit on SIGTERM.
+
+### Graceful shutdown via SIGTERM and SIGINT
+
+```bash
+target/debug/logmon-broker &
+sleep 1
+kill -TERM $!                  # try -INT too in a separate run
+wait
+```
+
+Expected: broker exits 0; `logmon.sock` and `daemon.pid` removed;
+`daemon.log` records "received SIGTERM" (or "SIGINT").
+
+### System service install (macOS)
+
+```bash
+target/debug/logmon-broker install-service --scope user
+launchctl print gui/$(id -u)/logmon.broker | head -5
+target/debug/logmon-broker status
+target/debug/logmon-broker uninstall-service --scope user
+```
+
+Expected: install succeeds → launchctl shows the agent → status
+reports running → uninstall removes the plist.
+
+### System service install (Linux)
+
+```bash
+target/debug/logmon-broker install-service --scope user
+systemctl --user status logmon-broker
+target/debug/logmon-broker status
+target/debug/logmon-broker uninstall-service --scope user
+```
+
+Expected: install succeeds → `systemctl status` shows
+"active (running)" within 2 s of start (Type=notify) → status reports
+running → uninstall removes the unit.
+
 ## License
 
 MIT
