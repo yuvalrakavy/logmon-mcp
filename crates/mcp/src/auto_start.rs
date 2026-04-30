@@ -27,8 +27,13 @@ fn locate_broker_binary() -> anyhow::Result<PathBuf> {
         }
     }
     anyhow::bail!(
-        "logmon-broker not found; install via 'cargo install --path crates/broker', \
-         set LOGMON_BROKER_BIN, or run 'logmon-broker install-service'"
+        "logmon-broker not found. Tried: \
+         (1) LOGMON_BROKER_BIN env var, \
+         (2) `which logmon-broker` (any directory on $PATH), \
+         (3) sibling of current executable. \
+         Install via 'cargo install --path crates/broker', \
+         set LOGMON_BROKER_BIN to an absolute path, \
+         or run 'logmon-broker install-service' to register it as a system service."
     )
 }
 
