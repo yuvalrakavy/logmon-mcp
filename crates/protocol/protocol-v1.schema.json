@@ -2501,6 +2501,14 @@
           "items": {
             "type": "string"
           }
+        },
+        "capabilities": {
+          "description": "Capability strings advertised by the daemon. Lets SDKs feature-gate\nwithout sniffing protocol versions. Always serialized (no\n`skip_serializing_if`) so callers can rely on the field being present.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [

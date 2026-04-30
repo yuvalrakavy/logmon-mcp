@@ -68,6 +68,7 @@ fn test_session_start_result_roundtrip() {
         daemon_uptime_secs: 100,
         buffer_size: 500,
         receivers: vec!["gelf (UDP:12201, TCP:12201)".to_string()],
+        capabilities: vec!["bookmarks".to_string()],
     };
     let json = serde_json::to_string(&result).unwrap();
     let parsed: SessionStartResult = serde_json::from_str(&json).unwrap();

@@ -83,6 +83,11 @@ pub struct SessionStartResult {
     pub daemon_uptime_secs: u64,
     pub buffer_size: usize,
     pub receivers: Vec<String>,
+    /// Capability strings advertised by the daemon. Lets SDKs feature-gate
+    /// without sniffing protocol versions. Always serialized (no
+    /// `skip_serializing_if`) so callers can rely on the field being present.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 impl RpcRequest {

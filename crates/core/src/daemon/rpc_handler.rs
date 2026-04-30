@@ -81,6 +81,11 @@ impl RpcHandler {
             daemon_uptime_secs: self.start_time.elapsed().as_secs(),
             buffer_size: self.pipeline.store_len(),
             receivers: self.receivers_info.clone(),
+            capabilities: vec![
+                "bookmarks".into(),
+                "oneshot_triggers".into(),
+                "client_info".into(),
+            ],
         }
     }
 
