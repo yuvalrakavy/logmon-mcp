@@ -95,15 +95,33 @@ status.get
 
 The single notification kind is `notifications/trigger_fired`. Notifications have always been server-pushed via the JSON-RPC notification envelope (no `id` field).
 
+`trigger_fired` payload shape (frozen as v1):
+
+```
+{
+  trigger_id:      u32,
+  description:     string | null,
+  filter_string:   string,
+  pre_window:      u32,
+  post_window:     u32,
+  notify_context:  u32,
+  oneshot:         bool,           // new in v1; mirrors the request param
+  matched_entry:   LogEntry,
+  context_before:  LogEntry[]      // size ≤ notify_context
+}
+```
+
 ### Three additive extensions
 
 All backward-compatible at the wire level — old request shapes still parse, new fields default to empty/false.
 
 #### 1. `triggers.add` gains `oneshot: bool`
 
-Optional, default `false`. When `true`, the daemon removes the trigger immediately after the first `trigger.fired` notification is enqueued for the owning session.
+Optional, default `false`. When `true`, the daemon removes the trigger immediately after the first `trigger_fired` notification is enqueued for the owning session.
 
-`triggers.list` results carry the `oneshot` flag.
+`triggers.list` results carry the `oneshot` flag. The `trigger_fired` notification payload also carries it (for diagnostics — the client knows which triggers are oneshot without having to look them up).
+
+The trigger removal is persisted to `state.json` before any subsequent shutdown, so daemon restart does not resurrect a fired oneshot trigger. The notification queue itself is in-memory; if the daemon restarts after the trigger fires but before the client receives the notification, the notification is lost — consistent with existing queueing behavior.
 
 State persisted into `state.json` for named sessions.
 
@@ -184,7 +202,7 @@ Same defaults as today, same `~/.config/logmon/config.json` fallback.
 1. **Start.** Bind sockets and receivers; restore named-session triggers/filters from `state.json`; write `daemon.pid`; emit `OTEL:ONLINE` UDP beacon; send systemd `READY=1` via `sd-notify` (no-op when not under systemd); begin accepting connections. The `READY=1` only fires after every receiver is bound, so dependents using `Type=notify` see the broker as ready exactly when it actually is.
 2. **Run.** Existing accept loop and RPC dispatch.
 3. **Shutdown.** SIGTERM and SIGINT both trigger graceful shutdown: emit `OTEL:OFFLINE`, drain in-flight RPCs, persist `state.json`, remove socket file + pid file, exit 0.
-4. **Crash recovery.** PID file may remain. Next start checks for stale PID via `kill -0` and self-cleans; same logic as today's shim auto-start, lifted into the broker's own startup path.
+4. **Crash recovery.** PID file may remain. Next start performs a platform-specific liveness check on the existing PID (`kill -0` on Unix, `tasklist` on Windows) and self-cleans if stale; same logic as today's shim auto-start, lifted into the broker's own startup path.
 
 ### `logmon-mcp`
 
@@ -264,7 +282,11 @@ WantedBy=default.target
 
 ### Log routing under a service manager
 
-The daemon's tracing-appender continues to write `~/.config/logmon/daemon.log` regardless of how it was started. Under `--system` install on macOS, `~` resolves to root's home — known wart of `--system`, documented but not fixed in v1. Most users want `--user`.
+The daemon's tracing-appender continues to write `~/.config/logmon/daemon.log` regardless of how it was started.
+
+### `--system` on macOS: known limitation
+
+Under `--system`, `~` resolves to the broker's running-user's home. macOS launchd `LaunchDaemons` always run as root by default, putting state and socket under `/var/root/.config/logmon/`, where user-context shims cannot reach. **v1 recommends `--user` on macOS; `--system` on macOS is documented but not supported.** Linux `systemd --system` works correctly because the unit can specify `User=`. Fixing macOS `--system` (e.g., by configuring `UserName` in the plist or by routing the socket to a known shared location like `/var/run/logmon.sock`) is deferred.
 
 ## SDK shape (`logmon-broker-sdk`)
 
@@ -339,7 +361,7 @@ let mut sub = broker.subscribe_notifications();
 while let Ok(notif) = sub.recv().await {
     match notif {
         Notification::TriggerFired(m) => { /* ... */ }
-        Notification::Reconnected { is_new } => { /* SDK-internal — see §Reconnection */ }
+        Notification::Reconnected      => { /* SDK-internal — see §Reconnection */ }
         // unknown variants ignored
     }
 }
@@ -386,11 +408,26 @@ Dropping the `Broker` closes the connection. Anonymous sessions disappear server
 
 - Detect disconnect (read returns EOF or transport error) → mark connection state as `Reconnecting`.
 - Backoff loop: try to reconnect, exponential with jitter. Defaults: 100 ms initial, 30 s cap, max 10 attempts. All three configurable on the builder.
-- On reconnect: re-issue `session.start` with the same session_name + client_info.
-- **Named sessions resume cleanly.** Daemon returns `is_new: false`, restores triggers/filters from `state.json`, drains queued notifications. Client's existing trigger/filter IDs remain valid.
-- **Anonymous sessions do not resume.** Session is gone server-side; client's local state (trigger IDs, filter IDs, bookmarks) is invalidated. SDK fails loud with `BrokerError::SessionLost`. Caller decides whether to start fresh.
-- In-flight RPCs during disconnect: error with `BrokerError::Disconnected`. Caller retries after reconnect.
-- Subscribers see `Notification::Reconnected { is_new }` (SDK-internal, not server-pushed) when reconnect completes.
+- On reconnect: re-issue `session.start` with the same `session_name` + `client_info`.
+- **Named sessions resume cleanly when daemon state survived.** Daemon returns `is_new: false`, restores triggers/filters from `state.json`, drains queued notifications. Client's existing trigger/filter IDs remain valid.
+- **Resurrection (named session, `is_new: true` on reconnect) is treated as session loss.** If `state.json` was wiped, corrupted, or manually cleared between disconnect and reconnect, the daemon creates a fresh session under the same name and reports `is_new: true`. The caller's locally-held trigger/filter IDs are now stale and would fail with "not found" on subsequent calls. Rather than letting these errors propagate piecemeal, the SDK fails the reconnect cycle with `BrokerError::SessionLost` — same recovery path as anonymous-session reconnect. Invariant: **after a successful reconnect, your trigger/filter IDs are still valid; if they would not be, the SDK fails loud instead.**
+- **Anonymous sessions do not resume.** Session is gone server-side; client's local state is invalidated. SDK fails loud with `BrokerError::SessionLost`.
+
+#### RPC behavior during the disconnect/reconnect window
+
+- **In-flight RPCs** (request was on the wire when disconnect happened) error with `BrokerError::Disconnected`. The SDK does not auto-retry, because not all methods are idempotent (`triggers.add`, `bookmarks.add(replace=false)` etc. would double-fire). The caller decides whether to retry per call.
+- **New RPCs issued during the disconnect/reconnect window** block on their `await` until reconnect succeeds and the call dispatches normally, OR until the per-call timeout expires (configurable on the builder via `.call_timeout(Duration)`, default: `reconnect_max_attempts × reconnect_max_backoff`), in which case the call errors with `BrokerError::Disconnected`. This makes transient broker restarts invisible to clients — they see at most a brief latency bump.
+- If the reconnect cycle exhausts retries or fails with `SessionLost`, all blocked calls error.
+
+#### Notification ordering across reconnect
+
+When reconnect completes successfully, subscribers see notifications in this order:
+
+1. `Notification::Reconnected` — emitted SDK-internally as soon as the new `session.start` handshake returns successfully.
+2. Drained queued notifications from the daemon's per-session queue (chronologically older than the reconnect, generated during the disconnect window).
+3. Live notifications resume.
+
+Caller's mental model: "I'm back; here's what I missed during the gap; now I'm current."
 
 #### Adoption rule for callers
 
@@ -467,7 +504,7 @@ Document in README; not exercised by CI.
 2. Named session create → `triggers.add` (oneshot) → daemon sends matching log → `trigger_fired` delivered → trigger auto-removed → `triggers.list` confirms empty.
 3. `client_info` round-trip: `session.start` with payload → `session.list` returns it.
 4. Capabilities advertised: every entry from `["bookmarks", "oneshot_triggers", "client_info"]` present.
-5. Filter builder produces correct strings for every selector (table-driven test against the existing parser).
+5. Filter builder round-trip — table-driven integration test: for each selector, the SDK builder produces a filter string; the test sends it to the broker via `logs.recent` against pre-loaded synthetic logs and asserts the right entries match. Validates the SDK's serialization matches the broker's parser without crossing the dep boundary into `core`.
 6. Reconnect: kill broker, verify backoff retries, restart broker, verify session restored and notifications resume.
 7. Anonymous-session reconnect fails with `BrokerError::SessionLost`.
 8. Schema-file matches `cargo build` regenerated form.
