@@ -1,0 +1,14 @@
+[Unit]
+Description=logmon broker daemon
+After=network.target
+
+[Service]
+Type=notify
+ExecStart={BINARY_PATH}
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=default.target
