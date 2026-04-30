@@ -1,0 +1,3332 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "logmon-broker-protocol-v1",
+  "description": "logmon broker JSON-RPC protocol, PROTOCOL_VERSION = 1",
+  "version": 1,
+  "definitions": {
+    "LogsRecent": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsRecent",
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "LogsRecentResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsRecentResult",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "logs",
+        "count"
+      ],
+      "$defs": {
+        "LogEntry": {
+          "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "message": {
+              "type": "string"
+            },
+            "full_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "facility": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "additional_fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_filters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "source": {
+              "$ref": "#/$defs/LogSource",
+              "default": "Filter"
+            }
+          },
+          "required": [
+            "seq",
+            "timestamp",
+            "level",
+            "message",
+            "host"
+          ]
+        },
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "LogsContext": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsContext",
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "after": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "seq"
+      ]
+    },
+    "LogsContextResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsContextResult",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "logs",
+        "count"
+      ],
+      "$defs": {
+        "LogEntry": {
+          "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "message": {
+              "type": "string"
+            },
+            "full_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "facility": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "additional_fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_filters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "source": {
+              "$ref": "#/$defs/LogSource",
+              "default": "Filter"
+            }
+          },
+          "required": [
+            "seq",
+            "timestamp",
+            "level",
+            "message",
+            "host"
+          ]
+        },
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "LogsExport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsExport",
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "LogsExportResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsExportResult",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "format": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "logs",
+        "count",
+        "format"
+      ],
+      "$defs": {
+        "LogEntry": {
+          "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "message": {
+              "type": "string"
+            },
+            "full_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "facility": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "additional_fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_filters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "source": {
+              "$ref": "#/$defs/LogSource",
+              "default": "Filter"
+            }
+          },
+          "required": [
+            "seq",
+            "timestamp",
+            "level",
+            "message",
+            "host"
+          ]
+        },
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "LogsClear": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsClear",
+      "type": "object"
+    },
+    "LogsClearResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsClearResult",
+      "type": "object",
+      "properties": {
+        "cleared": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "cleared"
+      ]
+    },
+    "FiltersList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersList",
+      "type": "object"
+    },
+    "FiltersListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersListResult",
+      "type": "object",
+      "properties": {
+        "filters": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FilterInfo"
+          }
+        }
+      },
+      "required": [
+        "filters"
+      ],
+      "$defs": {
+        "FilterInfo": {
+          "description": "One entry in a `filters.list` response.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "filter": {
+              "type": "string"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "filter"
+          ]
+        }
+      }
+    },
+    "FiltersAdd": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersAdd",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "filter"
+      ]
+    },
+    "FiltersAddResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersAddResult",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "FiltersEdit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersEdit",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "FiltersEditResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersEditResult",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filter": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "filter"
+      ]
+    },
+    "FiltersRemove": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersRemove",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "FiltersRemoveResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FiltersRemoveResult",
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "removed"
+      ]
+    },
+    "TriggersList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersList",
+      "type": "object"
+    },
+    "TriggersListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersListResult",
+      "type": "object",
+      "properties": {
+        "triggers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TriggerInfo"
+          }
+        }
+      },
+      "required": [
+        "triggers"
+      ],
+      "$defs": {
+        "TriggerInfo": {
+          "description": "One entry in a `triggers.list` response.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "filter": {
+              "type": "string"
+            },
+            "pre_window": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "post_window": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "notify_context": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "match_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "filter",
+            "pre_window",
+            "post_window",
+            "notify_context",
+            "match_count"
+          ]
+        }
+      }
+    },
+    "TriggersAdd": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersAdd",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": "string"
+        },
+        "pre_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "post_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "notify_context": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "filter"
+      ]
+    },
+    "TriggersAddResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersAddResult",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "TriggersEdit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersEdit",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pre_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "post_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "notify_context": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "TriggersEditResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersEditResult",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filter": {
+          "type": "string"
+        },
+        "pre_window": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "post_window": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "notify_context": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "filter",
+        "pre_window",
+        "post_window",
+        "notify_context",
+        "match_count"
+      ]
+    },
+    "TriggersRemove": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersRemove",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "TriggersRemoveResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggersRemoveResult",
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "removed"
+      ]
+    },
+    "TracesRecent": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesRecent",
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TracesRecentResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesRecentResult",
+      "type": "object",
+      "properties": {
+        "traces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TraceSummary"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "traces",
+        "count"
+      ],
+      "$defs": {
+        "TraceSummary": {
+          "description": "A high-level summary of a single trace. Mirrors `core::span::types::TraceSummary`.",
+          "type": "object",
+          "properties": {
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": "string"
+            },
+            "root_span_name": {
+              "type": "string"
+            },
+            "service_name": {
+              "type": "string"
+            },
+            "start_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "total_duration_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "span_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "has_errors": {
+              "type": "boolean"
+            },
+            "linked_log_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "trace_id",
+            "root_span_name",
+            "service_name",
+            "start_time",
+            "total_duration_ms",
+            "span_count",
+            "has_errors",
+            "linked_log_count"
+          ]
+        }
+      }
+    },
+    "TracesGet": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesGet",
+      "type": "object",
+      "properties": {
+        "trace_id": {
+          "type": "string"
+        },
+        "include_logs": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "trace_id"
+      ]
+    },
+    "TracesGetResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesGetResult",
+      "type": "object",
+      "properties": {
+        "trace_id": {
+          "type": "string"
+        },
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SpanEntry"
+          }
+        },
+        "logs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          }
+        },
+        "span_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "log_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "trace_id",
+        "spans",
+        "logs",
+        "span_count",
+        "log_count"
+      ],
+      "$defs": {
+        "SpanEntry": {
+          "description": "A single span. Mirrors `core::span::types::SpanEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": "string"
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": "string"
+            },
+            "parent_span_id": {
+              "description": "Parent span id rendered as 16-char lowercase hex (none for root spans).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "end_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "duration_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/SpanKind"
+            },
+            "service_name": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/SpanStatus"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SpanEvent"
+              },
+              "default": []
+            }
+          },
+          "required": [
+            "seq",
+            "trace_id",
+            "span_id",
+            "start_time",
+            "end_time",
+            "duration_ms",
+            "name",
+            "kind",
+            "service_name",
+            "status"
+          ]
+        },
+        "SpanKind": {
+          "description": "Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.",
+          "type": "string",
+          "enum": [
+            "unspecified",
+            "internal",
+            "server",
+            "client",
+            "producer",
+            "consumer"
+          ]
+        },
+        "SpanStatus": {
+          "description": "Span status. Wire format mirrors `core::span::types::SpanStatus`:\n`{\"type\":\"unset\"}`, `{\"type\":\"ok\"}`, `{\"type\":\"error\",\"message\":\"...\"}`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "unset"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "ok"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "error"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ]
+            }
+          ]
+        },
+        "SpanEvent": {
+          "description": "A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "timestamp"
+          ]
+        },
+        "LogEntry": {
+          "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "message": {
+              "type": "string"
+            },
+            "full_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "facility": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "additional_fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_filters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "source": {
+              "$ref": "#/$defs/LogSource",
+              "default": "Filter"
+            }
+          },
+          "required": [
+            "seq",
+            "timestamp",
+            "level",
+            "message",
+            "host"
+          ]
+        },
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "TracesSummary": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesSummary",
+      "type": "object",
+      "properties": {
+        "trace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "trace_id"
+      ]
+    },
+    "TracesSummaryResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesSummaryResult",
+      "type": "object",
+      "properties": {
+        "root_span": {
+          "type": "string"
+        },
+        "total_duration_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "breakdown": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TraceSummaryBreakdownEntry"
+          }
+        },
+        "other_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "span_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "root_span",
+        "total_duration_ms",
+        "breakdown",
+        "other_ms",
+        "span_count"
+      ],
+      "$defs": {
+        "TraceSummaryBreakdownEntry": {
+          "description": "One row in `TracesSummaryResult.breakdown`: the contribution of one direct\nchild of the root span to the trace's wall-clock time.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "self_time_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "total_time_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "percentage": {
+              "type": "number",
+              "format": "double"
+            },
+            "is_error": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "self_time_ms",
+            "total_time_ms",
+            "percentage",
+            "is_error"
+          ]
+        }
+      }
+    },
+    "TracesSlow": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesSlow",
+      "type": "object",
+      "properties": {
+        "min_duration_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_by": {
+          "description": "When set to `\"name\"`, results are aggregated into `groups`; otherwise\nindividual spans are returned in `spans`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TracesSlowResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesSlowResult",
+      "description": "`traces.slow` returns either an ungrouped list of spans or a grouped\naggregation, depending on the `group_by` parameter. Both shapes are\nexpressed as optional fields on the same result struct.",
+      "type": "object",
+      "properties": {
+        "spans": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/SpanEntry"
+          }
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "grouped_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "groups": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/TracesSlowGroup"
+          }
+        }
+      },
+      "$defs": {
+        "SpanEntry": {
+          "description": "A single span. Mirrors `core::span::types::SpanEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": "string"
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": "string"
+            },
+            "parent_span_id": {
+              "description": "Parent span id rendered as 16-char lowercase hex (none for root spans).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "end_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "duration_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/SpanKind"
+            },
+            "service_name": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/SpanStatus"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SpanEvent"
+              },
+              "default": []
+            }
+          },
+          "required": [
+            "seq",
+            "trace_id",
+            "span_id",
+            "start_time",
+            "end_time",
+            "duration_ms",
+            "name",
+            "kind",
+            "service_name",
+            "status"
+          ]
+        },
+        "SpanKind": {
+          "description": "Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.",
+          "type": "string",
+          "enum": [
+            "unspecified",
+            "internal",
+            "server",
+            "client",
+            "producer",
+            "consumer"
+          ]
+        },
+        "SpanStatus": {
+          "description": "Span status. Wire format mirrors `core::span::types::SpanStatus`:\n`{\"type\":\"unset\"}`, `{\"type\":\"ok\"}`, `{\"type\":\"error\",\"message\":\"...\"}`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "unset"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "ok"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "error"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ]
+            }
+          ]
+        },
+        "SpanEvent": {
+          "description": "A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "timestamp"
+          ]
+        },
+        "TracesSlowGroup": {
+          "description": "One row in a grouped `TracesSlowResult` (when `group_by == \"name\"`).",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "avg_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "name",
+            "avg_ms",
+            "p95_ms",
+            "count"
+          ]
+        }
+      }
+    },
+    "TracesLogs": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesLogs",
+      "type": "object",
+      "properties": {
+        "trace_id": {
+          "type": "string"
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "trace_id"
+      ]
+    },
+    "TracesLogsResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesLogsResult",
+      "type": "object",
+      "properties": {
+        "logs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "logs",
+        "count"
+      ],
+      "$defs": {
+        "LogEntry": {
+          "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "message": {
+              "type": "string"
+            },
+            "full_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "facility": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "additional_fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_filters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "source": {
+              "$ref": "#/$defs/LogSource",
+              "default": "Filter"
+            }
+          },
+          "required": [
+            "seq",
+            "timestamp",
+            "level",
+            "message",
+            "host"
+          ]
+        },
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "SpansContext": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpansContext",
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "after": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "seq"
+      ]
+    },
+    "SpansContextResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpansContextResult",
+      "type": "object",
+      "properties": {
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SpanEntry"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "spans",
+        "count"
+      ],
+      "$defs": {
+        "SpanEntry": {
+          "description": "A single span. Mirrors `core::span::types::SpanEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": "string"
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": "string"
+            },
+            "parent_span_id": {
+              "description": "Parent span id rendered as 16-char lowercase hex (none for root spans).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "end_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "duration_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/SpanKind"
+            },
+            "service_name": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/SpanStatus"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SpanEvent"
+              },
+              "default": []
+            }
+          },
+          "required": [
+            "seq",
+            "trace_id",
+            "span_id",
+            "start_time",
+            "end_time",
+            "duration_ms",
+            "name",
+            "kind",
+            "service_name",
+            "status"
+          ]
+        },
+        "SpanKind": {
+          "description": "Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.",
+          "type": "string",
+          "enum": [
+            "unspecified",
+            "internal",
+            "server",
+            "client",
+            "producer",
+            "consumer"
+          ]
+        },
+        "SpanStatus": {
+          "description": "Span status. Wire format mirrors `core::span::types::SpanStatus`:\n`{\"type\":\"unset\"}`, `{\"type\":\"ok\"}`, `{\"type\":\"error\",\"message\":\"...\"}`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "unset"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "ok"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "error"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ]
+            }
+          ]
+        },
+        "SpanEvent": {
+          "description": "A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "timestamp"
+          ]
+        }
+      }
+    },
+    "BookmarksAdd": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksAdd",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "replace": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "BookmarksAddResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksAddResult",
+      "type": "object",
+      "properties": {
+        "qualified_name": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "replaced": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "qualified_name",
+        "timestamp",
+        "replaced"
+      ]
+    },
+    "BookmarksList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksList",
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "BookmarksListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksListResult",
+      "type": "object",
+      "properties": {
+        "bookmarks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BookmarkInfo"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "bookmarks",
+        "count"
+      ],
+      "$defs": {
+        "BookmarkInfo": {
+          "description": "One entry in a `bookmarks.list` response.",
+          "type": "object",
+          "properties": {
+            "qualified_name": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "age_secs": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "required": [
+            "qualified_name",
+            "name",
+            "session",
+            "timestamp",
+            "age_secs"
+          ]
+        }
+      }
+    },
+    "BookmarksRemove": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksRemove",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "BookmarksRemoveResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksRemoveResult",
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "removed"
+      ]
+    },
+    "BookmarksClear": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksClear",
+      "type": "object",
+      "properties": {
+        "session": {
+          "description": "Defaults to the calling session when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "BookmarksClearResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarksClearResult",
+      "type": "object",
+      "properties": {
+        "removed_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "session": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "removed_count",
+        "session"
+      ]
+    },
+    "SessionList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionList",
+      "type": "object"
+    },
+    "SessionListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionListResult",
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SessionInfo"
+          }
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "$defs": {
+        "SessionInfo": {
+          "description": "One entry in a `session.list` or `status.get` response.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "connected": {
+              "type": "boolean"
+            },
+            "trigger_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "filter_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "queue_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "last_seen_secs_ago": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "connected",
+            "trigger_count",
+            "filter_count",
+            "queue_size",
+            "last_seen_secs_ago"
+          ]
+        }
+      }
+    },
+    "SessionDrop": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionDrop",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "SessionDropResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionDropResult",
+      "type": "object",
+      "properties": {
+        "dropped": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "dropped"
+      ]
+    },
+    "StatusGet": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "StatusGet",
+      "type": "object"
+    },
+    "StatusGetResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "StatusGetResult",
+      "type": "object",
+      "properties": {
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "daemon_uptime_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "receivers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "store": {
+          "$ref": "#/$defs/StoreStats"
+        }
+      },
+      "required": [
+        "daemon_uptime_secs",
+        "receivers",
+        "store"
+      ],
+      "$defs": {
+        "SessionInfo": {
+          "description": "One entry in a `session.list` or `status.get` response.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "connected": {
+              "type": "boolean"
+            },
+            "trigger_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "filter_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "queue_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "last_seen_secs_ago": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "id",
+            "connected",
+            "trigger_count",
+            "filter_count",
+            "queue_size",
+            "last_seen_secs_ago"
+          ]
+        },
+        "StoreStats": {
+          "description": "Pipeline buffer / receive statistics. Embedded in `status.get`.",
+          "type": "object",
+          "properties": {
+            "total_received": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_stored": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "current_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "total_received",
+            "total_stored",
+            "malformed_count",
+            "current_size"
+          ]
+        }
+      }
+    },
+    "SessionStartParams": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionStartParams",
+      "description": "session.start parameters",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "protocol_version"
+      ]
+    },
+    "SessionStartResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionStartResult",
+      "description": "session.start response",
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "is_new": {
+          "type": "boolean"
+        },
+        "queued_notifications": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "trigger_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "filter_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "daemon_uptime_secs": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "receivers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "session_id",
+        "is_new",
+        "queued_notifications",
+        "trigger_count",
+        "filter_count",
+        "daemon_uptime_secs",
+        "buffer_size",
+        "receivers"
+      ]
+    },
+    "TriggerFiredPayload": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggerFiredPayload",
+      "description": "Payload of `notifications/trigger_fired`.",
+      "type": "object",
+      "properties": {
+        "trigger_id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filter_string": {
+          "type": "string"
+        },
+        "pre_window": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "post_window": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "notify_context": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "oneshot": {
+          "description": "New in v1; mirrors the `oneshot` param on `triggers.add`. Tells the\nclient this is the only fire it will see for this trigger ID.",
+          "type": "boolean",
+          "default": false
+        },
+        "matched_entry": {
+          "$ref": "#/$defs/LogEntry"
+        },
+        "context_before": {
+          "description": "Context entries that arrived before the matched_entry. Size at most\n`notify_context`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogEntry"
+          }
+        }
+      },
+      "required": [
+        "trigger_id",
+        "filter_string",
+        "pre_window",
+        "post_window",
+        "notify_context",
+        "matched_entry"
+      ],
+      "$defs": {
+        "LogEntry": {
+          "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "level": {
+              "$ref": "#/$defs/Level"
+            },
+            "message": {
+              "type": "string"
+            },
+            "full_message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "facility": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "file": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "line": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "additional_fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "matched_filters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "source": {
+              "$ref": "#/$defs/LogSource",
+              "default": "Filter"
+            }
+          },
+          "required": [
+            "seq",
+            "timestamp",
+            "level",
+            "message",
+            "host"
+          ]
+        },
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "LogEntry": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogEntry",
+      "description": "A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.",
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "level": {
+          "$ref": "#/$defs/Level"
+        },
+        "message": {
+          "type": "string"
+        },
+        "full_message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": "string"
+        },
+        "facility": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "additional_fields": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "trace_id": {
+          "description": "Trace id rendered as 32-char lowercase hex.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "span_id": {
+          "description": "Span id rendered as 16-char lowercase hex.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "matched_filters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "source": {
+          "$ref": "#/$defs/LogSource",
+          "default": "Filter"
+        }
+      },
+      "required": [
+        "seq",
+        "timestamp",
+        "level",
+        "message",
+        "host"
+      ],
+      "$defs": {
+        "Level": {
+          "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+          "type": "string",
+          "enum": [
+            "Trace",
+            "Debug",
+            "Info",
+            "Warn",
+            "Error"
+          ]
+        },
+        "LogSource": {
+          "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+          "type": "string",
+          "enum": [
+            "Filter",
+            "PreTrigger",
+            "PostTrigger"
+          ]
+        }
+      }
+    },
+    "Level": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Level",
+      "description": "Log severity level. Wire format is the variant name as written\n(e.g. `\"Info\"`, `\"Error\"`), matching `core::gelf::message::Level`.",
+      "type": "string",
+      "enum": [
+        "Trace",
+        "Debug",
+        "Info",
+        "Warn",
+        "Error"
+      ]
+    },
+    "LogSource": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogSource",
+      "description": "Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.",
+      "type": "string",
+      "enum": [
+        "Filter",
+        "PreTrigger",
+        "PostTrigger"
+      ]
+    },
+    "SpanEntry": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpanEntry",
+      "description": "A single span. Mirrors `core::span::types::SpanEntry`.",
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "trace_id": {
+          "description": "Trace id rendered as 32-char lowercase hex.",
+          "type": "string"
+        },
+        "span_id": {
+          "description": "Span id rendered as 16-char lowercase hex.",
+          "type": "string"
+        },
+        "parent_span_id": {
+          "description": "Parent span id rendered as 16-char lowercase hex (none for root spans).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "duration_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SpanKind"
+        },
+        "service_name": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/SpanStatus"
+        },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SpanEvent"
+          },
+          "default": []
+        }
+      },
+      "required": [
+        "seq",
+        "trace_id",
+        "span_id",
+        "start_time",
+        "end_time",
+        "duration_ms",
+        "name",
+        "kind",
+        "service_name",
+        "status"
+      ],
+      "$defs": {
+        "SpanKind": {
+          "description": "Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.",
+          "type": "string",
+          "enum": [
+            "unspecified",
+            "internal",
+            "server",
+            "client",
+            "producer",
+            "consumer"
+          ]
+        },
+        "SpanStatus": {
+          "description": "Span status. Wire format mirrors `core::span::types::SpanStatus`:\n`{\"type\":\"unset\"}`, `{\"type\":\"ok\"}`, `{\"type\":\"error\",\"message\":\"...\"}`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "unset"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "ok"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "error"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ]
+            }
+          ]
+        },
+        "SpanEvent": {
+          "description": "A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "timestamp"
+          ]
+        }
+      }
+    },
+    "SpanKind": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpanKind",
+      "description": "Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.",
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "internal",
+        "server",
+        "client",
+        "producer",
+        "consumer"
+      ]
+    },
+    "SpanStatus": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpanStatus",
+      "description": "Span status. Wire format mirrors `core::span::types::SpanStatus`:\n`{\"type\":\"unset\"}`, `{\"type\":\"ok\"}`, `{\"type\":\"error\",\"message\":\"...\"}`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "unset"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "ok"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "error"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message"
+          ]
+        }
+      ]
+    },
+    "SpanEvent": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpanEvent",
+      "description": "A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "name",
+        "timestamp"
+      ]
+    },
+    "TraceSummary": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TraceSummary",
+      "description": "A high-level summary of a single trace. Mirrors `core::span::types::TraceSummary`.",
+      "type": "object",
+      "properties": {
+        "trace_id": {
+          "description": "Trace id rendered as 32-char lowercase hex.",
+          "type": "string"
+        },
+        "root_span_name": {
+          "type": "string"
+        },
+        "service_name": {
+          "type": "string"
+        },
+        "start_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "total_duration_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "span_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "has_errors": {
+          "type": "boolean"
+        },
+        "linked_log_count": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "trace_id",
+        "root_span_name",
+        "service_name",
+        "start_time",
+        "total_duration_ms",
+        "span_count",
+        "has_errors",
+        "linked_log_count"
+      ]
+    },
+    "TraceSummaryBreakdownEntry": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TraceSummaryBreakdownEntry",
+      "description": "One row in `TracesSummaryResult.breakdown`: the contribution of one direct\nchild of the root span to the trace's wall-clock time.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "self_time_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "total_time_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "percentage": {
+          "type": "number",
+          "format": "double"
+        },
+        "is_error": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "self_time_ms",
+        "total_time_ms",
+        "percentage",
+        "is_error"
+      ]
+    },
+    "TracesSlowGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesSlowGroup",
+      "description": "One row in a grouped `TracesSlowResult` (when `group_by == \"name\"`).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "avg_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "p95_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "avg_ms",
+        "p95_ms",
+        "count"
+      ]
+    },
+    "FilterInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FilterInfo",
+      "description": "One entry in a `filters.list` response.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filter": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "filter"
+      ]
+    },
+    "TriggerInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TriggerInfo",
+      "description": "One entry in a `triggers.list` response.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filter": {
+          "type": "string"
+        },
+        "pre_window": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "post_window": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "notify_context": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "match_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "filter",
+        "pre_window",
+        "post_window",
+        "notify_context",
+        "match_count"
+      ]
+    },
+    "SessionInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionInfo",
+      "description": "One entry in a `session.list` or `status.get` response.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connected": {
+          "type": "boolean"
+        },
+        "trigger_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "filter_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "queue_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "last_seen_secs_ago": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "connected",
+        "trigger_count",
+        "filter_count",
+        "queue_size",
+        "last_seen_secs_ago"
+      ]
+    },
+    "StoreStats": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "StoreStats",
+      "description": "Pipeline buffer / receive statistics. Embedded in `status.get`.",
+      "type": "object",
+      "properties": {
+        "total_received": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_stored": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "malformed_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "current_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "total_received",
+        "total_stored",
+        "malformed_count",
+        "current_size"
+      ]
+    },
+    "BookmarkInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "BookmarkInfo",
+      "description": "One entry in a `bookmarks.list` response.",
+      "type": "object",
+      "properties": {
+        "qualified_name": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "age_secs": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "qualified_name",
+        "name",
+        "session",
+        "timestamp",
+        "age_secs"
+      ]
+    }
+  }
+}

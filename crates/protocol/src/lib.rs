@@ -2,11 +2,9 @@ pub mod methods;
 pub mod notifications;
 
 pub use methods::*;
-// `notifications` is currently empty; the re-export is wired so that when
-// notification payload types land they're accessible at the crate root.
-#[allow(unused_imports)]
 pub use notifications::*;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -64,14 +62,14 @@ pub fn parse_daemon_message_from_str(line: &str) -> anyhow::Result<DaemonMessage
 }
 
 /// session.start parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStartParams {
     pub name: Option<String>,
     pub protocol_version: u32,
 }
 
 /// session.start response
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStartResult {
     pub session_id: String,
     pub is_new: bool,
