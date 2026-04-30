@@ -21,13 +21,36 @@ enum Cmd {
         #[arg(long, default_value = "crates/protocol/protocol-v1.schema.json")]
         out: PathBuf,
     },
+    /// Regenerate schema and fail if it differs from the committed file
+    VerifySchema {
+        #[arg(long, default_value = "crates/protocol/protocol-v1.schema.json")]
+        expected: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::GenSchema { out } => gen_schema(&out)?,
+        Cmd::VerifySchema { expected } => verify_schema(&expected)?,
     }
+    Ok(())
+}
+
+/// Regenerate the schema into a temp file and fail if it differs from the
+/// expected committed copy. Used in CI / pre-commit to guard against drift.
+fn verify_schema(expected: &PathBuf) -> anyhow::Result<()> {
+    let tmp = tempfile::NamedTempFile::new()?;
+    gen_schema(&tmp.path().to_path_buf())?;
+    let on_disk = fs::read_to_string(expected)?;
+    let regenerated = fs::read_to_string(tmp.path())?;
+    if on_disk != regenerated {
+        anyhow::bail!(
+            "{} is out of date — run 'cargo xtask gen-schema' and commit the result",
+            expected.display()
+        );
+    }
+    println!("schema {} is up to date", expected.display());
     Ok(())
 }
 
