@@ -111,6 +111,31 @@ fn default_source() -> LogSource {
     LogSource::Filter
 }
 
+impl LogEntry {
+    /// Construct a synthetic log entry for tests / harness injection.
+    ///
+    /// `seq` is set to 0 — the pipeline reassigns it via `assign_seq()` when the
+    /// entry passes through `process_entry`.
+    pub fn synthetic(level: Level, message: &str) -> Self {
+        Self {
+            seq: 0,
+            timestamp: Utc::now(),
+            level,
+            message: message.to_string(),
+            full_message: None,
+            host: "test".to_string(),
+            facility: None,
+            file: None,
+            line: None,
+            additional_fields: HashMap::new(),
+            trace_id: None,
+            span_id: None,
+            matched_filters: Vec::new(),
+            source: LogSource::Filter,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GelfParseError {
     #[error("invalid JSON: {0}")]

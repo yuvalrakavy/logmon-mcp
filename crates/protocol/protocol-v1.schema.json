@@ -2424,6 +2424,9 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "client_info": {
+          "description": "Caller-supplied identity/metadata. The daemon currently records and ignores\nthis field; size validation lands in Task 11."
         }
       },
       "required": [

@@ -49,6 +49,7 @@ fn test_session_start_params_roundtrip() {
     let params = SessionStartParams {
         name: Some("store-debug".to_string()),
         protocol_version: PROTOCOL_VERSION,
+        client_info: None,
     };
     let json = serde_json::to_string(&params).unwrap();
     let parsed: SessionStartParams = serde_json::from_str(&json).unwrap();

@@ -17,7 +17,6 @@ use logmon_broker_protocol::{
 pub struct BrokerBuilder {
     socket_path: Option<PathBuf>,
     session_name: Option<String>,
-    #[allow(dead_code)] // wired through to SessionStartParams in Task 11
     client_info: Option<Value>,
     reconnect_max_attempts: u32,
     reconnect_max_backoff: Duration,
@@ -120,7 +119,7 @@ impl BrokerBuilder {
         let params = SessionStartParams {
             name: self.session_name.clone(),
             protocol_version: PROTOCOL_VERSION,
-            // client_info added in Task 11
+            client_info: self.client_info.clone(),
         };
         let result_value = bridge
             .call("session.start", serde_json::to_value(&params).unwrap())

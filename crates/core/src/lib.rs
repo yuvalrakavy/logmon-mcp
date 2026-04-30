@@ -14,6 +14,12 @@ pub mod daemon {
     pub mod transport;
 }
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 // Programmatic entry point used by integration tests in the SDK crate.
 // Spins up an in-process daemon listening on a caller-provided socket.
 pub use daemon::persistence::DaemonConfig;
+
+#[cfg(feature = "test-support")]
+pub use test_support::{spawn_test_daemon, TestClient, TestDaemonHandle};

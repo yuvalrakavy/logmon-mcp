@@ -66,6 +66,10 @@ pub fn parse_daemon_message_from_str(line: &str) -> anyhow::Result<DaemonMessage
 pub struct SessionStartParams {
     pub name: Option<String>,
     pub protocol_version: u32,
+    /// Caller-supplied identity/metadata. The daemon currently records and ignores
+    /// this field; size validation lands in Task 11.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_info: Option<Value>,
 }
 
 /// session.start response
