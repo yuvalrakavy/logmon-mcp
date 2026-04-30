@@ -1,7 +1,9 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand as ClapSubcommand, ValueEnum};
 use logmon_broker_core::daemon::persistence::{config_dir, load_config};
 use logmon_broker_core::daemon::process::is_process_alive;
+
+mod service;
 
 #[derive(Parser, Debug)]
 #[command(name = "logmon-broker", version, about = "logmon broker daemon")]
@@ -32,11 +34,38 @@ struct Cli {
     span_buffer_size: Option<usize>,
 }
 
-#[derive(Parser, Debug)]
+#[derive(ClapSubcommand, Debug)]
 enum Subcommand {
     /// Print broker status (running pid + socket, or "not running")
     Status,
-    // install-service / uninstall-service added in Task 23
+    /// Install logmon-broker as a managed system service
+    /// (launchd on macOS, systemd on Linux).
+    InstallService {
+        /// Install as a per-user service (default) or system-wide.
+        #[arg(long, value_enum, default_value_t = ScopeArg::User)]
+        scope: ScopeArg,
+    },
+    /// Remove a previously-installed broker system service.
+    UninstallService {
+        /// Scope previously used to install.
+        #[arg(long, value_enum, default_value_t = ScopeArg::User)]
+        scope: ScopeArg,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum ScopeArg {
+    User,
+    System,
+}
+
+impl From<ScopeArg> for service::Scope {
+    fn from(s: ScopeArg) -> Self {
+        match s {
+            ScopeArg::User => service::Scope::User,
+            ScopeArg::System => service::Scope::System,
+        }
+    }
 }
 
 /// Print broker status. Returns the desired process exit code:
@@ -75,6 +104,8 @@ async fn main() -> Result<()> {
         Some(Subcommand::Status) => {
             std::process::exit(status()?);
         }
+        Some(Subcommand::InstallService { scope }) => service::install(scope.into()),
+        Some(Subcommand::UninstallService { scope }) => service::uninstall(scope.into()),
         None => {
             let mut config = load_config(&config_dir().join("config.json"))?;
             if let Some(p) = cli.gelf_port {

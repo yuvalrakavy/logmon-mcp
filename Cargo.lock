@@ -905,6 +905,8 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dirs",
+ "libc",
  "logmon-broker-core",
  "logmon-broker-protocol",
  "sd-notify",
