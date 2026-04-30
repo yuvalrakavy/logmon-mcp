@@ -1,6 +1,6 @@
-use logmon_mcp_server::store::memory::InMemoryStore;
-use logmon_mcp_server::store::traits::LogStore;
-use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use logmon_broker_core::store::memory::InMemoryStore;
+use logmon_broker_core::store::traits::LogStore;
+use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
 use chrono::Utc;
 use std::collections::HashMap;
 
@@ -88,7 +88,7 @@ fn test_recent_with_filter() {
     store.append(make_entry(2, Level::Error, "bad"));
     store.append(make_entry(3, Level::Info, "good again"));
 
-    use logmon_mcp_server::filter::parser::parse_filter;
+    use logmon_broker_core::filter::parser::parse_filter;
     let filter = parse_filter("l>=ERROR").unwrap();
     let recent = store.recent(10, Some(&filter));
     assert_eq!(recent.len(), 1);

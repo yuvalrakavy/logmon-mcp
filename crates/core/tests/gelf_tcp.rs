@@ -1,5 +1,5 @@
-use logmon_mcp_server::gelf::tcp::start_tcp_listener;
-use logmon_mcp_server::gelf::message::LogEntry;
+use logmon_broker_core::gelf::tcp::start_tcp_listener;
+use logmon_broker_core::gelf::message::LogEntry;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};

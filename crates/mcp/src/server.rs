@@ -1,23 +1,22 @@
-use crate::shim::bridge::DaemonBridge;
+use logmon_broker_sdk::Broker;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::ServerHandler;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct GelfMcpServer {
-    bridge: Arc<DaemonBridge>,
+    broker: Broker,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 impl GelfMcpServer {
-    pub fn new_with_bridge(bridge: Arc<DaemonBridge>) -> Self {
+    pub fn new(broker: Broker) -> Self {
         Self {
-            bridge,
+            broker,
             tool_router: Self::tool_router(),
         }
     }
@@ -213,7 +212,7 @@ impl GelfMcpServer {
     #[rmcp::tool(description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics")]
     async fn get_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call("status.get", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -230,7 +229,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetRecentLogsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "logs.recent",
                 serde_json::json!({
@@ -258,7 +257,7 @@ impl GelfMcpServer {
             )
         })?;
         let result = self
-            .bridge
+            .broker
             .call(
                 "logs.context",
                 serde_json::json!({
@@ -283,7 +282,7 @@ impl GelfMcpServer {
 
         // Fetch logs from daemon
         let logs = self
-            .bridge
+            .broker
             .call(
                 "logs.export",
                 serde_json::json!({
@@ -335,7 +334,7 @@ impl GelfMcpServer {
     #[rmcp::tool(description = "Clear all log entries from the in-memory buffer.")]
     async fn clear_logs(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call("logs.clear", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -349,7 +348,7 @@ impl GelfMcpServer {
     #[rmcp::tool(description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored.")]
     async fn get_filters(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call("filters.list", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -364,7 +363,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<AddFilterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "filters.add",
                 serde_json::json!({
@@ -385,7 +384,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<EditFilterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "filters.edit",
                 serde_json::json!({
@@ -407,7 +406,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<RemoveFilterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "filters.remove",
                 serde_json::json!({
@@ -426,7 +425,7 @@ impl GelfMcpServer {
     #[rmcp::tool(description = "List all triggers. Triggers capture a window of logs around matching entries and emit notifications.")]
     async fn get_triggers(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call("triggers.list", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -441,7 +440,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<AddTriggerParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "triggers.add",
                 serde_json::json!({
@@ -465,7 +464,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<EditTriggerParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "triggers.edit",
                 serde_json::json!({
@@ -490,7 +489,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<RemoveTriggerParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "triggers.remove",
                 serde_json::json!({
@@ -512,7 +511,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetRecentTracesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "traces.recent",
                 serde_json::json!({
@@ -533,7 +532,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetTraceParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "traces.get",
                 serde_json::json!({
@@ -555,7 +554,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetTraceSummaryParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "traces.summary",
                 serde_json::json!({
@@ -575,7 +574,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetSlowSpansParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "traces.slow",
                 serde_json::json!({
@@ -598,7 +597,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetSpanContextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "spans.context",
                 serde_json::json!({
@@ -620,7 +619,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<GetTraceLogsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "traces.logs",
                 serde_json::json!({
@@ -643,7 +642,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<AddBookmarkParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "bookmarks.add",
                 serde_json::json!({
@@ -664,7 +663,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<ListBookmarksParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "bookmarks.list",
                 serde_json::json!({ "session": p.session }),
@@ -682,7 +681,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<RemoveBookmarkParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "bookmarks.remove",
                 serde_json::json!({ "name": p.name }),
@@ -700,7 +699,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<ClearBookmarksParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "bookmarks.clear",
                 serde_json::json!({ "session": p.session }),
@@ -717,7 +716,7 @@ impl GelfMcpServer {
     #[rmcp::tool(description = "List all active sessions connected to the daemon.")]
     async fn get_sessions(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call("session.list", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
@@ -732,7 +731,7 @@ impl GelfMcpServer {
         Parameters(p): Parameters<DropSessionParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
-            .bridge
+            .broker
             .call(
                 "session.drop",
                 serde_json::json!({

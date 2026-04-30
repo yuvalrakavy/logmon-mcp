@@ -1,4 +1,4 @@
-use logmon_mcp_server::rpc::types::*;
+use logmon_broker_protocol::*;
 
 #[test]
 fn test_rpc_request_roundtrip() {

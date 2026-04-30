@@ -1,5 +1,5 @@
-use logmon_mcp_server::gelf::udp::start_udp_listener;
-use logmon_mcp_server::gelf::message::LogEntry;
+use logmon_broker_core::gelf::udp::start_udp_listener;
+use logmon_broker_core::gelf::message::LogEntry;
 use std::net::UdpSocket;
 use tokio::time::{sleep, Duration};
 use serde_json::json;

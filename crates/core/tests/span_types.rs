@@ -1,4 +1,4 @@
-use logmon_mcp_server::span::types::*;
+use logmon_broker_core::span::types::*;
 use chrono::Utc;
 use std::collections::HashMap;
 

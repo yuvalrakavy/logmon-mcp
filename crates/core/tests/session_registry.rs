@@ -1,6 +1,6 @@
-use logmon_mcp_server::daemon::session::*;
-use logmon_mcp_server::engine::pipeline::PipelineEvent;
-use logmon_mcp_server::gelf::message::{Level, LogEntry, LogSource};
+use logmon_broker_core::daemon::session::*;
+use logmon_broker_core::engine::pipeline::PipelineEvent;
+use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
 use std::collections::HashMap;
 
 fn make_entry(level: Level, msg: &str, facility: Option<&str>) -> LogEntry {

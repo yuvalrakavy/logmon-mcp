@@ -1,6 +1,6 @@
-use logmon_mcp_server::filter::parser::*;
-use logmon_mcp_server::filter::matcher::matches_entry;
-use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use logmon_broker_core::filter::parser::*;
+use logmon_broker_core::filter::matcher::matches_entry;
+use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
 use chrono::Utc;
 use std::collections::HashMap;
 

@@ -1,5 +1,5 @@
-use logmon_mcp_server::receiver::otlp::mapping::*;
-use logmon_mcp_server::gelf::message::Level;
+use logmon_broker_core::receiver::otlp::mapping::*;
+use logmon_broker_core::gelf::message::Level;
 
 #[test]
 fn test_severity_to_level() {

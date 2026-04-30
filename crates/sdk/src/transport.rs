@@ -1,4 +1,4 @@
-use super::types::*;
+use logmon_broker_protocol::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 /// Write a JSON-RPC message followed by newline

@@ -1,6 +1,6 @@
-use logmon_mcp_server::filter::parser::*;
-use logmon_mcp_server::filter::matcher::matches_span;
-use logmon_mcp_server::span::types::*;
+use logmon_broker_core::filter::parser::*;
+use logmon_broker_core::filter::matcher::matches_span;
+use logmon_broker_core::span::types::*;
 use chrono::Utc;
 use std::collections::HashMap;
 

@@ -1,8 +1,8 @@
-use logmon_mcp_server::daemon::log_processor::{process_entry, sync_pre_buffer_size};
-use logmon_mcp_server::daemon::session::SessionRegistry;
-use logmon_mcp_server::engine::pipeline::LogPipeline;
-use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
-use logmon_mcp_server::filter::parser::parse_filter;
+use logmon_broker_core::daemon::log_processor::{process_entry, sync_pre_buffer_size};
+use logmon_broker_core::daemon::session::SessionRegistry;
+use logmon_broker_core::engine::pipeline::LogPipeline;
+use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
+use logmon_broker_core::filter::parser::parse_filter;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;

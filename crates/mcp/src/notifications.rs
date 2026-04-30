@@ -1,4 +1,4 @@
-use crate::rpc::types::RpcNotification;
+use logmon_broker_protocol::RpcNotification;
 use rmcp::model::{CustomNotification, ServerNotification};
 use rmcp::Peer;
 use rmcp::RoleServer;

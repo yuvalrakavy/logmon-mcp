@@ -1,5 +1,5 @@
-use logmon_mcp_server::engine::pre_buffer::PreTriggerBuffer;
-use logmon_mcp_server::gelf::message::{LogEntry, Level, LogSource};
+use logmon_broker_core::engine::pre_buffer::PreTriggerBuffer;
+use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
 use chrono::Utc;
 use std::collections::HashMap;
 

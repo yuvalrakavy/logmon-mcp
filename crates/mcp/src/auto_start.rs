@@ -4,21 +4,41 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use fs2::FileExt;
 
-use crate::daemon::persistence::config_dir;
+use logmon_broker_core::daemon::persistence::config_dir;
 
-/// Holds the connection to the daemon process.
-pub struct DaemonConnection {
-    #[cfg(unix)]
-    pub stream: tokio::net::UnixStream,
-    #[cfg(windows)]
-    pub stream: tokio::net::TcpStream,
+/// Locate the `logmon-broker` binary using a three-tier lookup:
+/// 1. `LOGMON_BROKER_BIN` env var
+/// 2. `which logmon-broker` (any directory on `$PATH`)
+/// 3. Sibling of the current executable (e.g., when both binaries live in
+///    the same `target/debug/` directory during development)
+fn locate_broker_binary() -> anyhow::Result<PathBuf> {
+    if let Ok(p) = std::env::var("LOGMON_BROKER_BIN") {
+        return Ok(p.into());
+    }
+    if let Ok(p) = which::which("logmon-broker") {
+        return Ok(p);
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(dir) = self_exe.parent() {
+            let candidate = dir.join("logmon-broker");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+    anyhow::bail!(
+        "logmon-broker not found; install via 'cargo install --path crates/broker', \
+         set LOGMON_BROKER_BIN, or run 'logmon-broker install-service'"
+    )
 }
 
-/// Connect to the running daemon, starting it if necessary.
+/// Ensure the broker is running, starting it if necessary.
 ///
-/// Acquires an exclusive file lock on `daemon.lock` to prevent race conditions
-/// when multiple shim instances attempt to start the daemon simultaneously.
-pub async fn connect_to_daemon() -> anyhow::Result<DaemonConnection> {
+/// Acquires an exclusive file lock on `daemon.lock` to prevent races between
+/// concurrent shim instances. On return, the broker has been verified to be
+/// listening on its socket — but this function does NOT return a connection;
+/// the caller (typically the SDK's `Broker::connect`) opens its own.
+pub async fn ensure_broker_running() -> anyhow::Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create config dir: {}", dir.display()))?;
@@ -35,7 +55,7 @@ pub async fn connect_to_daemon() -> anyhow::Result<DaemonConnection> {
         .lock_exclusive()
         .context("failed to acquire daemon lock")?;
 
-    let result = try_connect_or_start(&dir).await;
+    let result = try_start_or_verify(&dir).await;
 
     // Always release the lock, even on error.
     let _ = lock_file.unlock();
@@ -43,8 +63,9 @@ pub async fn connect_to_daemon() -> anyhow::Result<DaemonConnection> {
     result
 }
 
-/// Try to connect to an existing daemon or start a new one.
-async fn try_connect_or_start(dir: &Path) -> anyhow::Result<DaemonConnection> {
+/// Verify a running broker (probing its socket) or spawn a new one and
+/// poll until its socket becomes connectable.
+async fn try_start_or_verify(dir: &Path) -> anyhow::Result<()> {
     let pid_path = dir.join("daemon.pid");
 
     // If a PID file exists, check whether the process is still alive.
@@ -52,9 +73,9 @@ async fn try_connect_or_start(dir: &Path) -> anyhow::Result<DaemonConnection> {
         if let Ok(contents) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = contents.trim().parse::<u32>() {
                 if is_process_alive(pid) {
-                    // Process is alive -- try connecting to its socket.
-                    if let Ok(conn) = try_connect(dir).await {
-                        return Ok(conn);
+                    // Process is alive -- probe the socket.
+                    if probe_socket(dir).await.is_ok() {
+                        return Ok(());
                     }
                     // Socket might not be ready yet; fall through to polling.
                 } else {
@@ -69,18 +90,19 @@ async fn try_connect_or_start(dir: &Path) -> anyhow::Result<DaemonConnection> {
     }
 
     // No running daemon -- start one.
-    start_daemon()?;
+    start_broker()?;
 
     // Poll for the socket to appear.
     wait_for_socket(dir).await
 }
 
-/// Attempt to connect to the daemon socket.
-async fn try_connect(dir: &Path) -> anyhow::Result<DaemonConnection> {
+/// Probe the broker socket to verify it accepts connections. Returns Ok on
+/// success and discards the connection — the SDK opens its own.
+async fn probe_socket(dir: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let socket_path = dir.join("logmon.sock");
-        let stream = tokio::net::UnixStream::connect(&socket_path)
+        tokio::net::UnixStream::connect(&socket_path)
             .await
             .with_context(|| {
                 format!(
@@ -88,15 +110,15 @@ async fn try_connect(dir: &Path) -> anyhow::Result<DaemonConnection> {
                     socket_path.display()
                 )
             })?;
-        Ok(DaemonConnection { stream })
     }
     #[cfg(windows)]
     {
-        let stream = tokio::net::TcpStream::connect("127.0.0.1:12200")
+        let _ = dir;
+        tokio::net::TcpStream::connect("127.0.0.1:12200")
             .await
             .context("failed to connect to daemon on 127.0.0.1:12200")?;
-        Ok(DaemonConnection { stream })
     }
+    Ok(())
 }
 
 /// Remove stale PID file and socket.
@@ -106,21 +128,24 @@ fn cleanup_stale_files(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("logmon.sock"));
 }
 
-/// Start the daemon as a detached child process.
-fn start_daemon() -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("failed to determine current executable path")?;
-    std::process::Command::new(exe)
-        .arg("daemon")
+/// Start the broker as a detached child process.
+///
+/// The broker binary is invoked with no subcommand — `logmon-broker` runs
+/// the daemon by default. (Status / install-service modes use explicit
+/// subcommands.)
+fn start_broker() -> anyhow::Result<()> {
+    let bin = locate_broker_binary()?;
+    std::process::Command::new(bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn daemon process")?;
+        .context("failed to spawn broker process")?;
     Ok(())
 }
 
-/// Poll until the daemon socket appears and is connectable, or timeout.
-async fn wait_for_socket(dir: &Path) -> anyhow::Result<DaemonConnection> {
+/// Poll until the broker socket appears and is connectable, or timeout.
+async fn wait_for_socket(dir: &Path) -> anyhow::Result<()> {
     let poll_interval = tokio::time::Duration::from_millis(100);
     let timeout = tokio::time::Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + timeout;
@@ -130,8 +155,8 @@ async fn wait_for_socket(dir: &Path) -> anyhow::Result<DaemonConnection> {
             bail!("timed out waiting for daemon socket to become available");
         }
 
-        if let Ok(conn) = try_connect(dir).await {
-            return Ok(conn);
+        if probe_socket(dir).await.is_ok() {
+            return Ok(());
         }
 
         tokio::time::sleep(poll_interval).await;

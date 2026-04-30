@@ -3,15 +3,15 @@
 //! and exercises the full RPC path: parse → resolve bookmarks → match → return.
 
 use chrono::Utc;
-use logmon_mcp_server::daemon::log_processor::process_entry;
-use logmon_mcp_server::daemon::rpc_handler::RpcHandler;
-use logmon_mcp_server::daemon::session::SessionRegistry;
-use logmon_mcp_server::engine::pipeline::LogPipeline;
-use logmon_mcp_server::engine::seq_counter::SeqCounter;
-use logmon_mcp_server::gelf::message::{Level, LogEntry, LogSource};
-use logmon_mcp_server::rpc::types::RpcRequest;
-use logmon_mcp_server::span::store::SpanStore;
-use logmon_mcp_server::store::bookmarks::BookmarkStore;
+use logmon_broker_core::daemon::log_processor::process_entry;
+use logmon_broker_core::daemon::rpc_handler::RpcHandler;
+use logmon_broker_core::daemon::session::SessionRegistry;
+use logmon_broker_core::engine::pipeline::LogPipeline;
+use logmon_broker_core::engine::seq_counter::SeqCounter;
+use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
+use logmon_broker_protocol::RpcRequest;
+use logmon_broker_core::span::store::SpanStore;
+use logmon_broker_core::store::bookmarks::BookmarkStore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,7 +53,7 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
 
 fn call(
     handler: &RpcHandler,
-    session: &logmon_mcp_server::daemon::session::SessionId,
+    session: &logmon_broker_core::daemon::session::SessionId,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {

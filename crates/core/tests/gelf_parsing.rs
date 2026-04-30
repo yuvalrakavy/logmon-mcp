@@ -1,4 +1,4 @@
-use logmon_mcp_server::gelf::message::{Level, parse_gelf_message};
+use logmon_broker_core::gelf::message::{Level, parse_gelf_message};
 use serde_json::json;
 
 #[test]

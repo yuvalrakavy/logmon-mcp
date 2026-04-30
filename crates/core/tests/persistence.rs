@@ -1,4 +1,4 @@
-use logmon_mcp_server::daemon::persistence::*;
+use logmon_broker_core::daemon::persistence::*;
 use std::path::PathBuf;
 
 #[test]
