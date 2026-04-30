@@ -266,6 +266,13 @@ pub async fn run_with_overrides(
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
         info!(?socket_path, "listening on Unix socket");
 
+        // Track spawned connection-handler tasks so we can abort them on
+        // shutdown. Without this, the accept loop exits but per-connection
+        // tasks remain alive — they keep serving requests on the old socket
+        // after `shutdown_future` resolves, which makes restart-based
+        // reconnect testing impossible.
+        let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
         // Accept loop with override-aware shutdown for graceful termination.
         loop {
             // Honor accept-pause: when paused, do not call accept(). Sleep a
@@ -292,7 +299,7 @@ pub async fn run_with_overrides(
                             let handler = handler.clone();
                             let pipeline = pipeline.clone();
                             let sessions = sessions.clone();
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
                                 if let Err(e) = handle_connection(stream, handler, pipeline, sessions).await {
                                     warn!("connection error: {e}");
                                 }
@@ -303,12 +310,22 @@ pub async fn run_with_overrides(
                         }
                     }
                 }
+                // Reap finished connection tasks so the JoinSet doesn't grow
+                // unbounded over the daemon's lifetime. Returns None when
+                // empty, which the select macro treats as never-ready — we
+                // won't busy-loop.
+                Some(_) = connection_tasks.join_next() => {}
                 _ = &mut shutdown_future => {
                     info!("received shutdown signal, stopping");
                     break;
                 }
             }
         }
+
+        // Abort any in-flight connection-handler tasks. This is what makes
+        // shutdown actually disconnect clients (without it, per-connection
+        // tasks survive the accept-loop exit).
+        connection_tasks.shutdown().await;
 
         // Send offline beacon before stopping receivers
         send_otel_beacon("OTEL:OFFLINE\n");
@@ -337,6 +354,8 @@ pub async fn run_with_overrides(
         let listener = tokio::net::TcpListener::bind("127.0.0.1:12200").await?;
         info!("listening on TCP 127.0.0.1:12200");
 
+        let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
         loop {
             if let Some(p) = accept_paused.as_ref() {
                 if p.load(Ordering::SeqCst) {
@@ -360,7 +379,7 @@ pub async fn run_with_overrides(
                             let handler = handler.clone();
                             let pipeline = pipeline.clone();
                             let sessions = sessions.clone();
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
                                 if let Err(e) = handle_connection(stream, handler, pipeline, sessions).await {
                                     warn!("connection error: {e}");
                                 }
@@ -371,12 +390,17 @@ pub async fn run_with_overrides(
                         }
                     }
                 }
+                Some(_) = connection_tasks.join_next() => {}
                 _ = &mut shutdown_future => {
                     info!("received shutdown signal, stopping");
                     break;
                 }
             }
         }
+
+        // Abort any in-flight connection-handler tasks so shutdown actually
+        // disconnects clients.
+        connection_tasks.shutdown().await;
 
         // Send offline beacon before stopping receivers
         send_otel_beacon("OTEL:OFFLINE\n");

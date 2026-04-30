@@ -65,6 +65,8 @@ pub enum SessionError {
     InvalidName(String),
     #[error("session already connected: {0}")]
     AlreadyConnected(String),
+    #[error("session already exists (disconnected): {0}")]
+    AlreadyExists(String),
     #[error("session not found: {0}")]
     NotFound(String),
     #[error("filter error: {0}")]
@@ -194,6 +196,15 @@ impl SessionRegistry {
         id
     }
 
+    /// Create a brand-new named session. If a session with this name already
+    /// exists (whether currently connected or disconnected from a prior run),
+    /// returns an error — callers must use [`Self::reconnect`] to resume an
+    /// existing-but-disconnected session.
+    ///
+    /// Distinguishing "actually new" from "resumed-from-persisted-state" is
+    /// what lets `session.start` set `is_new` correctly: an existing
+    /// disconnected session should resume with `is_new=false` so the SDK
+    /// knows the daemon's named-session state is intact.
     pub fn create_named(&self, name: &str) -> Result<SessionId, SessionError> {
         if !is_valid_session_name(name) {
             return Err(SessionError::InvalidName(name.to_string()));
@@ -206,10 +217,9 @@ impl SessionRegistry {
             if existing.connected.load(Ordering::Relaxed) {
                 return Err(SessionError::AlreadyConnected(name.to_string()));
             }
-            // Named session exists but disconnected — reconnect it
-            existing.connected.store(true, Ordering::Relaxed);
-            existing.touch();
-            return Ok(id);
+            // Named session exists but disconnected — caller should use
+            // `reconnect()` to resume it.
+            return Err(SessionError::AlreadyExists(name.to_string()));
         }
 
         let state = SessionState::new_named(name);

@@ -3,11 +3,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 
-use crate::bridge::{BridgeError, DaemonBridge};
+use crate::reconnect::{
+    initial_connect, is_transport_error, map_bridge_error, ConnectionManager,
+};
 use crate::{BrokerError, Notification};
-use logmon_broker_protocol::{SessionStartParams, SessionStartResult, PROTOCOL_VERSION};
 
 /// Builder for [`Broker`] connections. Use [`Broker::connect`] to obtain one
 /// with default settings, then chain builder methods before calling
@@ -18,7 +19,6 @@ pub struct BrokerBuilder {
     client_info: Option<Value>,
     reconnect_max_attempts: u32,
     reconnect_max_backoff: Duration,
-    #[allow(dead_code)] // used by reconnect machinery in Task 16
     reconnect_initial_backoff: Duration,
     call_timeout: Option<Duration>, // None = compute dynamically from reconnect knobs
     notification_buffer: usize,
@@ -60,6 +60,10 @@ impl BrokerBuilder {
         self.reconnect_max_backoff = d;
         self
     }
+    pub fn reconnect_initial_backoff(mut self, d: Duration) -> Self {
+        self.reconnect_initial_backoff = d;
+        self
+    }
     pub fn call_timeout(mut self, d: Duration) -> Self {
         self.call_timeout = Some(d);
         self
@@ -69,7 +73,6 @@ impl BrokerBuilder {
     /// `reconnect_max_attempts × reconnect_max_backoff`. On overflow, falls
     /// back to 5 minutes so we never silently produce a zero-duration
     /// timeout.
-    #[allow(dead_code)] // consumed by reconnect machinery in Task 16
     pub(crate) fn resolved_call_timeout(&self) -> Duration {
         self.call_timeout.unwrap_or_else(|| {
             self.reconnect_max_backoff
@@ -78,84 +81,48 @@ impl BrokerBuilder {
         })
     }
 
-    pub async fn open(self) -> Result<Broker, BrokerError> {
-        // Resolve socket path — env > builder > default
-        let socket_path = self
-            .socket_path
+    pub(crate) fn resolved_socket_path(&self) -> Option<PathBuf> {
+        self.socket_path
             .clone()
             .or_else(|| std::env::var("LOGMON_BROKER_SOCKET").ok().map(PathBuf::from))
-            .unwrap_or_else(default_socket_path);
+    }
 
-        // Validate client_info size
-        if let Some(ref ci) = self.client_info {
-            let serialized =
-                serde_json::to_string(ci).map_err(|e| BrokerError::Protocol(e.to_string()))?;
-            if serialized.len() > 4096 {
-                return Err(BrokerError::Method {
-                    code: -32602,
-                    message: "client_info exceeds 4 KB limit".into(),
-                });
-            }
-        }
+    pub(crate) fn session_name_clone(&self) -> Option<String> {
+        self.session_name.clone()
+    }
 
-        // Connect socket
-        #[cfg(unix)]
-        let stream = tokio::net::UnixStream::connect(&socket_path).await?;
-        #[cfg(windows)]
-        let stream = {
-            // socket_path unused on Windows; broker listens on TCP
-            let _ = &socket_path;
-            tokio::net::TcpStream::connect("127.0.0.1:12200").await?
-        };
+    pub(crate) fn client_info_clone(&self) -> Option<Value> {
+        self.client_info.clone()
+    }
 
-        let (notification_tx, _) = broadcast::channel(self.notification_buffer);
-        let bridge = DaemonBridge::spawn(stream, notification_tx.clone())
-            .await
-            .map_err(map_bridge_error)?;
+    pub(crate) fn notification_buffer(&self) -> usize {
+        self.notification_buffer
+    }
 
-        // session.start handshake
-        let params = SessionStartParams {
-            name: self.session_name.clone(),
-            protocol_version: PROTOCOL_VERSION,
-            client_info: self.client_info.clone(),
-        };
-        let result_value = bridge
-            .call("session.start", serde_json::to_value(&params).unwrap())
-            .await
-            .map_err(map_bridge_error)?;
-        let result: SessionStartResult = serde_json::from_value(result_value)
-            .map_err(|e| BrokerError::Protocol(e.to_string()))?;
+    pub(crate) fn resolved_initial_backoff(&self) -> Duration {
+        self.reconnect_initial_backoff
+    }
 
-        Ok(Broker {
-            inner: Arc::new(Inner {
-                bridge: Mutex::new(bridge),
-                session_id: result.session_id,
-                is_new_session: result.is_new,
-                capabilities: vec![], // Task 12
-                daemon_uptime: Duration::from_secs(result.daemon_uptime_secs),
-                notification_tx,
-                config: Arc::new(self),
-            }),
-        })
+    pub(crate) fn resolved_max_backoff(&self) -> Duration {
+        self.reconnect_max_backoff
+    }
+
+    pub(crate) fn resolved_max_attempts(&self) -> u32 {
+        self.reconnect_max_attempts
+    }
+
+    pub async fn open(self) -> Result<Broker, BrokerError> {
+        let config = Arc::new(self);
+        let manager = initial_connect(config).await?;
+        Ok(Broker { inner: manager })
     }
 }
 
 /// Cheap-to-clone handle to a connected broker session. All clones share the
-/// same underlying bridge and session state.
+/// same underlying connection-manager and session state.
 #[derive(Clone)]
 pub struct Broker {
-    pub(crate) inner: Arc<Inner>,
-}
-
-pub(crate) struct Inner {
-    pub(crate) bridge: Mutex<DaemonBridge>,
-    pub(crate) session_id: String,
-    pub(crate) is_new_session: bool,
-    pub(crate) capabilities: Vec<String>,
-    pub(crate) daemon_uptime: Duration,
-    pub(crate) notification_tx: broadcast::Sender<Notification>,
-    #[allow(dead_code)] // consumed by reconnect machinery in Task 16
-    pub(crate) config: Arc<BrokerBuilder>,
+    pub(crate) inner: Arc<ConnectionManager>,
 }
 
 impl Broker {
@@ -190,13 +157,23 @@ impl Broker {
 
     /// Untyped JSON-RPC call — convenience pass-through used by the MCP shim
     /// and by [`Broker::call_typed`].
-    pub async fn call(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, BrokerError> {
-        let bridge = self.inner.bridge.lock().await;
-        bridge.call(method, params).await.map_err(map_bridge_error)
+    pub async fn call(&self, method: &str, params: Value) -> Result<Value, BrokerError> {
+        let deadline =
+            tokio::time::Instant::now() + self.inner.config.resolved_call_timeout();
+        let bridge = self.inner.current_bridge(deadline).await?;
+        match bridge.call(method, params).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if is_transport_error(&e) {
+                    // The bridge is dead — drive the state machine into
+                    // Reconnecting (or PermanentlyFailed for anonymous). The
+                    // bridge's own EOF notify will also fire; both paths are
+                    // idempotent.
+                    self.inner.enter_disconnect().await;
+                }
+                Err(map_bridge_error(e))
+            }
+        }
     }
 
     /// Typed JSON-RPC dispatch helper. Serializes `params` to JSON, sends the
@@ -211,15 +188,6 @@ impl Broker {
             serde_json::to_value(&params).map_err(|e| BrokerError::Protocol(e.to_string()))?;
         let result_value = self.call(method, value).await?;
         serde_json::from_value(result_value).map_err(|e| BrokerError::Protocol(e.to_string()))
-    }
-}
-
-fn map_bridge_error(err: BridgeError) -> BrokerError {
-    match err {
-        BridgeError::Transport(e) => BrokerError::Transport(e),
-        BridgeError::Rpc { code, message } => BrokerError::Method { code, message },
-        BridgeError::Closed => BrokerError::Disconnected,
-        BridgeError::Protocol(msg) => BrokerError::Protocol(msg),
     }
 }
 

@@ -961,6 +961,7 @@ dependencies = [
  "fs2",
  "logmon-broker-core",
  "logmon-broker-protocol",
+ "rand",
  "serde",
  "serde_json",
  "tempfile",
@@ -968,6 +969,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod connect;
 pub mod filter;
 mod methods;
+mod reconnect;
 pub mod transport;
 
 pub use filter::{Filter, FilterBuilder, FilterSpanKind, FilterSpanStatus, Level};
@@ -35,9 +36,11 @@ pub enum Notification {
     TriggerFired(TriggerFiredPayload),
 
     /// The bridge re-established its session after a transient disconnect.
-    /// Defined here so subscribers can pattern-match without conditional
-    /// compilation; emission lands with the reconnect state machine in
-    /// Task 16. Until then this variant is unreachable.
+    /// Emitted by the reconnect state machine ([`crate::reconnect`]) AFTER a
+    /// successful `session.start` resume but BEFORE the new bridge's reader
+    /// task starts processing daemon-drained queued notifications, so
+    /// subscribers see `Reconnected` first and any drained `TriggerFired`
+    /// events second.
     Reconnected,
 }
 
