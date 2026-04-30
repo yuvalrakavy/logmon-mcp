@@ -38,14 +38,62 @@ enum Subcommand {
     // install-service / uninstall-service added in Task 23
 }
 
+/// Print broker status. Returns the desired process exit code:
+/// `0` when a live broker is found, `1` otherwise (no pid file, stale pid file,
+/// or unparseable pid).
+fn status() -> Result<i32> {
+    let dir = config_dir();
+    let pid_path = dir.join("daemon.pid");
+    let socket_path = dir.join("logmon.sock");
+
+    if !pid_path.exists() {
+        println!("not running");
+        return Ok(1);
+    }
+    let pid_str = std::fs::read_to_string(&pid_path)?;
+    let pid: u32 = match pid_str.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            println!("not running (unparseable pid file)");
+            return Ok(1);
+        }
+    };
+    if !is_process_alive(pid) {
+        println!("not running (stale pid file)");
+        return Ok(1);
+    }
+    println!("running pid={pid} socket={}", socket_path.display());
+    Ok(0)
+}
+
+/// Liveness probe for a pid using a signal-0 / tasklist check.
+/// Lives in `main.rs` for Task 18; lifted into a shared module in Task 21.
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    return std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    #[cfg(windows)]
+    return std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Some(Subcommand::Status) => {
-            // Implemented in Task 18
-            unimplemented!("Task 18")
+            std::process::exit(status()?);
         }
         None => {
             let mut config = load_config(&config_dir().join("config.json"))?;
