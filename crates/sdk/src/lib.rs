@@ -7,8 +7,11 @@
 
 pub mod bridge;
 pub mod connect;
+pub mod filter;
 mod methods;
 pub mod transport;
+
+pub use filter::{Filter, FilterBuilder, FilterSpanKind, FilterSpanStatus, Level};
 
 pub use connect::{Broker, BrokerBuilder};
 pub use logmon_broker_protocol::{
