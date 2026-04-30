@@ -30,12 +30,13 @@ You have access to a log collector MCP server that receives structured logs from
 
 ## Architecture
 
-logmon uses a **daemon + shim** architecture:
+logmon uses a **broker + clients** architecture:
 
-- **Daemon**: Long-running process that collects GELF logs (UDP/TCP), stores them in a ring buffer, and evaluates triggers/filters per session.
-- **Shim**: Thin MCP bridge that connects your Claude session to the daemon. Auto-starts the daemon if not running.
+- **logmon-broker** (daemon): Long-running process that ingests GELF (UDP/TCP) and OTLP (gRPC/HTTP), stores logs and traces in ring buffers, and serves clients over a Unix domain socket via JSON-RPC 2.0. Usually runs as a system service (`logmon-broker install-service`); the shim auto-starts it on demand if no service is installed.
+- **logmon-mcp** (shim): Thin MCP bridge. One per Claude session, all connected to the same broker.
+- **logmon-broker-sdk**: Typed Rust client SDK for non-MCP consumers (test harnesses, dashboards, archival workers). Cross-language clients can codegen from `crates/protocol/protocol-v1.schema.json`.
 
-Multiple Claude sessions share the same daemon and log buffer. Each session has its own triggers and filters.
+Multiple Claude sessions share the same broker and log buffer. Each session has its own triggers and filters; named sessions persist across disconnects.
 
 ## Available Tools
 
@@ -211,3 +212,7 @@ Span filters use the same comma-separated syntax but with span-specific selector
 | `d>=` / `d<=` | duration (ms) | `d>=100` |
 
 Cannot mix log selectors and span selectors in the same filter.
+
+## SDK consumers (forward link)
+
+For non-MCP clients (test harnesses, archival workers, dashboards), see the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). The first SDK consumer outside this repo is `store-test` — see Spec B handoff at `docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md` for the integration brief.
