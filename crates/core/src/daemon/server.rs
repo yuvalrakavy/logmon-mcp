@@ -5,14 +5,14 @@ use crate::daemon::persistence::{
 use crate::daemon::rpc_handler::RpcHandler;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::daemon::span_processor::spawn_span_processor;
+use crate::daemon::transport::{read_request, write_message};
 use crate::engine::pipeline::LogPipeline;
 use crate::engine::seq_counter::SeqCounter;
 use crate::receiver::gelf::{GelfReceiver, GelfReceiverConfig};
 use crate::receiver::otlp::{OtlpReceiver, OtlpReceiverConfig};
 use crate::receiver::Receiver;
-use crate::rpc::transport::{read_request, write_message};
-use crate::rpc::types::*;
 use crate::span::store::SpanStore;
+use logmon_broker_protocol::*;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::mpsc;

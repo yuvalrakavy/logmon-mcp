@@ -21,10 +21,9 @@ pub mod shim;           // still in _legacy/src/shim/ until Task 5
 pub mod mcp;            // still in _legacy/src/mcp/ until Task 5
 
 pub mod daemon {
-    pub use logmon_broker_core::daemon::log_processor;
-    pub use logmon_broker_core::daemon::span_processor;
-    pub use logmon_broker_core::daemon::persistence;
-    pub use logmon_broker_core::daemon::session;
-    pub use logmon_broker_core::daemon::rpc_handler;
-    pub mod server;     // still in _legacy/src/daemon/server.rs until Task 4
+    // server.rs moved to logmon-broker-core in Task 4. The wildcard re-export
+    // surfaces `daemon::server` (and all sibling modules) so the legacy
+    // main.rs's `use logmon_mcp_server::daemon::server::run_daemon` still
+    // resolves through the shim.
+    pub use logmon_broker_core::daemon::*;
 }
