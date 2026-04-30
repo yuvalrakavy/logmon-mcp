@@ -284,6 +284,17 @@ pub async fn run_with_overrides(
     // 14. Listen on Unix socket (unix) or TCP (windows)
     info!("daemon ready, listening for connections");
 
+    // Notify systemd we are ready (Type=notify support). On non-Linux this
+    // is a no-op at compile time. On Linux without `NOTIFY_SOCKET` set (i.e.
+    // not running under systemd), `sd_notify::notify` returns an Err which
+    // we log at debug — it is not a real failure.
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+            tracing::debug!(error = %e, "sd_notify ready failed (likely not running under systemd)");
+        }
+    }
+
     // Build a single shutdown future from either the override (test harness)
     // or `wait_for_shutdown()` (production: SIGTERM | SIGINT), so the accept
     // loop has a uniform branch to await.

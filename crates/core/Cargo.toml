@@ -29,6 +29,9 @@ opentelemetry-proto.workspace = true
 axum.workspace = true
 tempfile = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = { workspace = true }
+
 [dev-dependencies]
 tokio-test.workspace = true
 tempfile.workspace = true
