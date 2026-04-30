@@ -148,7 +148,8 @@ pub async fn run_with_overrides(
     std::fs::create_dir_all(&dir)?;
 
     // 2. Set up file-based tracing (daily rotation), unless the harness owns
-    //    its own subscriber.
+    //    its own subscriber. Done before the stale-pid sweep so its log line
+    //    actually lands in `daemon.log`.
     let _tracing_guard = if skip_tracing_init {
         None
     } else {
@@ -164,6 +165,35 @@ pub async fn run_with_overrides(
     };
 
     info!("logmon daemon starting");
+
+    // 2b. Stale-pid sweep. If a `daemon.pid` exists from a previous run:
+    //     - and that pid is alive, refuse to start (someone else owns the
+    //       config dir; running two brokers concurrently would corrupt the
+    //       socket and state file);
+    //     - otherwise, remove the stale pid file AND the (now-unowned)
+    //       socket file so we can start cleanly. This is what makes
+    //       `kill -9 logmon-broker; logmon-broker` work without manual
+    //       cleanup.
+    //
+    //     Tests use an injected, ephemeral config_dir per run, so any
+    //     `daemon.pid` they encounter is a leftover from a crashed test —
+    //     the same recovery semantics we want in production.
+    let pid_path = dir.join("daemon.pid");
+    let socket_path_for_sweep = socket_override
+        .clone()
+        .unwrap_or_else(|| dir.join("logmon.sock"));
+    if pid_path.exists() {
+        let pid_str = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if crate::daemon::process::is_process_alive(pid) {
+                anyhow::bail!("another broker is already running (pid {pid}); abort");
+            }
+        }
+        info!(?pid_path, "removing stale pid file from previous run");
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&socket_path_for_sweep);
+    }
+    drop(socket_path_for_sweep);
 
     // 3. Load state, get initial_seq from seq_block
     let state_path = dir.join("state.json");
@@ -259,8 +289,8 @@ pub async fn run_with_overrides(
         }
     };
 
-    // 10. Write PID file
-    let pid_path = dir.join("daemon.pid");
+    // 10. Write PID file (path was resolved earlier in step 1b for the
+    //     stale-pid sweep)
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
     // 11. Start log processor

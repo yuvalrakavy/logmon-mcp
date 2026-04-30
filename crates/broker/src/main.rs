@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use logmon_broker_core::daemon::persistence::{config_dir, load_config};
+use logmon_broker_core::daemon::process::is_process_alive;
 
 #[derive(Parser, Debug)]
 #[command(name = "logmon-broker", version, about = "logmon broker daemon")]
@@ -64,27 +65,6 @@ fn status() -> Result<i32> {
     }
     println!("running pid={pid} socket={}", socket_path.display());
     Ok(0)
-}
-
-/// Liveness probe for a pid using a signal-0 / tasklist check.
-/// Lives in `main.rs` for Task 18; lifted into a shared module in Task 21.
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    return std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    #[cfg(windows)]
-    return std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
 }
 
 #[tokio::main]

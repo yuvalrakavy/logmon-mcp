@@ -926,6 +926,7 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "regex",
+ "sd-notify",
  "serde",
  "serde_json",
  "socket2 0.5.10",

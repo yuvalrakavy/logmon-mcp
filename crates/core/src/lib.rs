@@ -7,6 +7,7 @@ pub mod store;
 pub mod daemon {
     pub mod log_processor;
     pub mod persistence;
+    pub mod process;
     pub mod rpc_handler;
     pub mod server;
     pub mod session;
