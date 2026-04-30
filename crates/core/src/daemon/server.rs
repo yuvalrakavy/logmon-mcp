@@ -59,6 +59,45 @@ fn send_otel_beacon(message: &str) {
     }
 }
 
+/// Wait for either SIGTERM or SIGINT (Unix), or `ctrl_c` (Windows).
+/// Production path uses this; the test harness injects a oneshot channel
+/// via [`DaemonOverrides::shutdown_rx`] instead.
+///
+/// SIGTERM is what `systemctl stop` and `launchctl bootout` send by default.
+/// SIGINT is what an interactive `Ctrl-C` sends. Both should drain cleanly.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "failed to install SIGTERM handler; falling back to ctrl_c only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        let mut intr = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "failed to install SIGINT handler; awaiting SIGTERM only");
+                term.recv().await;
+                info!("received SIGTERM");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => info!("received SIGTERM"),
+            _ = intr.recv() => info!("received SIGINT"),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("received ctrl_c");
+    }
+}
+
 /// Optional overrides applied by `run_with_overrides`. Used by the in-process
 /// test harness (and only the test harness) to drive the daemon without a real
 /// filesystem layout, real GELF/OTLP receivers, or `ctrl_c` shutdown.
@@ -245,16 +284,15 @@ pub async fn run_with_overrides(
     // 14. Listen on Unix socket (unix) or TCP (windows)
     info!("daemon ready, listening for connections");
 
-    // Build a single shutdown future from either the override or ctrl_c, so
-    // the accept loop has a uniform branch to await.
+    // Build a single shutdown future from either the override (test harness)
+    // or `wait_for_shutdown()` (production: SIGTERM | SIGINT), so the accept
+    // loop has a uniform branch to await.
     let shutdown_future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
         match shutdown_rx {
             Some(rx) => Box::pin(async move {
                 let _ = rx.await;
             }),
-            None => Box::pin(async {
-                let _ = tokio::signal::ctrl_c().await;
-            }),
+            None => Box::pin(wait_for_shutdown()),
         };
     tokio::pin!(shutdown_future);
 
