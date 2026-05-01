@@ -225,9 +225,10 @@ Once logs are flowing, ask your assistant:
 | `get_log_context` | Get logs surrounding a specific entry by seq number |
 | `export_logs` | Save logs to a file |
 | `clear_logs` | Clear the log buffer |
-| `add_bookmark` | Set a named timestamp anchor at the current moment (global, qualified by session name) |
-| `list_bookmarks` | List all live bookmarks, newest first |
+| `add_bookmark` | Set a named seq anchor at the current moment (global, qualified by session name). Optional `start_seq` overrides the default; `replace=true` overwrites existing. |
+| `list_bookmarks` | List all live bookmarks with their seq position |
 | `remove_bookmark` | Remove a bookmark (bare name = current session; `session/name` reaches another session) |
+| `clear_bookmarks` | Clear all bookmarks for the current session |
 | `get_status` | Server status and statistics |
 | `get_filters` | List buffer filters for this session |
 | `add_filter` | Add a buffer filter (OR semantics across filters) |
@@ -255,9 +256,11 @@ connection refused,h=myapp   # substring match + host filter
 
 **Special filters:** `ALL` (match everything), `NONE` (match nothing)
 
-### Bookmarks
+### Bookmarks and cursors
 
-Bookmarks let you scope queries to a time range without destructively clearing logs. Set one before an operation, another after, and query the range:
+Bookmarks are named seq positions in the broker's record stream. Two interaction patterns share the same storage:
+
+**Pure-read (`b>=`, `b<=`).** Set a bookmark; read records strictly after it. The bookmark never moves on its own.
 
 ```
 add_bookmark("before")
@@ -267,9 +270,24 @@ get_recent_logs(filter="b>=before, b<=after, l>=warn")
 get_recent_traces(filter="b>=before, b<=after, d>=100")
 ```
 
-Bookmarks are global across sessions and qualified by the creating session (`session/name`). Bare names in tool calls and DSL expressions resolve to the current session. Bookmarks auto-evict when both the log and span buffers have rolled past their timestamp — they cannot outlive the data they point at.
+**Read-and-advance (`c>=`).** Same filter as `b>=`, but atomically updates the bookmark to the max seq returned. The same bookmark can be referenced via either operator — `b>=` reads, `c>=` reads-and-advances. Useful for "what's new since I last checked":
 
-`b>=` / `b<=` are usable only in query tools, not in registered filters or triggers.
+```
+# First call — auto-creates the bookmark at seq=0 if missing,
+# returns everything currently in the buffer matching, advances cursor.
+get_recent_logs(filter="c>=test-run", count=500)
+
+# Subsequent calls — return only new records since the previous call
+get_recent_logs(filter="c>=test-run", count=500)
+```
+
+When a `c>=` qualifier is present, results are returned **oldest-first within the cursor's window** (so paginated polls drain monotonically). Without `c>=`, results stay newest-first as today.
+
+`c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Other query methods (`get_log_context`, `get_recent_traces`, etc.) reject `c>=` because their results aren't seq-streamable.
+
+Bookmarks are global across sessions and qualified by the creating session (`session/name`). Bare names in tool calls and DSL expressions resolve to the current session. Bookmarks auto-evict when both the log and span buffers have rolled past their seq.
+
+`b>=`, `b<=`, and `c>=` are usable only in query tools — they're rejected by `add_filter` and `add_trigger`.
 
 ## Triggers
 
@@ -331,6 +349,8 @@ cargo test
 ## Embedding via SDK
 
 For non-MCP consumers (test harnesses, archival workers, dashboards), use the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). It speaks JSON-RPC 2.0 against the broker's UDS, returns typed `Result<R, BrokerError>` for every method, supports named-session reconnection across daemon restarts, and emits typed `Notification` events (TriggerFired, Reconnected) on a broadcast channel.
+
+**See [`crates/sdk/README.md`](crates/sdk/README.md) for the canonical SDK guide** — quick start, full method index, filter builder, notification handling, reconnect model, error semantics, and the test-support harness.
 
 The first SDK consumer outside this repo is `store-test` — see [`docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md`](docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md) for the integration brief.
 
