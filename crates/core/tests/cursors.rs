@@ -36,7 +36,7 @@ async fn add_bookmark_with_explicit_start_seq() {
     let entry = list
         .bookmarks
         .iter()
-        .find(|b| b.name.ends_with("/anchor"))
+        .find(|b| b.qualified_name.ends_with("/anchor"))
         .expect("expected to find /anchor in list");
     assert_eq!(entry.seq, 42);
     assert_eq!(entry.description.as_deref(), Some("explicit start"));
@@ -80,7 +80,7 @@ async fn add_bookmark_replace_overwrites() {
     let entry = list
         .bookmarks
         .iter()
-        .find(|b| b.name.ends_with("/x"))
+        .find(|b| b.qualified_name.ends_with("/x"))
         .expect("expected to find /x in list");
     assert_eq!(entry.seq, 2);
 }

@@ -2143,8 +2143,8 @@
           "description": "One entry in a `bookmarks.list` response.\n\nAs of the cursor design (2026-05-01), bookmark position is a `u64` seq\nrather than a wall-clock timestamp. `created_at` is retained for human\ndisplay only; never use it for filter semantics.",
           "type": "object",
           "properties": {
-            "name": {
-              "description": "Qualified form (`\"session/bookmark\"`). Carries the qualified name even\nthough the field is called `name` — the bare name is recoverable by\nsplitting on the last `/`.",
+            "qualified_name": {
+              "description": "Qualified form (`\"session/bookmark\"`). The bare name is recoverable\nby splitting on the last `/`.",
               "type": "string"
             },
             "seq": {
@@ -2167,7 +2167,7 @@
             }
           },
           "required": [
-            "name",
+            "qualified_name",
             "seq",
             "created_at"
           ]
@@ -3368,8 +3368,8 @@
       "description": "One entry in a `bookmarks.list` response.\n\nAs of the cursor design (2026-05-01), bookmark position is a `u64` seq\nrather than a wall-clock timestamp. `created_at` is retained for human\ndisplay only; never use it for filter semantics.",
       "type": "object",
       "properties": {
-        "name": {
-          "description": "Qualified form (`\"session/bookmark\"`). Carries the qualified name even\nthough the field is called `name` — the bare name is recoverable by\nsplitting on the last `/`.",
+        "qualified_name": {
+          "description": "Qualified form (`\"session/bookmark\"`). The bare name is recoverable\nby splitting on the last `/`.",
           "type": "string"
         },
         "seq": {
@@ -3392,7 +3392,7 @@
         }
       },
       "required": [
-        "name",
+        "qualified_name",
         "seq",
         "created_at"
       ]

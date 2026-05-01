@@ -18,10 +18,10 @@ pub enum Qualifier {
     BookmarkFilter { op: BookmarkOp, name: String },
     /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`.
     /// Never emitted by the parser, never serialized in user-facing wire shapes.
-    /// Comparison is strict: `Gte` means `entry.seq > value`, `Lte` means
-    /// `entry.seq < value` — matches the cursor design's "strictly after the
-    /// bookmark" semantics.
-    SeqFilter { op: BookmarkOp, value: u64 },
+    /// Uses `SeqOp` (strict `Gt`/`Lt`) — distinct from `BookmarkOp` because the
+    /// cursor design resolves `b>=name` / `b<=name` to STRICT `>` / `<` against
+    /// the bookmark's seq (not ≥/≤).
+    SeqFilter { op: SeqOp, value: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +34,15 @@ pub enum DurationOp {
 pub enum BookmarkOp {
     Gte,
     Lte,
+}
+
+/// Strict comparison op for the internal-only `SeqFilter` qualifier.
+/// Distinct from `BookmarkOp` because the spec semantics for `b>=name` and
+/// `b<=name` resolve to STRICT `>` / `<` against the bookmark's seq (not ≥/≤).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum SeqOp {
+    Gt,
+    Lt,
 }
 
 #[derive(Debug, Clone)]

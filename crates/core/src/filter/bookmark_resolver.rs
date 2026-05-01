@@ -1,4 +1,4 @@
-use crate::filter::parser::{ParsedFilter, Qualifier};
+use crate::filter::parser::{BookmarkOp, ParsedFilter, Qualifier, SeqOp};
 use crate::store::bookmarks::{qualify, BookmarkStore};
 use thiserror::Error;
 
@@ -29,7 +29,10 @@ pub fn resolve_bookmarks(
                             .get(&qualified)
                             .ok_or(BookmarkResolutionError::NotFound(qualified))?;
                         out.push(Qualifier::SeqFilter {
-                            op,
+                            op: match op {
+                                BookmarkOp::Gte => SeqOp::Gt,
+                                BookmarkOp::Lte => SeqOp::Lt,
+                            },
                             value: bookmark.seq,
                         });
                     }
@@ -44,7 +47,7 @@ pub fn resolve_bookmarks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::parser::{parse_filter, BookmarkOp};
+    use crate::filter::parser::parse_filter;
 
     #[test]
     fn bare_name_resolves_against_current_session() {
@@ -54,7 +57,7 @@ mod tests {
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved {
             assert_eq!(qs.len(), 1);
-            assert!(matches!(qs[0], Qualifier::SeqFilter { op: BookmarkOp::Gte, value: 7 }));
+            assert!(matches!(qs[0], Qualifier::SeqFilter { op: SeqOp::Gt, value: 7 }));
         } else {
             panic!("expected qualifiers");
         }
@@ -67,7 +70,7 @@ mod tests {
         let filter = parse_filter("b<=B/x").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved {
-            assert!(matches!(qs[0], Qualifier::SeqFilter { op: BookmarkOp::Lte, value: 12 }));
+            assert!(matches!(qs[0], Qualifier::SeqFilter { op: SeqOp::Lt, value: 12 }));
         } else {
             panic!("expected qualifiers");
         }

@@ -333,7 +333,7 @@ pub struct TracesSlowGroup {
 
 ```rust
 pub struct BookmarkInfo {
-    pub name: String,                        // Qualified as "session/bookmark-name".
+    pub qualified_name: String,              // "session/bookmark-name". Bare name recoverable by splitting on the last '/'.
     pub seq: u64,                            // Position in the broker's seq stream.
     pub created_at: chrono::DateTime<Utc>,   // ISO 8601; informational, not used for filtering.
     pub description: Option<String>,

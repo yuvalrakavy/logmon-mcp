@@ -220,10 +220,9 @@ pub struct StoreStats {
 /// display only; never use it for filter semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BookmarkInfo {
-    /// Qualified form (`"session/bookmark"`). Carries the qualified name even
-    /// though the field is called `name` — the bare name is recoverable by
-    /// splitting on the last `/`.
-    pub name: String,
+    /// Qualified form (`"session/bookmark"`). The bare name is recoverable
+    /// by splitting on the last `/`.
+    pub qualified_name: String,
     /// Position the bookmark anchors. Filter DSL `b>=name` matches records
     /// with `entry.seq > seq`; `b<=name` matches `entry.seq < seq`.
     pub seq: u64,

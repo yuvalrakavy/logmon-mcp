@@ -125,8 +125,9 @@ impl BookmarkStore {
     pub fn list(&self) -> Vec<Bookmark> {
         let map = self.bookmarks.read().expect("bookmarks lock poisoned");
         let mut v: Vec<Bookmark> = map.values().cloned().collect();
-        // Newest seq first.
-        v.sort_by(|a, b| b.seq.cmp(&a.seq));
+        // Newest seq first; tie-break on qualified_name so equal-seq ordering
+        // is deterministic (HashMap iteration order is not).
+        v.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| a.qualified_name.cmp(&b.qualified_name)));
         v
     }
 

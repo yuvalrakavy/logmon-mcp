@@ -27,6 +27,9 @@ impl SeqCounter {
         self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Returns the most-recently-assigned seq (the value `next()` last returned).
+    /// `Relaxed` ordering is correct here: we're reading the counter, not
+    /// synchronizing on log-data writes elsewhere.
     pub fn current(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
     }

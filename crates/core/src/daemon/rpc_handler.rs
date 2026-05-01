@@ -682,11 +682,16 @@ impl RpcHandler {
             .unwrap_or(false);
         // `start_seq` defaults to the daemon's current seq counter — i.e.,
         // "the cursor we'd hand out right now". Cursor auto-create (later
-        // task) uses 0 explicitly to mean "before all records".
-        let start_seq = params
-            .get("start_seq")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| self.pipeline.current_seq());
+        // task) uses 0 explicitly to mean "before all records". Distinguish
+        // "absent / null" (use default) from "present but wrong type/range"
+        // (error, don't silently coerce).
+        let start_seq = match params.get("start_seq") {
+            None => self.pipeline.current_seq(),
+            Some(v) if v.is_null() => self.pipeline.current_seq(),
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| "start_seq must be a non-negative integer".to_string())?,
+        };
         let description = params.get("description").and_then(|v| v.as_str());
 
         // Sweep before adding so the store stays tidy.
@@ -717,7 +722,7 @@ impl RpcHandler {
                 json!({
                     // The qualified ("session/bookmark") name carries both the
                     // session and the bare name; clients can split if needed.
-                    "name": b.qualified_name,
+                    "qualified_name": b.qualified_name,
                     "seq": b.seq,
                     "created_at": b.created_at.to_rfc3339(),
                     "description": b.description,

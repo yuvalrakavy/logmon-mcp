@@ -19,9 +19,8 @@ fn matches_qualifier(qualifier: &Qualifier, entry: &LogEntry) -> bool {
         Qualifier::DurationFilter(..) => false, // duration only applies to spans
         Qualifier::BookmarkFilter { .. } => false,
         Qualifier::SeqFilter { op, value } => match op {
-            // Strict comparison per cursor design: "strictly after the bookmark".
-            BookmarkOp::Gte => entry.seq > *value,
-            BookmarkOp::Lte => entry.seq < *value,
+            SeqOp::Gt => entry.seq > *value,
+            SeqOp::Lt => entry.seq < *value,
         },
     }
 }
@@ -185,9 +184,8 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
         Qualifier::LevelFilter { .. } => false, // log-only
         Qualifier::BookmarkFilter { .. } => false,
         Qualifier::SeqFilter { op, value } => match op {
-            // Strict comparison per cursor design: "strictly after the bookmark".
-            BookmarkOp::Gte => span.seq > *value,
-            BookmarkOp::Lte => span.seq < *value,
+            SeqOp::Gt => span.seq > *value,
+            SeqOp::Lt => span.seq < *value,
         },
     }
 }
@@ -219,16 +217,16 @@ mod seq_tests {
     }
 
     #[test]
-    fn seq_gte_matches_entries_strictly_after_bookmark() {
-        let q = Qualifier::SeqFilter { op: BookmarkOp::Gte, value: 10 };
+    fn seq_gt_matches_entries_strictly_after_bookmark() {
+        let q = Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 };
         assert!(matches_qualifier(&q, &log_entry_with_seq(11)));
         assert!(!matches_qualifier(&q, &log_entry_with_seq(10)), "strict gt — bookmark seq itself excluded");
         assert!(!matches_qualifier(&q, &log_entry_with_seq(5)));
     }
 
     #[test]
-    fn seq_lte_matches_entries_strictly_before_bookmark() {
-        let q = Qualifier::SeqFilter { op: BookmarkOp::Lte, value: 10 };
+    fn seq_lt_matches_entries_strictly_before_bookmark() {
+        let q = Qualifier::SeqFilter { op: SeqOp::Lt, value: 10 };
         assert!(matches_qualifier(&q, &log_entry_with_seq(9)));
         assert!(!matches_qualifier(&q, &log_entry_with_seq(10)), "strict lt — bookmark seq itself excluded");
         assert!(!matches_qualifier(&q, &log_entry_with_seq(15)));
