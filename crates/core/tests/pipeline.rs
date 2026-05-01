@@ -36,12 +36,12 @@ fn test_store_and_query() {
     pipeline.append_to_store(make_entry(2, Level::Error, "bad"));
     assert_eq!(pipeline.store_len(), 2);
 
-    let all = pipeline.recent_logs(10, None);
+    let all = pipeline.recent_logs(10, None, false);
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].seq, 2); // newest first
 
     let filter = parse_filter("l>=ERROR").unwrap();
-    let errors = pipeline.recent_logs(10, Some(&filter));
+    let errors = pipeline.recent_logs(10, Some(&filter), false);
     assert_eq!(errors.len(), 1);
 }
 

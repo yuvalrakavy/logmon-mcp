@@ -32,7 +32,7 @@ fn test_two_sessions_share_logs() {
     process_entry(&mut entry, &pipeline, &sessions);
 
     let filter = parse_filter("ALL").unwrap();
-    let logs = pipeline.recent_logs(10, Some(&filter));
+    let logs = pipeline.recent_logs(10, Some(&filter), false);
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].message, "shared log");
 }
@@ -57,12 +57,12 @@ fn test_per_session_filter_lens() {
     assert_eq!(pipeline.store_len(), 2);
 
     let filter_a = parse_filter("fa=mqtt").unwrap();
-    let logs_a = pipeline.recent_logs(10, Some(&filter_a));
+    let logs_a = pipeline.recent_logs(10, Some(&filter_a), false);
     assert_eq!(logs_a.len(), 1);
     assert_eq!(logs_a[0].message, "mqtt msg");
 
     let filter_b = parse_filter("fa=http").unwrap();
-    let logs_b = pipeline.recent_logs(10, Some(&filter_b));
+    let logs_b = pipeline.recent_logs(10, Some(&filter_b), false);
     assert_eq!(logs_b.len(), 1);
     assert_eq!(logs_b[0].message, "http msg");
 }

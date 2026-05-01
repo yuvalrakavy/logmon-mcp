@@ -178,7 +178,7 @@ fn test_trigger_with_pre_window_zero() {
     process_entry(&mut error, &pipeline, &sessions);
 
     // Triggering entry must be stored even with pre_window=0
-    let logs = pipeline.recent_logs(100, None);
+    let logs = pipeline.recent_logs(100, None, false);
     assert!(logs.iter().any(|l| l.message == "crash"));
 }
 
@@ -222,7 +222,7 @@ fn test_trace_aware_prebuffer_flush() {
     process_entry(&mut error, &pipeline, &sessions);
 
     // Pre-buffer flush + trace-aware flush should include the traced INFO logs
-    let logs = pipeline.recent_logs(100, None);
+    let logs = pipeline.recent_logs(100, None, false);
     let traced_logs: Vec<_> = logs.iter().filter(|l| l.trace_id == Some(trace)).collect();
     assert!(traced_logs.len() > 1); // error + at least some context
 }

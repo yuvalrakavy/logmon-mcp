@@ -212,3 +212,152 @@ async fn c_ge_rejected_in_traces_slow() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Tasks 10/11/12: cursor commit + oldest-first ordering through the allow-list
+// handlers (logs.recent / logs.export / traces.logs).
+// ---------------------------------------------------------------------------
+
+use logmon_broker_core::gelf::message::Level;
+use logmon_broker_protocol::{LogsExportResult, LogsRecentResult, TracesLogsResult};
+
+#[tokio::test]
+async fn cursor_advances_and_paginates_oldest_first() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    for i in 0..5 {
+        daemon.inject_log(Level::Info, &format!("record-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // First cursor read with count=3 — returns oldest 3, advances cursor.
+    let r1: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "count": 3,
+                "filter": "c>=cur",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.logs.len(), 3);
+    assert_eq!(r1.logs[0].message, "record-0"); // oldest first
+    assert_eq!(r1.logs[1].message, "record-1");
+    assert_eq!(r1.logs[2].message, "record-2");
+    assert!(r1.cursor_advanced_to.is_some());
+
+    // Second cursor read — returns next 2.
+    let r2: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "count": 3,
+                "filter": "c>=cur",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.logs.len(), 2);
+    assert_eq!(r2.logs[0].message, "record-3");
+    assert_eq!(r2.logs[1].message, "record-4");
+
+    // Third cursor read — empty, no advance.
+    let r3: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "count": 3,
+                "filter": "c>=cur",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(r3.logs.is_empty());
+    assert_eq!(r3.cursor_advanced_to, None);
+}
+
+#[tokio::test]
+async fn no_cursor_returns_newest_first_unchanged() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    for i in 0..3 {
+        daemon.inject_log(Level::Info, &format!("record-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let r: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "count": 5,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.logs.len(), 3);
+    assert_eq!(r.logs[0].message, "record-2"); // newest first
+    assert_eq!(r.logs[2].message, "record-0");
+    assert_eq!(r.cursor_advanced_to, None);
+}
+
+#[tokio::test]
+async fn export_with_cursor_advances_and_returns_oldest_first() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    for i in 0..5 {
+        daemon.inject_log(Level::Info, &format!("export-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let r: LogsExportResult = client
+        .call(
+            "logs.export",
+            json!({
+                "filter": "c>=expcur",
+                "count": 100,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.logs.len(), 5);
+    assert_eq!(r.logs[0].message, "export-0");
+    assert!(r.cursor_advanced_to.is_some());
+
+    let r2: LogsExportResult = client
+        .call(
+            "logs.export",
+            json!({
+                "filter": "c>=expcur",
+                "count": 100,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(r2.logs.is_empty());
+    assert_eq!(r2.cursor_advanced_to, None);
+}
+
+#[tokio::test]
+async fn traces_logs_with_cursor_field_present() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    // Use a trace_id that no logs have. Result is empty; cursor_advanced_to is None.
+    // The point of this test is just that the field exists on the wire.
+    let r: TracesLogsResult = client
+        .call(
+            "traces.logs",
+            json!({
+                "trace_id": "00000000000000000000000000000001",
+                "filter": "c>=tlcur",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(r.logs.is_empty());
+    assert_eq!(r.cursor_advanced_to, None);
+}

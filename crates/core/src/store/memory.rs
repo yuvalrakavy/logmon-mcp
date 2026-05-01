@@ -68,19 +68,42 @@ impl LogStore for InMemoryStore {
         }
     }
 
-    fn recent(&self, count: usize, filter: Option<&ParsedFilter>) -> Vec<LogEntry> {
+    fn recent(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        oldest_first: bool,
+    ) -> Vec<LogEntry> {
         let entries = self.entries.read().unwrap();
         let mut result = Vec::new();
 
-        for entry in entries.iter().rev() {
-            if let Some(f) = filter {
-                if !matches_entry(f, entry) {
-                    continue;
+        if oldest_first {
+            // Cursor-driven path: walk forward (oldest → newest) and take the
+            // first `count` filter-matching records. Pagination drains
+            // monotonically across calls.
+            for entry in entries.iter() {
+                if let Some(f) = filter {
+                    if !matches_entry(f, entry) {
+                        continue;
+                    }
+                }
+                result.push(entry.clone());
+                if result.len() >= count {
+                    break;
                 }
             }
-            result.push(entry.clone());
-            if result.len() >= count {
-                break;
+        } else {
+            // Default path: newest-first, preserves prior behavior.
+            for entry in entries.iter().rev() {
+                if let Some(f) = filter {
+                    if !matches_entry(f, entry) {
+                        continue;
+                    }
+                }
+                result.push(entry.clone());
+                if result.len() >= count {
+                    break;
+                }
             }
         }
 

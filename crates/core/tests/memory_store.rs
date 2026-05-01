@@ -20,7 +20,7 @@ fn test_append_and_recent() {
     let store = InMemoryStore::new(100);
     store.append(make_entry(1, Level::Info, "first"));
     store.append(make_entry(2, Level::Info, "second"));
-    let recent = store.recent(10, None);
+    let recent = store.recent(10, None, false);
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].seq, 2); // newest first
     assert_eq!(recent[1].seq, 1);
@@ -33,7 +33,7 @@ fn test_max_capacity() {
         store.append(make_entry(i, Level::Info, &format!("msg {i}")));
     }
     assert_eq!(store.len(), 3);
-    let recent = store.recent(10, None);
+    let recent = store.recent(10, None, false);
     assert_eq!(recent[0].seq, 5);
     assert_eq!(recent[2].seq, 3); // oldest surviving
 }
@@ -90,7 +90,7 @@ fn test_recent_with_filter() {
 
     use logmon_broker_core::filter::parser::parse_filter;
     let filter = parse_filter("l>=ERROR").unwrap();
-    let recent = store.recent(10, Some(&filter));
+    let recent = store.recent(10, Some(&filter), false);
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].seq, 2);
 }
@@ -101,7 +101,7 @@ fn test_recent_with_count_limit() {
     for i in 1..=10 {
         store.append(make_entry(i, Level::Info, &format!("msg {i}")));
     }
-    let recent = store.recent(3, None);
+    let recent = store.recent(3, None, false);
     assert_eq!(recent.len(), 3);
     assert_eq!(recent[0].seq, 10); // newest
     assert_eq!(recent[2].seq, 8);

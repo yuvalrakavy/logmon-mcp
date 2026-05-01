@@ -151,9 +151,31 @@ impl RpcHandler {
             return Ok(json!({ "logs": logs, "count": logs.len() }));
         }
 
-        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
-        let entries = self.pipeline.recent_logs(count, resolved.as_ref());
-        Ok(json!({ "logs": entries, "count": entries.len() }))
+        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let oldest_first = cursor_commit.is_some();
+        let entries = self.pipeline.recent_logs(count, resolved.as_ref(), oldest_first);
+
+        // Drive the cursor commit + populate cursor_advanced_to.
+        let advanced_to = if let Some(commit) = cursor_commit {
+            let max_seq = entries.iter().map(|e| e.seq).max();
+            if let Some(s) = max_seq {
+                commit.commit(s);
+                Some(s)
+            } else {
+                // No records returned: leave the cursor at its current position.
+                // Dropping the unused commit is a no-op.
+                drop(commit);
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut result = json!({ "logs": entries, "count": entries.len() });
+        if let Some(s) = advanced_to {
+            result["cursor_advanced_to"] = json!(s);
+        }
+        Ok(result)
     }
 
     fn handle_logs_context(&self, params: &Value) -> Result<Value, String> {
@@ -177,9 +199,29 @@ impl RpcHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(u64::MAX) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
-        let entries = self.pipeline.recent_logs(count, resolved.as_ref());
-        Ok(json!({ "logs": entries, "count": entries.len(), "format": "json" }))
+        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let oldest_first = cursor_commit.is_some();
+        let entries = self.pipeline.recent_logs(count, resolved.as_ref(), oldest_first);
+
+        let advanced_to = if let Some(commit) = cursor_commit {
+            let max_seq = entries.iter().map(|e| e.seq).max();
+            if let Some(s) = max_seq {
+                commit.commit(s);
+                Some(s)
+            } else {
+                drop(commit);
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut result =
+            json!({ "logs": entries, "count": entries.len(), "format": "json" });
+        if let Some(s) = advanced_to {
+            result["cursor_advanced_to"] = json!(s);
+        }
+        Ok(result)
     }
 
     fn handle_logs_clear(&self) -> Result<Value, String> {
@@ -631,13 +673,34 @@ impl RpcHandler {
             u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
 
+        // logs_by_trace_id already returns logs in stored (seq-ascending) order
+        // — that's the same order cursor pagination wants — so no ordering
+        // switch is needed on this code path.
         let mut logs = self.pipeline.logs_by_trace_id(trace_id);
         if let Some(f) = resolved.as_ref() {
             logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
         }
-        Ok(json!({ "logs": logs, "count": logs.len() }))
+
+        let advanced_to = if let Some(commit) = cursor_commit {
+            let max_seq = logs.iter().map(|e| e.seq).max();
+            if let Some(s) = max_seq {
+                commit.commit(s);
+                Some(s)
+            } else {
+                drop(commit);
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut result = json!({ "logs": logs, "count": logs.len() });
+        if let Some(s) = advanced_to {
+            result["cursor_advanced_to"] = json!(s);
+        }
+        Ok(result)
     }
 
     fn handle_spans_context(&self, params: &Value) -> Result<Value, String> {

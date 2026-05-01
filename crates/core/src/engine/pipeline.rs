@@ -139,8 +139,13 @@ impl LogPipeline {
         count
     }
 
-    pub fn recent_logs(&self, count: usize, filter: Option<&ParsedFilter>) -> Vec<LogEntry> {
-        self.store.recent(count, filter)
+    pub fn recent_logs(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        oldest_first: bool,
+    ) -> Vec<LogEntry> {
+        self.store.recent(count, filter, oldest_first)
     }
 
     pub fn oldest_log_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {

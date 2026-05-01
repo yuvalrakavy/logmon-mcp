@@ -11,7 +11,12 @@ pub struct StoreStats {
 
 pub trait LogStore: Send + Sync {
     fn append(&self, entry: LogEntry);
-    fn recent(&self, count: usize, filter: Option<&ParsedFilter>) -> Vec<LogEntry>;
+    fn recent(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        oldest_first: bool,
+    ) -> Vec<LogEntry>;
     fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry>;
     fn context_by_time(&self, timestamp: DateTime<Utc>, window: Duration) -> Vec<LogEntry>;
     fn contains_seq(&self, seq: u64) -> bool;
