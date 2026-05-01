@@ -178,3 +178,37 @@ async fn bookmark_persists_across_restart() {
         post_add
     );
 }
+
+#[tokio::test]
+async fn c_ge_rejected_in_traces_recent() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let result: Result<serde_json::Value, _> = client.call("traces.recent", json!({
+        "filter": "c>=mycur"
+    })).await;
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
+}
+
+#[tokio::test]
+async fn c_ge_rejected_in_traces_get() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let result: Result<serde_json::Value, _> = client.call("traces.get", json!({
+        "trace_id": "00000000000000000000000000000001",
+        "filter": "c>=mycur"
+    })).await;
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
+}
+
+#[tokio::test]
+async fn c_ge_rejected_in_traces_slow() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let result: Result<serde_json::Value, _> = client.call("traces.slow", json!({
+        "filter": "c>=mycur"
+    })).await;
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
+}
