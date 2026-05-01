@@ -270,6 +270,19 @@ impl FilterBuilder {
         self
     }
 
+    // ---- Cursors (read-and-advance) ----
+    /// Cursor (read-and-advance) reference: emits `c>=<name>`. The broker
+    /// auto-creates the bookmark at seq=0 on first reference. See the design
+    /// at docs/superpowers/specs/2026-05-01-cursor-bookmarks-design.md.
+    ///
+    /// Cross-session cursor advance is intentionally not exposed — the broker
+    /// rejects it. Use `bookmark_after("session/name")` for cross-session
+    /// pure-read instead.
+    pub fn cursor(mut self, name: &str) -> Self {
+        self.qualifiers.push(format!("c>={name}"));
+        self
+    }
+
     // ---- Escape hatch for additional fields ----
     pub fn additional_field(mut self, name: &str, value: &str) -> Self {
         self.qualifiers.push(format!("{name}={}", esc(value)));
