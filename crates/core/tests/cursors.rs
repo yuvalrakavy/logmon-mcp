@@ -414,3 +414,50 @@ async fn anonymous_session_disconnect_drops_bookmarks() {
         "ephemeral bookmark should be dropped on anon disconnect; got: {bookmarks:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 15: Regression tests for cursor eviction under churn
+// ---------------------------------------------------------------------------
+
+// Gated until TestDaemonHandle::spawn exposes a buffer_size override.
+// Today's spawn() uses a 10_000-record buffer; flooding past it would take
+// ~30s of injection at typical rates and would be flaky in CI. Once the
+// harness gains a small-buffer mode, drop the #[ignore] and verify.
+#[tokio::test]
+#[ignore = "needs harness buffer_size override; see TestDaemonHandle::spawn"]
+async fn cursor_evicted_under_churn_auto_recreates_with_full_buffer() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    daemon.inject_log(Level::Info, "before").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let _r1: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "filter": "c>=churn", "count": 100
+            }),
+        )
+        .await
+        .unwrap();
+
+    for i in 0..15_000 {
+        daemon.inject_log(Level::Info, &format!("flood-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let r3: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "filter": "c>=churn", "count": 50_000
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        r3.logs.len() >= 1000,
+        "expected flood-recreation to return many records, got {}",
+        r3.logs.len()
+    );
+}
