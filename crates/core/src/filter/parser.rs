@@ -16,8 +16,13 @@ pub enum Qualifier {
     LevelFilter { op: LevelOp, level: Level },
     DurationFilter(DurationOp, f64),
     BookmarkFilter { op: BookmarkOp, name: String },
-    /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`.
-    /// Never emitted by the parser, never serialized in user-facing wire shapes.
+    /// Read-and-advance bookmark reference. Resolved to `SeqFilter` by
+    /// `bookmark_resolver::resolve_bookmarks` (which also acquires the
+    /// CursorCommit handle from the BookmarkStore).
+    CursorFilter { name: String },
+    /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`
+    /// (and from `CursorFilter` once Task 6/7 lands). Never emitted by the
+    /// parser, never serialized in user-facing wire shapes.
     /// Uses `SeqOp` (strict `Gt`/`Lt`) — distinct from `BookmarkOp` because the
     /// cursor design resolves `b>=name` / `b<=name` to STRICT `>` / `<` against
     /// the bookmark's seq (not ≥/≤).
@@ -187,6 +192,8 @@ pub enum FilterParseError {
     EmptyBookmarkName,
     #[error("invalid bookmark name: {0}")]
     InvalidBookmarkName(String),
+    #[error("only one cursor qualifier permitted per filter")]
+    MultipleCursorQualifiers,
 }
 
 /// Validate a bookmark name as it appears inside a DSL filter token.
@@ -347,6 +354,20 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
         });
     }
 
+    // Cursor filter: c>=NAME (read-and-advance variant of b>=)
+    if let Some(rest) = token.strip_prefix("c>=") {
+        let name = rest.trim();
+        if name.is_empty() {
+            return Err(FilterParseError::EmptyBookmarkName);
+        }
+        if !is_valid_bookmark_token(name) {
+            return Err(FilterParseError::InvalidBookmarkName(name.to_string()));
+        }
+        return Ok(Qualifier::CursorFilter {
+            name: name.to_string(),
+        });
+    }
+
     // Quoted bare pattern: "..."
     if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
         let inner = &token[1..token.len() - 1];
@@ -459,6 +480,15 @@ pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
         return Err(FilterParseError::MixedLogSpanSelectors);
     }
 
+    // Validate: only one cursor qualifier permitted
+    let cursor_count = qualifiers
+        .iter()
+        .filter(|q| matches!(q, Qualifier::CursorFilter { .. }))
+        .count();
+    if cursor_count > 1 {
+        return Err(FilterParseError::MultipleCursorQualifiers);
+    }
+
     Ok(ParsedFilter::Qualifiers(qualifiers))
 }
 
@@ -560,16 +590,89 @@ mod bookmark_tests {
         assert!(!contains_bookmark_qualifier(&ParsedFilter::All));
         assert!(!contains_bookmark_qualifier(&ParsedFilter::None));
     }
+
+    #[test]
+    fn parses_c_ge_qualifier() {
+        let f = parse_filter("c>=mycursor").unwrap();
+        if let ParsedFilter::Qualifiers(qs) = f {
+            assert!(matches!(
+                &qs[0],
+                Qualifier::CursorFilter { name } if name == "mycursor"
+            ));
+        } else {
+            panic!("expected Qualifiers");
+        }
+    }
+
+    #[test]
+    fn parses_c_ge_with_session_qualifier() {
+        let f = parse_filter("c>=other-sess/cursor1").unwrap();
+        if let ParsedFilter::Qualifiers(qs) = f {
+            assert!(matches!(
+                &qs[0],
+                Qualifier::CursorFilter { name } if name == "other-sess/cursor1"
+            ));
+        } else {
+            panic!("expected Qualifiers");
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_cursor_qualifiers() {
+        let err = parse_filter("c>=a, c>=b").unwrap_err();
+        assert!(
+            format!("{err}").contains("only one cursor qualifier"),
+            "expected multi-cursor error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn c_le_token_falls_through_to_selector_pattern() {
+        // c<= is intentionally not defined (snapshot-of-past doesn't fit
+        // streaming semantics). It falls through to selector pattern parsing.
+        let f = parse_filter("c<=foo").unwrap();
+        // Parses as a selector pattern (c< = additional field name, foo = value)
+        if let ParsedFilter::Qualifiers(qs) = f {
+            assert!(matches!(
+                &qs[0],
+                Qualifier::SelectorPattern(Selector::AdditionalField(field), _) if field == "c<"
+            ));
+        } else {
+            panic!("expected Qualifiers");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_cursor_name_chars() {
+        let err = parse_filter("c>=bad name").unwrap_err();
+        assert!(
+            matches!(err, FilterParseError::InvalidBookmarkName(_)),
+            "expected InvalidBookmarkName, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn contains_bookmark_qualifier_matches_cursor_too() {
+        let f = parse_filter("c>=foo").unwrap();
+        assert!(contains_bookmark_qualifier(&f));
+        let f = parse_filter("b>=foo").unwrap();
+        assert!(contains_bookmark_qualifier(&f));
+        let f = parse_filter("l>=ERROR").unwrap();
+        assert!(!contains_bookmark_qualifier(&f));
+    }
 }
 
-/// Returns true if any qualifier in the filter is a `BookmarkFilter`.
-/// Used by registration guards to reject bookmark filters in long-lived
+/// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
+/// Used by registration guards to reject bookmark filters and cursor filters in long-lived
 /// registered filters/triggers.
 pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs
-            .iter()
-            .any(|q| matches!(q, Qualifier::BookmarkFilter { .. })),
+        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| {
+            matches!(
+                q,
+                Qualifier::BookmarkFilter { .. } | Qualifier::CursorFilter { .. }
+            )
+        }),
     }
 }

@@ -18,6 +18,7 @@ fn matches_qualifier(qualifier: &Qualifier, entry: &LogEntry) -> bool {
         Qualifier::LevelFilter { op, level } => matches_level(*op, *level, entry.level),
         Qualifier::DurationFilter(..) => false, // duration only applies to spans
         Qualifier::BookmarkFilter { .. } => false,
+        Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to SeqFilter
         Qualifier::SeqFilter { op, value } => match op {
             SeqOp::Gt => entry.seq > *value,
             SeqOp::Lt => entry.seq < *value,
@@ -183,6 +184,7 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
         }
         Qualifier::LevelFilter { .. } => false, // log-only
         Qualifier::BookmarkFilter { .. } => false,
+        Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to SeqFilter
         Qualifier::SeqFilter { op, value } => match op {
             SeqOp::Gt => span.seq > *value,
             SeqOp::Lt => span.seq < *value,

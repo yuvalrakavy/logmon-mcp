@@ -234,7 +234,7 @@ impl RpcHandler {
             .map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
             return Err(
-                "bookmarks (b>=, b<=) are not allowed in registered filters/triggers — use them only in query tools"
+                "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
                     .to_string(),
             );
         }
@@ -325,7 +325,7 @@ impl RpcHandler {
             .map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
             return Err(
-                "bookmarks (b>=, b<=) are not allowed in registered filters/triggers — use them only in query tools"
+                "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
                     .to_string(),
             );
         }
