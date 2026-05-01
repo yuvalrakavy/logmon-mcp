@@ -20,12 +20,40 @@ impl SeqCounter {
         Self { counter: AtomicU64::new(initial) }
     }
 
-    /// Returns the next sequence number (1-based). Matches existing LogPipeline::assign_seq() behavior.
+    /// Returns the next sequence number. Always ≥ 1 — `seq = 0` is reserved
+    /// as a sentinel for "before all records," used by cursor auto-create.
+    /// See docs/superpowers/specs/2026-05-01-cursor-bookmarks-design.md.
     pub fn next(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn current(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cursor design relies on seq=0 being a never-assigned sentinel.
+    /// See docs/superpowers/specs/2026-05-01-cursor-bookmarks-design.md
+    /// §Storage `seq = 0 is reserved as a sentinel`.
+    #[test]
+    fn next_never_returns_zero_from_default() {
+        let c = SeqCounter::new();
+        assert_eq!(c.next(), 1);
+    }
+
+    #[test]
+    fn next_never_returns_zero_from_initial_zero() {
+        let c = SeqCounter::new_with_initial(0);
+        assert_eq!(c.next(), 1);
+    }
+
+    #[test]
+    fn next_returns_initial_plus_one() {
+        let c = SeqCounter::new_with_initial(42);
+        assert_eq!(c.next(), 43);
     }
 }
