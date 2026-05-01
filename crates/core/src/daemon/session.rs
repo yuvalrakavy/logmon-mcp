@@ -752,10 +752,19 @@ impl SessionRegistry {
                 .expect("client_info lock poisoned") = Some(ci.clone());
         }
 
-        // Restore bookmarks (seq-based; cursor design). `replace=true` so a
-        // duplicate from any earlier load doesn't error.
+        // Restore bookmarks (seq-based; cursor design). Use insert_persisted to
+        // preserve the original created_at timestamp from disk, bypassing the
+        // `Utc::now()` logic in `add()`.
         for pb in &persisted.bookmarks {
-            let _ = bookmark_store.add(name, &pb.name, pb.seq, pb.description.as_deref(), true);
+            let qualified_name = format!("{}/{}", name, pb.name);
+            bookmark_store.insert_persisted(crate::store::bookmarks::Bookmark {
+                qualified_name,
+                name: pb.name.clone(),
+                session: name.to_string(),
+                seq: pb.seq,
+                created_at: pb.created_at,
+                description: pb.description.clone(),
+            });
         }
 
         self.sessions

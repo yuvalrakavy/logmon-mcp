@@ -122,6 +122,20 @@ impl BookmarkStore {
         Ok((bookmark, existed))
     }
 
+    /// Insert a bookmark from a persisted snapshot, preserving the original
+    /// `created_at`. Used only by `SessionRegistry::restore_named` during
+    /// daemon startup; production code paths use `add()` (which sets
+    /// `created_at = Utc::now()`).
+    ///
+    /// Always overwrites if `qualified_name` already exists (consistent with
+    /// `add(.., replace=true)`); the restore path can't usefully error on
+    /// a pre-existing in-memory entry because the persisted snapshot is the
+    /// source of truth at startup.
+    pub fn insert_persisted(&self, bookmark: Bookmark) {
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        map.insert(bookmark.qualified_name.clone(), bookmark);
+    }
+
     pub fn list(&self) -> Vec<Bookmark> {
         let map = self.bookmarks.read().expect("bookmarks lock poisoned");
         let mut v: Vec<Bookmark> = map.values().cloned().collect();

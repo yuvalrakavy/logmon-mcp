@@ -140,8 +140,8 @@ async fn bookmark_persists_across_restart() {
     let mut daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_named("persist", None).await;
 
-    // Add a bookmark with explicit start_seq so we can assert exact equality
-    // post-restart (without depending on the seq counter's runtime value).
+    // Capture pre-add and post-add times to verify created_at survives the restart.
+    let pre_add = chrono::Utc::now();
     let added: BookmarksAddResult = client
         .call(
             "bookmarks.add",
@@ -153,6 +153,7 @@ async fn bookmark_persists_across_restart() {
         )
         .await
         .unwrap();
+    let post_add = chrono::Utc::now();
     assert_eq!(added.seq, 42);
 
     // Drop client, restart daemon, reconnect to same named session.
@@ -160,7 +161,7 @@ async fn bookmark_persists_across_restart() {
     daemon.restart().await;
     let mut client = daemon.connect_named("persist", None).await;
 
-    // Bookmark survives.
+    // Bookmark survives with original seq, description, AND created_at.
     let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
     let entry = list
         .bookmarks
@@ -169,4 +170,11 @@ async fn bookmark_persists_across_restart() {
         .expect("anchor bookmark should survive restart");
     assert_eq!(entry.seq, 42);
     assert_eq!(entry.description.as_deref(), Some("preserved"));
+    assert!(
+        entry.created_at >= pre_add && entry.created_at <= post_add,
+        "created_at should be preserved from pre-restart; got {:?}, pre_add {:?}, post_add {:?}",
+        entry.created_at,
+        pre_add,
+        post_add
+    );
 }
