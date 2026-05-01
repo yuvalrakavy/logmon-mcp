@@ -231,7 +231,15 @@ pub async fn run_with_overrides(
     //      start the real GELF + OTLP receivers. Both paths spawn a span
     //      processor so the wiring is uniform; in the harness path nothing
     //      pushes into the span channel so the processor sits idle.
-    let (log_rx, _otlp_receiver, all_receivers_info) = match injected_log_rx {
+    //
+    // NOTE on receiver lifetime: BOTH `_gelf_receiver` AND `_otlp_receiver`
+    // must be bound to locals that outlive the accept loop. Their `Drop`
+    // impls cancel the spawned listener tasks and release the bound sockets.
+    // A previous version of this code dropped `gelf_receiver` at the end of
+    // the match arm, which left the daemon claiming "GELF receiver started"
+    // in the log while no GELF port was actually bound — silent ingestion
+    // failure. Keep both handles alive at function scope.
+    let (log_rx, _gelf_receiver, _otlp_receiver, all_receivers_info) = match injected_log_rx {
         Some(rx) => {
             info!("daemon running with injected log channel; GELF/OTLP receivers disabled");
             // Idle span channel — sender dropped immediately, processor will
@@ -244,7 +252,7 @@ pub async fn run_with_overrides(
                 sessions.clone(),
                 pipeline.clone(),
             );
-            (rx, None, Vec::<String>::new())
+            (rx, None, None, Vec::<String>::new())
         }
         None => {
             // Real GELF receiver
@@ -288,7 +296,7 @@ pub async fn run_with_overrides(
                 sessions.clone(),
                 pipeline.clone(),
             );
-            (log_rx, otlp_receiver, all_receivers_info)
+            (log_rx, Some(gelf_receiver), otlp_receiver, all_receivers_info)
         }
     };
 
