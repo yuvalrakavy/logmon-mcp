@@ -361,3 +361,56 @@ async fn traces_logs_with_cursor_field_present() {
     assert!(r.logs.is_empty());
     assert_eq!(r.cursor_advanced_to, None);
 }
+
+// ---------------------------------------------------------------------------
+// Task 13: anonymous session disconnect drops bookmarks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bookmark_store_clear_session_removes_matching() {
+    use logmon_broker_core::store::bookmarks::BookmarkStore;
+    let store = BookmarkStore::new();
+
+    let (_b1, _) = store.add("session1", "name1", 0, None, false).unwrap();
+    let (_b2, _) = store.add("session1", "name2", 1, None, false).unwrap();
+    let (_b3, _) = store.add("session2", "name3", 2, None, false).unwrap();
+
+    assert_eq!(store.list().len(), 3);
+
+    // Clear session1
+    let removed = store.clear_session("session1");
+    assert_eq!(removed, 2);
+    assert_eq!(store.list().len(), 1);
+    assert_eq!(store.list()[0].qualified_name, "session2/name3");
+}
+
+#[tokio::test]
+async fn anonymous_session_disconnect_drops_bookmarks() {
+    let daemon = spawn_test_daemon().await;
+
+    {
+        let mut client = daemon.connect_anon().await;
+        let _: BookmarksAddResult = client
+            .call(
+                "bookmarks.add",
+                json!({
+                    "name": "ephemeral"
+                }),
+            )
+            .await
+            .unwrap();
+        // Explicitly close the connection to trigger EOF on the server side
+        client.close().await.unwrap();
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut client = daemon.connect_anon().await;
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
+    let bookmarks = &list.bookmarks;
+    assert!(
+        !bookmarks
+            .iter()
+            .any(|b| b.qualified_name.ends_with("/ephemeral")),
+        "ephemeral bookmark should be dropped on anon disconnect; got: {bookmarks:?}"
+    );
+}

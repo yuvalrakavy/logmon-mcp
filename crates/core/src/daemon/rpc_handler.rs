@@ -851,6 +851,12 @@ impl RpcHandler {
         Ok(json!({ "removed_count": removed_count, "session": session }))
     }
 
+    /// Clear all bookmarks for a given session. Used when anonymous sessions disconnect
+    /// to drop their ephemeral bookmarks. (Named sessions preserve bookmarks via snapshot.)
+    pub fn clear_session_bookmarks(&self, session: &str) -> usize {
+        self.bookmarks.clear_session(session)
+    }
+
     fn sweep_bookmarks(&self) {
         let oldest_log = self.pipeline.oldest_log_seq();
         let oldest_span = self.span_store.oldest_seq();

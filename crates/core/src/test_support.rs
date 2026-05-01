@@ -427,6 +427,13 @@ impl TestClient {
         Ok(client.session_start_result.clone())
     }
 
+    /// Explicitly close the connection to the daemon. This will cause the server
+    /// to detect EOF and clean up the session. Useful for testing session cleanup behavior.
+    pub async fn close(mut self) -> anyhow::Result<()> {
+        self.writer.shutdown().await?;
+        Ok(())
+    }
+
     /// Call a method, await the response, and deserialize the result into
     /// `R`. Returns `Err` if the daemon returned a JSON-RPC error.
     ///

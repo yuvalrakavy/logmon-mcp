@@ -669,6 +669,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
+    // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via snapshot).
+    if matches!(session_id, SessionId::Anonymous(_)) {
+        let removed = handler.clear_session_bookmarks(&session_id.to_string());
+        if removed > 0 {
+            info!(?session_id, removed, "cleared anonymous-session bookmarks on disconnect");
+        }
+    }
+
     // Disconnect session
     sessions.disconnect(&session_id);
     info!(?session_id, "session disconnected");
