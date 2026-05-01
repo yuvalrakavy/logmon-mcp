@@ -143,8 +143,16 @@ impl RpcHandler {
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
 
-        // Optional trace_id filter (unchanged)
+        // trace_id shortcut path — does NOT support cursor; reject c>= if present.
         if let Some(trace_id_hex) = params.get("trace_id").and_then(|v| v.as_str()) {
+            if let Some(s) = filter_str {
+                if !s.trim().is_empty() {
+                    let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
+                    if crate::filter::parser::contains_cursor_qualifier(&parsed) {
+                        return Err("cursor qualifier not permitted in logs.recent with trace_id".to_string());
+                    }
+                }
+            }
             let trace_id = u128::from_str_radix(trace_id_hex, 16)
                 .map_err(|_| "invalid trace_id")?;
             let logs = self.pipeline.logs_by_trace_id(trace_id);

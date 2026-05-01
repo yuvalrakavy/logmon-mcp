@@ -690,3 +690,11 @@ pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
         }),
     }
 }
+
+/// Returns true if any qualifier in the filter is a CursorFilter.
+pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| matches!(q, Qualifier::CursorFilter { .. })),
+    }
+}

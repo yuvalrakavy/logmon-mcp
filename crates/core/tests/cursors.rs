@@ -135,8 +135,8 @@ async fn legacy_state_json_with_old_bookmark_shape_warns_and_continues() {
 #[tokio::test]
 async fn bookmark_persists_across_restart() {
     // Verify the persistence round-trip works for seq-based bookmarks via the
-    // pure-read b>= path. (Cursor-specific cross-restart behavior is tested
-    // in Task 15 once c>= and cursor_advanced_to are wired.)
+    // pure-read b>= path. Cursor-mode cross-restart behavior is verified by
+    // cursor_persists_across_restart_returns_post_restart_records_only below.
     let mut daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_named("persist", None).await;
 
@@ -211,6 +211,26 @@ async fn c_ge_rejected_in_traces_slow() {
     })).await;
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
+}
+
+#[tokio::test]
+async fn c_ge_rejected_in_logs_recent_with_trace_id() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let result: Result<serde_json::Value, _> = client
+        .call(
+            "logs.recent",
+            json!({
+                "trace_id": "0123456789abcdef0123456789abcdef",
+                "filter": "c>=mycur"
+            }),
+        )
+        .await;
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("cursor qualifier not permitted"),
+        "got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -459,5 +479,73 @@ async fn cursor_evicted_under_churn_auto_recreates_with_full_buffer() {
         r3.logs.len() >= 1000,
         "expected flood-recreation to return many records, got {}",
         r3.logs.len()
+    );
+}
+
+#[tokio::test]
+async fn cursor_persists_across_restart_returns_post_restart_records_only() {
+    let mut daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_named("cur-persist", None).await;
+
+    // Inject + advance the cursor.
+    daemon.inject_log(Level::Info, "before-restart").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let r1: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "filter": "c>=mycur", "count": 100
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        r1.cursor_advanced_to.is_some(),
+        "first read should advance cursor"
+    );
+    let advanced_to = r1.cursor_advanced_to.unwrap();
+    assert!(advanced_to > 0);
+
+    // Drop client, restart daemon, reconnect.
+    drop(client);
+    daemon.restart().await;
+    let mut client = daemon.connect_named("cur-persist", None).await;
+
+    // The cursor's persisted seq is now far below the new seq counter (which
+    // resumed at state.seq_block + SEQ_BLOCK_SIZE). The in-memory buffer is
+    // empty post-restart; first c>= read returns nothing.
+    let r2: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "filter": "c>=mycur", "count": 100
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        r2.logs.is_empty(),
+        "expected empty post-restart, got {:?}",
+        r2.logs
+    );
+    assert_eq!(r2.cursor_advanced_to, None);
+
+    // Inject a new record post-restart; cursor advances from the post-restart seq.
+    daemon.inject_log(Level::Info, "after-restart").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let r3: LogsRecentResult = client
+        .call(
+            "logs.recent",
+            json!({
+                "filter": "c>=mycur", "count": 100
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.logs.len(), 1);
+    assert_eq!(r3.logs[0].message, "after-restart");
+    assert!(
+        r3.cursor_advanced_to.unwrap() > advanced_to,
+        "post-restart cursor seq should exceed pre-restart seq"
     );
 }
