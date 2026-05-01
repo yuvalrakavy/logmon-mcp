@@ -9,7 +9,7 @@ pub enum BookmarkResolutionError {
 }
 
 /// Walk a parsed filter and rewrite every `BookmarkFilter` qualifier to a
-/// `TimestampFilter` by looking up the bookmark in the store. Bare names are
+/// `SeqFilter` by looking up the bookmark in the store. Bare names are
 /// qualified against `current_session`. Returns `NotFound` on the first
 /// missing bookmark.
 pub fn resolve_bookmarks(
@@ -28,9 +28,9 @@ pub fn resolve_bookmarks(
                         let bookmark = store
                             .get(&qualified)
                             .ok_or(BookmarkResolutionError::NotFound(qualified))?;
-                        out.push(Qualifier::TimestampFilter {
+                        out.push(Qualifier::SeqFilter {
                             op,
-                            ts: bookmark.timestamp,
+                            value: bookmark.seq,
                         });
                     }
                     other => out.push(other),
@@ -49,12 +49,12 @@ mod tests {
     #[test]
     fn bare_name_resolves_against_current_session() {
         let store = BookmarkStore::new();
-        store.add("A", "before", false).unwrap(); // returns (Bookmark, bool); ignored here
+        store.add("A", "before", 7, None, false).unwrap();
         let filter = parse_filter("b>=before").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved {
             assert_eq!(qs.len(), 1);
-            assert!(matches!(qs[0], Qualifier::TimestampFilter { op: BookmarkOp::Gte, .. }));
+            assert!(matches!(qs[0], Qualifier::SeqFilter { op: BookmarkOp::Gte, value: 7 }));
         } else {
             panic!("expected qualifiers");
         }
@@ -63,11 +63,11 @@ mod tests {
     #[test]
     fn qualified_name_resolves_directly() {
         let store = BookmarkStore::new();
-        store.add("B", "x", false).unwrap();
+        store.add("B", "x", 12, None, false).unwrap();
         let filter = parse_filter("b<=B/x").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved {
-            assert!(matches!(qs[0], Qualifier::TimestampFilter { op: BookmarkOp::Lte, .. }));
+            assert!(matches!(qs[0], Qualifier::SeqFilter { op: BookmarkOp::Lte, value: 12 }));
         } else {
             panic!("expected qualifiers");
         }
@@ -96,14 +96,14 @@ mod tests {
     #[test]
     fn multiple_bookmarks_all_resolved() {
         let store = BookmarkStore::new();
-        store.add("A", "start", false).unwrap();
-        store.add("A", "end", false).unwrap();
+        store.add("A", "start", 1, None, false).unwrap();
+        store.add("A", "end", 99, None, false).unwrap();
         let filter = parse_filter("b>=start, b<=end, l>=info").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved {
             assert_eq!(qs.len(), 3);
-            assert!(matches!(qs[0], Qualifier::TimestampFilter { .. }));
-            assert!(matches!(qs[1], Qualifier::TimestampFilter { .. }));
+            assert!(matches!(qs[0], Qualifier::SeqFilter { value: 1, .. }));
+            assert!(matches!(qs[1], Qualifier::SeqFilter { value: 99, .. }));
             assert!(matches!(qs[2], Qualifier::LevelFilter { .. }));
         } else {
             panic!("expected qualifiers");

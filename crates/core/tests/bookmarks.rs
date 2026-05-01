@@ -76,23 +76,32 @@ fn bookmarks_end_to_end() {
     process_entry(&mut e1, &pipeline, &sessions);
     let mut e2 = make_entry(Level::Info, "first batch line 2");
     process_entry(&mut e2, &pipeline, &sessions);
-    std::thread::sleep(std::time::Duration::from_millis(20));
 
-    // 2. Set bookmark "before"
+    // 2. Set bookmark "before". Default `start_seq` snaps it to the current
+    //    seq counter (= e2's seq), so `b>=before` matches every record with
+    //    `entry.seq > e2.seq` — exactly the second-batch entries that follow.
     let r = call(&handler, &sid_a, "bookmarks.add", json!({ "name": "before" })).unwrap();
     assert_eq!(r["qualified_name"], "A/before");
     assert_eq!(r["replaced"], false);
-    std::thread::sleep(std::time::Duration::from_millis(20));
 
     // 3. Second batch of logs (after the bookmark)
     let mut e3 = make_entry(Level::Warn, "second batch line 1");
     process_entry(&mut e3, &pipeline, &sessions);
     let mut e4 = make_entry(Level::Error, "second batch line 2");
     process_entry(&mut e4, &pipeline, &sessions);
-    std::thread::sleep(std::time::Duration::from_millis(20));
 
-    // 4. Set bookmark "after"
-    let r = call(&handler, &sid_a, "bookmarks.add", json!({ "name": "after" })).unwrap();
+    // 4. Set bookmark "after" with an explicit seq beyond e4's so `b<=after`
+    //    captures the whole second batch (strict `entry.seq < bookmark.seq`).
+    //    `start_seq: u64::MAX` means "everything that ever existed lies before
+    //    this bookmark," which is the correct intent for an "after the second
+    //    batch" anchor in this test.
+    let r = call(
+        &handler,
+        &sid_a,
+        "bookmarks.add",
+        json!({ "name": "after", "start_seq": u64::MAX }),
+    )
+    .unwrap();
     assert_eq!(r["qualified_name"], "A/after");
 
     // 5. Query: between bookmarks, expect exactly the second batch.
@@ -121,7 +130,6 @@ fn bookmarks_end_to_end() {
     assert_eq!(r["logs"].as_array().unwrap().len(), 2);
 
     // 7. Replace flag actually overwrites
-    std::thread::sleep(std::time::Duration::from_millis(20));
     let r = call(
         &handler,
         &sid_a,

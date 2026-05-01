@@ -17,8 +17,11 @@ pub enum Qualifier {
     DurationFilter(DurationOp, f64),
     BookmarkFilter { op: BookmarkOp, name: String },
     /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`.
-    /// Never emitted by the parser, never serialized.
-    TimestampFilter { op: BookmarkOp, ts: chrono::DateTime<chrono::Utc> },
+    /// Never emitted by the parser, never serialized in user-facing wire shapes.
+    /// Comparison is strict: `Gte` means `entry.seq > value`, `Lte` means
+    /// `entry.seq < value` — matches the cursor design's "strictly after the
+    /// bookmark" semantics.
+    SeqFilter { op: BookmarkOp, value: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

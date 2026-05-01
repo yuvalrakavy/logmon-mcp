@@ -214,13 +214,24 @@ pub struct StoreStats {
 }
 
 /// One entry in a `bookmarks.list` response.
+///
+/// As of the cursor design (2026-05-01), bookmark position is a `u64` seq
+/// rather than a wall-clock timestamp. `created_at` is retained for human
+/// display only; never use it for filter semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BookmarkInfo {
-    pub qualified_name: String,
+    /// Qualified form (`"session/bookmark"`). Carries the qualified name even
+    /// though the field is called `name` — the bare name is recoverable by
+    /// splitting on the last `/`.
     pub name: String,
-    pub session: String,
-    pub timestamp: DateTime<Utc>,
-    pub age_secs: i64,
+    /// Position the bookmark anchors. Filter DSL `b>=name` matches records
+    /// with `entry.seq > seq`; `b<=name` matches `entry.seq < seq`.
+    pub seq: u64,
+    /// Wall-clock creation time, for display only.
+    pub created_at: DateTime<Utc>,
+    /// Optional caller-supplied note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 // =============================================================================
@@ -541,6 +552,13 @@ pub struct SpansContextResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BookmarksAdd {
     pub name: String,
+    /// Caller-chosen anchor seq. Defaults to the daemon's current seq counter
+    /// (i.e., "right now") when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_seq: Option<u64>,
+    /// Optional caller-supplied note retained for human display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default)]
     pub replace: bool,
 }
@@ -548,7 +566,8 @@ pub struct BookmarksAdd {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BookmarksAddResult {
     pub qualified_name: String,
-    pub timestamp: DateTime<Utc>,
+    /// Anchor seq the bookmark was created at.
+    pub seq: u64,
     pub replaced: bool,
 }
 

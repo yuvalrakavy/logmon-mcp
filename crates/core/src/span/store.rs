@@ -147,6 +147,12 @@ impl SpanStore {
     pub fn oldest_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.inner.read().unwrap().buffer.front().map(|s| s.start_time)
     }
+
+    /// Seq of the oldest span currently in the buffer, or `None` if empty.
+    /// Used by the bookmark sweep — see `crate::store::bookmarks::should_evict`.
+    pub fn oldest_seq(&self) -> Option<u64> {
+        self.inner.read().unwrap().buffer.front().map(|s| s.seq)
+    }
 }
 
 #[cfg(test)]

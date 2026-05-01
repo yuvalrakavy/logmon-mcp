@@ -2055,6 +2055,22 @@
         "name": {
           "type": "string"
         },
+        "start_seq": {
+          "description": "Caller-chosen anchor seq. Defaults to the daemon's current seq counter\n(i.e., \"right now\") when omitted.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "description": {
+          "description": "Optional caller-supplied note retained for human display.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "replace": {
           "type": "boolean",
           "default": false
@@ -2072,9 +2088,11 @@
         "qualified_name": {
           "type": "string"
         },
-        "timestamp": {
-          "type": "string",
-          "format": "date-time"
+        "seq": {
+          "description": "Anchor seq the bookmark was created at.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
         "replaced": {
           "type": "boolean"
@@ -2082,7 +2100,7 @@
       },
       "required": [
         "qualified_name",
-        "timestamp",
+        "seq",
         "replaced"
       ]
     },
@@ -2122,33 +2140,36 @@
       ],
       "$defs": {
         "BookmarkInfo": {
-          "description": "One entry in a `bookmarks.list` response.",
+          "description": "One entry in a `bookmarks.list` response.\n\nAs of the cursor design (2026-05-01), bookmark position is a `u64` seq\nrather than a wall-clock timestamp. `created_at` is retained for human\ndisplay only; never use it for filter semantics.",
           "type": "object",
           "properties": {
-            "qualified_name": {
-              "type": "string"
-            },
             "name": {
+              "description": "Qualified form (`\"session/bookmark\"`). Carries the qualified name even\nthough the field is called `name` — the bare name is recoverable by\nsplitting on the last `/`.",
               "type": "string"
             },
-            "session": {
-              "type": "string"
+            "seq": {
+              "description": "Position the bookmark anchors. Filter DSL `b>=name` matches records\nwith `entry.seq > seq`; `b<=name` matches `entry.seq < seq`.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
             },
-            "timestamp": {
+            "created_at": {
+              "description": "Wall-clock creation time, for display only.",
               "type": "string",
               "format": "date-time"
             },
-            "age_secs": {
-              "type": "integer",
-              "format": "int64"
+            "description": {
+              "description": "Optional caller-supplied note.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
-            "qualified_name",
             "name",
-            "session",
-            "timestamp",
-            "age_secs"
+            "seq",
+            "created_at"
           ]
         }
       }
@@ -3344,33 +3365,36 @@
     "BookmarkInfo": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "BookmarkInfo",
-      "description": "One entry in a `bookmarks.list` response.",
+      "description": "One entry in a `bookmarks.list` response.\n\nAs of the cursor design (2026-05-01), bookmark position is a `u64` seq\nrather than a wall-clock timestamp. `created_at` is retained for human\ndisplay only; never use it for filter semantics.",
       "type": "object",
       "properties": {
-        "qualified_name": {
-          "type": "string"
-        },
         "name": {
+          "description": "Qualified form (`\"session/bookmark\"`). Carries the qualified name even\nthough the field is called `name` — the bare name is recoverable by\nsplitting on the last `/`.",
           "type": "string"
         },
-        "session": {
-          "type": "string"
+        "seq": {
+          "description": "Position the bookmark anchors. Filter DSL `b>=name` matches records\nwith `entry.seq > seq`; `b<=name` matches `entry.seq < seq`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
-        "timestamp": {
+        "created_at": {
+          "description": "Wall-clock creation time, for display only.",
           "type": "string",
           "format": "date-time"
         },
-        "age_secs": {
-          "type": "integer",
-          "format": "int64"
+        "description": {
+          "description": "Optional caller-supplied note.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
-        "qualified_name",
         "name",
-        "session",
-        "timestamp",
-        "age_secs"
+        "seq",
+        "created_at"
       ]
     }
   }

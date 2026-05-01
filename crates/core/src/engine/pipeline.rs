@@ -96,6 +96,13 @@ impl LogPipeline {
         self.seq_counter.next()
     }
 
+    /// Current value of the shared seq counter (the highest seq assigned so
+    /// far, or `0` if none). Used by `bookmarks.add` to default `start_seq`
+    /// to "the cursor we'd hand out right now".
+    pub fn current_seq(&self) -> u64 {
+        self.seq_counter.current()
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<PipelineEvent> {
         self.event_sender.subscribe()
     }
@@ -138,6 +145,12 @@ impl LogPipeline {
 
     pub fn oldest_log_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.store.oldest_timestamp()
+    }
+
+    /// Seq of the oldest log entry currently in the store, or `None` if empty.
+    /// Drives bookmark eviction — see `bookmarks::should_evict`.
+    pub fn oldest_log_seq(&self) -> Option<u64> {
+        self.store.oldest_seq()
     }
 
     pub fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry> {

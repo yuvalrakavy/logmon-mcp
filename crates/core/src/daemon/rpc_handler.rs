@@ -680,6 +680,14 @@ impl RpcHandler {
             .get("replace")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // `start_seq` defaults to the daemon's current seq counter — i.e.,
+        // "the cursor we'd hand out right now". Cursor auto-create (later
+        // task) uses 0 explicitly to mean "before all records".
+        let start_seq = params
+            .get("start_seq")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| self.pipeline.current_seq());
+        let description = params.get("description").and_then(|v| v.as_str());
 
         // Sweep before adding so the store stays tidy.
         self.sweep_bookmarks();
@@ -687,11 +695,11 @@ impl RpcHandler {
         let session = session_id.to_string();
         let (bookmark, replaced) = self
             .bookmarks
-            .add(&session, name, replace)
+            .add(&session, name, start_seq, description, replace)
             .map_err(|e| e.to_string())?;
         Ok(json!({
             "qualified_name": bookmark.qualified_name,
-            "timestamp": bookmark.timestamp,
+            "seq": bookmark.seq,
             "replaced": replaced,
         }))
     }
@@ -700,20 +708,19 @@ impl RpcHandler {
         self.sweep_bookmarks();
         let session_filter = params.get("session").and_then(|v| v.as_str());
 
-        let now = chrono::Utc::now();
         let items: Vec<Value> = self
             .bookmarks
             .list()
             .into_iter()
             .filter(|b| session_filter.is_none_or(|s| b.session == s))
             .map(|b| {
-                let age = (now - b.timestamp).num_seconds().max(0);
                 json!({
-                    "qualified_name": b.qualified_name,
-                    "name": b.name,
-                    "session": b.session,
-                    "timestamp": b.timestamp,
-                    "age_secs": age,
+                    // The qualified ("session/bookmark") name carries both the
+                    // session and the bare name; clients can split if needed.
+                    "name": b.qualified_name,
+                    "seq": b.seq,
+                    "created_at": b.created_at.to_rfc3339(),
+                    "description": b.description,
                 })
             })
             .collect();
@@ -753,8 +760,8 @@ impl RpcHandler {
     }
 
     fn sweep_bookmarks(&self) {
-        let oldest_log = self.pipeline.oldest_log_timestamp();
-        let oldest_span = self.span_store.oldest_timestamp();
+        let oldest_log = self.pipeline.oldest_log_seq();
+        let oldest_span = self.span_store.oldest_seq();
         self.bookmarks.sweep(oldest_log, oldest_span);
     }
 }

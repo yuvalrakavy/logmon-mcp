@@ -18,9 +18,10 @@ fn matches_qualifier(qualifier: &Qualifier, entry: &LogEntry) -> bool {
         Qualifier::LevelFilter { op, level } => matches_level(*op, *level, entry.level),
         Qualifier::DurationFilter(..) => false, // duration only applies to spans
         Qualifier::BookmarkFilter { .. } => false,
-        Qualifier::TimestampFilter { op, ts } => match op {
-            BookmarkOp::Gte => entry.timestamp >= *ts,
-            BookmarkOp::Lte => entry.timestamp <= *ts,
+        Qualifier::SeqFilter { op, value } => match op {
+            // Strict comparison per cursor design: "strictly after the bookmark".
+            BookmarkOp::Gte => entry.seq > *value,
+            BookmarkOp::Lte => entry.seq < *value,
         },
     }
 }
@@ -183,24 +184,25 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
         }
         Qualifier::LevelFilter { .. } => false, // log-only
         Qualifier::BookmarkFilter { .. } => false,
-        Qualifier::TimestampFilter { op, ts } => match op {
-            BookmarkOp::Gte => span.start_time >= *ts,
-            BookmarkOp::Lte => span.start_time <= *ts,
+        Qualifier::SeqFilter { op, value } => match op {
+            // Strict comparison per cursor design: "strictly after the bookmark".
+            BookmarkOp::Gte => span.seq > *value,
+            BookmarkOp::Lte => span.seq < *value,
         },
     }
 }
 
 #[cfg(test)]
-mod timestamp_tests {
+mod seq_tests {
     use super::*;
     use crate::gelf::message::{LogEntry, Level, LogSource};
     use chrono::Utc;
     use std::collections::HashMap;
 
-    fn log_entry_at(ts: chrono::DateTime<chrono::Utc>) -> LogEntry {
+    fn log_entry_with_seq(seq: u64) -> LogEntry {
         LogEntry {
-            seq: 1,
-            timestamp: ts,
+            seq,
+            timestamp: Utc::now(),
             level: Level::Info,
             message: "m".into(),
             full_message: None,
@@ -217,19 +219,19 @@ mod timestamp_tests {
     }
 
     #[test]
-    fn timestamp_gte_matches_entry_at_or_after() {
-        let cutoff = Utc::now() - chrono::Duration::seconds(10);
-        let q = Qualifier::TimestampFilter { op: BookmarkOp::Gte, ts: cutoff };
-        assert!(matches_qualifier(&q, &log_entry_at(Utc::now())));
-        assert!(!matches_qualifier(&q, &log_entry_at(cutoff - chrono::Duration::seconds(5))));
+    fn seq_gte_matches_entries_strictly_after_bookmark() {
+        let q = Qualifier::SeqFilter { op: BookmarkOp::Gte, value: 10 };
+        assert!(matches_qualifier(&q, &log_entry_with_seq(11)));
+        assert!(!matches_qualifier(&q, &log_entry_with_seq(10)), "strict gt — bookmark seq itself excluded");
+        assert!(!matches_qualifier(&q, &log_entry_with_seq(5)));
     }
 
     #[test]
-    fn timestamp_lte_matches_entry_at_or_before() {
-        let cutoff = Utc::now();
-        let q = Qualifier::TimestampFilter { op: BookmarkOp::Lte, ts: cutoff };
-        assert!(matches_qualifier(&q, &log_entry_at(cutoff - chrono::Duration::seconds(5))));
-        assert!(!matches_qualifier(&q, &log_entry_at(cutoff + chrono::Duration::seconds(5))));
+    fn seq_lte_matches_entries_strictly_before_bookmark() {
+        let q = Qualifier::SeqFilter { op: BookmarkOp::Lte, value: 10 };
+        assert!(matches_qualifier(&q, &log_entry_with_seq(9)));
+        assert!(!matches_qualifier(&q, &log_entry_with_seq(10)), "strict lt — bookmark seq itself excluded");
+        assert!(!matches_qualifier(&q, &log_entry_with_seq(15)));
     }
 
     #[test]
@@ -240,6 +242,6 @@ mod timestamp_tests {
             op: BookmarkOp::Gte,
             name: "x".into(),
         };
-        assert!(!matches_qualifier(&q, &log_entry_at(Utc::now())));
+        assert!(!matches_qualifier(&q, &log_entry_with_seq(1)));
     }
 }

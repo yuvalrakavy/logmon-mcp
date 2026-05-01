@@ -160,6 +160,10 @@ impl LogStore for InMemoryStore {
     fn oldest_timestamp(&self) -> Option<DateTime<Utc>> {
         self.entries.read().unwrap().front().map(|e| e.timestamp)
     }
+
+    fn oldest_seq(&self) -> Option<u64> {
+        self.entries.read().unwrap().front().map(|e| e.seq)
+    }
 }
 
 #[cfg(test)]
