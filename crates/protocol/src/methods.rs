@@ -251,6 +251,8 @@ pub struct LogsRecent {
 pub struct LogsRecentResult {
     pub logs: Vec<LogEntry>,
     pub count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_advanced_to: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -281,6 +283,8 @@ pub struct LogsExportResult {
     pub logs: Vec<LogEntry>,
     pub count: usize,
     pub format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_advanced_to: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -527,6 +531,8 @@ pub struct TracesLogs {
 pub struct TracesLogsResult {
     pub logs: Vec<LogEntry>,
     pub count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_advanced_to: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
