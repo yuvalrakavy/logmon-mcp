@@ -427,7 +427,10 @@ impl RpcHandler {
     ) -> Result<Value, String> {
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        if cursor_commit.is_some() {
+            return Err("cursor qualifier not permitted in traces.recent".to_string());
+        }
 
         let pipeline = &self.pipeline;
         let summaries = self.span_store.recent_traces(
@@ -456,7 +459,10 @@ impl RpcHandler {
 
         // Resolve filter (used to filter spans within the trace below)
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        if cursor_commit.is_some() {
+            return Err("cursor qualifier not permitted in traces.get".to_string());
+        }
 
         let mut spans = self.span_store.get_trace(trace_id);
         if let Some(f) = resolved.as_ref() {
@@ -563,7 +569,10 @@ impl RpcHandler {
             .unwrap_or(100.0);
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        if cursor_commit.is_some() {
+            return Err("cursor qualifier not permitted in traces.slow".to_string());
+        }
         let group_by = params.get("group_by").and_then(|v| v.as_str());
 
         let slow = self
