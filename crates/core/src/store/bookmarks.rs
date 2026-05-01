@@ -32,6 +32,7 @@ pub enum BookmarkError {
 /// [`CursorCommit::commit`] or dropped (which is a no-op — the cursor stays at
 /// its current position). The `#[must_use]` reminds callers to handle the
 /// result of the query phase.
+#[derive(Debug)]
 #[must_use = "CursorCommit must be committed or explicitly dropped after the query phase"]
 pub struct CursorCommit {
     bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,

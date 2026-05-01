@@ -95,20 +95,35 @@ impl RpcHandler {
 
     /// Parse a filter string and resolve any bookmark qualifiers against the
     /// bookmark store using `session_id` as the current session.
-    /// Returns `Ok(None)` if the input is `None` or an empty/whitespace-only
-    /// string — this matches the previous `recent_logs_str` behavior, which
-    /// silently treated empty/parse-failed filters as "no filter".
-    /// Real parse errors and resolution errors are surfaced (this is a
-    /// behavior change from the old `.ok()`-swallowing path, but a desirable
-    /// one — bookmark errors must be visible).
+    /// Returns `Ok((None, None))` if the input is `None` or an
+    /// empty/whitespace-only string — this matches the previous
+    /// `recent_logs_str` behavior, which silently treated empty/parse-failed
+    /// filters as "no filter". Real parse errors and resolution errors are
+    /// surfaced (this is a behavior change from the old `.ok()`-swallowing
+    /// path, but a desirable one — bookmark errors must be visible).
+    ///
+    /// The second tuple element is the cursor commit handle when the filter
+    /// contained a `c>=` qualifier. Callers that support cursor semantics
+    /// (`logs.recent`, `logs.export`, `traces.logs`) capture it and call
+    /// `commit_handle.commit(max_seq)` after the lock-free query phase. For
+    /// non-cursor handlers, the value is always `None`. Task 9 will add an
+    /// explicit reject-with-error path for handlers that disallow cursor
+    /// qualifiers (e.g. `traces.recent`, `traces.get`, `traces.slow`); for
+    /// now non-cursor handlers simply ignore the field.
     fn parse_and_resolve_filter(
         &self,
         filter_str: Option<&str>,
         session_id: &SessionId,
-    ) -> Result<Option<crate::filter::parser::ParsedFilter>, String> {
-        let Some(s) = filter_str else { return Ok(None) };
+    ) -> Result<
+        (
+            Option<crate::filter::parser::ParsedFilter>,
+            Option<crate::store::bookmarks::CursorCommit>,
+        ),
+        String,
+    > {
+        let Some(s) = filter_str else { return Ok((None, None)) };
         if s.trim().is_empty() {
-            return Ok(None);
+            return Ok((None, None));
         }
         let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
         let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
@@ -117,7 +132,7 @@ impl RpcHandler {
             &session_id.to_string(),
         )
         .map_err(|e| e.to_string())?;
-        Ok(Some(resolved))
+        Ok((Some(resolved.filter), resolved.cursor_commit))
     }
 
     fn handle_logs_recent(
@@ -136,7 +151,7 @@ impl RpcHandler {
             return Ok(json!({ "logs": logs, "count": logs.len() }));
         }
 
-        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let entries = self.pipeline.recent_logs(count, resolved.as_ref());
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
@@ -162,7 +177,7 @@ impl RpcHandler {
             .and_then(|v| v.as_u64())
             .unwrap_or(u64::MAX) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let entries = self.pipeline.recent_logs(count, resolved.as_ref());
         Ok(json!({ "logs": entries, "count": entries.len(), "format": "json" }))
     }
@@ -412,7 +427,7 @@ impl RpcHandler {
     ) -> Result<Value, String> {
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
 
         let pipeline = &self.pipeline;
         let summaries = self.span_store.recent_traces(
@@ -441,7 +456,7 @@ impl RpcHandler {
 
         // Resolve filter (used to filter spans within the trace below)
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
 
         let mut spans = self.span_store.get_trace(trace_id);
         if let Some(f) = resolved.as_ref() {
@@ -548,7 +563,7 @@ impl RpcHandler {
             .unwrap_or(100.0);
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let group_by = params.get("group_by").and_then(|v| v.as_str());
 
         let slow = self
@@ -607,7 +622,7 @@ impl RpcHandler {
             u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let resolved = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, _cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
 
         let mut logs = self.pipeline.logs_by_trace_id(trace_id);
         if let Some(f) = resolved.as_ref() {
