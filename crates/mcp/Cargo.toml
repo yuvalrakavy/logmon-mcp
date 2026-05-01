@@ -1,0 +1,25 @@
+[package]
+name = "logmon-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "logmon-mcp"
+path = "src/main.rs"
+
+[dependencies]
+logmon-broker-protocol = { path = "../protocol" }
+logmon-broker-core = { path = "../core" }
+logmon-broker-sdk = { path = "../sdk" }
+rmcp.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+fs2.workspace = true
+which.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -6,21 +6,28 @@ Works with any MCP-compatible client: Claude Code, Cursor, Windsurf, VS Code (Co
 
 ## Architecture
 
+logmon is a **broker** for structured logs and OTLP traces. A long-lived daemon ingests via GELF (UDP+TCP) and OTLP (gRPC+HTTP), and serves multiple clients over a Unix domain socket using JSON-RPC 2.0.
+
 ```
-Application(s)                AI Coding Sessions
-     |                          |           |
-  GELF UDP/TCP              Shim (MCP)   Shim (MCP)
-     |                          |           |
-     v                          v           v
-  +------------------------------------------+
-  |              logmon daemon               |
-  |  GELF Receivers -> Log Processor -> Store|
-  |  Per-session: triggers, filters, notifs  |
-  +------------------------------------------+
+Application(s)        AI Sessions / Test Harnesses / Other Clients
+     |                        |          |          |
+  GELF UDP/TCP           logmon-mcp   logmon-mcp   SDK consumer
+  OTLP gRPC/HTTP             |          |          |
+     |                       v          v          v
+     v                ┌───────────────────────────────┐
+                      │       logmon-broker           │
+                      │   (long-lived daemon, UDS)    │
+                      │  Receivers → Pipeline → Store │
+                      │  Per-session triggers/filters │
+                      └───────────────────────────────┘
 ```
 
-- **Daemon**: Long-running process that collects logs, evaluates per-session triggers/filters, stores entries in a ring buffer, and serves RPC requests over a Unix socket.
-- **Shim**: Thin MCP bridge that auto-starts the daemon and translates MCP tool calls to daemon RPC. One shim per AI session, all connected to the same daemon.
+**Binaries:**
+
+- `logmon-broker` — the daemon. Run as a system service (launchd / systemd) for always-on availability.
+- `logmon-mcp` — MCP shim. Exposes broker tools to Claude Code / Cursor / etc. Auto-starts the broker if no service is installed.
+
+**Other clients:** anything depending on the public `logmon-broker-sdk` Rust crate, or speaking JSON-RPC against the documented protocol (`crates/protocol/protocol-v1.schema.json`).
 
 ## Prerequisites
 
@@ -37,33 +44,47 @@ cd logmon-mcp
 cargo build --release
 ```
 
-The binary is at `target/release/logmon-mcp-server`. You can copy it to a directory on your PATH:
+The binaries are at `target/release/logmon-broker` and `target/release/logmon-mcp`. You can copy them to a directory on your PATH:
 
 ```bash
-cp target/release/logmon-mcp-server ~/.local/bin/
+cp target/release/logmon-broker target/release/logmon-mcp ~/.local/bin/
 ```
+
+Or install via cargo:
+
+```bash
+cargo install --path crates/broker --path crates/mcp
+```
+
+### Run the broker as a system service (recommended)
+
+```bash
+logmon-broker install-service --scope user
+```
+
+Boots the broker via launchd (macOS) or systemd (Linux). Starts at login, restarts on crash. To uninstall: `logmon-broker uninstall-service --scope user`.
 
 ### Configure your AI coding assistant
 
-The daemon starts automatically when the first MCP client connects. No manual setup needed.
+If a system service is installed, the broker is already running. Otherwise the MCP shim auto-starts it on the first client connection. No manual setup needed.
 
 #### Claude Code
 
 ```bash
 # Register globally (available in all projects)
-claude mcp add logmon --scope user -- logmon-mcp-server
+claude mcp add logmon --scope user -- logmon-mcp
 
 # Or with a named session (persists triggers/filters across reconnects)
-claude mcp add logmon --scope user -- logmon-mcp-server --session my-session
+claude mcp add logmon --scope user -- logmon-mcp --session my-session
 
 # Or register for current project only
-claude mcp add logmon -- logmon-mcp-server
+claude mcp add logmon -- logmon-mcp
 ```
 
 If the binary is not on your PATH, use the full path:
 
 ```bash
-claude mcp add logmon --scope user -- /path/to/logmon-mcp-server
+claude mcp add logmon --scope user -- /path/to/logmon-mcp
 ```
 
 #### Cursor
@@ -74,7 +95,7 @@ Add to your Cursor MCP settings (`.cursor/mcp.json` in your project or `~/.curso
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -87,7 +108,7 @@ For a named session:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": ["--session", "my-session"]
     }
   }
@@ -102,7 +123,7 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -118,7 +139,7 @@ Add to your VS Code `settings.json`:
   "mcp": {
     "servers": {
       "logmon": {
-        "command": "logmon-mcp-server",
+        "command": "logmon-mcp",
         "args": []
       }
     }
@@ -132,7 +153,7 @@ Or add to `.vscode/mcp.json` in your project:
 {
   "servers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -147,7 +168,7 @@ Add to `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -162,7 +183,7 @@ Add to `~/.codex/config.json`:
 {
   "mcpServers": {
     "logmon": {
-      "command": "logmon-mcp-server",
+      "command": "logmon-mcp",
       "args": []
     }
   }
@@ -171,7 +192,7 @@ Add to `~/.codex/config.json`:
 
 #### Any MCP-compatible client
 
-logmon-mcp uses the standard MCP stdio transport. Configure your client to run `logmon-mcp-server` as a stdio MCP server. Optional argument: `--session <name>` for persistent sessions.
+logmon-mcp uses the standard MCP stdio transport. Configure your client to run `logmon-mcp` as a stdio MCP server. Optional argument: `--session <name>` for persistent sessions.
 
 ## Usage
 
@@ -204,9 +225,10 @@ Once logs are flowing, ask your assistant:
 | `get_log_context` | Get logs surrounding a specific entry by seq number |
 | `export_logs` | Save logs to a file |
 | `clear_logs` | Clear the log buffer |
-| `add_bookmark` | Set a named timestamp anchor at the current moment (global, qualified by session name) |
-| `list_bookmarks` | List all live bookmarks, newest first |
+| `add_bookmark` | Set a named seq anchor at the current moment (global, qualified by session name). Optional `start_seq` overrides the default; `replace=true` overwrites existing. |
+| `list_bookmarks` | List all live bookmarks with their seq position |
 | `remove_bookmark` | Remove a bookmark (bare name = current session; `session/name` reaches another session) |
+| `clear_bookmarks` | Clear all bookmarks for the current session |
 | `get_status` | Server status and statistics |
 | `get_filters` | List buffer filters for this session |
 | `add_filter` | Add a buffer filter (OR semantics across filters) |
@@ -234,9 +256,11 @@ connection refused,h=myapp   # substring match + host filter
 
 **Special filters:** `ALL` (match everything), `NONE` (match nothing)
 
-### Bookmarks
+### Bookmarks and cursors
 
-Bookmarks let you scope queries to a time range without destructively clearing logs. Set one before an operation, another after, and query the range:
+Bookmarks are named seq positions in the broker's record stream. Two interaction patterns share the same storage:
+
+**Pure-read (`b>=`, `b<=`).** Set a bookmark; read records strictly after it. The bookmark never moves on its own.
 
 ```
 add_bookmark("before")
@@ -246,9 +270,24 @@ get_recent_logs(filter="b>=before, b<=after, l>=warn")
 get_recent_traces(filter="b>=before, b<=after, d>=100")
 ```
 
-Bookmarks are global across sessions and qualified by the creating session (`session/name`). Bare names in tool calls and DSL expressions resolve to the current session. Bookmarks auto-evict when both the log and span buffers have rolled past their timestamp — they cannot outlive the data they point at.
+**Read-and-advance (`c>=`).** Same filter as `b>=`, but atomically updates the bookmark to the max seq returned. The same bookmark can be referenced via either operator — `b>=` reads, `c>=` reads-and-advances. Useful for "what's new since I last checked":
 
-`b>=` / `b<=` are usable only in query tools, not in registered filters or triggers.
+```
+# First call — auto-creates the bookmark at seq=0 if missing,
+# returns everything currently in the buffer matching, advances cursor.
+get_recent_logs(filter="c>=test-run", count=500)
+
+# Subsequent calls — return only new records since the previous call
+get_recent_logs(filter="c>=test-run", count=500)
+```
+
+When a `c>=` qualifier is present, results are returned **oldest-first within the cursor's window** (so paginated polls drain monotonically). Without `c>=`, results stay newest-first as today.
+
+`c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Other query methods (`get_log_context`, `get_recent_traces`, etc.) reject `c>=` because their results aren't seq-streamable.
+
+Bookmarks are global across sessions and qualified by the creating session (`session/name`). Bare names in tool calls and DSL expressions resolve to the current session. Bookmarks auto-evict when both the log and span buffers have rolled past their seq.
+
+`b>=`, `b<=`, and `c>=` are usable only in query tools — they're rejected by `add_filter` and `add_trigger`.
 
 ## Triggers
 
@@ -279,12 +318,22 @@ Config files are stored in `~/.config/logmon/`:
 ### CLI
 
 ```bash
-# Shim mode (default, used by MCP clients)
-logmon-mcp-server [--session <name>]
+# MCP shim — used by MCP clients
+logmon-mcp [--session <name>]
 
-# Daemon mode (usually auto-started by the shim)
-logmon-mcp-server daemon [--gelf-port 12201] [--buffer-size 10000]
+# Broker daemon — usually run as a service, but you can run it directly
+logmon-broker [--gelf-port 12201] [--buffer-size 10000]
+
+# Broker subcommands
+logmon-broker status                    # query daemon status
+logmon-broker install-service [--scope user|system]
+logmon-broker uninstall-service [--scope user|system]
 ```
+
+### Environment variable overrides
+
+- `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (defeats PATH lookup).
+- `LOGMON_BROKER_SOCKET` — explicit broker socket path (used by tests; defaults to `~/.config/logmon/logmon.sock`).
 
 ## Testing
 
@@ -296,6 +345,102 @@ cargo test
 ./test-gelf.sh              # TCP (default)
 ./test-gelf.sh 12201 udp    # UDP
 ```
+
+## Embedding via SDK
+
+For non-MCP consumers (test harnesses, archival workers, dashboards), use the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). It speaks JSON-RPC 2.0 against the broker's UDS, returns typed `Result<R, BrokerError>` for every method, supports named-session reconnection across daemon restarts, and emits typed `Notification` events (TriggerFired, Reconnected) on a broadcast channel.
+
+**See [`crates/sdk/README.md`](crates/sdk/README.md) for the canonical SDK guide** — quick start, full method index, filter builder, notification handling, reconnect model, error semantics, and the test-support harness.
+
+The first SDK consumer outside this repo is `store-test` — see [`docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md`](docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md) for the integration brief.
+
+## Manual smoke tests
+
+These are not run in CI; verify locally before tagging a release. Each
+section is independent — run only what's relevant to your platform.
+
+### Build + binaries
+
+```bash
+cargo build --workspace
+ls -lh target/debug/logmon-broker target/debug/logmon-mcp
+```
+
+Expected: both binaries exist; no warnings.
+
+### Auto-start path (shim spawns broker)
+
+```bash
+target/debug/logmon-mcp --session smoke <<'EOF'
+EOF
+```
+
+Expected: shim exits cleanly; `daemon.pid` and `logmon.sock` created in
+`~/.config/logmon/`.
+
+### Status subcommand
+
+```bash
+target/debug/logmon-broker status
+```
+
+Expected:
+- with no daemon running: prints `not running` and exits 1.
+- with a daemon running: prints `running pid=<N> socket=<path>` and exits 0.
+
+### Stale-pid recovery
+
+```bash
+target/debug/logmon-broker &
+PID1=$!
+sleep 1
+kill -9 $PID1                  # leave stale pid + socket
+target/debug/logmon-broker &
+PID2=$!
+sleep 1
+kill -TERM $PID2
+wait
+```
+
+Expected: second start succeeds; `daemon.log` shows
+"removing stale pid file from previous run"; clean exit on SIGTERM.
+
+### Graceful shutdown via SIGTERM and SIGINT
+
+```bash
+target/debug/logmon-broker &
+sleep 1
+kill -TERM $!                  # try -INT too in a separate run
+wait
+```
+
+Expected: broker exits 0; `logmon.sock` and `daemon.pid` removed;
+`daemon.log` records "received SIGTERM" (or "SIGINT").
+
+### System service install (macOS)
+
+```bash
+target/debug/logmon-broker install-service --scope user
+launchctl print gui/$(id -u)/logmon.broker | head -5
+target/debug/logmon-broker status
+target/debug/logmon-broker uninstall-service --scope user
+```
+
+Expected: install succeeds → launchctl shows the agent → status
+reports running → uninstall removes the plist.
+
+### System service install (Linux)
+
+```bash
+target/debug/logmon-broker install-service --scope user
+systemctl --user status logmon-broker
+target/debug/logmon-broker status
+target/debug/logmon-broker uninstall-service --scope user
+```
+
+Expected: install succeeds → `systemctl status` shows
+"active (running)" within 2 s of start (Type=notify) → status reports
+running → uninstall removes the unit.
 
 ## License
 

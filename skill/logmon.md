@@ -30,12 +30,13 @@ You have access to a log collector MCP server that receives structured logs from
 
 ## Architecture
 
-logmon uses a **daemon + shim** architecture:
+logmon uses a **broker + clients** architecture:
 
-- **Daemon**: Long-running process that collects GELF logs (UDP/TCP), stores them in a ring buffer, and evaluates triggers/filters per session.
-- **Shim**: Thin MCP bridge that connects your Claude session to the daemon. Auto-starts the daemon if not running.
+- **logmon-broker** (daemon): Long-running process that ingests GELF (UDP/TCP) and OTLP (gRPC/HTTP), stores logs and traces in ring buffers, and serves clients over a Unix domain socket via JSON-RPC 2.0. Usually runs as a system service (`logmon-broker install-service`); the shim auto-starts it on demand if no service is installed.
+- **logmon-mcp** (shim): Thin MCP bridge. One per Claude session, all connected to the same broker.
+- **logmon-broker-sdk**: Typed Rust client SDK for non-MCP consumers (test harnesses, dashboards, archival workers). Cross-language clients can codegen from `crates/protocol/protocol-v1.schema.json`.
 
-Multiple Claude sessions share the same daemon and log buffer. Each session has its own triggers and filters.
+Multiple Claude sessions share the same broker and log buffer. Each session has its own triggers and filters; named sessions persist across disconnects.
 
 ## Available Tools
 
@@ -96,6 +97,8 @@ Filters use a comma-separated qualifier syntax (AND semantics within a filter):
 | `/regex/` | Regex match (case-sensitive, use `/regex/i` for insensitive) |
 | `selector=pattern` | Match against a specific field |
 | `l>=LEVEL` | Level comparison (ERROR, WARN, INFO, DEBUG, TRACE) |
+| `b>=name` / `b<=name` | Bookmark filter (pure read by seq position) |
+| `c>=name` | Cursor filter (read AND advance — see "Cursors" below) |
 | `"quoted"` | Literal text (use for commas or equals in patterns) |
 
 **Selectors:** `m` (message), `fm` (full_message), `mfm` (message or full_message), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level), or any custom GELF field name.
@@ -125,11 +128,12 @@ Use bookmarks instead of `clear_logs` when you want a clear before/after boundar
 
 **DSL operators:**
 
-Bookmarks plug into the filter DSL as comparison qualifiers, just like `l>=warn` and `d>=100`:
+Bookmarks plug into the filter DSL as comparison qualifiers, just like `l>=warn` and `d>=100`. Bookmark positions are seq numbers (the broker's globally-monotonic record id), not timestamps:
 
-- `b>=name` — entries at or after the bookmark's timestamp
-- `b<=name` — entries at or before
-- `b>=other-session/name` — reach into another session's bookmarks
+- `b>=name` — entries with seq strictly greater than the bookmark's seq (pure read)
+- `b<=name` — entries with seq strictly less than the bookmark's seq (pure read)
+- `c>=name` — same filter as `b>=`, BUT atomically advances the bookmark to the max seq returned (read-and-advance — see "Cursors" below)
+- `b>=other-session/name` — reach into another session's bookmarks (pure-read across sessions allowed; `c>=other/name` is rejected — only the owning session can advance)
 
 Combine freely:
 
@@ -143,11 +147,64 @@ get_trace_logs(trace_id="...", filter="b>=before")
 
 Bookmarks are global across sessions and stored as `{session_name}/{name}`. Two sessions can both have a bookmark called `before` — they're stored as `A/before` and `B/before` and don't collide. Inside *your* session, a bare `before` means `your-session/before`.
 
-Bookmarks auto-evict when both the log buffer *and* the span buffer have rolled past their timestamp. You cannot end up with a stale bookmark pointing at data that no longer exists.
+Bookmarks auto-evict when both the log buffer *and* the span buffer have rolled past their seq. You cannot end up with a stale bookmark pointing at data that no longer exists.
 
 **Restrictions:**
 
-`b>=` and `b<=` are query-only — they're rejected by `add_filter` and `add_trigger`. Bookmarks are timestamps frozen at creation time, so they don't make sense in long-lived registered filters.
+`b>=`, `b<=`, and `c>=` are query-only — they're rejected by `add_filter` and `add_trigger`. Bookmarks anchor a moment in the seq stream; they don't make sense in long-lived registered filters.
+
+## Cursors (read-and-advance bookmarks)
+
+A cursor is a bookmark used via the `c>=` operator instead of `b>=`. Every read advances the bookmark to the max seq returned, so the next read returns only what's new since the previous one. Use cursors when you want "what's new since I last checked" without threading checkpoint values through your own code.
+
+**The same bookmark can be used either way.** `b>=name` reads without moving; `c>=name` reads and advances. There's no flag on the bookmark itself — the operator picks the operation.
+
+**Tools (no new ones — cursors piggyback on bookmarks):**
+
+- `add_bookmark(name)` — explicit creation. Defaults to "stream from now" (`start_seq` = current seq counter), so the next `c>=name` returns only records arriving after this call.
+- `c>=name` on a name you never added — auto-creates the bookmark at `seq = 0`, so the first read returns everything currently in the buffer matching the rest of the filter.
+- `add_bookmark(name, replace=true)` — reset an existing cursor (snaps to current seq counter, skipping any unread records).
+- `list_bookmarks()` — shows the current seq position; useful for inspecting where a cursor is at without advancing it.
+- `remove_bookmark(name)` — delete.
+
+**Where `c>=` is allowed:**
+
+- ✅ `get_recent_logs`, `export_logs`, `get_trace_logs`
+- ❌ `get_log_context`, `get_recent_traces`, `get_trace_summary`, `get_slow_spans`, `get_trace`, `get_span_context` — their results are anchor-driven or aggregated, not seq-streamable.
+
+**Result ordering with cursors:**
+
+When a `c>=` qualifier is present, results come back oldest-first within the cursor's window so paginated polls drain monotonically. (Without `c>=`, results are newest-first as today.) Combine with `count` to page through a large delta:
+
+```
+# Drain everything matching, in seq order, in pages of 500
+loop:
+    r = get_recent_logs(filter="c>=drain, l>=warn", count=500)
+    if r.logs is empty: break
+    process(r.logs)
+```
+
+**Eviction quirk:**
+
+If a cursor sits idle long enough that the buffer rolls past its seq, the entry evicts. The next `c>=name` reference auto-recreates at `seq = 0` and returns the entire current buffer — a sudden flood instead of a delta. The broker logs at WARN when this happens. For long-running cursors against high-churn workloads, bump `buffer_size` so the cursor doesn't outpace ingestion, or poll often enough to keep it alive.
+
+**One cursor per filter:**
+
+Multiple `c>=` qualifiers in one filter (`c>=foo, c>=bar`) are rejected at parse time — both would advance to the same seq, defeating the purpose of two distinct cursors. Bookmark *read* qualifiers (`b>=`, `b<=`) can appear any number of times alongside a `c>=`.
+
+**Per-test usage pattern (from store-test design):**
+
+```
+# At test start (optional — auto-create works too):
+add_bookmark("test-foo-run-abc123")  # stream from now
+
+# During the test, poll for new errors:
+get_recent_logs(filter="c>=test-foo-run-abc123, l>=ERROR")
+
+# At test end:
+get_recent_logs(filter="c>=test-foo-run-abc123")  # everything new since last poll
+remove_bookmark("test-foo-run-abc123")  # cleanup (auto-evicts if you forget)
+```
 
 ## Workflow Tips
 
@@ -211,3 +268,7 @@ Span filters use the same comma-separated syntax but with span-specific selector
 | `d>=` / `d<=` | duration (ms) | `d>=100` |
 
 Cannot mix log selectors and span selectors in the same filter.
+
+## SDK consumers (forward link)
+
+For non-MCP clients (test harnesses, archival workers, dashboards), see the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). The first SDK consumer outside this repo is `store-test` — see Spec B handoff at `docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md` for the integration brief.
