@@ -114,38 +114,58 @@ git commit -m "test(seq_counter): pin seq=0 sentinel contract for cursor design"
 
 ---
 
-## Task 2: BookmarkEntry uses seq instead of timestamp
+## Task 2: BookmarkEntry uses seq + protocol structs + handlers — single atomic change
+
+**Why merged:** the original Task 2 (storage shape) and Task 4 (protocol/handler shape) are tightly coupled. A split commit between them leaves the wire JSON and the typed `BookmarkInfo` deserializer disagreeing — any test or SDK consumer that round-trips through the typed struct would fail mid-plan. Land them together.
 
 **Files:**
-- Modify: `crates/core/src/store/bookmarks.rs` — replace `timestamp: DateTime<Utc>` with `seq: u64` + `created_at: DateTime<Utc>` on `Bookmark`; update `should_evict` to compare seqs; update `add()` signature; update existing tests in-file.
-- Modify: `crates/core/src/daemon/rpc_handler.rs` — adapt the existing `handle_bookmarks_add` and `handle_bookmarks_list` callers to the new signature (interim; full update in Task 4).
-
-This task changes the storage shape only. RPC handlers stay functional with the new field; cursor mechanics + `start_seq`/`replace` parameter handling come in later tasks.
+- Modify: `crates/core/src/store/bookmarks.rs` — drop `timestamp` field from `Bookmark`; add `seq: u64` and `description: Option<String>` (keep existing `created_at`, `qualified_name`, `name`, `session`); update `should_evict` to compare seqs; update `add()` signature to `add(session, name, seq, description, replace) -> Result<(Bookmark, bool)>`; rename existing `sweep()` to keep seq-typed args.
+- Modify: `crates/core/src/store/bookmarks.rs` (in-file unit tests) — rewrite the bookmark-add tests for the new signature.
+- Modify: `crates/protocol/src/methods.rs` — `BookmarkInfo` drops `timestamp`+`age_secs`+`qualified_name`+`session`, gains `seq: u64`+`created_at: DateTime<Utc>`+`description: Option<String>` (keeps `name`); `BookmarksAdd` adds `start_seq: Option<u64>` (already has `name`+`replace`); `BookmarksAddResult` drops `timestamp`, gains `seq: u64`.
+- Modify: `crates/core/src/daemon/rpc_handler.rs` — `handle_bookmarks_add` reads `start_seq` (default = current seq counter), reads `replace`, passes both to `bookmark_store.add(...)`; `handle_bookmarks_list` returns the new shape; `handle_bookmarks_clear` unaffected. Add `current_seq()` accessor on `LogPipeline` if missing (one-line passthrough to `SeqCounter::current()`).
+- Modify: `crates/core/src/daemon/rpc_handler.rs::sweep` callsite — `BookmarkStore::sweep` now takes seq args; source from pipeline's `oldest_log_seq()` and span store's `oldest_span_seq()` (add accessors if missing).
+- Regen: `crates/protocol/protocol-v1.schema.json`.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `crates/core/src/store/bookmarks.rs::tests`:
+Append to `crates/core/src/store/bookmarks.rs` `#[cfg(test)] mod tests`:
 
 ```rust
 #[test]
-fn add_records_seq_and_created_at() {
+fn add_records_seq_and_created_at_and_description() {
     let store = BookmarkStore::new();
-    let id = store.add("session-a", "checkpoint", 42, None).unwrap();
-    let listed = store.list();
-    let entry = listed.iter().find(|b| b.qualified_name() == id).unwrap();
-    assert_eq!(entry.seq, 42);
-    assert!(entry.created_at <= chrono::Utc::now());
+    let (bm, replaced) = store.add("session-a", "checkpoint", 42, Some("note"), false).unwrap();
+    assert_eq!(bm.seq, 42);
+    assert_eq!(bm.description.as_deref(), Some("note"));
+    assert_eq!(bm.session, "session-a");
+    assert_eq!(bm.name, "checkpoint");
+    assert!(!replaced);
+}
+
+#[test]
+fn add_replace_false_errors_on_existing() {
+    let store = BookmarkStore::new();
+    let _ = store.add("s", "x", 1, None, false).unwrap();
+    let err = store.add("s", "x", 2, None, false).unwrap_err();
+    assert!(matches!(err, BookmarkError::AlreadyExists(_)));
+}
+
+#[test]
+fn add_replace_true_overwrites() {
+    let store = BookmarkStore::new();
+    let _ = store.add("s", "x", 1, None, false).unwrap();
+    let (bm, replaced) = store.add("s", "x", 2, None, true).unwrap();
+    assert!(replaced);
+    assert_eq!(bm.seq, 2);
 }
 
 #[test]
 fn evict_by_seq_when_both_stores_advanced_past() {
     let store = BookmarkStore::new();
-    store.add("s", "old", 10, None).unwrap();
-    store.add("s", "new", 100, None).unwrap();
-    // Both store oldests at seq=50: the seq=10 bookmark evicts, seq=100 stays.
-    let removed = store.evict_stale(Some(50), Some(50));
-    assert_eq!(removed, 1);
-    let remaining: Vec<_> = store.list();
+    store.add("s", "old", 10, None, false).unwrap();
+    store.add("s", "new", 100, None, false).unwrap();
+    store.sweep(Some(50), Some(50));
+    let remaining = store.list();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].seq, 100);
 }
@@ -153,51 +173,90 @@ fn evict_by_seq_when_both_stores_advanced_past() {
 #[test]
 fn evict_skips_when_either_store_empty() {
     let store = BookmarkStore::new();
-    store.add("s", "x", 5, None).unwrap();
-    // Span store empty → eviction must not fire (cannot positively confirm).
-    let removed = store.evict_stale(Some(100), None);
-    assert_eq!(removed, 0);
-    let removed = store.evict_stale(None, Some(100));
-    assert_eq!(removed, 0);
+    store.add("s", "x", 5, None, false).unwrap();
+    store.sweep(Some(100), None);
+    assert_eq!(store.list().len(), 1);
+    store.sweep(None, Some(100));
+    assert_eq!(store.list().len(), 1);
 }
 ```
 
-(Use whatever helper the existing tests use to build the store; if there's no `qualified_name()` accessor, inline the `format!("{}/{}", session, name)` construction.)
+Also append a typed integration test at `crates/core/tests/cursors.rs` (create the file if not yet present from Task 3 — it's earlier in this revised order):
 
-- [ ] **Step 2: Run test, expect failure**
+```rust
+#![cfg(feature = "test-support")]
+
+use logmon_broker_core::test_support::*;
+use logmon_broker_protocol::{BookmarksAdd, BookmarksAddResult, BookmarksList, BookmarksListResult};
+use serde_json::json;
+
+#[tokio::test]
+async fn add_bookmark_with_explicit_start_seq() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let added: BookmarksAddResult = client.call("bookmarks.add", json!({
+        "name": "anchor",
+        "start_seq": 42,
+        "description": "explicit start"
+    })).await.unwrap();
+    assert_eq!(added.seq, 42);
+
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
+    let entry = list.bookmarks.iter().find(|b| b.name.ends_with("/anchor")).unwrap();
+    assert_eq!(entry.seq, 42);
+    assert_eq!(entry.description.as_deref(), Some("explicit start"));
+}
+
+#[tokio::test]
+async fn add_bookmark_replace_overwrites() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let _: BookmarksAddResult = client.call("bookmarks.add", json!({
+        "name": "x", "start_seq": 1
+    })).await.unwrap();
+
+    // Without replace, second add errors.
+    let err: Result<BookmarksAddResult, _> = client.call("bookmarks.add", json!({
+        "name": "x", "start_seq": 2
+    })).await;
+    assert!(err.is_err());
+
+    // With replace, succeeds.
+    let _: BookmarksAddResult = client.call("bookmarks.add", json!({
+        "name": "x", "start_seq": 2, "replace": true
+    })).await.unwrap();
+
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
+    let entry = list.bookmarks.iter().find(|b| b.name.ends_with("/x")).unwrap();
+    assert_eq!(entry.seq, 2);
+}
+```
+
+- [ ] **Step 2: Run, expect failure**
 
 ```
-cargo test -p logmon-broker-core bookmarks::tests::add_records_seq_and_created_at
+cargo build --workspace
 ```
 
-Expected: FAIL — `Bookmark` has `timestamp`, not `seq`/`created_at`.
+Expected: COMPILE FAILURE — `Bookmark.seq` doesn't exist; `BookmarkInfo.seq` doesn't exist; `add()` signature mismatch.
 
-- [ ] **Step 3: Modify the Bookmark struct + add()/should_evict()**
+- [ ] **Step 3: Update `Bookmark` and `BookmarkStore`**
 
 In `crates/core/src/store/bookmarks.rs`:
 
 ```rust
 #[derive(Debug, Clone)]
 pub struct Bookmark {
-    pub session: String,
+    pub qualified_name: String,
     pub name: String,
+    pub session: String,
     pub seq: u64,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
     pub description: Option<String>,
 }
 
-impl Bookmark {
-    pub fn qualified_name(&self) -> String {
-        format!("{}/{}", self.session, self.name)
-    }
-}
-
-/// Should this bookmark be auto-evicted?
-///
-/// True only when **both** stores have positively confirmed advancement past
-/// the bookmark's seq. A store "confirms" when `oldest_seq.is_some()` and the
-/// reported value > the bookmark's seq. An empty store does NOT confirm —
-/// it could simply not have logged anything yet.
 pub fn should_evict(
     bookmark_seq: u64,
     oldest_log_seq: Option<u64>,
@@ -207,93 +266,219 @@ pub fn should_evict(
     let span_evicted = oldest_span_seq.is_some_and(|s| s > bookmark_seq);
     log_evicted && span_evicted
 }
-```
 
-Update `BookmarkStore::add` signature:
-
-```rust
-pub fn add(
-    &self,
-    session: &str,
-    name: &str,
-    seq: u64,
-    description: Option<&str>,
-) -> Result<String, BookmarkError> {
-    if !is_valid_bookmark_name(name) {
-        return Err(BookmarkError::InvalidName(name.to_string()));
+impl BookmarkStore {
+    pub fn add(
+        &self,
+        session: &str,
+        name: &str,
+        seq: u64,
+        description: Option<&str>,
+        replace: bool,
+    ) -> Result<(Bookmark, bool), BookmarkError> {
+        if !is_valid_bookmark_name(name) {
+            return Err(BookmarkError::InvalidName(name.to_string()));
+        }
+        let qualified_name = format!("{session}/{name}");
+        let bookmark = Bookmark {
+            qualified_name: qualified_name.clone(),
+            name: name.to_string(),
+            session: session.to_string(),
+            seq,
+            created_at: Utc::now(),
+            description: description.map(String::from),
+        };
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        let existed = map.contains_key(&qualified_name);
+        if existed && !replace {
+            return Err(BookmarkError::AlreadyExists(qualified_name));
+        }
+        map.insert(qualified_name, bookmark.clone());
+        Ok((bookmark, existed))
     }
-    let qualified_name = format!("{session}/{name}");
-    let bookmark = Bookmark {
-        session: session.to_string(),
-        name: name.to_string(),
-        seq,
-        created_at: chrono::Utc::now(),
-        description: description.map(String::from),
-    };
-    let mut map = self.map.write().expect("bookmark map poisoned");
-    map.insert(qualified_name.clone(), bookmark);
-    Ok(qualified_name)
+
+    pub fn sweep(&self, oldest_log_seq: Option<u64>, oldest_span_seq: Option<u64>) {
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        map.retain(|_, b| !should_evict(b.seq, oldest_log_seq, oldest_span_seq));
+    }
+
+    // ... list(), get(), remove(), clear_session() unchanged in shape;
+    // adjust list()'s sort to compare on `seq` instead of `timestamp`.
+    pub fn list(&self) -> Vec<Bookmark> {
+        let map = self.bookmarks.read().expect("bookmarks lock poisoned");
+        let mut v: Vec<Bookmark> = map.values().cloned().collect();
+        v.sort_by(|a, b| b.seq.cmp(&a.seq));   // seq desc, was timestamp desc
+        v
+    }
 }
 ```
 
-Update `evict_stale` (rename if it's currently called something else like `prune` or `evict_evicted`):
+Update existing in-file tests that constructed bookmarks via the old signature.
+
+- [ ] **Step 4: Update protocol structs**
+
+In `crates/protocol/src/methods.rs`:
 
 ```rust
-/// Remove every bookmark whose seq has been positively passed by both stores.
-pub fn evict_stale(
-    &self,
-    oldest_log_seq: Option<u64>,
-    oldest_span_seq: Option<u64>,
-) -> usize {
-    let mut map = self.map.write().expect("bookmark map poisoned");
-    let before = map.len();
-    map.retain(|_, b| !should_evict(b.seq, oldest_log_seq, oldest_span_seq));
-    before - map.len()
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BookmarkInfo {
+    pub name: String,                       // qualified: "session/bookmark"
+    pub seq: u64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BookmarksAdd {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_seq: Option<u64>,
+    #[serde(default)]
+    pub replace: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct BookmarksAddResult {
+    pub qualified_name: String,
+    pub seq: u64,
+    pub replaced: bool,
 }
 ```
 
-Update any in-file unit tests that constructed bookmarks via the old signature.
+- [ ] **Step 5: Update RPC handlers**
 
-- [ ] **Step 4: Adapt rpc_handler.rs callers (interim)**
-
-In `crates/core/src/daemon/rpc_handler.rs::handle_bookmarks_add`, the call to `bookmark_store.add(session, name, ts, desc)` currently passes a timestamp. Replace the timestamp argument with the current seq counter value:
+In `crates/core/src/daemon/rpc_handler.rs::handle_bookmarks_add` (current implementation expects `name` + `replace`; extend):
 
 ```rust
-// Interim: full param handling (start_seq/replace) lands in Task 4.
-let seq = self.pipeline.current_seq();   // or whatever exposes the SeqCounter's current value
-let qualified = self.bookmarks.add(session_id_str, name, seq, description.as_deref())
-    .map_err(|e| e.to_string())?;
+fn handle_bookmarks_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    let name = params.get("name").and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: name".to_string())?;
+    let description = params.get("description").and_then(|v| v.as_str());
+    let replace = params.get("replace").and_then(|v| v.as_bool()).unwrap_or(false);
+    let seq = params.get("start_seq").and_then(|v| v.as_u64())
+        .unwrap_or_else(|| self.pipeline.current_seq());
+
+    let (bm, replaced) = self.bookmarks.add(&session_id.to_string(), name, seq, description, replace)
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "qualified_name": bm.qualified_name,
+        "seq": bm.seq,
+        "replaced": replaced,
+    }))
+}
 ```
 
-If `LogPipeline` doesn't expose `current_seq()`, add it as a one-line passthrough to `SeqCounter::current()`. The pipeline holds the counter Arc.
-
-In `handle_bookmarks_list`, the JSON construction reads `b.timestamp`. Change to `b.seq`:
+In `handle_bookmarks_list`:
 
 ```rust
-json!({
-    "name": b.qualified_name(),
-    "seq": b.seq,
-    "created_at": b.created_at.to_rfc3339(),
-    "description": b.description,
-})
+fn handle_bookmarks_list(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    let session_filter = params.get("session").and_then(|v| v.as_str()).map(String::from);
+    let all = self.bookmarks.list();
+    let bookmarks: Vec<Value> = all.into_iter()
+        .filter(|b| session_filter.as_deref().is_none_or(|s| b.session == s))
+        .map(|b| json!({
+            "name": b.qualified_name,
+            "seq": b.seq,
+            "created_at": b.created_at.to_rfc3339(),
+            "description": b.description,
+        }))
+        .collect();
+    Ok(json!({ "bookmarks": bookmarks, "count": bookmarks.len() }))
+}
 ```
 
-Also update the eviction-sweep call site (search for `should_evict(`): it now takes seq args. Source the pipeline's `oldest_seq()` and the span store's `oldest_seq()`. Add those accessors if missing — they should walk the existing buffer's oldest entry and return `Some(seq)` or `None`.
+Find the existing `bookmarks.sweep(...)` call site (eviction sweep — likely in the log/span processor, run periodically). Change the args to `Some(pipeline.oldest_log_seq())` and `Some(span_store.oldest_span_seq())`. Add those accessors if missing (they read the store's first entry's seq, return `None` if empty).
 
-- [ ] **Step 5: Run all tests**
+Add to `crates/core/src/engine/pipeline.rs::LogPipeline`:
+
+```rust
+pub fn current_seq(&self) -> u64 {
+    self.seq_counter.current()
+}
+pub fn oldest_log_seq(&self) -> Option<u64> {
+    self.store.iter().map(|e| e.seq).min()  // or however the store exposes its iteration
+}
+```
+
+Add equivalent `oldest_span_seq` to `SpanStore`.
+
+- [ ] **Step 6: Migrate filter qualifier from `TimestampFilter` to `SeqFilter`**
+
+Today's `crates/core/src/filter/parser.rs` declares an internal-only qualifier variant `TimestampFilter { op: BookmarkOp, ts: DateTime<Utc> }` (line 21) that the resolver emits from `Bookmark.timestamp`. After this task replaces `Bookmark.timestamp` with `Bookmark.seq`, `TimestampFilter` is unreachable and the resolver no longer compiles. Migrate the variant atomically:
+
+In `crates/core/src/filter/parser.rs`:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Qualifier {
+    BarePattern(Pattern),
+    SelectorPattern(Selector, Pattern),
+    LevelFilter { op: LevelOp, level: Level },
+    DurationFilter(DurationOp, f64),
+    BookmarkFilter { op: BookmarkOp, name: String },
+    /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`
+    /// (and from `CursorFilter` once Task 5 lands). Never emitted by the parser,
+    /// never serialized.
+    SeqFilter { op: BookmarkOp, value: u64 },
+}
+```
+
+(Drop the old `TimestampFilter` variant entirely.)
+
+In `crates/core/src/filter/matcher.rs`, find the three `Qualifier::BookmarkFilter { .. } => false` arms (lines ~20, ~185, plus the test-only construction around line 239). For each `match` over `Qualifier`, replace the `TimestampFilter { op, ts }` arm with:
+
+```rust
+Qualifier::SeqFilter { op, value } => match op {
+    BookmarkOp::Gte => entry.seq > *value,
+    BookmarkOp::Lte => entry.seq < *value,
+},
+```
+
+(Strict greater-than / less-than per spec semantics: `b>=name` returns `entry.seq > bookmark.seq`, not `>=`. The `Gte`/`Lte` names refer to the user-facing operator, not the internal comparison.)
+
+In `crates/core/src/filter/bookmark_resolver.rs`:
+
+```rust
+Qualifier::BookmarkFilter { op, name } => {
+    let qualified = qualify(&name, current_session);
+    let bookmark = store
+        .get(&qualified)
+        .ok_or(BookmarkResolutionError::NotFound(qualified))?;
+    out.push(Qualifier::SeqFilter {
+        op,
+        value: bookmark.seq,
+    });
+}
+```
+
+Update the in-file resolver tests (4 tests asserting `Qualifier::TimestampFilter`) to assert `Qualifier::SeqFilter` instead, with `value` matching the bookmark's seq.
+
+- [ ] **Step 7: Regenerate schema**
 
 ```
-cargo build --workspace
+cargo xtask gen-schema
+cargo xtask verify-schema
+```
+
+Expected: clean.
+
+- [ ] **Step 8: Run all tests**
+
+```
+cargo build --workspace --all-targets
 cargo test --workspace
 ```
 
-Expected: all pass. Test count: 254 + 3 (new bookmark tests) = 257.
+Expected: 254 + 5 (unit tests in bookmarks::tests) + 2 (integration tests in cursors.rs) = 261. Existing `b>=` round-trip tests in resolver should still pass after the `TimestampFilter → SeqFilter` rewrite.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/core/src/store/bookmarks.rs crates/core/src/engine/pipeline.rs crates/core/src/daemon/rpc_handler.rs
-git commit -m "refactor(bookmarks): seq-based positions instead of timestamps; eviction by seq"
+git add crates/core/src/store/bookmarks.rs crates/core/src/engine/pipeline.rs crates/core/src/span/store.rs crates/core/src/daemon/rpc_handler.rs crates/core/src/filter/parser.rs crates/core/src/filter/matcher.rs crates/core/src/filter/bookmark_resolver.rs crates/protocol/src/methods.rs crates/protocol/protocol-v1.schema.json crates/core/tests/cursors.rs
+git commit -m "refactor(bookmarks): seq-based positions; protocol + handlers + filter qualifier (TimestampFilter→SeqFilter) atomic"
 ```
 
 ---
@@ -421,181 +606,80 @@ cargo test -p logmon-broker-core --features test-support --test cursors
 
 Expected: PASS. Tail the daemon log; should see "discarding bookmarks from previous-version state.json".
 
+- [ ] **Step 4.5: Add cross-restart cursor preservation test**
+
+Append to `crates/core/tests/cursors.rs`:
+
+```rust
+use logmon_broker_core::gelf::message::Level;
+use logmon_broker_protocol::LogsRecentResult;
+
+#[tokio::test]
+async fn cursor_persists_across_restart_returns_post_restart_records_only() {
+    let mut daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_named("persist", None).await;
+
+    // Inject + advance the cursor.
+    daemon.inject_log(Level::Info, "before-restart").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let r1: LogsRecentResult = client.call("logs.recent", json!({
+        "filter": "c>=mycur", "count": 100
+    })).await.unwrap();
+    assert!(r1.cursor_advanced_to.is_some());
+    let advanced_to = r1.cursor_advanced_to.unwrap();
+
+    // Drop client, restart daemon, reconnect.
+    drop(client);
+    daemon.restart().await;
+    let mut client = daemon.connect_named("persist", None).await;
+
+    // The cursor's persisted seq is now far below the new seq counter (which
+    // resumed at state.seq_block + SEQ_BLOCK_SIZE). The in-memory buffer is
+    // empty post-restart; first c>= read returns nothing.
+    let r2: LogsRecentResult = client.call("logs.recent", json!({
+        "filter": "c>=mycur", "count": 100
+    })).await.unwrap();
+    assert!(r2.logs.is_empty(), "expected empty post-restart, got {:?}", r2.logs);
+    assert_eq!(r2.cursor_advanced_to, None);
+
+    // Inject a new record post-restart; cursor should advance again from the
+    // post-restart seq (much higher than advanced_to before restart).
+    daemon.inject_log(Level::Info, "after-restart").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let r3: LogsRecentResult = client.call("logs.recent", json!({
+        "filter": "c>=mycur", "count": 100
+    })).await.unwrap();
+    assert_eq!(r3.logs.len(), 1);
+    assert_eq!(r3.logs[0].message, "after-restart");
+    assert!(r3.cursor_advanced_to.unwrap() > advanced_to,
+        "post-restart cursor seq should exceed pre-restart seq");
+}
+```
+
+This test pins the spec's "persisted cursor seq is functionally 'skip to restart'" semantic.
+
 - [ ] **Step 5: Run all tests**
 
 ```
 cargo test --workspace
 ```
 
-Expected: 257 + 1 = 258.
+Expected: 257 + 2 = 259 (one new tolerate-and-discard test + one cross-restart preservation test).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/core/src/daemon/persistence.rs crates/core/src/daemon/session.rs crates/core/tests/cursors.rs
-git commit -m "feat(persistence): seq-based bookmarks; tolerate-and-discard legacy state.json shape"
+git commit -m "feat(persistence): seq-based bookmarks; tolerate-and-discard legacy state.json shape; cross-restart preservation"
 ```
 
 ---
 
-## Task 4: Update protocol structs (BookmarkInfo, BookmarksAdd) + handler shape
+## Task 4: ~~(REMOVED — merged into Task 2)~~
 
-**Files:**
-- Modify: `crates/protocol/src/methods.rs` — `BookmarkInfo`, `BookmarksAdd`.
-- Modify: `crates/core/src/daemon/rpc_handler.rs` — `handle_bookmarks_add` accepts `start_seq`/`replace`; `handle_bookmarks_list` returns new shape.
-- Regen: `crates/protocol/protocol-v1.schema.json`.
+The original Task 4 (protocol struct shape change + add_bookmark / list_bookmarks handler updates) is now part of **Task 2**, because splitting it left a transient state where the wire JSON and the typed `BookmarkInfo` deserializer disagreed (typed clients would deserialize-fail mid-plan).
 
-- [ ] **Step 1: Write the failing test**
-
-Append to `crates/core/tests/cursors.rs`:
-
-```rust
-use logmon_broker_protocol::{BookmarksAdd, BookmarksAddResult, BookmarksList, BookmarksListResult};
-
-#[tokio::test]
-async fn add_bookmark_with_explicit_start_seq() {
-    let daemon = spawn_test_daemon().await;
-    let mut client = daemon.connect_anon().await;
-
-    let _: BookmarksAddResult = client.call("bookmarks.add", json!({
-        "name": "anchor",
-        "start_seq": 42,
-        "description": "explicit start"
-    })).await.unwrap();
-
-    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
-    let entry = list.bookmarks.iter().find(|b| b.name.ends_with("/anchor")).unwrap();
-    assert_eq!(entry.seq, 42);
-    assert_eq!(entry.description.as_deref(), Some("explicit start"));
-}
-
-#[tokio::test]
-async fn add_bookmark_replace_overwrites() {
-    let daemon = spawn_test_daemon().await;
-    let mut client = daemon.connect_anon().await;
-
-    let _: BookmarksAddResult = client.call("bookmarks.add", json!({
-        "name": "x", "start_seq": 1
-    })).await.unwrap();
-
-    // Without replace, second add errors:
-    let result: Result<BookmarksAddResult, _> = client.call("bookmarks.add", json!({
-        "name": "x", "start_seq": 2
-    })).await;
-    assert!(result.is_err());
-
-    // With replace, succeeds:
-    let _: BookmarksAddResult = client.call("bookmarks.add", json!({
-        "name": "x", "start_seq": 2, "replace": true
-    })).await.unwrap();
-
-    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
-    let entry = list.bookmarks.iter().find(|b| b.name.ends_with("/x")).unwrap();
-    assert_eq!(entry.seq, 2);
-}
-```
-
-- [ ] **Step 2: Run, expect failure**
-
-```
-cargo test -p logmon-broker-core --features test-support --test cursors add_bookmark_
-```
-
-Expected: FAIL — `start_seq` and `replace` aren't accepted; `BookmarkInfo.seq` doesn't exist (still `timestamp`).
-
-- [ ] **Step 3: Update protocol structs**
-
-In `crates/protocol/src/methods.rs`:
-
-```rust
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct BookmarkInfo {
-    pub name: String,
-    pub seq: u64,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct BookmarksAdd {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_seq: Option<u64>,
-    #[serde(default)]
-    pub replace: bool,
-}
-```
-
-(`BookmarksAddResult`, `BookmarksListResult` shapes don't change.)
-
-- [ ] **Step 4: Update rpc_handler.rs**
-
-In `handle_bookmarks_add`:
-
-```rust
-let name = params.get("name").and_then(|v| v.as_str())
-    .ok_or_else(|| "missing required parameter: name".to_string())?;
-let description = params.get("description").and_then(|v| v.as_str()).map(String::from);
-let replace = params.get("replace").and_then(|v| v.as_bool()).unwrap_or(false);
-let seq = params.get("start_seq").and_then(|v| v.as_u64())
-    .unwrap_or_else(|| self.pipeline.current_seq());
-
-if !replace {
-    // Error if name already exists for this session.
-    let qualified = format!("{}/{}", session_id, name);
-    if self.bookmarks.list().iter().any(|b| b.qualified_name() == qualified) {
-        return Err("bookmark exists; pass replace=true to overwrite".to_string());
-    }
-}
-
-self.bookmarks.add(&session_id.to_string(), name, seq, description.as_deref())
-    .map_err(|e| e.to_string())?;
-Ok(json!({ "name": format!("{}/{}", session_id, name) }))
-```
-
-In `handle_bookmarks_list`, build entries with the new shape:
-
-```rust
-let bookmarks = self.bookmarks.list_for_session(&session_id.to_string())
-    .into_iter()
-    .map(|b| json!({
-        "name": b.qualified_name(),
-        "seq": b.seq,
-        "created_at": b.created_at.to_rfc3339(),
-        "description": b.description,
-    }))
-    .collect::<Vec<_>>();
-Ok(json!({ "bookmarks": bookmarks }))
-```
-
-If `BookmarkStore::list_for_session(&str) -> Vec<Bookmark>` doesn't exist, add it (filter `list()` by session).
-
-- [ ] **Step 5: Regenerate schema**
-
-```
-cargo xtask gen-schema
-cargo xtask verify-schema
-```
-
-Expected: schema regenerated, verify clean.
-
-- [ ] **Step 6: Run tests**
-
-```
-cargo test --workspace
-```
-
-Expected: 258 + 2 = 260.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/protocol/src/methods.rs crates/protocol/protocol-v1.schema.json crates/core/src/daemon/rpc_handler.rs crates/core/src/store/bookmarks.rs crates/core/tests/cursors.rs
-git commit -m "feat(bookmarks): add start_seq + replace params; surface seq + created_at in list"
-```
+Task numbers 5–15 are unchanged to avoid renumbering churn across cross-references in this document.
 
 ---
 
@@ -749,7 +833,7 @@ if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
 }
 ```
 
-(Search for the existing string in rpc_handler.rs to find both call sites.)
+(The existing call site in `rpc_handler.rs::handle_triggers_add` is around line 319 — search for `contains_bookmark_qualifier(` to find both `add_filter` and `add_trigger` sites.)
 
 - [ ] **Step 6: Run all tests**
 
@@ -787,14 +871,14 @@ fn cursor_read_and_advance_auto_creates_at_zero() {
     let (lower, _commit) = store.cursor_read_and_advance("s", "fresh");
     assert_eq!(lower, 0);
     let listed = store.list();
-    let entry = listed.iter().find(|b| b.qualified_name() == "s/fresh").unwrap();
+    let entry = listed.iter().find(|b| b.qualified_name == "s/fresh").unwrap();
     assert_eq!(entry.seq, 0);
 }
 
 #[test]
 fn cursor_read_and_advance_returns_existing_seq() {
     let store = BookmarkStore::new();
-    store.add("s", "existing", 50, None).unwrap();
+    let _ = store.add("s", "existing", 50, None, false).unwrap();
     let (lower, _commit) = store.cursor_read_and_advance("s", "existing");
     assert_eq!(lower, 50);
 }
@@ -805,18 +889,18 @@ fn commit_advances_when_max_greater_than_lower() {
     let (lower, commit) = store.cursor_read_and_advance("s", "c");
     assert_eq!(lower, 0);
     commit.commit(100);
-    let entry = store.list().into_iter().find(|b| b.qualified_name() == "s/c").unwrap();
+    let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
     assert_eq!(entry.seq, 100);
 }
 
 #[test]
 fn commit_no_op_when_max_le_lower() {
     let store = BookmarkStore::new();
-    store.add("s", "c", 50, None).unwrap();
+    let _ = store.add("s", "c", 50, None, false).unwrap();
     let (lower, commit) = store.cursor_read_and_advance("s", "c");
     assert_eq!(lower, 50);
     commit.commit(50);   // No new records — max equals lower.
-    let entry = store.list().into_iter().find(|b| b.qualified_name() == "s/c").unwrap();
+    let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
     assert_eq!(entry.seq, 50);
 }
 
@@ -825,14 +909,33 @@ fn commit_re_inserts_after_eviction_race() {
     let store = BookmarkStore::new();
     let (_lower, commit) = store.cursor_read_and_advance("s", "c");
     // Simulate eviction sweep removing the entry between read-and-advance and commit.
-    store.evict_stale(Some(u64::MAX), Some(u64::MAX));
-    assert!(store.list().iter().all(|b| b.qualified_name() != "s/c"));
+    store.sweep(Some(u64::MAX), Some(u64::MAX));
+    assert!(store.list().iter().all(|b| b.qualified_name != "s/c"));
     // Commit re-inserts at the high-water mark.
     commit.commit(200);
-    let entry = store.list().into_iter().find(|b| b.qualified_name() == "s/c").unwrap();
+    let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
     assert_eq!(entry.seq, 200);
 }
+
+#[test]
+fn auto_create_after_eviction_logs_warn() {
+    use tracing_test::traced_test;
+    #[traced_test]
+    fn inner() {
+        let store = BookmarkStore::new();
+        let _ = store.add("s", "evicted", 5, None, false).unwrap();
+        // Sweep evicts the bookmark.
+        store.sweep(Some(u64::MAX), Some(u64::MAX));
+        // Subsequent c>= reference auto-recreates and should WARN.
+        let (lower, _commit) = store.cursor_read_and_advance("s", "evicted");
+        assert_eq!(lower, 0);  // Recreated at seq=0
+        assert!(logs_contain("auto-recreating at seq=0"));
+    }
+    inner();
+}
 ```
+
+If `tracing-test` isn't yet in `[dev-dependencies]`, add `tracing-test = "0.2"` to `crates/core/Cargo.toml`.
 
 - [ ] **Step 2: Run, expect failure**
 
@@ -842,15 +945,27 @@ cargo test -p logmon-broker-core bookmarks::tests::cursor_read_and_advance
 
 Expected: FAIL — method doesn't exist.
 
-- [ ] **Step 3: Implement the primitive**
+- [ ] **Step 3: Implement the primitive (with WARN-on-evicted-auto-recreate baked in)**
 
 In `crates/core/src/store/bookmarks.rs`:
 
 ```rust
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, RwLock};
+
+pub struct BookmarkStore {
+    bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,
+    /// Tracks names removed by `sweep` since the last call to `cursor_read_and_advance`
+    /// for that name. Lets the primitive distinguish "fresh auto-create" from
+    /// "post-eviction auto-recreate" so we can WARN in the latter case.
+    /// Bounded to MAX_RECENTLY_EVICTED entries; oldest dropped when over.
+    recently_evicted: Mutex<HashSet<String>>,
+}
+
+const MAX_RECENTLY_EVICTED: usize = 1024;
 
 pub struct CursorCommit {
-    map: Arc<RwLock<HashMap<String, Bookmark>>>,
+    bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,
     qualified_name: String,
     session: String,
     name: String,
@@ -859,15 +974,14 @@ pub struct CursorCommit {
 
 impl CursorCommit {
     /// Advance the cursor to `max_returned_seq`. No-op if `max_returned_seq <= lower_bound`
-    /// (no records returned, or all returned records were ≤ lower bound — shouldn't happen
-    /// if the query path passes them correctly, but treated as no-op defensively).
-    /// If the entry was evicted between read-and-advance and commit, re-inserts at
-    /// `max_returned_seq`.
+    /// (no records returned). If the entry was evicted by `sweep` between
+    /// read-and-advance and commit, re-inserts at `max_returned_seq` —
+    /// preserves advance intent across racing eviction.
     pub fn commit(self, max_returned_seq: u64) {
         if max_returned_seq <= self.lower_bound {
             return;
         }
-        let mut map = self.map.write().expect("bookmark map poisoned");
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         match map.get_mut(&self.qualified_name) {
             Some(b) => {
                 b.seq = max_returned_seq;
@@ -875,6 +989,7 @@ impl CursorCommit {
             None => {
                 // Evicted during the lock-free query phase — re-insert at high-water mark.
                 map.insert(self.qualified_name.clone(), Bookmark {
+                    qualified_name: self.qualified_name.clone(),
                     session: self.session.clone(),
                     name: self.name.clone(),
                     seq: max_returned_seq,
@@ -887,43 +1002,77 @@ impl CursorCommit {
 }
 
 impl BookmarkStore {
-    /// Atomic get-or-create + capture lower bound. Returns the seq the caller
-    /// should use as the strict-greater-than lower bound, plus a commit handle
-    /// to call after the query completes with `max(returned.seq)`.
+    /// Atomic get-or-create + capture lower bound. Returns (lower_bound, commit_handle).
+    /// On auto-create of a name recently evicted by `sweep`, logs at WARN — the
+    /// next read will return the full buffer instead of a delta.
     pub fn cursor_read_and_advance(&self, session: &str, name: &str) -> (u64, CursorCommit) {
         let qualified_name = format!("{session}/{name}");
-        let mut map = self.map.write().expect("bookmark map poisoned");
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         let lower_bound = match map.get(&qualified_name) {
             Some(b) => b.seq,
             None => {
-                // Auto-create at seq=0 (the never-assigned sentinel).
-                let was_auto_created = true;
+                // Check whether this is a post-eviction auto-recreate
+                let was_evicted = {
+                    let mut recent = self.recently_evicted.lock().expect("recently_evicted poisoned");
+                    recent.remove(&qualified_name)
+                };
+                if was_evicted {
+                    tracing::warn!(
+                        cursor = %qualified_name,
+                        "cursor was evicted under buffer churn; auto-recreating at seq=0 (next read returns full buffer)"
+                    );
+                } else {
+                    tracing::debug!(cursor = %qualified_name, "cursor auto-created at seq=0");
+                }
                 map.insert(qualified_name.clone(), Bookmark {
+                    qualified_name: qualified_name.clone(),
                     session: session.to_string(),
                     name: name.to_string(),
                     seq: 0,
                     created_at: chrono::Utc::now(),
                     description: None,
                 });
-                if was_auto_created {
-                    tracing::debug!(qualified_name, "cursor auto-created at seq=0");
-                }
                 0
             }
         };
         drop(map);
         (lower_bound, CursorCommit {
-            map: self.map.clone(),
+            bookmarks: self.bookmarks.clone(),
             qualified_name,
             session: session.to_string(),
             name: name.to_string(),
             lower_bound,
         })
     }
+
+    /// Override `sweep` to track evicted names so future cursor auto-creates can WARN.
+    pub fn sweep(&self, oldest_log_seq: Option<u64>, oldest_span_seq: Option<u64>) {
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        let evicted: Vec<String> = map.iter()
+            .filter(|(_, b)| should_evict(b.seq, oldest_log_seq, oldest_span_seq))
+            .map(|(k, _)| k.clone())
+            .collect();
+        map.retain(|_, b| !should_evict(b.seq, oldest_log_seq, oldest_span_seq));
+        drop(map);
+        if !evicted.is_empty() {
+            let mut recent = self.recently_evicted.lock().expect("recently_evicted poisoned");
+            for name in evicted {
+                if recent.len() >= MAX_RECENTLY_EVICTED {
+                    // Cheap bound: drop an arbitrary entry.
+                    if let Some(victim) = recent.iter().next().cloned() {
+                        recent.remove(&victim);
+                    }
+                }
+                recent.insert(name);
+            }
+        }
+    }
 }
 ```
 
-(If `BookmarkStore.map` is currently an `RwLock<HashMap<...>>` not wrapped in `Arc`, wrap it in `Arc<RwLock<...>>` so `CursorCommit` can hold a reference.)
+`BookmarkStore::new` must be updated to initialize `recently_evicted: Mutex::new(HashSet::new())` and to wrap `bookmarks` in `Arc<RwLock<...>>` (was plain `RwLock<...>`). The `Arc` wrap is required so `CursorCommit` can hold an owned reference to the map.
+
+This single step provides both the read-and-advance primitive AND the WARN-on-evicted-recreate behavior. No retrofit needed.
 
 - [ ] **Step 4: Run tests, expect pass**
 
@@ -931,44 +1080,17 @@ impl BookmarkStore {
 cargo test -p logmon-broker-core bookmarks::tests::
 ```
 
-Expected: PASS.
+Expected: PASS, including `auto_create_after_eviction_logs_warn`.
 
-- [ ] **Step 5: Eviction WARN log on auto-recreate**
-
-The current `cursor_read_and_advance` doesn't distinguish "fresh auto-create" from "post-eviction auto-recreate." Add the distinction by checking whether the qualified_name was recently in the map. Simplest: a separate `recently_evicted: Mutex<HashSet<String>>` updated by `evict_stale`. When `cursor_read_and_advance` auto-creates a name that was just evicted, log at WARN:
-
-```rust
-// In evict_stale, after the retain():
-let evicted_names: Vec<String> = /* names that were removed */;
-let mut recent = self.recently_evicted.lock().expect("recent set poisoned");
-recent.extend(evicted_names);
-
-// In cursor_read_and_advance auto-create branch:
-let recently_evicted = {
-    let recent = self.recently_evicted.lock().expect("recent set poisoned");
-    recent.contains(&qualified_name)
-};
-if recently_evicted {
-    tracing::warn!(
-        cursor = qualified_name,
-        "cursor was evicted under buffer churn; auto-recreating at seq=0 (next read returns full buffer)"
-    );
-    let mut recent = self.recently_evicted.lock().expect("recent set poisoned");
-    recent.remove(&qualified_name);
-}
-```
-
-(Bound the set's growth: cap at e.g. 1000 entries, evict oldest if over. Cheap — the spec accepts this as a best-effort signal.)
-
-- [ ] **Step 6: Run all tests**
+- [ ] **Step 5: Run all tests**
 
 ```
 cargo test --workspace
 ```
 
-Expected: 266 + 5 = 271.
+Expected: 266 + 6 = 272 (5 unit tests from this task's primitive + 1 WARN-on-recreate).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/core/src/store/bookmarks.rs
@@ -977,21 +1099,61 @@ git commit -m "feat(bookmarks): cursor_read_and_advance primitive with commit-re
 
 ---
 
-## Task 7: Filter resolver handles CursorFilter qualifier
+## Task 7: Filter resolver handles CursorFilter qualifier — and 8 callers update atomically
 
 **Files:**
-- Modify: `crates/core/src/filter/bookmark_resolver.rs` — handle `Qualifier::CursorFilter`.
-- Test: in-file unit tests OR add to `bookmark_resolver` tests if they exist.
+- Modify: `crates/core/src/filter/bookmark_resolver.rs` — return type changes; handle `Qualifier::CursorFilter`.
+- Modify: 8 RPC handler call sites in `crates/core/src/daemon/rpc_handler.rs` (enumerated below).
+- Test: in-file unit tests in `bookmark_resolver.rs::tests`.
 
-The resolver currently translates `Qualifier::BookmarkFilter { op, name }` into a seq comparison by looking up the bookmark. For cursors, it must also obtain a `CursorCommit` handle and surface it back to the caller (the RPC handler that will commit after the query).
+The resolver currently translates `Qualifier::BookmarkFilter { op, name }` into a `SeqFilter` (post-Task-2). For cursors, it must also obtain a `CursorCommit` handle and surface it back to the caller. The return type changes from `Result<ParsedFilter, BookmarkResolutionError>` to `Result<ResolvedFilter, BookmarkResolutionError>`, which is a **breaking signature change touching every call site simultaneously**.
 
-The resolver's return type needs to grow: alongside the resolved `ParsedFilter`, it now optionally returns a `CursorCommit` (one per filter, by Task 5's multi-cursor reject).
+### Caller enumeration — must all update in this task or build fails
 
-- [ ] **Step 1: Decide on the return shape (no test yet, design step)**
+The 8 callers of `resolve_bookmarks` in `crates/core/src/daemon/rpc_handler.rs` (verified by `grep -n 'resolve_bookmarks(' crates/core/src/daemon/rpc_handler.rs` at plan-write time; line numbers may shift slightly during implementation — re-grep if needed):
 
-Current shape (assumed): `pub fn resolve_bookmarks(parsed, store, session) -> Result<ParsedFilter, ResolveError>`.
+1. `handle_logs_recent` (around line 134)
+2. `handle_logs_export` (around line 160)
+3. `handle_traces_recent` (around line 402)
+4. `handle_traces_summary`
+5. `handle_traces_slow`
+6. `handle_traces_get`
+7. `handle_traces_logs`
+8. `handle_logs_context` (if it uses the resolver — verify; if it doesn't take a filter, drop from list)
 
-New shape:
+Note: `handle_spans_context` does NOT take a filter param (per `protocol::SpansContext` shape) and is not a caller. Anywhere else `parse_and_resolve_filter` is called also counts — `crates/core/src/daemon/rpc_handler.rs::parse_and_resolve_filter` is the helper that wraps `resolve_bookmarks`; check whether it's the actual caller or whether handlers call directly. If it's the helper, update the helper's signature once and the cascade collapses to one site.
+
+For non-cursor handlers (allow-list rejection in Task 9), the cursor_commit returned in this task should be `None`. Task 7 just adapts each caller to consume the new return shape; allow-list rejection lands in Task 9.
+
+### `ParsedFilter` shape note
+
+`crates/core/src/filter/parser.rs::ParsedFilter` is an enum, NOT a struct with `.qualifiers`:
+
+```rust
+pub enum ParsedFilter {
+    All,
+    None,
+    Qualifiers(Vec<Qualifier>),
+}
+```
+
+The resolver pattern-matches on it (see today's `bookmark_resolver.rs:20-41`); follow the existing pattern. Tests below match against the `Qualifiers(qs)` arm, not `.qualifiers`.
+
+### `BookmarkResolutionError` extension
+
+The existing error type is `BookmarkResolutionError` (NOT `ResolveError` as the prior plan draft mentioned — names are normalized below). Add one variant:
+
+```rust
+#[derive(Debug, Error)]
+pub enum BookmarkResolutionError {
+    #[error("bookmark not found: {0}")]
+    NotFound(String),
+    #[error("cross-session cursor advance is not permitted: {0}")]
+    CrossSessionCursorAdvance(String),
+}
+```
+
+### New return shape
 
 ```rust
 pub struct ResolvedFilter {
@@ -1000,36 +1162,31 @@ pub struct ResolvedFilter {
 }
 
 pub fn resolve_bookmarks(
-    parsed: ParsedFilter,
-    bookmarks: &BookmarkStore,
+    filter: ParsedFilter,
+    store: &BookmarkStore,
     current_session: &str,
-) -> Result<ResolvedFilter, ResolveError>;
+) -> Result<ResolvedFilter, BookmarkResolutionError>;
 ```
 
-`ResolveError` already exists; add a new variant for cross-session cursor advance rejection:
+- [ ] **Step 1: Write the failing test**
 
-```rust
-pub enum ResolveError {
-    // ... existing
-    CrossSessionCursorAdvance(String),  // "cross-session cursor advance is not permitted"
-}
-```
-
-- [ ] **Step 2: Write the failing test**
-
-In `crates/core/src/filter/bookmark_resolver.rs::tests` (or wherever resolver tests live):
+In `crates/core/src/filter/bookmark_resolver.rs::tests`:
 
 ```rust
 #[test]
-fn resolves_cursor_qualifier_to_seq_filter() {
+fn resolves_cursor_qualifier_to_seq_filter_with_auto_create() {
     let bookmarks = BookmarkStore::new();
     let parsed = parse_filter("c>=mycur").unwrap();
     let resolved = resolve_bookmarks(parsed, &bookmarks, "test-session").unwrap();
-    // Cursor was auto-created → lower bound 0 → filter "seq > 0"
-    assert!(matches!(
-        &resolved.filter.qualifiers[0],
-        Qualifier::SeqFilter { op: SeqOp::Gt, value: 0 }
-    ));
+    // Auto-created at seq=0 → SeqFilter with value=0
+    if let ParsedFilter::Qualifiers(qs) = resolved.filter {
+        assert!(matches!(
+            qs[0],
+            Qualifier::SeqFilter { op: BookmarkOp::Gte, value: 0 }
+        ));
+    } else {
+        panic!("expected qualifiers");
+    }
     assert!(resolved.cursor_commit.is_some());
 }
 
@@ -1038,31 +1195,33 @@ fn rejects_cross_session_cursor_advance() {
     let bookmarks = BookmarkStore::new();
     let parsed = parse_filter("c>=other-session/cur").unwrap();
     let err = resolve_bookmarks(parsed, &bookmarks, "test-session").unwrap_err();
-    assert!(matches!(err, ResolveError::CrossSessionCursorAdvance(_)));
+    assert!(matches!(err, BookmarkResolutionError::CrossSessionCursorAdvance(_)));
 }
 
 #[test]
 fn cursor_qualifier_uses_existing_seq_for_existing_entry() {
     let bookmarks = BookmarkStore::new();
-    bookmarks.add("test-session", "existing", 100, None).unwrap();
+    let _ = bookmarks.add("test-session", "existing", 100, None, false).unwrap();
     let parsed = parse_filter("c>=existing").unwrap();
     let resolved = resolve_bookmarks(parsed, &bookmarks, "test-session").unwrap();
-    assert!(matches!(
-        &resolved.filter.qualifiers[0],
-        Qualifier::SeqFilter { op: SeqOp::Gt, value: 100 }
-    ));
+    if let ParsedFilter::Qualifiers(qs) = resolved.filter {
+        assert!(matches!(
+            qs[0],
+            Qualifier::SeqFilter { op: BookmarkOp::Gte, value: 100 }
+        ));
+    } else {
+        panic!("expected qualifiers");
+    }
 }
 ```
 
-If `Qualifier::SeqFilter` doesn't exist (the resolver may currently emit a different shape — perhaps it pushes a function predicate or a numeric-comparison qualifier), check what the existing `b>=` resolution emits and use the same shape. Substitute as needed.
-
-- [ ] **Step 3: Run, expect failure**
+- [ ] **Step 2: Run, expect failure**
 
 ```
-cargo test -p logmon-broker-core filter::bookmark_resolver::tests::resolves_cursor
+cargo build --workspace
 ```
 
-Expected: FAIL — resolver doesn't handle `CursorFilter`.
+Expected: COMPILE FAILURE — `resolve_bookmarks` returns the wrong type, all 8 callers break.
 
 - [ ] **Step 4: Implement the resolver case**
 
@@ -1262,7 +1421,7 @@ async fn c_ge_rejected_in_traces_summary() {
 }
 ```
 
-(Add similar tests for `traces.slow`, `traces.get`, `spans.context` if you want exhaustive coverage; the three above are sufficient for the allow-list mechanism.)
+(Add similar tests for `traces.slow` and `traces.get` if you want exhaustive coverage; the three above are sufficient for the allow-list mechanism. `spans.context` is excluded from rejection because its protocol struct has no `filter` param.)
 
 - [ ] **Step 2: Run, expect failure**
 
@@ -1285,7 +1444,7 @@ if resolved.cursor_commit.is_some() {
 let parsed_filter = resolved.filter;
 ```
 
-Substitute `METHOD_NAME` with the literal: `"logs.context"`, `"traces.recent"`, `"traces.summary"`, `"traces.slow"`, `"traces.get"`, `"spans.context"`.
+Substitute `METHOD_NAME` with the literal: `"logs.context"`, `"traces.recent"`, `"traces.summary"`, `"traces.slow"`, `"traces.get"`. (`spans.context` is not in this list — its protocol struct `SpansContext` doesn't accept a `filter` param, so there's nothing to reject.)
 
 For methods that don't currently take a `filter` param (e.g. `traces.get` may only take `trace_id`), no change needed.
 
@@ -1683,7 +1842,7 @@ if matches!(session_id, SessionId::Anonymous(_)) {
 sessions.disconnect(&session_id);
 ```
 
-`bookmarks` (the Arc<BookmarkStore>) needs to be in scope inside `handle_connection`. It's already passed via `RpcHandler`; capture it in the surrounding closure if necessary, or thread it through the call signature.
+`handle_connection` already takes `handler: Arc<RpcHandler>` as a param, and `RpcHandler.bookmarks: Arc<BookmarkStore>` is a public field (verify by grep). Access via `handler.bookmarks.clear_session(&session_id.to_string())`. No new threading required.
 
 - [ ] **Step 4: Run tests, expect pass**
 
@@ -1909,21 +2068,22 @@ git tag cursor-feature-v1 -m "cursor (seq-native bookmarks) feature"
 **Spec coverage:** spec is at `docs/superpowers/specs/2026-05-01-cursor-bookmarks-design.md`. Walking through each section:
 
 - §Storage (BookmarkEntry shape, seq=0 sentinel, name charset) → Tasks 1, 2.
-- §DSL (b>=/c>=/b<= tokens, allow-list, multi-cursor reject, resolution ordering) → Tasks 5, 7, 9, 10-12.
+- §DSL (b>=/c>=/b<= tokens, allow-list, multi-cursor reject, resolution ordering) → Tasks 5, 7, 9, 10–12.
 - §Auto-create on c>= reference → Task 6.
-- §Creation paths side-by-side (the two creation paths) → Tasks 4 (explicit add_bookmark), 6 (implicit auto-create).
-- §Eviction interaction (active polling) → Task 6 (WARN), Task 15 (regression test).
-- §MCP tool changes → Task 4.
-- §Result-shape change → Task 8.
-- §SDK changes (typed methods, filter builder) → Task 4 (typed surface comes free with protocol struct change), Task 14 (builder).
-- §Persistence + cross-restart → Task 3.
-- §Concurrency (lock acquisitions, eviction-during-query) → Tasks 6, 15.
-- §Migration (state.json, wire) → Task 3.
-- §Wire changes → Tasks 4, 8.
-- §Testing list → Tasks 6, 9, 10, 11, 12, 13, 15 cover the integration-test inventory; the spec lists ~15 tests, the plan implements them across these tasks.
+- §Creation paths side-by-side → Tasks 2 (explicit add_bookmark with start_seq/replace), 6 (implicit auto-create).
+- §Eviction interaction (active polling, WARN on auto-recreate) → Task 6 (WARN baked into primitive impl), Task 15 (regression test).
+- §MCP tool changes (add_bookmark/list_bookmarks shape) → Task 2.
+- §Result-shape change (cursor_advanced_to on three result types) → Task 8.
+- §SDK changes (typed surface, filter builder) → Task 2 (typed surface comes free with protocol struct change), Task 14 (builder).
+- §Persistence + cross-restart → Task 3 (now includes cross-restart preservation test).
+- §Concurrency (lock acquisitions, eviction-during-query commit re-insert) → Tasks 6, 15.
+- §Migration (state.json clean break) → Task 3.
+- §Wire changes → Tasks 2, 8.
+- §Filter qualifier migration (TimestampFilter → SeqFilter) — atomic with §Storage change → Task 2 (folded into the merged task).
+- §Testing list → Tasks 5, 6, 7, 9, 10, 11, 12, 13, 15 cover the integration-test inventory.
 
-**Placeholder scan:** no "TBD/TODO/etc." All steps have actual code or commands.
+**Placeholder scan:** no "TBD/TODO/etc." All steps have actual code or commands. Task 4 is intentionally a "removed — merged into Task 2" placeholder; numbering preserved to avoid renumbering churn across cross-references.
 
-**Type consistency:** `BookmarkEntry` vs `Bookmark` — the existing code uses `Bookmark` (verified via grep). Plan uses `Bookmark` consistently. `cursor_read_and_advance` signature consistent across Tasks 6, 7, 15. `Qualifier::CursorFilter { name }` consistent across Tasks 5, 7. `ResolvedFilter` shape consistent across Tasks 7, 9, 10, 11, 12. `CursorCommit::commit(self, max_returned_seq: u64)` consistent across Tasks 6, 7, 10. Field names: `cursor_advanced_to` consistent. Method names: `bookmarks.add` (RPC), `BookmarkStore::add` (Rust), `Filter::builder().cursor(name)` (SDK) all match spec.
+**Type consistency:** `Bookmark` (existing struct, kept; cursor design adds `seq` and `description`, drops `timestamp`). `cursor_read_and_advance` signature consistent across Tasks 6, 7, 15. `Qualifier::CursorFilter { name }` defined in Task 5; `Qualifier::SeqFilter { op: BookmarkOp, value: u64 }` introduced in Task 2 (replaces `TimestampFilter`); both used in Task 7's resolver. `ResolvedFilter` shape consistent across Tasks 7, 9, 10, 11, 12. `CursorCommit::commit(self, max_returned_seq: u64)` consistent across Tasks 6, 7, 10. Field names: `cursor_advanced_to` consistent. `BookmarkResolutionError` (NOT `ResolveError`) — verified against existing code.
 
-**Test count progression:** 254 → 257 → 258 → 260 → 266 → 271 → 274 → 274 → 277 → 279 → 280 → 281 → 282 → 285 → 286+. Monotonic, audit-friendly.
+**Test count progression:** 254 → 254 (Task 1, no new) → 261 (Task 2 adds 7) → 263 (Task 3 adds 2) → (Task 4 removed) → 269 (Task 5 adds 6) → 275 (Task 6 adds 6) → 278 (Task 7 adds 3) → 278 (Task 8 adds 0) → 281 (Task 9 adds 3) → 283 (Task 10 adds 2) → 284 (Task 11 adds 1) → 285 (Task 12 adds 1) → 286 (Task 13 adds 1) → 289 (Task 14 adds 3) → 290+ (Task 15 adds 1 unit test + optionally 1 integration test depending on harness extension).
