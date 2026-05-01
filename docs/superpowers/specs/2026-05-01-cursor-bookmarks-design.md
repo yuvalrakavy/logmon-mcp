@@ -43,6 +43,16 @@ One position field. No discriminator, no enum. The `created_at` is purely inform
 
 `BookmarkStore` keeps the same `Mutex<HashMap<(String, String), BookmarkEntry>>` shape as today.
 
+#### `seq = 0` is reserved as a sentinel
+
+`SeqCounter` starts assigning at `seq = 1`, never `0`. This makes `seq = 0` a safe sentinel for "the cursor has never advanced," used by auto-create (`c>=name` on missing entry → entry stored with `seq = 0` → filter `entry.seq > 0` matches every record ever ingested). Without the reservation, the very-first-record case would silently skip the first record on the first auto-create read.
+
+Implementation: `SeqCounter::new` and `SeqCounter::new_with_initial(initial)` both ensure the first allocation returns `max(initial, 1) + 1` (or equivalent — the contract is "the value `0` is never returned by `next_seq()`"). Existing tests that assert on specific seq values may need to shift by 1.
+
+#### Bookmark name charset
+
+Cursor names share the existing bookmark name charset, validated by the existing `is_valid_bookmark_token` function in `crates/core/src/filter/parser.rs`: `[a-zA-Z0-9_-/]+`. The `/` is reserved as the session/name separator (e.g. `c>=other-sess/cursor-name`); a name containing `/` is interpreted as cross-session-qualified. A cursor name with multiple slashes (`a/b/c`) is rejected at parse time, same as today's bookmark behavior.
+
 ### DSL
 
 | Token | Operation |
@@ -56,7 +66,7 @@ Both `b>=` and `c>=` accept cross-session reach via `other-session/name`:
 - `b>=other/name` — allowed, read-only.
 - `c>=other/name` — **rejected at parse-resolve time** with `"cross-session cursor advance is not permitted"`. Mutating another session's bookmark from outside is an attractive footgun, never useful in practice.
 
-Both tokens are rejected by `add_filter` and `add_trigger` (existing restriction for `b>=`/`b<=`); cursor positions don't make sense in long-lived registered filters.
+Both tokens are rejected by `add_filter` and `add_trigger`. Today the existing `b>=`/`b<=` rejection is keyed on a generic predicate `contains_bookmark_qualifier(parsed_filter) -> bool` in `crates/core/src/filter/parser.rs` (called from `crates/core/src/daemon/rpc_handler.rs::handle_filters_add` / `handle_triggers_add`). Extend this predicate to also match the new `c>=` qualifier variant, and update the user-facing error string from `"bookmarks (b>=, b<=) are not allowed in registered filters/triggers"` to `"bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers"`. One predicate, one error site, no duplication.
 
 The token's behavior is determined entirely by which token is used. The same bookmark can be referenced via either token by the same session — the bookmark itself has no "this is a cursor" flag.
 
@@ -67,6 +77,8 @@ The token's behavior is determined entirely by which token is used. The same boo
 - `logs.recent`
 - `logs.export`
 - `traces.logs`
+
+**Result ordering when `c>=` is present.** Today these methods return records newest-first (typical "recent" semantics). When the filter contains a `c>=` qualifier, the result is reordered to **oldest-first within the cursor's window**, so that cursor advance + paginated re-reads drain the buffer monotonically. Concretely: with cursor at `seq = 10` and `count = 100`, the call returns records with seqs in `[11, 110]` (oldest 100 matching the rest of the filter), and advances to `110`. Next call returns `[111, 210]`. Without the reordering, a buffer of 10 000 records polled with `count = 100` would silently drop 9 900 — the caller would only see the most-recent 100 and skip past everything older. The ordering shift applies only when `c>=` is present in the filter; non-cursor calls remain newest-first.
 
 Rejected at parse-resolve time (`"cursor qualifier not permitted in <method>"`):
 
@@ -129,8 +141,8 @@ Three of four bookmark tools change shape; no new tools.
 
 | Tool | Change |
 |---|---|
-| `add_bookmark` | Optional `start_seq: u64` (default = current seq counter). Optional `replace: bool` (default false). On existing name with `replace=false`, errors with `"bookmark exists; pass replace=true to overwrite"`. With `replace=true`, overwrites unconditionally — note that this is destructive against an actively-polled cursor: the cursor snaps to `start_seq` and any unread records below the new position are skipped on the next `c>=` read. |
-| `list_bookmarks` | Result entries return `seq: u64`, `created_at: <ISO 8601 string>`, `name`, `description` (optional). The legacy `timestamp` field is removed. |
+| `add_bookmark` | Existing `description: Option<String>` param preserved unchanged. New: optional `start_seq: u64` (default = current seq counter). New: optional `replace: bool` (default false). On existing name with `replace=false`, errors with `"bookmark exists; pass replace=true to overwrite"`. With `replace=true`, overwrites unconditionally — note that this is destructive against an actively-polled cursor: the cursor snaps to `start_seq` and any unread records below the new position are skipped on the next `c>=` read. |
+| `list_bookmarks` | Result entries return `name`, `seq: u64`, `created_at: <ISO 8601 string>`, `description: Option<String>`. The legacy `timestamp` field is removed. |
 | `remove_bookmark` | Unchanged. |
 | `clear_bookmarks` | Unchanged. |
 
@@ -146,6 +158,8 @@ Three result types — exactly the methods that accept `c>=` per the allow-list 
 
 Populated as `Some(new_seq)` when the query's filter included a `c>=...` qualifier AND at least one record matched (the cursor actually advanced). `None` in two cases: (a) filter contained no `c>=...` qualifier; (b) `c>=...` was present but no records matched, so the cursor is unchanged. Callers that need to know "what's my cursor seq right now regardless" should call `list_bookmarks`.
 
+For `logs.export`: today's handler returns the matched records inline in the result (`{ logs: [...], count: N, format: "json" }`). Cursor advance accumulates `max(returned.seq)` over the same materialized vector — no streaming-write semantics required. If `logs.export` ever evolves to stream to a file, the cursor commit must move to after the successful flush so a write failure aborts the advance.
+
 ### SDK changes
 
 **Typed methods:** `BookmarksAdd` gains `start_seq: Option<u64>` and `replace: bool`. `BookmarkInfo` (the `list_bookmarks` element type) gains `seq: u64` and `created_at: DateTime<Utc>`, drops `timestamp`. The three query result types listed above (`LogsRecentResult`, `LogsExportResult`, `TracesLogsResult`) gain `cursor_advanced_to: Option<u64>`. No new method.
@@ -155,26 +169,26 @@ Populated as `Some(new_seq)` when the query's filter included a `c>=...` qualifi
 ```rust
 impl FilterBuilder {
     /// Read-and-advance: emits "c>=<name>". Auto-creates the bookmark at
-    /// seq=0 server-side on first reference. Cross-session reach via
-    /// `Filter::builder().cursor_in("other-sess", "name")` is rejected at
-    /// the broker — only the owning session can advance.
+    /// seq=0 server-side on first reference. Cross-session cursor advance
+    /// is intentionally not buildable — the broker rejects it. To read
+    /// another session's cursor position pure-read, use `bookmark_after`
+    /// with a `session/name` argument.
     pub fn cursor(mut self, name: &str) -> Self {
         self.qualifiers.push(format!("c>={name}"));
-        self
-    }
-
-    pub fn cursor_in(mut self, session: &str, name: &str) -> Self {
-        self.qualifiers.push(format!("c>={session}/{name}"));
         self
     }
 }
 ```
 
+No `cursor_in(session, name)` method — exposing a builder that always emits a server-rejected form is a footgun. Cross-session cursor advance is intentionally unsupported; cross-session pure-read uses `bookmark_after("session/name")` instead.
+
 The existing `bookmark_after(name)` and `bookmark_before(name)` are unchanged.
 
 ### Persistence and eviction
 
-**Persistence.** Named-session state.json keeps its existing `bookmarks: Vec<PersistedBookmark>` shape, with `PersistedBookmark { name, seq, created_at, description }`. Anonymous-session bookmarks are not persisted (today's behavior).
+**Persistence.** Named-session state.json keeps its existing `bookmarks: Vec<PersistedBookmark>` shape, with `PersistedBookmark { name, seq, created_at, description }`. Anonymous-session bookmark entries are dropped from the in-memory store when the session disconnects (the entire `SessionState` is removed today; this includes any bookmark/cursor entries scoped to that session).
+
+**Loading an old `state.json`** (from a pre-cursor broker version): the new struct's required fields (`seq`, `created_at`) won't match the old shape (which has `timestamp` instead of `seq`). On deserialize failure for the `bookmarks` vector specifically, the broker logs at WARN (`"discarding bookmarks from previous-version state.json: <serde error>"`) and starts with an empty bookmarks store. The rest of state.json (`seq_block`, `named_sessions` structure, triggers, filters, client_info) loads normally. The user re-creates any bookmarks they need; daemon doesn't refuse to start.
 
 Note on cross-restart cursor behavior: when the daemon restarts, the in-memory log and span buffers are empty and the seq counter resumes at `state.seq_block + SEQ_BLOCK_SIZE`. A persisted cursor's seq is therefore far below any in-buffer record, so the first post-restart `c>=name` returns nothing (the buffer is empty), then deltas as new records arrive. Persisted cursor seq is functionally "skip to restart" — useful for the rare case where a long-running named session resumes its polling after a daemon bounce, but not a substitute for in-memory state across restart. Callers wanting per-test isolation should use unique cursor names per run regardless of session persistence.
 
@@ -209,20 +223,26 @@ impl CursorCommit {
 }
 ```
 
-The query path:
-1. Parse filter, find `c>=name`. Call `cursor_read_and_advance(session, name)` → `(lower_bound, commit_handle)`.
-2. Execute the query with `entry.seq > lower_bound` plus the rest of the filter.
-3. Compute `cursor_advanced_to = entries.iter().map(|e| e.seq).max()`.
-4. Call `commit_handle.commit(cursor_advanced_to)` (a no-op if no records returned).
-5. Return result with `cursor_advanced_to` populated.
+The query path uses two brief lock acquisitions bracketing a lock-free query:
 
-The lock is held only during the get-or-create phase and the advance commit, not during the actual store query — so cursor operations don't block other sessions' work.
+1. Parse + validate the filter (no lock held).
+2. **First lock acquisition.** Call `cursor_read_and_advance(session, name)` → atomically gets-or-creates the entry, returns `(lower_bound, commit_handle)`. Lock released.
+3. Execute the store query with `entry.seq > lower_bound` plus the rest of the filter. **No lock held during this phase** — other sessions' bookmark operations proceed in parallel.
+4. Compute `cursor_advanced_to = entries.iter().map(|e| e.seq).max()`.
+5. **Second lock acquisition.** Call `commit_handle.commit(cursor_advanced_to)` — re-acquires the lock briefly to update the entry's seq. No-op if no records returned (i.e. `cursor_advanced_to` would be `None`).
+6. Return result with `cursor_advanced_to` populated.
+
+**Eviction race during the lock-free query phase.** If an eviction sweep removes the bookmark entry between steps 2 and 5 (because its seq fell below both stores' oldest seqs while the query was running on historical buffer content), `commit_handle.commit(seq)` finds the entry gone. The commit re-inserts the entry at `max_returned_seq` with `created_at = now()`, preserving advance intent — the cursor effectively "rebuilds itself at the new high-water mark." A subsequent `c>=name` from the same session continues from there, not from `seq = 0`. This avoids the surprising "I just queried successfully but my cursor is now reset" failure mode.
+
+(The eviction sweep itself is the only writer that removes entries other than explicit `remove_bookmark` / `clear_bookmarks` / session disconnect; commit re-insert is safe under the same lock.)
 
 ### Migration
 
-None. The new broker version manifests as a fresh deployment; no prior `state.json` is loaded across the schema change. Old bookmarks vanish on first start of the new binary; users re-create what they need.
+**State.json:** None. The new broker version treats an old-shape `bookmarks` vector as a deserialize failure → WARN log + empty bookmarks store, daemon starts normally (per §Persistence above).
 
-A one-line CHANGELOG note: `b>=name` filtering is now seq-based rather than timestamp-based; for live ingestion this is invisible, divergence only manifests under bulk-replay or clock-skew workloads.
+**Wire / SDK:** This release breaks `BookmarkInfo` (drops `timestamp`, adds `seq` + `created_at`) and `BookmarksAdd` (adds optional `start_seq` + `replace`). At v1, the only SDK consumer outside this repo's tree is the in-development store-test integration (Spec B); the MCP shim and broker-sdk crate ship together with the broker, so the break is contained. Future protocol versions must use additive-field discipline (no removed fields) — the `BookmarkInfo` field removal is a one-time cleanup tied to the cursor-mechanism introduction at v1, not a precedent.
+
+CHANGELOG note: bookmark filtering (`b>=`, `b<=`) is now seq-based rather than timestamp-based. For live ingestion this is invisible because the broker assigns seq within microseconds of receipt; divergence would only manifest under bulk-replay (loading historical logs whose `timestamp` field predates their assignment-time) or clock-skew (a GELF client whose host clock drifts relative to the broker's). Neither is a documented workload for this broker.
 
 ## Wire changes
 
@@ -272,11 +292,16 @@ Already covered above. One new builder method, three protocol struct extensions 
 - `multiple_cursor_qualifiers_rejected` — filter `c>=foo, c>=bar` returns parse-resolution error.
 - `failed_filter_does_not_create_cursor` — `c>=fresh, l>=BOGUS` errors at parse-validate; `list_bookmarks` shows no entry for `fresh`.
 - `replace_true_on_active_cursor_skips_unread` — explicit `add_bookmark(name, replace=true)` snaps the cursor forward; subsequent `c>=name` returns only post-replace records.
+- `cursor_paginates_oldest_first_within_window` — buffer with 250 matching records; cursor at 0; `c>=cur` with `count=100` returns the oldest 100, advances; second call returns next 100; third call returns last 50; cursor advances each time.
+- `cursor_eviction_during_query_re_inserts_at_high_water` — start a long-running query, evict the cursor entry mid-flight, verify commit re-inserts the entry at `max(returned.seq)` rather than dropping the advance.
+- `b_le_uses_seq_position` — `add_bookmark("anchor")`, ingest 5 records, `b<=anchor` returns records with `seq < anchor.seq` (i.e. nothing — anchor was created at current seq before the 5 records arrived). Confirms `b<=` semantics shifted from timestamp to seq cleanly.
+- `seq_zero_never_assigned` — sanity test that the broker's first record gets `seq >= 1`, not `0`. Direct test of the SeqCounter contract.
+- `anonymous_session_disconnect_drops_bookmarks` — anon session adds bookmark, disconnects, reconnects under a new anon ID, `list_bookmarks` is empty.
 
 **SDK tests (`crates/sdk/tests/cursors.rs`):**
 - `Filter::builder().cursor("name").build() == "c>=name"`.
-- `Filter::builder().cursor_in("sess", "name").build() == "c>=sess/name"`.
-- End-to-end: typed `broker.logs_recent(LogsRecent { filter: Some(Filter::builder().cursor("c1").build()), ... })`, assert `cursor_advanced_to.is_some()` after first call returning records.
+- `Filter::builder().bookmark_after("sess/name").build() == "b>=sess/name"` — confirms cross-session pure-read still composable through the existing builder.
+- End-to-end: typed `broker.logs_recent(LogsRecent { filter: Some(Filter::builder().cursor("c1").build()), ... })`, ingest known seqs, assert `result.cursor_advanced_to == Some(entries.last().seq)` (exact value, not just `is_some()` — catches a bug where the field is always populated with `Some(0)`).
 
 ## Out of scope (deferred / YAGNI)
 
@@ -301,7 +326,8 @@ Already covered above. One new builder method, three protocol struct extensions 
 | RPC handlers | Thread `cursor_advanced_to` through 3 cursor-permitted handlers; reject `c>=` in the rest |
 | Persistence | Drop timestamp, add seq + created_at to PersistedBookmark |
 | Schema regen | Yes, `cargo xtask gen-schema` |
-| Migration code | None (clean break) |
-| Docs | Skill section on cursors; README cursor paragraph |
+| Migration code | State.json: tolerate-and-discard old bookmark shape (one Result match in load_state); SDK: none |
+| Docs | Skill section on cursors; README cursor paragraph; update existing bookmark guide where it asserts timestamp semantics for `b>=`/`b<=` |
+| SeqCounter | Reserve seq=0 as sentinel; first allocation returns ≥1 |
 
 Substantially smaller than the original "separate cursors namespace" design, while delivering the same semantics.
