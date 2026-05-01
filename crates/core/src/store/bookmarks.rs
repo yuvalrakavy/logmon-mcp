@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]
@@ -28,13 +28,72 @@ pub enum BookmarkError {
     NotFound(String),
 }
 
+/// Read-and-advance commit handle. Must be either explicitly committed via
+/// [`CursorCommit::commit`] or dropped (which is a no-op — the cursor stays at
+/// its current position). The `#[must_use]` reminds callers to handle the
+/// result of the query phase.
+#[must_use = "CursorCommit must be committed or explicitly dropped after the query phase"]
+pub struct CursorCommit {
+    bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,
+    qualified_name: String,
+    session: String,
+    name: String,
+    lower_bound: u64,
+}
+
+impl CursorCommit {
+    /// Advance the cursor to `max_returned_seq`. No-op if
+    /// `max_returned_seq <= lower_bound` (no records returned). If the entry
+    /// was evicted by `sweep` between read-and-advance and commit, re-inserts
+    /// at `max_returned_seq` — preserves advance intent across racing eviction.
+    pub fn commit(self, max_returned_seq: u64) {
+        if max_returned_seq <= self.lower_bound {
+            return;
+        }
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        match map.get_mut(&self.qualified_name) {
+            Some(b) => {
+                b.seq = max_returned_seq;
+            }
+            None => {
+                // Evicted during the lock-free query phase — re-insert at high-water mark.
+                map.insert(
+                    self.qualified_name.clone(),
+                    Bookmark {
+                        qualified_name: self.qualified_name.clone(),
+                        session: self.session.clone(),
+                        name: self.name.clone(),
+                        seq: max_returned_seq,
+                        created_at: Utc::now(),
+                        description: None,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Maximum number of recently-evicted cursor names tracked for the
+/// "auto-recreate after eviction" WARN signal. When the set is full, an
+/// arbitrary entry is dropped to make room (HashSet has no insertion order).
+const MAX_RECENTLY_EVICTED: usize = 1024;
+
 pub struct BookmarkStore {
-    bookmarks: RwLock<HashMap<String, Bookmark>>,
+    bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,
+    /// Tracks names removed by `sweep` since the last call to
+    /// `cursor_read_and_advance` for that name. Lets the primitive distinguish
+    /// "fresh auto-create" from "post-eviction auto-recreate" so we can WARN
+    /// in the latter case. Bounded to `MAX_RECENTLY_EVICTED` entries; arbitrary
+    /// victim dropped when over.
+    recently_evicted: Mutex<HashSet<String>>,
 }
 
 impl BookmarkStore {
     pub fn new() -> Self {
-        Self { bookmarks: RwLock::new(HashMap::new()) }
+        Self {
+            bookmarks: Arc::new(RwLock::new(HashMap::new())),
+            recently_evicted: Mutex::new(HashSet::new()),
+        }
     }
 }
 
@@ -153,13 +212,41 @@ impl BookmarkStore {
     }
 
     /// Remove every bookmark whose data has been evicted from both stores.
+    ///
+    /// Lock-ordering discipline (uniform with `cursor_read_and_advance` to avoid
+    /// deadlock AND missed-WARN races):
+    /// - Always acquire `bookmarks` (RwLock) BEFORE `recently_evicted` (Mutex).
+    /// - Hold bookmarks write lock until AFTER `recently_evicted` is updated, so
+    ///   a concurrent `cursor_read_and_advance` waiting on the bookmarks lock
+    ///   observes the eviction signal atomically with the entry's removal.
     pub fn sweep(
         &self,
         oldest_log_seq: Option<u64>,
         oldest_span_seq: Option<u64>,
     ) {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        let evicted: Vec<String> = map
+            .iter()
+            .filter(|(_, b)| should_evict(b.seq, oldest_log_seq, oldest_span_seq))
+            .map(|(k, _)| k.clone())
+            .collect();
         map.retain(|_, b| !should_evict(b.seq, oldest_log_seq, oldest_span_seq));
+
+        if !evicted.is_empty() {
+            let mut recent = self
+                .recently_evicted
+                .lock()
+                .expect("recently_evicted poisoned");
+            for name in evicted {
+                if recent.len() >= MAX_RECENTLY_EVICTED {
+                    if let Some(victim) = recent.iter().next().cloned() {
+                        recent.remove(&victim);
+                    }
+                }
+                recent.insert(name);
+            }
+        }
+        // Both locks released here as `recent` and `map` go out of scope.
     }
 
     /// Remove every bookmark whose `session` field equals `session`.
@@ -178,6 +265,67 @@ impl BookmarkStore {
             .expect("bookmarks lock poisoned")
             .get(qualified_name)
             .cloned()
+    }
+
+    /// Atomic get-or-create + capture lower bound. Returns
+    /// `(lower_bound, commit_handle)`. The caller filters records with
+    /// `entry.seq > lower_bound` and then calls `commit_handle.commit(max_seq)`
+    /// after the lock-free query phase.
+    ///
+    /// On auto-create of a name recently evicted by [`Self::sweep`], logs at
+    /// WARN — the next read returns the full buffer instead of a delta.
+    pub fn cursor_read_and_advance(&self, session: &str, name: &str) -> (u64, CursorCommit) {
+        let qualified_name = format!("{session}/{name}");
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        let lower_bound = match map.get(&qualified_name) {
+            Some(b) => b.seq,
+            None => {
+                // Check whether this is a post-eviction auto-recreate.
+                // recently_evicted lock acquired AFTER bookmarks lock — uniform
+                // ordering matches `sweep` to prevent deadlocks.
+                let was_evicted = {
+                    let mut recent = self
+                        .recently_evicted
+                        .lock()
+                        .expect("recently_evicted poisoned");
+                    recent.remove(&qualified_name)
+                };
+                if was_evicted {
+                    tracing::warn!(
+                        cursor = %qualified_name,
+                        "cursor was evicted under buffer churn; auto-recreating at seq=0 (next read returns full buffer)"
+                    );
+                } else {
+                    tracing::debug!(
+                        cursor = %qualified_name,
+                        "cursor auto-created at seq=0"
+                    );
+                }
+                map.insert(
+                    qualified_name.clone(),
+                    Bookmark {
+                        qualified_name: qualified_name.clone(),
+                        session: session.to_string(),
+                        name: name.to_string(),
+                        seq: 0,
+                        created_at: Utc::now(),
+                        description: None,
+                    },
+                );
+                0
+            }
+        };
+        drop(map);
+        (
+            lower_bound,
+            CursorCommit {
+                bookmarks: self.bookmarks.clone(),
+                qualified_name,
+                session: session.to_string(),
+                name: name.to_string(),
+                lower_bound,
+            },
+        )
     }
 }
 
@@ -378,5 +526,72 @@ mod tests {
         assert_eq!(store.list().len(), 1);
         store.sweep(None, Some(100));
         assert_eq!(store.list().len(), 1);
+    }
+
+    // ---- New tests for cursor_read_and_advance + CursorCommit (Task 6) ----
+
+    #[test]
+    fn cursor_read_and_advance_auto_creates_at_zero() {
+        let store = BookmarkStore::new();
+        let (lower, _commit) = store.cursor_read_and_advance("s", "fresh");
+        assert_eq!(lower, 0);
+        let listed = store.list();
+        let entry = listed.iter().find(|b| b.qualified_name == "s/fresh").unwrap();
+        assert_eq!(entry.seq, 0);
+    }
+
+    #[test]
+    fn cursor_read_and_advance_returns_existing_seq() {
+        let store = BookmarkStore::new();
+        let _ = store.add("s", "existing", 50, None, false).unwrap();
+        let (lower, _commit) = store.cursor_read_and_advance("s", "existing");
+        assert_eq!(lower, 50);
+    }
+
+    #[test]
+    fn commit_advances_when_max_greater_than_lower() {
+        let store = BookmarkStore::new();
+        let (lower, commit) = store.cursor_read_and_advance("s", "c");
+        assert_eq!(lower, 0);
+        commit.commit(100);
+        let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
+        assert_eq!(entry.seq, 100);
+    }
+
+    #[test]
+    fn commit_no_op_when_max_le_lower() {
+        let store = BookmarkStore::new();
+        let _ = store.add("s", "c", 50, None, false).unwrap();
+        let (lower, commit) = store.cursor_read_and_advance("s", "c");
+        assert_eq!(lower, 50);
+        commit.commit(50);   // No new records — max equals lower.
+        let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
+        assert_eq!(entry.seq, 50);
+    }
+
+    #[test]
+    fn commit_re_inserts_after_eviction_race() {
+        let store = BookmarkStore::new();
+        let (_lower, commit) = store.cursor_read_and_advance("s", "c");
+        // Simulate eviction sweep removing the entry between read-and-advance and commit.
+        store.sweep(Some(u64::MAX), Some(u64::MAX));
+        assert!(store.list().iter().all(|b| b.qualified_name != "s/c"));
+        // Commit re-inserts at the high-water mark.
+        commit.commit(200);
+        let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
+        assert_eq!(entry.seq, 200);
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn auto_create_after_eviction_logs_warn() {
+        let store = BookmarkStore::new();
+        let _ = store.add("s", "evicted", 5, None, false).unwrap();
+        // Sweep evicts the bookmark.
+        store.sweep(Some(u64::MAX), Some(u64::MAX));
+        // Subsequent c>= reference auto-recreates and should WARN.
+        let (lower, _commit) = store.cursor_read_and_advance("s", "evicted");
+        assert_eq!(lower, 0); // Recreated at seq=0
+        assert!(logs_contain("auto-recreating at seq=0"));
     }
 }
