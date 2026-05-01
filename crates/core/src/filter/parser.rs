@@ -194,6 +194,8 @@ pub enum FilterParseError {
     InvalidBookmarkName(String),
     #[error("only one cursor qualifier permitted per filter")]
     MultipleCursorQualifiers,
+    #[error("c<= is not a valid qualifier; cursors only support read-and-advance via c>=. For a read-only snapshot of past records, use b<=name.")]
+    CursorLteNotSupported,
 }
 
 /// Validate a bookmark name as it appears inside a DSL filter token.
@@ -366,6 +368,13 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
         return Ok(Qualifier::CursorFilter {
             name: name.to_string(),
         });
+    }
+
+    // c<= is intentionally not defined per the cursor design spec.
+    // Reject explicitly so users don't silently get a custom-field filter
+    // (which is what would happen if c<=foo fell through to selector parsing).
+    if token.starts_with("c<=") {
+        return Err(FilterParseError::CursorLteNotSupported);
     }
 
     // Quoted bare pattern: "..."
@@ -627,19 +636,24 @@ mod bookmark_tests {
     }
 
     #[test]
-    fn c_le_token_falls_through_to_selector_pattern() {
-        // c<= is intentionally not defined (snapshot-of-past doesn't fit
-        // streaming semantics). It falls through to selector pattern parsing.
-        let f = parse_filter("c<=foo").unwrap();
-        // Parses as a selector pattern (c< = additional field name, foo = value)
-        if let ParsedFilter::Qualifiers(qs) = f {
-            assert!(matches!(
-                &qs[0],
-                Qualifier::SelectorPattern(Selector::AdditionalField(field), _) if field == "c<"
-            ));
-        } else {
-            panic!("expected Qualifiers");
-        }
+    fn c_le_token_rejected_with_guidance() {
+        // c<= is intentionally not defined per the cursor design spec.
+        // Must reject explicitly (not fall through to selector pattern parsing)
+        // to avoid the user getting a silent no-match filter.
+        let err = parse_filter("c<=foo").unwrap_err();
+        assert!(
+            matches!(err, FilterParseError::CursorLteNotSupported),
+            "expected CursorLteNotSupported, got: {err:?}"
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("c<="),
+            "error message should mention the offending token, got: {msg}"
+        );
+        assert!(
+            msg.contains("c>=") || msg.contains("b<="),
+            "error message should suggest the correct alternative, got: {msg}"
+        );
     }
 
     #[test]
