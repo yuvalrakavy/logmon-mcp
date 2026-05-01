@@ -67,6 +67,75 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Iterating recent traces
+
+```rust
+use logmon_broker_sdk::Broker;
+use logmon_broker_protocol::TracesRecent;
+
+let result = broker.traces_recent(TracesRecent {
+    count: Some(20),
+    ..Default::default()
+}).await?;
+
+for t in &result.traces {
+    println!(
+        "[{}] {} ({}) — {:.1} ms, {} spans{}",
+        t.trace_id,
+        t.root_span_name,
+        t.service_name,
+        t.total_duration_ms,
+        t.span_count,
+        if t.has_errors { " ⚠ errors" } else { "" },
+    );
+}
+```
+
+`traces_recent` returns `Vec<TraceSummary>` — one row per trace, with the root span's name, service, total wall-clock duration, span count, and an `has_errors` flag (boolean — see "Record types" below for the full shape).
+
+### Walking one trace's spans
+
+```rust
+use logmon_broker_sdk::Broker;
+use logmon_broker_protocol::{TracesGet, SpanEntry};
+use std::collections::HashMap;
+
+let result = broker.traces_get(TracesGet {
+    trace_id: "0123456789abcdef0123456789abcdef".into(),
+    include_logs: Some(false),
+    ..Default::default()
+}).await?;
+
+// Index spans by their span_id so we can walk parent → child.
+let by_id: HashMap<&str, &SpanEntry> = result.spans.iter()
+    .map(|s| (s.span_id.as_str(), s))
+    .collect();
+
+// Compute depth by walking parent_span_id chain to root.
+fn depth_of(span: &SpanEntry, by_id: &HashMap<&str, &SpanEntry>) -> usize {
+    let mut depth = 0;
+    let mut cur = span;
+    while let Some(parent_id) = &cur.parent_span_id {
+        let Some(parent) = by_id.get(parent_id.as_str()) else { break };
+        depth += 1;
+        cur = parent;
+    }
+    depth
+}
+
+for span in &result.spans {
+    let indent = "  ".repeat(depth_of(span, &by_id));
+    println!(
+        "{indent}{} ({}) {:.1} ms",
+        span.name,
+        span.service_name,
+        span.duration_ms,
+    );
+}
+```
+
+`traces_get` returns the full span tree as a flat `Vec<SpanEntry>` plus the trace's linked logs (when `include_logs: true`). Walk the tree by indexing on `span_id` and following `parent_span_id`. Root spans have `parent_span_id: None`.
+
 ---
 
 ## Connecting
@@ -165,6 +234,164 @@ broker.call_typed::<P, R>(method: &str, params: P) -> Result<R, BrokerError>
 
 ---
 
+## Record types
+
+The SDK returns these as fully-typed Rust structs from `logmon-broker-protocol`. The shapes documented below mirror the wire JSON the broker emits — every field name appears verbatim in `crates/protocol/src/methods.rs` and `crates/protocol/src/notifications.rs`. The JSON Schema at `crates/protocol/protocol-v1.schema.json` is drift-guarded against these definitions and is the canonical wire contract for cross-language clients.
+
+For Rust consumers: `use logmon_broker_protocol::*;` brings everything into scope.
+
+### Logs
+
+```rust
+pub enum Level { Trace, Debug, Info, Warn, Error }
+// Wire format: variant name as-written ("Info", "Error", ...).
+
+pub enum LogSource { Filter, PreTrigger, PostTrigger }
+// Where the entry came from in the pipeline.
+
+pub struct LogEntry {
+    pub seq: u64,                            // Monotonic position; cursor-friendly.
+    pub timestamp: chrono::DateTime<Utc>,    // ISO 8601 on the wire.
+    pub level: Level,
+    pub message: String,                     // GELF "short_message".
+    pub full_message: Option<String>,        // GELF "full_message" if present.
+    pub host: String,                        // GELF "host".
+    pub facility: Option<String>,            // GELF "facility".
+    pub file: Option<String>,                // GELF "file".
+    pub line: Option<u32>,                   // GELF "line".
+    pub additional_fields: HashMap<String, serde_json::Value>,
+        // Anything carried as `_*` GELF fields lands here with the leading underscore stripped.
+    pub trace_id: Option<String>,            // 32-char lowercase hex string on the wire (NOT numeric).
+    pub span_id: Option<String>,             // 16-char lowercase hex string on the wire.
+    pub matched_filters: Vec<String>,        // Names of filters this entry matched.
+    pub source: LogSource,
+}
+```
+
+### Spans and traces
+
+```rust
+pub enum SpanKind {
+    Unspecified, Internal, Server, Client, Producer, Consumer
+}
+// Wire format: snake_case ("unspecified", "server", ...).
+
+pub enum SpanStatus { Unset, Ok, Error(String) }
+// Tagged enum on the wire: {"type":"unset"} | {"type":"ok"} | {"type":"error","message":"..."}.
+// Distinct from the SDK builder's payload-free `FilterSpanStatus`.
+
+pub struct SpanEvent {
+    pub name: String,
+    pub timestamp: chrono::DateTime<Utc>,    // ISO 8601.
+    pub attributes: HashMap<String, serde_json::Value>,
+}
+
+pub struct SpanEntry {
+    pub seq: u64,                            // Shared seq counter with logs.
+    pub trace_id: String,                    // 32-char lowercase hex.
+    pub span_id: String,                     // 16-char lowercase hex.
+    pub parent_span_id: Option<String>,      // 16-char lowercase hex; None for root.
+    pub start_time: chrono::DateTime<Utc>,   // ISO 8601.
+    pub end_time: chrono::DateTime<Utc>,     // ISO 8601.
+    pub duration_ms: f64,
+    pub name: String,                        // OTel span name.
+    pub kind: SpanKind,
+    pub service_name: String,                // OTel service.name resource attribute.
+    pub status: SpanStatus,
+    pub attributes: HashMap<String, serde_json::Value>,
+    pub events: Vec<SpanEvent>,
+}
+
+pub struct TraceSummary {
+    pub trace_id: String,                    // 32-char lowercase hex.
+    pub root_span_name: String,
+    pub service_name: String,                // Of the root span.
+    pub start_time: chrono::DateTime<Utc>,   // ISO 8601.
+    pub total_duration_ms: f64,
+    pub span_count: u32,
+    pub has_errors: bool,                    // True if any span in the trace has SpanStatus::Error.
+    pub linked_log_count: u32,               // Logs the broker has correlated to this trace.
+}
+
+pub struct TraceSummaryBreakdownEntry {
+    pub name: String,                        // Direct child of the root span.
+    pub self_time_ms: f64,                   // Time spent in this child only.
+    pub total_time_ms: f64,                  // Including descendants.
+    pub percentage: f64,                     // Of trace's wall-clock.
+    pub is_error: bool,
+}
+
+pub struct TracesSlowGroup {
+    pub name: String,                        // Span name (the grouping key).
+    pub avg_ms: f64,
+    pub p95_ms: f64,
+    pub count: usize,
+}
+```
+
+### Bookmarks (post-cursor design)
+
+```rust
+pub struct BookmarkInfo {
+    pub name: String,                        // Qualified as "session/bookmark-name".
+    pub seq: u64,                            // Position in the broker's seq stream.
+    pub created_at: chrono::DateTime<Utc>,   // ISO 8601; informational, not used for filtering.
+    pub description: Option<String>,
+}
+```
+
+See "Bookmarks and cursors" below for how to use the same `BookmarkInfo` with the `b>=` (pure read) and `c>=` (read-and-advance) DSL operators.
+
+### Filters and triggers
+
+```rust
+pub struct FilterInfo {
+    pub id: u32,                             // Per-session, monotonic.
+    pub filter: String,                      // The DSL string as registered.
+    pub description: Option<String>,
+}
+
+pub struct TriggerInfo {
+    pub id: u32,                             // Per-session, monotonic.
+    pub filter: String,                      // The DSL string as registered.
+    pub pre_window: u32,                     // Pre-trigger context capacity.
+    pub post_window: u32,                    // Post-trigger capture window.
+    pub notify_context: u32,                 // How many pre-window entries to include in the notification.
+    pub description: Option<String>,
+    pub match_count: u64,                    // Lifetime fire count.
+    pub oneshot: bool,                       // Auto-removes after the first match if true.
+}
+```
+
+### Sessions and status
+
+```rust
+pub struct SessionInfo {
+    pub id: String,                          // UUID for anonymous, name for named sessions.
+    pub name: Option<String>,                // None for anonymous sessions.
+    pub connected: bool,
+    pub trigger_count: usize,
+    pub filter_count: usize,
+    pub queue_size: usize,                   // Pending notifications buffered while disconnected.
+    pub last_seen_secs_ago: u64,
+    pub client_info: Option<serde_json::Value>,
+        // Caller-supplied identity blob from the most recent session.start.
+}
+
+pub struct StoreStats {
+    pub total_received: u64,                 // Lifetime ingest count.
+    pub total_stored: u64,                   // After filter screening.
+    pub malformed_count: u64,                // Receiver-level parse failures.
+    pub current_size: usize,                 // Records currently in the ring buffer.
+}
+```
+
+### Cross-language note
+
+Non-Rust consumers can codegen these same shapes from `crates/protocol/protocol-v1.schema.json` (JSON Schema 2020-12). Every type listed above appears there under `definitions/`. The schema is drift-guarded by `cargo xtask verify-schema`, so it's safe to treat it as the authoritative wire contract — when the schema and the Rust structs disagree, CI fails before a release ships.
+
+---
+
 ## Notifications
 
 The broker pushes notifications on JSON-RPC notification frames. The SDK converts them to a typed `Notification` enum and broadcasts them on a `tokio::sync::broadcast` channel:
@@ -195,7 +422,21 @@ loop {
 }
 ```
 
-`TriggerFiredPayload` carries the matched log entry plus pre-window context. See `logmon_broker_protocol::TriggerFiredPayload` for the full struct.
+### TriggerFiredPayload
+
+```rust
+pub struct TriggerFiredPayload {
+    pub trigger_id: u32,                     // Matches the id returned by triggers_add.
+    pub description: Option<String>,         // Mirror of TriggerInfo.description.
+    pub filter_string: String,               // The DSL string of the firing trigger.
+    pub pre_window: u32,                     // Pre-trigger context capacity (see TriggerInfo).
+    pub post_window: u32,                    // Post-trigger capture window.
+    pub notify_context: u32,                 // Cap on context_before length.
+    pub oneshot: bool,                       // True iff the trigger auto-removed itself on this fire.
+    pub matched_entry: LogEntry,             // The log line that matched.
+    pub context_before: Vec<LogEntry>,       // Up to notify_context entries that arrived before the match.
+}
+```
 
 `Reconnected` is emitted *after* a successful handshake but *before* the new bridge processes any daemon-drained queued notifications, so subscribers see `Reconnected` first and any drained `TriggerFired` events second.
 
