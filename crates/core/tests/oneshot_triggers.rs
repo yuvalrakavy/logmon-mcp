@@ -170,6 +170,7 @@ async fn restored_trigger_preserves_oneshot() {
             }],
             filters: vec![],
             client_info: None,
+            bookmarks: vec![],
         },
     );
     let json = serde_json::to_string_pretty(&state).unwrap();

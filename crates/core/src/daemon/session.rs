@@ -704,6 +704,7 @@ impl SessionRegistry {
         &self,
         name: &str,
         persisted: &crate::daemon::persistence::PersistedSession,
+        bookmark_store: &crate::store::bookmarks::BookmarkStore,
     ) {
         let id = SessionId::Named(name.to_string());
         let state = SessionState::new_named(name);
@@ -751,6 +752,12 @@ impl SessionRegistry {
                 .expect("client_info lock poisoned") = Some(ci.clone());
         }
 
+        // Restore bookmarks (seq-based; cursor design). `replace=true` so a
+        // duplicate from any earlier load doesn't error.
+        for pb in &persisted.bookmarks {
+            let _ = bookmark_store.add(name, &pb.name, pb.seq, pb.description.as_deref(), true);
+        }
+
         self.sessions
             .write()
             .expect("sessions lock poisoned")
@@ -759,11 +766,31 @@ impl SessionRegistry {
 
     /// Build a snapshot of all named sessions suitable for persistence to
     /// `state.json`. Anonymous sessions are skipped. Captures the live
-    /// triggers, filters, and `client_info` for each named session.
+    /// triggers, filters, `client_info`, and bookmarks for each named session.
     pub fn snapshot_named_for_persistence(
         &self,
+        bookmark_store: &crate::store::bookmarks::BookmarkStore,
     ) -> std::collections::HashMap<String, crate::daemon::persistence::PersistedSession> {
-        use crate::daemon::persistence::{PersistedFilter, PersistedSession, PersistedTrigger};
+        use crate::daemon::persistence::{
+            PersistedBookmark, PersistedFilter, PersistedSession, PersistedTrigger,
+        };
+
+        // Snapshot all bookmarks once and bucket by session — avoids re-listing
+        // (and re-locking) per session inside the loop.
+        let all_bookmarks = bookmark_store.list();
+        let mut bookmarks_by_session: std::collections::HashMap<String, Vec<PersistedBookmark>> =
+            std::collections::HashMap::new();
+        for b in all_bookmarks {
+            bookmarks_by_session
+                .entry(b.session.clone())
+                .or_default()
+                .push(PersistedBookmark {
+                    name: b.name,
+                    seq: b.seq,
+                    created_at: b.created_at,
+                    description: b.description,
+                });
+        }
 
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         let mut out = std::collections::HashMap::new();
@@ -797,12 +824,14 @@ impl SessionRegistry {
                 .read()
                 .expect("client_info lock poisoned")
                 .clone();
+            let bookmarks = bookmarks_by_session.remove(name).unwrap_or_default();
             out.insert(
                 name.clone(),
                 PersistedSession {
                     triggers,
                     filters,
                     client_info,
+                    bookmarks,
                 },
             );
         }

@@ -6,13 +6,55 @@ pub const SEQ_BLOCK_SIZE: u64 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
+    #[serde(default)]
     pub triggers: Vec<PersistedTrigger>,
+    #[serde(default)]
     pub filters: Vec<PersistedFilter>,
     /// Caller-supplied identity blob from the most recent `session.start`.
     /// `#[serde(default)]` so existing `state.json` files (written before
     /// client_info landed) load with `None`.
     #[serde(default)]
     pub client_info: Option<serde_json::Value>,
+    /// Tolerant: deserialize errors → empty vec + WARN log. Old-shape entries
+    /// (with `timestamp` instead of `seq`) are silently dropped on load so a
+    /// pre-cursor state.json doesn't crash the daemon.
+    #[serde(default, deserialize_with = "deserialize_bookmarks_lenient")]
+    pub bookmarks: Vec<PersistedBookmark>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedBookmark {
+    /// Bare bookmark name (NOT the qualified `session/name` form). The owning
+    /// session is implicit in [`PersistedSession`]'s map key.
+    pub name: String,
+    /// Anchor seq the bookmark was created at.
+    pub seq: u64,
+    /// Wall-clock creation time, retained for human display only.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Lenient deserializer: on any error, log a WARN and return an empty vec.
+/// This is the migration path for pre-cursor `state.json` files whose
+/// bookmark entries used `timestamp` instead of `seq`.
+fn deserialize_bookmarks_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PersistedBookmark>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    match serde_json::from_value::<Vec<PersistedBookmark>>(raw) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "discarding bookmarks from previous-version state.json"
+            );
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

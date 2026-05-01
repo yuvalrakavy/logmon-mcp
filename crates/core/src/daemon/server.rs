@@ -218,10 +218,13 @@ pub async fn run_with_overrides(
     };
     save_state(&state_path, &new_state)?;
 
-    // 7. Create SessionRegistry, restore named sessions from state
+    // 7. Create SessionRegistry + BookmarkStore, restore named sessions from state.
+    //    BookmarkStore is created here (rather than later) so persisted
+    //    bookmarks can be hydrated alongside triggers/filters during restore.
     let sessions = Arc::new(SessionRegistry::new());
+    let bookmark_store = Arc::new(crate::store::bookmarks::BookmarkStore::new());
     for (name, persisted) in &state.named_sessions {
-        sessions.restore_named(name, persisted);
+        sessions.restore_named(name, persisted, &bookmark_store);
     }
 
     // 8/9. Receivers — either inject a pre-built channel (test harness) or
@@ -299,10 +302,8 @@ pub async fn run_with_overrides(
     // 12. Sync pre-buffer size after restoring sessions
     sync_pre_buffer_size(&pipeline, &sessions);
 
-    // 13a. Create BookmarkStore (in-memory only, not persisted)
-    let bookmark_store = Arc::new(crate::store::bookmarks::BookmarkStore::new());
-
-    // 13. Create RpcHandler
+    // 13. Create RpcHandler (BookmarkStore created earlier in step 7 so
+    //     persisted bookmarks can be restored alongside triggers/filters).
     let handler = Arc::new(RpcHandler::new(
         pipeline.clone(),
         span_store.clone(),
@@ -409,10 +410,10 @@ pub async fn run_with_overrides(
         // Send offline beacon before stopping receivers
         send_otel_beacon("OTEL:OFFLINE\n");
 
-        // Persist live named-session state (triggers, filters, client_info)
-        // before tearing down. Best-effort: failures are logged but do not
-        // block shutdown.
-        let snapshot = sessions.snapshot_named_for_persistence();
+        // Persist live named-session state (triggers, filters, client_info,
+        // bookmarks) before tearing down. Best-effort: failures are logged but
+        // do not block shutdown.
+        let snapshot = sessions.snapshot_named_for_persistence(&bookmark_store);
         let final_state = DaemonState {
             seq_block: reserved_seq_block,
             named_sessions: snapshot,
@@ -484,10 +485,10 @@ pub async fn run_with_overrides(
         // Send offline beacon before stopping receivers
         send_otel_beacon("OTEL:OFFLINE\n");
 
-        // Persist live named-session state (triggers, filters, client_info)
-        // before tearing down. Best-effort: failures are logged but do not
-        // block shutdown.
-        let snapshot = sessions.snapshot_named_for_persistence();
+        // Persist live named-session state (triggers, filters, client_info,
+        // bookmarks) before tearing down. Best-effort: failures are logged but
+        // do not block shutdown.
+        let snapshot = sessions.snapshot_named_for_persistence(&bookmark_store);
         let final_state = DaemonState {
             seq_block: reserved_seq_block,
             named_sessions: snapshot,

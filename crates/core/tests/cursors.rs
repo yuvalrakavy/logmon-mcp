@@ -10,6 +10,7 @@ use logmon_broker_protocol::{
     BookmarksAddResult, BookmarksListResult,
 };
 use serde_json::json;
+use std::fs;
 
 #[tokio::test]
 async fn add_bookmark_with_explicit_start_seq() {
@@ -83,4 +84,89 @@ async fn add_bookmark_replace_overwrites() {
         .find(|b| b.qualified_name.ends_with("/x"))
         .expect("expected to find /x in list");
     assert_eq!(entry.seq, 2);
+}
+
+#[tokio::test]
+async fn legacy_state_json_with_old_bookmark_shape_warns_and_continues() {
+    // Spawn a daemon, get its tempdir, shut down, write a legacy-shape state.json,
+    // restart, verify daemon starts and bookmarks are dropped.
+    let daemon = spawn_test_daemon().await;
+    let tempdir = daemon.tempdir.clone();
+    let tempdir_path = tempdir.path().to_path_buf();
+    daemon.shutdown().await;
+    drop(daemon);
+
+    let legacy = json!({
+        "seq_block": 1000,
+        "named_sessions": {
+            "test_session": {
+                "triggers": [],
+                "filters": [],
+                "client_info": null,
+                "bookmarks": [{
+                    "name": "old",
+                    "timestamp": "2026-04-30T12:00:00Z",
+                    "description": "from before cursor migration"
+                }]
+            }
+        }
+    });
+    fs::write(
+        tempdir_path.join("state.json"),
+        serde_json::to_string_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    // Re-spawn with same tempdir using the single-arg public API.
+    let daemon = TestDaemonHandle::spawn_in_tempdir(tempdir).await;
+    let mut client = daemon.connect_named("test_session", None).await;
+
+    // Daemon survived deserialize; bookmarks should be empty for the restored session.
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
+    assert!(
+        list.bookmarks
+            .iter()
+            .all(|b| !b.qualified_name.starts_with("test_session/old")),
+        "legacy bookmarks should have been discarded; got {:?}",
+        list.bookmarks
+    );
+}
+
+#[tokio::test]
+async fn bookmark_persists_across_restart() {
+    // Verify the persistence round-trip works for seq-based bookmarks via the
+    // pure-read b>= path. (Cursor-specific cross-restart behavior is tested
+    // in Task 15 once c>= and cursor_advanced_to are wired.)
+    let mut daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_named("persist", None).await;
+
+    // Add a bookmark with explicit start_seq so we can assert exact equality
+    // post-restart (without depending on the seq counter's runtime value).
+    let added: BookmarksAddResult = client
+        .call(
+            "bookmarks.add",
+            json!({
+                "name": "anchor",
+                "start_seq": 42,
+                "description": "preserved",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(added.seq, 42);
+
+    // Drop client, restart daemon, reconnect to same named session.
+    drop(client);
+    daemon.restart().await;
+    let mut client = daemon.connect_named("persist", None).await;
+
+    // Bookmark survives.
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
+    let entry = list
+        .bookmarks
+        .iter()
+        .find(|b| b.qualified_name == "persist/anchor")
+        .expect("anchor bookmark should survive restart");
+    assert_eq!(entry.seq, 42);
+    assert_eq!(entry.description.as_deref(), Some("preserved"));
 }
