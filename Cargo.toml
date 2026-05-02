@@ -34,9 +34,10 @@ uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"
 async-trait = "0.1"
 socket2 = "0.5"
-tonic = "0.12"
-prost = "0.13"
-opentelemetry-proto = { version = "0.27", features = ["gen-tonic", "logs", "trace"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+opentelemetry-proto = { version = "0.31", features = ["gen-tonic", "logs", "trace"] }
 axum = "0.8"
 rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
 tokio-test = "0.4"
