@@ -3,9 +3,10 @@ pub mod http;
 pub mod mapping;
 
 use crate::gelf::message::LogEntry;
-use crate::receiver::Receiver;
+use crate::receiver::{Receiver, ReceiverMetrics};
 use crate::span::types::SpanEntry;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
@@ -29,6 +30,7 @@ impl OtlpReceiver {
         config: OtlpReceiverConfig,
         log_sender: mpsc::Sender<LogEntry>,
         span_sender: mpsc::Sender<SpanEntry>,
+        metrics: Arc<ReceiverMetrics>,
     ) -> anyhow::Result<Self> {
         let (shutdown_tx, _) = broadcast::channel(1);
         let grpc_addr: std::net::SocketAddr = config.grpc_addr.parse()?;
@@ -37,9 +39,12 @@ impl OtlpReceiver {
         let grpc_handle = {
             let log_tx = log_sender.clone();
             let span_tx = span_sender.clone();
+            let metrics = metrics.clone();
             let rx = shutdown_tx.subscribe();
             tokio::spawn(async move {
-                if let Err(e) = grpc::start_grpc_server(grpc_addr, log_tx, span_tx, rx).await {
+                if let Err(e) =
+                    grpc::start_grpc_server(grpc_addr, log_tx, span_tx, metrics, rx).await
+                {
                     tracing::error!("OTLP gRPC server error: {e}");
                 }
             })
@@ -49,7 +54,7 @@ impl OtlpReceiver {
             let rx = shutdown_tx.subscribe();
             tokio::spawn(async move {
                 if let Err(e) =
-                    http::start_http_server(http_addr, log_sender, span_sender, rx).await
+                    http::start_http_server(http_addr, log_sender, span_sender, metrics, rx).await
                 {
                     tracing::error!("OTLP HTTP server error: {e}");
                 }
@@ -81,5 +86,22 @@ impl Receiver for OtlpReceiver {
 
     async fn shutdown(self: Box<Self>) {
         let _ = self.shutdown_tx.send(());
+    }
+}
+
+impl Drop for OtlpReceiver {
+    fn drop(&mut self) {
+        // Best-effort: signal graceful shutdown. axum's
+        // `with_graceful_shutdown` waits for in-flight handlers to complete
+        // — which is fine for handlers that finish quickly, but if the
+        // shutdown is happening because we've already wedged, in-flight
+        // tasks may park on the (full) log/span channel forever. Aborting
+        // the JoinHandles forces an exit path regardless. Both paths leave
+        // the listening sockets to be cleaned up by the kernel after
+        // process exit; the only thing we lose is graceful body
+        // completion of an already-parked handler.
+        let _ = self.shutdown_tx.send(());
+        self.grpc_handle.abort();
+        self.http_handle.abort();
     }
 }

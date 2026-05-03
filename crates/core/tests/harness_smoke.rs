@@ -14,7 +14,13 @@ async fn harness_starts_and_status_responds() {
     let result: StatusGetResult = client.call("status.get", json!({})).await.unwrap();
     // The harness disables real receivers, so the daemon advertises an empty
     // receivers list. uptime must be >= 0 (u64); just sanity-check the shape.
-    assert!(result.receivers.is_empty(), "expected no receivers in test harness, got {:?}", result.receivers);
+    assert!(
+        result.receivers.is_empty(),
+        "expected no receivers in test harness, got {:?}",
+        result.receivers
+    );
+    // Fresh daemon — no drops yet.
+    assert_eq!(result.receiver_drops, Default::default());
 }
 
 #[tokio::test]

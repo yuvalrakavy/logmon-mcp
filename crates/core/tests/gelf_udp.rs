@@ -1,13 +1,16 @@
 use logmon_broker_core::gelf::udp::start_udp_listener;
 use logmon_broker_core::gelf::message::LogEntry;
+use logmon_broker_core::receiver::ReceiverMetrics;
 use std::net::UdpSocket;
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use serde_json::json;
 
 #[tokio::test]
 async fn test_udp_listener_receives_gelf() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(100);
-    let handle = start_udp_listener("127.0.0.1:0", tx).await.unwrap();
+    let metrics = Arc::new(ReceiverMetrics::new());
+    let handle = start_udp_listener("127.0.0.1:0", tx, metrics).await.unwrap();
 
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let msg = json!({
@@ -25,7 +28,8 @@ async fn test_udp_listener_receives_gelf() {
 #[tokio::test]
 async fn test_udp_malformed_not_sent() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(100);
-    let handle = start_udp_listener("127.0.0.1:0", tx).await.unwrap();
+    let metrics = Arc::new(ReceiverMetrics::new());
+    let handle = start_udp_listener("127.0.0.1:0", tx, metrics).await.unwrap();
 
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.send_to(b"not json", format!("127.0.0.1:{}", handle.port())).unwrap();

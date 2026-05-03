@@ -636,6 +636,20 @@ pub struct SessionDropResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct StatusGet {}
 
+/// Per-source receiver drop counts. Each field is the cumulative count of
+/// entries dropped at that receiver call site since broker start, due to
+/// the upstream channel being full (i.e. the consumer couldn't keep up).
+/// Healthy operation keeps all fields at 0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ReceiverDropCounts {
+    #[serde(default)] pub gelf_udp: u64,
+    #[serde(default)] pub gelf_tcp: u64,
+    #[serde(default)] pub otlp_http_logs: u64,
+    #[serde(default)] pub otlp_http_traces: u64,
+    #[serde(default)] pub otlp_grpc_logs: u64,
+    #[serde(default)] pub otlp_grpc_traces: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct StatusGetResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -643,4 +657,6 @@ pub struct StatusGetResult {
     pub daemon_uptime_secs: u64,
     pub receivers: Vec<String>,
     pub store: StoreStats,
+    #[serde(default)]
+    pub receiver_drops: ReceiverDropCounts,
 }

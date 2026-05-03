@@ -9,6 +9,7 @@ use logmon_broker_core::daemon::session::SessionRegistry;
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
 use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
+use logmon_broker_core::receiver::ReceiverMetrics;
 use logmon_broker_protocol::RpcRequest;
 use logmon_broker_core::span::store::SpanStore;
 use logmon_broker_core::store::bookmarks::BookmarkStore;
@@ -41,11 +42,13 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
     let span_store = Arc::new(SpanStore::new(1000, seq));
     let sessions = Arc::new(SessionRegistry::new());
     let bookmarks = Arc::new(BookmarkStore::new());
+    let metrics = Arc::new(ReceiverMetrics::new());
     let handler = Arc::new(RpcHandler::new(
         pipeline.clone(),
         span_store,
         sessions.clone(),
         bookmarks,
+        metrics,
         vec!["test".into()],
     ));
     (handler, pipeline, sessions)

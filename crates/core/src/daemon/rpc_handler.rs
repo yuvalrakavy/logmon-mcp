@@ -1,6 +1,7 @@
 use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
+use crate::receiver::ReceiverMetrics;
 use logmon_broker_protocol::*;
 use crate::span::store::SpanStore;
 use serde_json::{json, Value};
@@ -11,6 +12,7 @@ pub struct RpcHandler {
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
     bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
+    metrics: Arc<ReceiverMetrics>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
 }
@@ -21,6 +23,7 @@ impl RpcHandler {
         span_store: Arc<SpanStore>,
         sessions: Arc<SessionRegistry>,
         bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
+        metrics: Arc<ReceiverMetrics>,
         receivers_info: Vec<String>,
     ) -> Self {
         Self {
@@ -28,6 +31,7 @@ impl RpcHandler {
             span_store,
             sessions,
             bookmarks,
+            metrics,
             start_time: std::time::Instant::now(),
             receivers_info,
         }
@@ -244,6 +248,7 @@ impl RpcHandler {
     fn handle_status(&self, session_id: &SessionId) -> Result<Value, String> {
         let session_info = self.sessions.get(session_id);
         let stats = self.pipeline.store_stats();
+        let drops = self.metrics.snapshot();
         Ok(json!({
             "session": session_info.map(|s| json!({
                 "id": s.id.to_string(),
@@ -262,6 +267,14 @@ impl RpcHandler {
                 "total_stored": stats.total_stored,
                 "malformed_count": stats.malformed_count,
                 "current_size": self.pipeline.store_len(),
+            },
+            "receiver_drops": {
+                "gelf_udp": drops.gelf_udp,
+                "gelf_tcp": drops.gelf_tcp,
+                "otlp_http_logs": drops.otlp_http_logs,
+                "otlp_http_traces": drops.otlp_http_traces,
+                "otlp_grpc_logs": drops.otlp_grpc_logs,
+                "otlp_grpc_traces": drops.otlp_grpc_traces,
             },
         }))
     }

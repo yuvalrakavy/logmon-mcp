@@ -2388,6 +2388,17 @@
         },
         "store": {
           "$ref": "#/$defs/StoreStats"
+        },
+        "receiver_drops": {
+          "$ref": "#/$defs/ReceiverDropCounts",
+          "default": {
+            "gelf_udp": 0,
+            "gelf_tcp": 0,
+            "otlp_http_logs": 0,
+            "otlp_http_traces": 0,
+            "otlp_grpc_logs": 0,
+            "otlp_grpc_traces": 0
+          }
         }
       },
       "required": [
@@ -2476,6 +2487,48 @@
             "malformed_count",
             "current_size"
           ]
+        },
+        "ReceiverDropCounts": {
+          "description": "Per-source receiver drop counts. Each field is the cumulative count of\nentries dropped at that receiver call site since broker start, due to\nthe upstream channel being full (i.e. the consumer couldn't keep up).\nHealthy operation keeps all fields at 0.",
+          "type": "object",
+          "properties": {
+            "gelf_udp": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            },
+            "gelf_tcp": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            },
+            "otlp_http_logs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            },
+            "otlp_http_traces": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            },
+            "otlp_grpc_logs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            },
+            "otlp_grpc_traces": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
+            }
+          }
         }
       }
     },

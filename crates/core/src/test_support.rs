@@ -263,6 +263,91 @@ impl TestDaemonHandle {
         TestClient::try_connect(&self.socket_path, Some(name.to_string()), client_info).await
     }
 
+    /// Spawn the daemon with the REAL GELF receiver (UDP+TCP bound to
+    /// kernel-assigned ports). Required for tests that exercise the actual
+    /// receiver paths. `spawn()` uses the injected-channel harness which
+    /// disables real receivers and is unsuitable for backpressure tests.
+    pub async fn spawn_with_real_receivers() -> Self {
+        let tempdir = Arc::new(TempDir::new().expect("create tempdir for test daemon"));
+        Self::spawn_in_dir_no_inject(tempdir, default_test_config()).await
+    }
+
+    async fn spawn_in_dir_no_inject(tempdir: Arc<TempDir>, config: DaemonConfig) -> Self {
+        let socket_path = tempdir.path().join("logmon.sock");
+        let dir_for_daemon = tempdir.path().to_path_buf();
+        let socket_path_for_daemon = socket_path.clone();
+
+        // log_tx is unused for real-receiver tests, but the struct field
+        // must be initialised; keep a dropped channel so inject_log() (if
+        // ever called) becomes a silent no-op.
+        let (log_tx, _drop_log_rx) = mpsc::channel::<LogEntry>(1);
+        drop(_drop_log_rx);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let accept_paused = Arc::new(AtomicBool::new(false));
+        let accept_paused_for_daemon = accept_paused.clone();
+        let config_for_daemon = config.clone();
+
+        let join_handle = tokio::spawn(async move {
+            let overrides = DaemonOverrides {
+                config_dir: Some(dir_for_daemon),
+                socket_path: Some(socket_path_for_daemon),
+                injected_log_rx: None, // <-- key difference from spawn_in_dir
+                shutdown_rx: Some(shutdown_rx),
+                accept_paused: Some(accept_paused_for_daemon),
+                skip_tracing_init: true,
+            };
+            if let Err(e) = run_with_overrides(config_for_daemon, overrides).await {
+                eprintln!("test daemon (real receivers) exited with error: {e}");
+            }
+        });
+
+        let mut appeared = false;
+        for _ in 0..SOCKET_WAIT_TICKS {
+            if socket_path.exists() {
+                appeared = true;
+                break;
+            }
+            tokio::time::sleep(SOCKET_WAIT_INTERVAL).await;
+        }
+        assert!(
+            appeared,
+            "real-receiver daemon socket {} never appeared",
+            socket_path.display()
+        );
+
+        Self {
+            socket_path,
+            tempdir,
+            config,
+            log_tx,
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            accept_paused,
+            join_handle: Mutex::new(Some(join_handle)),
+        }
+    }
+
+    /// Discover the bound UDP port of the GELF receiver via a status.get
+    /// RPC call. Only meaningful for daemons spawned with
+    /// `spawn_with_real_receivers`.
+    pub async fn gelf_udp_port(&self) -> u16 {
+        use logmon_broker_protocol::StatusGetResult;
+        use serde_json::json;
+
+        let mut client = self.connect_anon().await;
+        let result: StatusGetResult = client
+            .call("status.get", json!({}))
+            .await
+            .expect("status.get must succeed on freshly-spawned daemon");
+        for entry in &result.receivers {
+            if let Some(rest) = entry.strip_prefix("UDP:") {
+                if let Ok(port) = rest.parse::<u16>() {
+                    return port;
+                }
+            }
+        }
+        panic!("no UDP receiver in receivers list: {:?}", result.receivers)
+    }
+
     /// Run a session.start handshake and immediately drop the connection,
     /// returning just the handshake result.
     pub async fn session_start(

@@ -1,7 +1,8 @@
-use super::Receiver;
+use super::{Receiver, ReceiverMetrics};
 use crate::gelf::message::LogEntry;
 use crate::gelf::{tcp, udp};
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct GelfReceiverConfig {
@@ -18,9 +19,12 @@ impl GelfReceiver {
     pub async fn start(
         config: GelfReceiverConfig,
         sender: mpsc::Sender<LogEntry>,
+        metrics: Arc<ReceiverMetrics>,
     ) -> anyhow::Result<Self> {
-        let udp_handle = udp::start_udp_listener(&config.udp_addr, sender.clone()).await?;
-        let tcp_handle = tcp::start_tcp_listener(&config.tcp_addr, sender).await?;
+        let udp_handle =
+            udp::start_udp_listener(&config.udp_addr, sender.clone(), metrics.clone()).await?;
+        let tcp_handle =
+            tcp::start_tcp_listener(&config.tcp_addr, sender, metrics).await?;
         Ok(Self {
             udp_handle,
             tcp_handle,

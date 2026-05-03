@@ -1,5 +1,6 @@
 use crate::gelf::message::{LogEntry, LogSource};
 use crate::receiver::otlp::mapping::*;
+use crate::receiver::{ReceiverMetrics, ReceiverSource};
 use crate::span::types::*;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     logs_service_server::{LogsService, LogsServiceServer},
@@ -12,9 +13,37 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use opentelemetry_proto::tonic::common::v1::{any_value::Value, KeyValue};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
+
+// ---------------------------------------------------------------------------
+// Backpressure threshold
+// ---------------------------------------------------------------------------
+
+/// Threshold above which OTLP gRPC returns UNAVAILABLE instead of consuming
+/// the remaining channel headroom. Compliant clients (tracing-init's OTLP
+/// exporter) retry with exponential backoff, so this is a soft brake — no
+/// information is lost as long as clients honour it.
+///
+/// Counter semantics: when the threshold gate fires and we return UNAVAILABLE,
+/// we do NOT bump per-source drop counters — the UNAVAILABLE status IS the
+/// backpressure signal, observable to clients (and their own metrics).
+/// Per-source counters track entries that survived the gate but lost the
+/// race to a full channel mid-loop. This keeps `status.get`'s
+/// `receiver_drops` honest about "broker actually dropped this entry"
+/// versus "broker rejected the request body wholesale, client knows."
+const BACKPRESSURE_THRESHOLD_PCT: u64 = 80;
+
+fn channel_used_pct<T>(sender: &mpsc::Sender<T>) -> u64 {
+    let cap = sender.max_capacity() as u64;
+    if cap == 0 {
+        return 0;
+    }
+    let avail = sender.capacity() as u64;
+    (cap - avail) * 100 / cap
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -141,6 +170,7 @@ fn map_span_events(
 
 pub struct OtlpLogsService {
     pub log_sender: mpsc::Sender<LogEntry>,
+    pub metrics: Arc<ReceiverMetrics>,
     pub malformed_count: AtomicU64,
 }
 
@@ -151,6 +181,10 @@ impl LogsService for OtlpLogsService {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         let req = request.into_inner();
+
+        if channel_used_pct(&self.log_sender) >= BACKPRESSURE_THRESHOLD_PCT {
+            return Err(Status::unavailable("broker log channel under backpressure"));
+        }
 
         for resource_logs in req.resource_logs {
             let resource_attrs = resource_logs
@@ -201,7 +235,11 @@ impl LogsService for OtlpLogsService {
                         source: LogSource::Filter,
                     };
 
-                    let _ = self.log_sender.send(entry).await;
+                    let _ = self.metrics.try_send_log(
+                        &self.log_sender,
+                        entry,
+                        ReceiverSource::OtlpGrpcLogs,
+                    );
                 }
             }
         }
@@ -218,6 +256,7 @@ impl LogsService for OtlpLogsService {
 
 pub struct OtlpTraceService {
     pub span_sender: mpsc::Sender<SpanEntry>,
+    pub metrics: Arc<ReceiverMetrics>,
     pub malformed_count: AtomicU64,
 }
 
@@ -228,6 +267,10 @@ impl TraceService for OtlpTraceService {
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
         let req = request.into_inner();
+
+        if channel_used_pct(&self.span_sender) >= BACKPRESSURE_THRESHOLD_PCT {
+            return Err(Status::unavailable("broker span channel under backpressure"));
+        }
 
         for resource_spans in req.resource_spans {
             let resource_attrs = resource_spans
@@ -280,7 +323,11 @@ impl TraceService for OtlpTraceService {
                         events: map_span_events(&span.events),
                     };
 
-                    let _ = self.span_sender.send(entry).await;
+                    let _ = self.metrics.try_send_span(
+                        &self.span_sender,
+                        entry,
+                        ReceiverSource::OtlpGrpcTraces,
+                    );
                 }
             }
         }
@@ -300,14 +347,17 @@ pub async fn start_grpc_server(
     addr: std::net::SocketAddr,
     log_sender: mpsc::Sender<LogEntry>,
     span_sender: mpsc::Sender<SpanEntry>,
+    metrics: Arc<ReceiverMetrics>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let logs_svc = OtlpLogsService {
         log_sender,
+        metrics: metrics.clone(),
         malformed_count: AtomicU64::new(0),
     };
     let trace_svc = OtlpTraceService {
         span_sender,
+        metrics,
         malformed_count: AtomicU64::new(0),
     };
 
@@ -322,4 +372,82 @@ pub async fn start_grpc_server(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::receiver::ReceiverMetrics;
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tonic::Request;
+
+    fn make_trace_service(span_cap: usize) -> (OtlpTraceService, mpsc::Receiver<SpanEntry>, Arc<ReceiverMetrics>) {
+        let (span_sender, span_rx) = mpsc::channel(span_cap);
+        let metrics = Arc::new(ReceiverMetrics::new());
+        let svc = OtlpTraceService {
+            span_sender,
+            metrics: metrics.clone(),
+            malformed_count: AtomicU64::new(0),
+        };
+        (svc, span_rx, metrics)
+    }
+
+    fn make_span_request() -> Request<ExportTraceServiceRequest> {
+        Request::new(ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: vec![Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![1; 8],
+                        name: "synthetic".into(),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_service_returns_unavailable_when_span_channel_at_capacity() {
+        let (svc, _rx, metrics) = make_trace_service(1);
+
+        // Fill the channel.
+        let dummy = SpanEntry {
+            seq: 0, trace_id: 1, span_id: 1, parent_span_id: None,
+            start_time: chrono::Utc::now(), end_time: chrono::Utc::now(),
+            duration_ms: 0.0, name: "x".into(),
+            kind: SpanKind::Internal, service_name: "s".into(),
+            status: SpanStatus::Unset,
+            attributes: std::collections::HashMap::new(),
+            events: vec![],
+        };
+        svc.span_sender.try_send(dummy).unwrap();
+
+        let result = svc.export(make_span_request()).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+        // Counter stays at 0 — the UNAVAILABLE response IS the backpressure signal,
+        // body was rejected wholesale before any per-entry try_send_span.
+        assert_eq!(metrics.snapshot().otlp_grpc_traces, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_service_below_threshold_sends_and_returns_ok() {
+        // cap=10, so 1 entry = 10% used, well below 80%.
+        let (svc, mut rx, metrics) = make_trace_service(10);
+
+        let result = svc.export(make_span_request()).await;
+        assert!(result.is_ok(), "expected OK, got {:?}", result.err());
+        // Counter unchanged — entry made it through.
+        assert_eq!(metrics.snapshot().otlp_grpc_traces, 0);
+        // Channel received exactly one span.
+        assert!(rx.try_recv().is_ok(), "expected one span in the channel");
+    }
 }
