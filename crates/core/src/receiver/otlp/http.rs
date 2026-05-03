@@ -1,26 +1,54 @@
 use crate::gelf::message::{LogEntry, LogSource};
 use crate::receiver::otlp::mapping::*;
+use crate::receiver::{ReceiverMetrics, ReceiverSource};
 use crate::span::types::*;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
 struct AppState {
     log_sender: mpsc::Sender<LogEntry>,
     span_sender: mpsc::Sender<SpanEntry>,
+    metrics: Arc<ReceiverMetrics>,
+}
+
+/// Threshold above which OTLP HTTP returns 429 instead of consuming the
+/// remaining channel headroom. Compliant clients (tracing-init's OTLP
+/// exporter) retry with exponential backoff, so this is a soft brake — no
+/// information is lost as long as clients honour it.
+///
+/// Counter semantics: when the threshold gate fires and we return 429, we
+/// do NOT bump per-source drop counters — the 429 response IS the
+/// backpressure signal, observable to clients (and their own metrics).
+/// Per-source counters track entries that survived the gate but lost the
+/// race to a full channel mid-loop. This keeps `status.get`'s
+/// `receiver_drops` honest about "broker actually dropped this entry"
+/// versus "broker rejected the request body wholesale, client knows."
+const BACKPRESSURE_THRESHOLD_PCT: u64 = 80;
+
+fn channel_used_pct<T>(sender: &mpsc::Sender<T>) -> u64 {
+    let cap = sender.max_capacity() as u64;
+    if cap == 0 {
+        return 0;
+    }
+    let avail = sender.capacity() as u64;
+    (cap - avail) * 100 / cap
 }
 
 pub async fn start_http_server(
     addr: std::net::SocketAddr,
     log_sender: mpsc::Sender<LogEntry>,
     span_sender: mpsc::Sender<SpanEntry>,
+    metrics: Arc<ReceiverMetrics>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     let state = AppState {
         log_sender,
         span_sender,
+        metrics,
     };
     let app = Router::new()
         .route("/v1/logs", post(handle_logs))
@@ -372,6 +400,14 @@ async fn handle_logs(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> StatusCode {
+    handle_logs_inner(&state, body).await
+}
+
+async fn handle_logs_inner(state: &AppState, body: serde_json::Value) -> StatusCode {
+    if channel_used_pct(&state.log_sender) >= BACKPRESSURE_THRESHOLD_PCT {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
     if let Some(resource_logs) = body.get("resourceLogs").and_then(|v| v.as_array()) {
         for rl in resource_logs {
             let resource_attrs = extract_json_resource_attrs(rl);
@@ -382,7 +418,11 @@ async fn handle_logs(
                     if let Some(records) = sl.get("logRecords").and_then(|v| v.as_array()) {
                         for record in records {
                             if let Some(entry) = parse_json_log_record(record, &service, &host) {
-                                let _ = state.log_sender.send(entry).await;
+                                let _ = state.metrics.try_send_log(
+                                    &state.log_sender,
+                                    entry,
+                                    ReceiverSource::OtlpHttpLogs,
+                                );
                             }
                         }
                     }
@@ -397,6 +437,14 @@ async fn handle_traces(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> StatusCode {
+    handle_traces_inner(&state, body).await
+}
+
+async fn handle_traces_inner(state: &AppState, body: serde_json::Value) -> StatusCode {
+    if channel_used_pct(&state.span_sender) >= BACKPRESSURE_THRESHOLD_PCT {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
     if let Some(resource_spans) = body.get("resourceSpans").and_then(|v| v.as_array()) {
         for rs in resource_spans {
             let resource_attrs = extract_json_resource_attrs(rs);
@@ -407,7 +455,11 @@ async fn handle_traces(
                     if let Some(spans) = ss.get("spans").and_then(|v| v.as_array()) {
                         for span_json in spans {
                             if let Some(entry) = parse_json_span(span_json, &service) {
-                                let _ = state.span_sender.send(entry).await;
+                                let _ = state.metrics.try_send_span(
+                                    &state.span_sender,
+                                    entry,
+                                    ReceiverSource::OtlpHttpTraces,
+                                );
                             }
                         }
                     }
@@ -416,4 +468,97 @@ async fn handle_traces(
         }
     }
     StatusCode::OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state(log_cap: usize, span_cap: usize) -> AppState {
+        let (log_sender, _log_rx) = mpsc::channel(log_cap);
+        let (span_sender, _span_rx) = mpsc::channel(span_cap);
+        AppState {
+            log_sender,
+            span_sender,
+            metrics: Arc::new(ReceiverMetrics::new()),
+        }
+    }
+
+    #[test]
+    fn channel_used_pct_reads_capacity() {
+        let state = make_state(10, 10);
+        // Empty channel → 0% used.
+        assert_eq!(channel_used_pct(&state.log_sender), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_traces_returns_429_when_span_channel_at_capacity() {
+        let state = make_state(10, 1);
+        // Fill the span channel.
+        let dummy_span = crate::span::types::SpanEntry {
+            seq: 0, trace_id: 1, span_id: 1, parent_span_id: None,
+            start_time: chrono::Utc::now(), end_time: chrono::Utc::now(),
+            duration_ms: 0.0, name: "x".into(),
+            kind: crate::span::types::SpanKind::Internal,
+            service_name: "s".into(),
+            status: crate::span::types::SpanStatus::Unset,
+            attributes: std::collections::HashMap::new(),
+            events: vec![],
+        };
+        state.span_sender.try_send(dummy_span).unwrap();
+
+        // POST a single span — channel is full, so the threshold gate
+        // returns 429 BEFORE any per-entry try_send_span runs. The
+        // counter stays at 0 (the 429 is the backpressure signal).
+        let body = serde_json::json!({
+            "resourceSpans": [{
+                "resource": { "attributes": [] },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "0102030405060708090a0b0c0d0e0f10",
+                        "spanId":  "0102030405060708",
+                        "name": "synthetic",
+                        "startTimeUnixNano": "0",
+                        "endTimeUnixNano":   "0"
+                    }]
+                }]
+            }]
+        });
+
+        let status = handle_traces_inner(&state, body).await;
+        // 80%+ full → 429 (span channel capacity=1, used=1 → 100%).
+        assert_eq!(status.as_u16(), 429);
+        // 80%+ full → 429 returned BEFORE any try_send_span runs, so
+        // nothing is dropped at the per-entry level. The 429 response IS
+        // the backpressure signal; the body is rejected wholesale.
+        assert_eq!(state.metrics.snapshot().otlp_http_traces, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_traces_below_threshold_sends_and_returns_200() {
+        // Span channel cap=10, so 1 entry = 10% used, well below 80%.
+        let state = make_state(10, 10);
+
+        let body = serde_json::json!({
+            "resourceSpans": [{
+                "resource": { "attributes": [] },
+                "scopeSpans": [{
+                    "spans": [{
+                        "traceId": "0102030405060708090a0b0c0d0e0f10",
+                        "spanId":  "0102030405060708",
+                        "name": "synthetic",
+                        "startTimeUnixNano": "0",
+                        "endTimeUnixNano":   "0"
+                    }]
+                }]
+            }]
+        });
+
+        let status = handle_traces_inner(&state, body).await;
+        assert_eq!(status.as_u16(), 200);
+        // Counter unchanged — entry made it through.
+        assert_eq!(state.metrics.snapshot().otlp_http_traces, 0);
+        // Channel now contains exactly one span.
+        assert_eq!(state.span_sender.capacity(), 9, "expected one slot consumed");
+    }
 }
