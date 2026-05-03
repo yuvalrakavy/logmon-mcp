@@ -248,6 +248,7 @@ impl RpcHandler {
     fn handle_status(&self, session_id: &SessionId) -> Result<Value, String> {
         let session_info = self.sessions.get(session_id);
         let stats = self.pipeline.store_stats();
+        let drops = self.metrics.snapshot();
         Ok(json!({
             "session": session_info.map(|s| json!({
                 "id": s.id.to_string(),
@@ -266,6 +267,14 @@ impl RpcHandler {
                 "total_stored": stats.total_stored,
                 "malformed_count": stats.malformed_count,
                 "current_size": self.pipeline.store_len(),
+            },
+            "receiver_drops": {
+                "gelf_udp": drops.gelf_udp,
+                "gelf_tcp": drops.gelf_tcp,
+                "otlp_http_logs": drops.otlp_http_logs,
+                "otlp_http_traces": drops.otlp_http_traces,
+                "otlp_grpc_logs": drops.otlp_grpc_logs,
+                "otlp_grpc_traces": drops.otlp_grpc_traces,
             },
         }))
     }
