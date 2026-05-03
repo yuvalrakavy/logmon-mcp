@@ -474,26 +474,37 @@ async fn handle_traces_inner(state: &AppState, body: serde_json::Value) -> Statu
 mod tests {
     use super::*;
 
-    fn make_state(log_cap: usize, span_cap: usize) -> AppState {
-        let (log_sender, _log_rx) = mpsc::channel(log_cap);
-        let (span_sender, _span_rx) = mpsc::channel(span_cap);
-        AppState {
+    /// Returns `(AppState, log_rx, span_rx)`. Callers MUST bind all three
+    /// return values — dropping `log_rx` or `span_rx` closes the channel,
+    /// which makes `try_send` return `Err(Closed)`.
+    fn make_state(
+        log_cap: usize,
+        span_cap: usize,
+    ) -> (
+        AppState,
+        mpsc::Receiver<LogEntry>,
+        mpsc::Receiver<crate::span::types::SpanEntry>,
+    ) {
+        let (log_sender, log_rx) = mpsc::channel(log_cap);
+        let (span_sender, span_rx) = mpsc::channel(span_cap);
+        let state = AppState {
             log_sender,
             span_sender,
             metrics: Arc::new(ReceiverMetrics::new()),
-        }
+        };
+        (state, log_rx, span_rx)
     }
 
     #[test]
     fn channel_used_pct_reads_capacity() {
-        let state = make_state(10, 10);
+        let (state, _log_rx, _span_rx) = make_state(10, 10);
         // Empty channel → 0% used.
         assert_eq!(channel_used_pct(&state.log_sender), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_traces_returns_429_when_span_channel_at_capacity() {
-        let state = make_state(10, 1);
+        let (state, _log_rx, span_rx) = make_state(10, 1);
         // Fill the span channel.
         let dummy_span = crate::span::types::SpanEntry {
             seq: 0, trace_id: 1, span_id: 1, parent_span_id: None,
@@ -532,12 +543,13 @@ mod tests {
         // nothing is dropped at the per-entry level. The 429 response IS
         // the backpressure signal; the body is rejected wholesale.
         assert_eq!(state.metrics.snapshot().otlp_http_traces, 0);
+        drop(span_rx); // explicit drop after assertions to make it clear we kept it alive
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn handle_traces_below_threshold_sends_and_returns_200() {
         // Span channel cap=10, so 1 entry = 10% used, well below 80%.
-        let state = make_state(10, 10);
+        let (state, _log_rx, _span_rx) = make_state(10, 10);
 
         let body = serde_json::json!({
             "resourceSpans": [{

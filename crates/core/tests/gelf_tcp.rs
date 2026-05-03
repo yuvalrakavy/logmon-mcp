@@ -1,5 +1,7 @@
 use logmon_broker_core::gelf::tcp::start_tcp_listener;
 use logmon_broker_core::gelf::message::LogEntry;
+use logmon_broker_core::receiver::ReceiverMetrics;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration};
@@ -8,7 +10,8 @@ use serde_json::json;
 #[tokio::test]
 async fn test_tcp_listener_receives_gelf() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(100);
-    let handle = start_tcp_listener("127.0.0.1:0", tx).await.unwrap();
+    let metrics = Arc::new(ReceiverMetrics::new());
+    let handle = start_tcp_listener("127.0.0.1:0", tx, metrics).await.unwrap();
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", handle.port())).await.unwrap();
     let msg = json!({"version":"1.1","host":"tcp-test","short_message":"msg1","level":6});
@@ -24,7 +27,8 @@ async fn test_tcp_listener_receives_gelf() {
 #[tokio::test]
 async fn test_tcp_multiple_clients() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(100);
-    let handle = start_tcp_listener("127.0.0.1:0", tx).await.unwrap();
+    let metrics = Arc::new(ReceiverMetrics::new());
+    let handle = start_tcp_listener("127.0.0.1:0", tx, metrics).await.unwrap();
 
     for i in 0..3 {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", handle.port())).await.unwrap();
@@ -43,7 +47,8 @@ async fn test_tcp_multiple_clients() {
 #[tokio::test]
 async fn test_tcp_malformed_not_sent() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(100);
-    let handle = start_tcp_listener("127.0.0.1:0", tx).await.unwrap();
+    let metrics = Arc::new(ReceiverMetrics::new());
+    let handle = start_tcp_listener("127.0.0.1:0", tx, metrics).await.unwrap();
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", handle.port())).await.unwrap();
     stream.write_all(b"not valid json\0").await.unwrap();

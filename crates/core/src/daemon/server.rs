@@ -227,6 +227,11 @@ pub async fn run_with_overrides(
         sessions.restore_named(name, persisted, &bookmark_store);
     }
 
+    // Receiver metrics (drop counters + rate-limited warn). Shared between
+    // every receiver call site and the RpcHandler so status.get can surface
+    // the counts.
+    let receiver_metrics = std::sync::Arc::new(crate::receiver::ReceiverMetrics::new());
+
     // 8/9. Receivers — either inject a pre-built channel (test harness) or
     //      start the real GELF + OTLP receivers. Both paths spawn a span
     //      processor so the wiring is uniform; in the harness path nothing
@@ -271,7 +276,8 @@ pub async fn run_with_overrides(
                 udp_addr: format!("0.0.0.0:{udp_port}"),
                 tcp_addr: format!("0.0.0.0:{tcp_port}"),
             };
-            let gelf_receiver = GelfReceiver::start(gelf_config, log_tx.clone()).await?;
+            let gelf_receiver =
+                GelfReceiver::start(gelf_config, log_tx.clone(), receiver_metrics.clone()).await?;
             let mut all_receivers_info = gelf_receiver.listening_on();
             info!(?all_receivers_info, "GELF receiver started");
 
@@ -284,7 +290,7 @@ pub async fn run_with_overrides(
                     http_addr: format!("0.0.0.0:{}", config.otlp_http_port),
                 };
                 let otlp_receiver =
-                    OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx).await?;
+                    OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx, receiver_metrics.clone()).await?;
                 let otlp_info = otlp_receiver.listening_on();
                 info!(?otlp_info, "OTLP receiver started");
                 all_receivers_info.extend(otlp_info);
@@ -324,6 +330,7 @@ pub async fn run_with_overrides(
         span_store.clone(),
         sessions.clone(),
         bookmark_store.clone(),
+        receiver_metrics.clone(),
         all_receivers_info,
     ));
 

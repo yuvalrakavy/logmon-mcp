@@ -1,6 +1,7 @@
 use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
+use crate::receiver::ReceiverMetrics;
 use logmon_broker_protocol::*;
 use crate::span::store::SpanStore;
 use serde_json::{json, Value};
@@ -11,6 +12,7 @@ pub struct RpcHandler {
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
     bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
+    metrics: Arc<ReceiverMetrics>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
 }
@@ -21,6 +23,7 @@ impl RpcHandler {
         span_store: Arc<SpanStore>,
         sessions: Arc<SessionRegistry>,
         bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
+        metrics: Arc<ReceiverMetrics>,
         receivers_info: Vec<String>,
     ) -> Self {
         Self {
@@ -28,6 +31,7 @@ impl RpcHandler {
             span_store,
             sessions,
             bookmarks,
+            metrics,
             start_time: std::time::Instant::now(),
             receivers_info,
         }

@@ -1,4 +1,6 @@
 use crate::gelf::message::{LogEntry, parse_gelf_message};
+use crate::receiver::ReceiverMetrics;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -16,6 +18,8 @@ impl UdpListenerHandle {
 pub async fn start_udp_listener(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
+    #[allow(unused_variables)]
+    metrics: Arc<ReceiverMetrics>,
 ) -> anyhow::Result<UdpListenerHandle> {
     let socket = UdpSocket::bind(addr).await?;
     let port = socket.local_addr()?.port();

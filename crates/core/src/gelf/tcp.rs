@@ -1,4 +1,5 @@
 use crate::gelf::message::{LogEntry, parse_gelf_message};
+use crate::receiver::ReceiverMetrics;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +25,8 @@ impl TcpListenerHandle {
 pub async fn start_tcp_listener(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
+    #[allow(unused_variables)]
+    metrics: Arc<ReceiverMetrics>,
 ) -> anyhow::Result<TcpListenerHandle> {
     let listener = TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
