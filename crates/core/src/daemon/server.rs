@@ -256,8 +256,15 @@ pub async fn run_with_overrides(
         }
         None => {
             // Real GELF receiver
-            let (log_tx, log_rx) = mpsc::channel(1024);
-            let (span_tx, span_rx_real) = mpsc::channel(1024);
+            // Bursts of GELF + OTLP traffic from store-test test runs can
+            // briefly overshoot the consumer; 65 536 entries × ~500 B ≈ 32 MB
+            // worst-case headroom keeps drop-counting from engaging on
+            // realistic workloads. Receivers use try_send (see ReceiverMetrics)
+            // so they never park if this cap is exceeded.
+            const LOG_CHANNEL_CAP: usize = 65_536;
+            const SPAN_CHANNEL_CAP: usize = 65_536;
+            let (log_tx, log_rx) = mpsc::channel(LOG_CHANNEL_CAP);
+            let (span_tx, span_rx_real) = mpsc::channel(SPAN_CHANNEL_CAP);
             let udp_port = config.gelf_udp_port.unwrap_or(config.gelf_port);
             let tcp_port = config.gelf_tcp_port.unwrap_or(config.gelf_port);
             let gelf_config = GelfReceiverConfig {
