@@ -88,3 +88,20 @@ impl Receiver for OtlpReceiver {
         let _ = self.shutdown_tx.send(());
     }
 }
+
+impl Drop for OtlpReceiver {
+    fn drop(&mut self) {
+        // Best-effort: signal graceful shutdown. axum's
+        // `with_graceful_shutdown` waits for in-flight handlers to complete
+        // — which is fine for handlers that finish quickly, but if the
+        // shutdown is happening because we've already wedged, in-flight
+        // tasks may park on the (full) log/span channel forever. Aborting
+        // the JoinHandles forces an exit path regardless. Both paths leave
+        // the listening sockets to be cleaned up by the kernel after
+        // process exit; the only thing we lose is graceful body
+        // completion of an already-parked handler.
+        let _ = self.shutdown_tx.send(());
+        self.grpc_handle.abort();
+        self.http_handle.abort();
+    }
+}
