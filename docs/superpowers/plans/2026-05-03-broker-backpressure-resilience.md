@@ -457,8 +457,10 @@ mod tests {
         let status = handle_traces_inner(&state, body).await;
         // 80%+ full → 429.
         assert_eq!(status.as_u16(), 429);
-        // Counter must reflect the drop.
-        assert_eq!(state.metrics.snapshot().otlp_http_traces, 1);
+        // 80%+ full → 429 returned BEFORE any try_send_span runs, so
+        // nothing is dropped at the per-entry level. The 429 response IS
+        // the backpressure signal; the body is rejected wholesale.
+        assert_eq!(state.metrics.snapshot().otlp_http_traces, 0);
     }
 }
 ```
