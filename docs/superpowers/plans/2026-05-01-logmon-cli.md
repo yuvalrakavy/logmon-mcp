@@ -121,19 +121,14 @@ enum Subcommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("logmon_mcp=info".parse()?),
-        )
-        .init();
-
     let cli = Cli::parse();
 
     match cli.command {
         Some(cmd) => {
             // CLI mode — short-lived, fail-fast, route to subcommand handler.
+            // No tracing init: CLI is silent on stderr unless format::error()
+            // explicitly writes there. Stray RUST_LOG settings shouldn't leak
+            // SDK warnings into a CLI consumer's stderr stream.
             let exit_code = cli::dispatch(cmd, cli.session, cli.json).await;
             std::process::exit(exit_code);
         }
@@ -145,6 +140,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_mcp_stdio(session: Option<String>) -> anyhow::Result<()> {
+    // Tracing init lives here, not in main(), so CLI mode stays silent on
+    // stderr (CLI consumers expect format::error() output, not interleaved
+    // tracing noise).
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("logmon_mcp=info".parse()?),
+        )
+        .init();
+
     auto_start::ensure_broker_running().await?;
 
     let mut builder = Broker::connect();
@@ -289,7 +295,10 @@ pub async fn connect_cli(session: &str, cmd: &Subcommand) -> Result<Broker> {
         })
 }
 
-/// Extract the subcommand path (group + verb) for client_info. No flags or values.
+/// Extract the subcommand group for client_info. Group only — verb is
+/// intentionally omitted per the spec (extracting the verb requires
+/// pattern-matching the inner Cmd enum at the connect site, adds coupling
+/// for diagnostic value that isn't load-bearing for any feature).
 fn subcommand_argv(cmd: &Subcommand) -> Vec<&'static str> {
     match cmd {
         Subcommand::Logs(_) => vec!["logs"],
@@ -304,7 +313,7 @@ fn subcommand_argv(cmd: &Subcommand) -> Vec<&'static str> {
 }
 ```
 
-Note: each subcommand module's `Cmd` enum will later expose its inner verb so `subcommand_argv` can return e.g. `["logs", "recent"]` instead of just `["logs"]`. That refinement happens in each per-group task. For now, group-only is fine — the `client_info` payload is small either way.
+This is the final form — no later task refines it. Spec says group only.
 
 For `format.rs`, write a minimal stub:
 
@@ -593,8 +602,9 @@ In `crates/mcp/Cargo.toml`, add a `[dev-dependencies]` section:
 logmon-broker-core = { path = "../core", features = ["test-support"] }
 assert_cmd = "2"
 tempfile = { workspace = true }
-predicates = "3"
 ```
+
+(No `predicates` dep — tests use plain `String::contains` on stdout/stderr bytes for substring assertions, which is sufficient and avoids one extra dev-dep.)
 
 - [ ] **Step 2: Verify the SDK already honors `LOGMON_BROKER_SOCKET`**
 
@@ -612,12 +622,22 @@ Create `crates/mcp/tests/cli_common.rs`:
 //! Shared helpers for CLI integration tests.
 //!
 //! Each test:
-//!   1. Spawns an in-process test daemon (via logmon_broker_core::test_support).
+//!   1. Spawns an in-process test daemon (via logmon_broker_core::test_support
+//!      — available because the dev-dep enables that feature on the core crate).
 //!   2. Builds an `assert_cmd::Command` for the `logmon-mcp` binary with
 //!      `LOGMON_BROKER_SOCKET` pointing at the daemon's socket.
 //!   3. Asserts on stdout/stderr/exit.
+//!
+//! Note: do NOT add `#![cfg(feature = "test-support")]` here — the logmon-mcp
+//! crate has no `test-support` feature; the dev-dep enables that feature on
+//! `logmon-broker-core` only. A cfg gate would always evaluate false and the
+//! module would compile to nothing, breaking every test that imports it.
+//!
+//! The 50ms `tokio::sleep` after `inject_log` calls in tests is a known fragile
+//! pattern (under load it can race the log_processor). It mirrors the cursor
+//! test pattern; future hardening would wire a deterministic ingest barrier
+//! into the harness.
 
-#![cfg(feature = "test-support")]
 #![allow(dead_code)] // shared helpers — used selectively per test file
 
 use assert_cmd::Command;
@@ -685,13 +705,17 @@ use cli_common::spawn_with_cli;
 async fn status_human_format_includes_uptime() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let assert = tokio::task::spawn_blocking(move || {
-        cli.cmd().arg("status").assert()
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = cli.cmd();
+        cmd.arg("status").output().expect("subprocess failed")
     })
     .await
     .unwrap();
 
-    assert.success().stdout(predicates::str::contains("uptime")).stdout(predicates::str::contains("receivers"));
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("uptime"), "stdout: {stdout}");
+    assert!(stdout.contains("receivers"), "stdout: {stdout}");
 }
 
 #[tokio::test]
@@ -699,7 +723,8 @@ async fn status_json_emits_typed_struct() {
     let (_daemon, cli) = spawn_with_cli().await;
 
     let output = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["status", "--json"]).output().expect("subprocess failed")
+        let mut cmd = cli.cmd();
+        cmd.args(["status", "--json"]).output().expect("subprocess failed")
     })
     .await
     .unwrap();
@@ -903,9 +928,15 @@ async fn logs_clear_succeeds() {
 #[tokio::test]
 async fn logs_recent_against_missing_broker_fails_with_guidance() {
     use assert_cmd::Command;
+    use tempfile::TempDir;
+
+    // Use a guaranteed-fresh, never-bound socket path so this test can't
+    // race a parallel test or pick up stale state from a prior run.
+    let tempdir = TempDir::new().unwrap();
+    let bogus_socket = tempdir.path().join("nonexistent.sock");
 
     let mut cmd = Command::cargo_bin("logmon-mcp").unwrap();
-    cmd.env("LOGMON_BROKER_SOCKET", "/tmp/logmon-cli-test-nonexistent.sock");
+    cmd.env("LOGMON_BROKER_SOCKET", &bogus_socket);
     let output = tokio::task::spawn_blocking(move || {
         cmd.args(["logs", "recent"]).output().unwrap()
     })
@@ -1151,19 +1182,17 @@ use cli_common::spawn_with_cli;
 async fn bookmarks_add_then_list_round_trip() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let add = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["bookmarks", "add", "--name", "my-anchor", "--start-seq", "42"]).output().unwrap()
-        }
+    let mut add_cmd = cli.cmd();
+    let add = tokio::task::spawn_blocking(move || {
+        add_cmd.args(["bookmarks", "add", "--name", "my-anchor", "--start-seq", "42"]).output().unwrap()
     }).await.unwrap();
     assert!(add.status.success(), "add failed: {}", String::from_utf8_lossy(&add.stderr));
     let add_stdout = String::from_utf8_lossy(&add.stdout);
     assert!(add_stdout.contains("my-anchor") || add_stdout.contains("seq=42"), "got: {add_stdout}");
 
+    let mut list_cmd = cli.cmd();
     let list = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["bookmarks", "list", "--json"]).output().unwrap()
+        list_cmd.args(["bookmarks", "list", "--json"]).output().unwrap()
     }).await.unwrap();
     assert!(list.status.success());
     let v: serde_json::Value = serde_json::from_slice(&list.stdout).expect("json");
@@ -1175,16 +1204,14 @@ async fn bookmarks_add_then_list_round_trip() {
 async fn bookmarks_remove_succeeds() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let _ = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["bookmarks", "add", "--name", "to-rm"]).output().unwrap()
-        }
+    let mut add_cmd = cli.cmd();
+    let _ = tokio::task::spawn_blocking(move || {
+        add_cmd.args(["bookmarks", "add", "--name", "to-rm"]).output().unwrap()
     }).await.unwrap();
 
+    let mut rm_cmd = cli.cmd();
     let rm = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["bookmarks", "remove", "--name", "cli/to-rm"]).output().unwrap()
+        rm_cmd.args(["bookmarks", "remove", "--name", "cli/to-rm"]).output().unwrap()
     }).await.unwrap();
     assert!(rm.status.success(), "remove failed: {}", String::from_utf8_lossy(&rm.stderr));
 }
@@ -1193,27 +1220,22 @@ async fn bookmarks_remove_succeeds() {
 async fn bookmarks_add_replace_overwrites() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let _ = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["bookmarks", "add", "--name", "x", "--start-seq", "1"]).output().unwrap()
-        }
+    let mut first_cmd = cli.cmd();
+    let _ = tokio::task::spawn_blocking(move || {
+        first_cmd.args(["bookmarks", "add", "--name", "x", "--start-seq", "1"]).output().unwrap()
     }).await.unwrap();
 
     // Without --replace, second add errors.
-    let dup = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["bookmarks", "add", "--name", "x", "--start-seq", "2"]).output().unwrap()
-        }
+    let mut dup_cmd = cli.cmd();
+    let dup = tokio::task::spawn_blocking(move || {
+        dup_cmd.args(["bookmarks", "add", "--name", "x", "--start-seq", "2"]).output().unwrap()
     }).await.unwrap();
     assert!(!dup.status.success());
 
     // With --replace, succeeds.
+    let mut replace_cmd = cli.cmd();
     let ok = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["bookmarks", "add", "--name", "x", "--start-seq", "2", "--replace"]).output().unwrap()
+        replace_cmd.args(["bookmarks", "add", "--name", "x", "--start-seq", "2", "--replace"]).output().unwrap()
     }).await.unwrap();
     assert!(ok.status.success(), "replace failed: {}", String::from_utf8_lossy(&ok.stderr));
 }
@@ -1381,17 +1403,15 @@ use cli_common::spawn_with_cli;
 async fn triggers_add_then_list() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let add = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["triggers", "add", "--filter", "l>=ERROR", "--oneshot", "--description", "test"]).output().unwrap()
-        }
+    let mut add_cmd = cli.cmd();
+    let add = tokio::task::spawn_blocking(move || {
+        add_cmd.args(["triggers", "add", "--filter", "l>=ERROR", "--oneshot", "--description", "test"]).output().unwrap()
     }).await.unwrap();
     assert!(add.status.success(), "add stderr: {}", String::from_utf8_lossy(&add.stderr));
 
+    let mut list_cmd = cli.cmd();
     let list = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["triggers", "list", "--json"]).output().unwrap()
+        list_cmd.args(["triggers", "list", "--json"]).output().unwrap()
     }).await.unwrap();
     assert!(list.status.success());
     let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
@@ -1406,18 +1426,16 @@ async fn triggers_add_then_list() {
 async fn triggers_remove_succeeds() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let add = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["triggers", "add", "--filter", "l>=WARN", "--json"]).output().unwrap()
-        }
+    let mut add_cmd = cli.cmd();
+    let add = tokio::task::spawn_blocking(move || {
+        add_cmd.args(["triggers", "add", "--filter", "l>=WARN", "--json"]).output().unwrap()
     }).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
     let id = v["id"].as_u64().unwrap();
 
+    let mut rm_cmd = cli.cmd();
     let rm = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["triggers", "remove", "--id", &id.to_string()]).output().unwrap()
+        rm_cmd.args(["triggers", "remove", "--id", &id.to_string()]).output().unwrap()
     }).await.unwrap();
     assert!(rm.status.success(), "rm stderr: {}", String::from_utf8_lossy(&rm.stderr));
 }
@@ -1603,29 +1621,24 @@ use cli_common::spawn_with_cli;
 async fn filters_add_list_remove() {
     let (_daemon, cli) = spawn_with_cli().await;
 
-    let add = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["filters", "add", "--filter", "fa=mqtt", "--description", "mqtt-only", "--json"]).output().unwrap()
-        }
+    let mut add_cmd = cli.cmd();
+    let add = tokio::task::spawn_blocking(move || {
+        add_cmd.args(["filters", "add", "--filter", "fa=mqtt", "--description", "mqtt-only", "--json"]).output().unwrap()
     }).await.unwrap();
     assert!(add.status.success(), "add stderr: {}", String::from_utf8_lossy(&add.stderr));
     let v: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
     let id = v["id"].as_u64().unwrap();
 
-    let list = tokio::task::spawn_blocking({
-        let cli = cli.cmd();
-        move || {
-            let mut c = cli;
-            c.args(["filters", "list", "--json"]).output().unwrap()
-        }
+    let mut list_cmd = cli.cmd();
+    let list = tokio::task::spawn_blocking(move || {
+        list_cmd.args(["filters", "list", "--json"]).output().unwrap()
     }).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert!(v["filters"].as_array().unwrap().iter().any(|f| f["filter"] == "fa=mqtt"));
 
+    let mut rm_cmd = cli.cmd();
     let rm = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["filters", "remove", "--id", &id.to_string()]).output().unwrap()
+        rm_cmd.args(["filters", "remove", "--id", &id.to_string()]).output().unwrap()
     }).await.unwrap();
     assert!(rm.status.success());
 }

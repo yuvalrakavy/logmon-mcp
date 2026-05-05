@@ -156,11 +156,11 @@ Concurrent CLI invocations to the same session work via the broker's existing na
     "name": "logmon-mcp",
     "version": "<pkg version>",
     "mode": "cli",
-    "argv": ["logs", "recent"]
+    "argv": ["logs"]
 }
 ```
 
-`argv` contains ONLY the subcommand path — group + verb (e.g. `["logs", "recent"]`, `["bookmarks", "add"]`). It does NOT include flag names or flag values. This keeps the field small and predictable, well within the broker's 4 KB `client_info` cap regardless of how the user invokes the CLI.
+`argv` contains ONLY the subcommand group (e.g. `["logs"]`, `["bookmarks"]`, `["status"]`). It does NOT include the verb (e.g. `recent`, `add`), flag names, or flag values. The verb-level distinction would require pattern-matching on each group's inner `Cmd` enum at the connect site, which adds coupling for diagnostic value that isn't load-bearing for any feature; group-level identification is sufficient to tell CLI invocations apart from MCP-shim sessions in `sessions list`. This keeps the field small and predictable, well within the broker's 4 KB `client_info` cap.
 
 This shows up in `sessions list` so an operator can tell CLI invocations apart from MCP-shim sessions.
 
