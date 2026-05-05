@@ -38,6 +38,18 @@ logmon uses a **broker + clients** architecture:
 
 Multiple Claude sessions share the same broker and log buffer. Each session has its own triggers and filters; named sessions persist across disconnects.
 
+## CLI alternative (Bash tool)
+
+In addition to the MCP tools above, the same operations are available as `logmon-mcp <subcommand>` invocations. This is useful when:
+
+- You're in a subagent (subagents launched via the Agent tool don't inherit MCP servers).
+- The MCP server has disconnected mid-session.
+- You want to pipe output through `head`, `jq`, or `grep`.
+
+The mapping is mechanical: `mcp__logmon__get_recent_logs` ⇔ `logmon-mcp logs recent`, `mcp__logmon__add_bookmark` ⇔ `logmon-mcp bookmarks add`, etc. See `crates/mcp/README.md` for the full reference.
+
+CLI sessions default to a named session called `"cli"`, so bookmarks and other session state persist across CLI invocations. Use `--session NAME` to isolate.
+
 ## Available Tools
 
 ### Querying Logs

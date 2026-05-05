@@ -56,6 +56,8 @@ Or install via cargo:
 cargo install --path crates/broker --path crates/mcp
 ```
 
+After `cargo install`, the `logmon-mcp` binary is available in two modes: as the MCP stdio shim (today's behavior) and as a CLI for shell consumers (`logmon-mcp <subcommand>` — see `crates/mcp/README.md`).
+
 ### Run the broker as a system service (recommended)
 
 ```bash
