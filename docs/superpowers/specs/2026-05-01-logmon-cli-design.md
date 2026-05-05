@@ -84,7 +84,7 @@ Grouped by namespace, mirroring the MCP tool families. The mapping from MCP tool
 |---|---|
 | `get_recent_logs` | `logmon-mcp logs recent --count 50 --filter '...'` |
 | `get_log_context` | `logmon-mcp logs context --seq 12345 --before 10 --after 10` |
-| `export_logs` | `logmon-mcp logs export --filter '...' [--out FILE]` |
+| `export_logs` | `logmon-mcp logs export --filter '...' [--out FILE]` (see "`--out FILE` semantics" below) |
 | `clear_logs` | `logmon-mcp logs clear` |
 | `add_bookmark` | `logmon-mcp bookmarks add --name foo [--start-seq N] [--description "..."] [--replace]` |
 | `list_bookmarks` | `logmon-mcp bookmarks list [--session NAME]` |
@@ -110,6 +110,10 @@ Grouped by namespace, mirroring the MCP tool families. The mapping from MCP tool
 
 25 MCP tools mapped to 25 CLI subcommands across 7 groups. The mapping is mechanical; no MCP tool is omitted, no CLI subcommand has functionality that isn't in MCP.
 
+**Triggers and notifications.** Triggers added via the CLI persist in the named session, but the CLI invocation exits before any matching log can fire the trigger. CLI is for trigger *management* — add, list, edit, remove. To actually receive trigger fires, subscribe via the long-running MCP shim (which holds a connection open and forwards `Notification::TriggerFired` to the MCP client) or via a custom SDK consumer that calls `Broker::subscribe_notifications()`. A user typing `logmon-mcp triggers add --filter ... --oneshot` and expecting the CLI to block until the fire arrives will not get that behavior; document this constraint in the subcommand's help text and in the README.
+
+**`--out FILE` semantics (logs export).** `--out FILE` redirects the export's output to `FILE` instead of stdout. The format follows `--json`: with `--json`, JSON is written to `FILE`; without, the human-readable block format is written to `FILE`. `--out -` (single dash) is stdout (POSIX convention); equivalent to omitting the flag. If `FILE` already exists, it is overwritten. No append mode in v1.
+
 ### Output format
 
 **Default: human-readable text.** Optimized for Claude reading the output via the Bash tool, secondarily for human terminal use.
@@ -124,7 +128,7 @@ Grouped by namespace, mirroring the MCP tool families. The mapping from MCP tool
 - **Single-record results** (`status`, `traces get`, `traces summary`): block format with key=value lines, headers for nested structures.
 - **Action confirmations** (`bookmarks add`, `triggers add`, `filters add`, etc.): one-line summary like `bookmark added: cli/foo (seq=12345)` or `trigger added: id=42 oneshot=true`.
 
-**Truncation.** When a result list is large enough to overflow Claude's Bash output budget (default ~30k chars), the formatter renders the first N records and appends `... 47 more records, use --json or refine the filter to see them`. Threshold is per-format-helper; tables truncate at row count, blocks at character count.
+**Truncation.** Claude's Bash output budget is finite (typically on the order of tens of thousands of characters per tool invocation). When a result list would overflow, the formatter renders the first N records and appends `... 47 more records, use --json or refine the filter to see them`. Threshold is per-format-helper; tables truncate at row count (~50 rows), blocks at character count (~16 KB by default — leaves headroom under typical Bash caps). Both thresholds are tunable constants in `crates/mcp/src/cli/format.rs` so CI or operator workflows that need different limits can override at build time if necessary; not exposed as user flags in v1.
 
 **`--json` flag.** Emits the typed protocol result struct serialized as pretty JSON to stdout. No truncation, no formatting cleverness. Pipes cleanly into `jq`. On error, emits `{"error": "<message>"}` to stdout and exits non-zero.
 
@@ -133,8 +137,10 @@ Grouped by namespace, mirroring the MCP tool families. The mapping from MCP tool
 CLI invocations connect to the broker as named sessions by default, using the session name `"cli"`. This means:
 
 - `logmon-mcp bookmarks add foo` adds a bookmark in the `cli` session.
-- A subsequent `logmon-mcp bookmarks list` (any time later, any shell, any user) finds the bookmark.
+- A subsequent `logmon-mcp bookmarks list` (any shell, any time, **same OS user** — the broker socket at `~/.config/logmon/logmon.sock` is per-user) finds the bookmark.
 - Triggers and filters added via CLI persist across CLI invocations and broker restarts (named-session persistence).
+
+**Cooperative multi-tenancy with MCP shims.** If a user has registered an MCP shim with the same session name (e.g. `claude mcp add logmon -- logmon-mcp --session cli`), the CLI shares state with that shim cooperatively. This is by design, not a collision: both surfaces operate on the same per-session triggers/filters/bookmarks. To isolate, pass `--session NAME` to either or both.
 
 Override with the global `--session NAME` flag for isolation. Use cases for override:
 
@@ -150,9 +156,11 @@ Concurrent CLI invocations to the same session work via the broker's existing na
     "name": "logmon-mcp",
     "version": "<pkg version>",
     "mode": "cli",
-    "argv": ["<subcommand>", "<verb>"]
+    "argv": ["logs", "recent"]
 }
 ```
+
+`argv` contains ONLY the subcommand path — group + verb (e.g. `["logs", "recent"]`, `["bookmarks", "add"]`). It does NOT include flag names or flag values. This keeps the field small and predictable, well within the broker's 4 KB `client_info` cap regardless of how the user invokes the CLI.
 
 This shows up in `sessions list` so an operator can tell CLI invocations apart from MCP-shim sessions.
 
@@ -165,9 +173,27 @@ This shows up in `sessions list` so an operator can tell CLI invocations apart f
 Error format:
 
 - **Human mode**: error message written to stderr, formatted as `error: <message>`. Stdout is empty on error. Exit 1.
-- **JSON mode**: error written to stdout as `{"error": "<message>"}`. No stderr output. Exit 1.
+- **JSON mode**: error written to **stdout** (not stderr) as `{"error": "<message>"}`. No stderr output. Exit 1.
 
-This mirrors common CLI conventions: `set -e; logmon-mcp ...` short-circuits on failure; `if logmon-mcp ...; then ...` works; `... | jq ...` always sees structured output (with `--json`).
+The JSON-mode-to-stdout choice is intentional and goes against the usual UNIX errors-to-stderr convention. Rationale: in `--json` mode the consumer is piping to `jq` or another structured-data tool, and it wants structured output regardless of whether the call succeeded or failed. Splitting success-to-stdout / errors-to-stderr would force every consumer to merge two streams. Distinguish success from failure via the exit code (which `jq` consumers honor via `set -e` or `$?`).
+
+The human-mode behavior is conventional: `set -e; logmon-mcp ...` short-circuits on failure; `if logmon-mcp ...; then ...` works.
+
+### Connection timeout / retry policy
+
+CLI is one-shot — every invocation is a fresh `Broker::connect()` followed by a single RPC call followed by exit. The SDK's defaults (`reconnect_max_attempts: 10`, `reconnect_max_backoff: 30s`, derived `call_timeout` of ~5 minutes) are tuned for long-lived clients and would block a CLI invocation against a missing broker for minutes before giving up. CLI mode overrides:
+
+```rust
+Broker::connect()
+    .reconnect_max_attempts(0)              // no retry on EOF
+    .call_timeout(Duration::from_secs(5))   // 5s ceiling on every RPC + initial connect
+    .session_name(session)                  // global --session flag, default "cli"
+    .client_info(client_info)
+    .open()
+    .await?;
+```
+
+A broker that's down errors immediately. A broker that's up but slow has 5 seconds. No retry storms, no surprise hangs.
 
 ### No auto-start
 
@@ -192,7 +218,7 @@ Exit 1. No retry, no auto-spawn. Auto-start is the MCP shim's job (one long-live
 | `crates/mcp/src/cli/{logs,bookmarks,triggers,filters,traces,spans,sessions}.rs` (new) | One module per group. Each: `Cmd` enum + `pub async fn dispatch(broker, cmd, json)`. |
 | `crates/mcp/src/cli/format.rs` (new) | Shared `block(...)`, `table(...)`, `json(...)`, `error(...)` helpers + truncation policy. |
 | `crates/mcp/src/cli/connect.rs` (new) | `pub async fn connect(session: Option<String>) -> Result<Broker, ExitError>` — handles transport-failure error formatting. |
-| `crates/mcp/Cargo.toml` | No new runtime deps. The SDK is already a dep. Optional: `comfy-table` for table output (or hand-roll). |
+| `crates/mcp/Cargo.toml` | Add `comfy-table` for table output (small dep, popular, handles alignment + borders). The SDK and clap are already deps. |
 | `crates/mcp/tests/cli_*.rs` (new) | One test file per subcommand group, using existing `test_support` harness. |
 
 ### Documentation
