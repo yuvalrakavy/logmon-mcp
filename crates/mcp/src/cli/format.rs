@@ -1,12 +1,11 @@
 //! Shared output formatters for CLI mode.
 
+use logmon_broker_protocol::Level;
 use serde::Serialize;
 
 /// Default truncation thresholds for block-formatted output. Tuned to stay
 /// well under typical Claude `Bash` output budgets.
-#[allow(dead_code)]
 pub const DEFAULT_MAX_BLOCK_RECORDS: usize = 50;
-#[allow(dead_code)]
 pub const DEFAULT_MAX_BLOCK_BYTES: usize = 16 * 1024;
 
 /// Pretty-print a serializable value as JSON. Trailing newline included.
@@ -62,15 +61,19 @@ pub fn truncate_blocks(
 }
 
 /// Print a list of pre-formatted blocks to stdout with default truncation.
-#[allow(dead_code)]
-pub fn print_blocks(blocks: Vec<String>) {
+/// When `blocks` is empty, prints `empty_marker` instead of a blank line so
+/// human callers see e.g. `(no logs)` rather than nothing.
+pub fn print_blocks(blocks: Vec<String>, empty_marker: &str) {
+    if blocks.is_empty() {
+        println!("{empty_marker}");
+        return;
+    }
     let out = truncate_blocks(blocks, DEFAULT_MAX_BLOCK_RECORDS, DEFAULT_MAX_BLOCK_BYTES);
     println!("{out}");
 }
 
-/// Build a comfy-table from headers and rows. Caller passes pre-stringified cells.
-#[allow(dead_code)]
-pub fn build_table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
+/// Print a comfy-table to stdout. Caller passes pre-stringified cells.
+pub fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
     use comfy_table::{ContentArrangement, Table};
 
     let mut table = Table::new();
@@ -83,13 +86,19 @@ pub fn build_table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
         table.add_row(row);
     }
 
-    table.to_string()
+    println!("{table}");
 }
 
-/// Print a comfy-table to stdout.
-#[allow(dead_code)]
-pub fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
-    println!("{}", build_table(headers, rows));
+/// Render a log level as an uppercase static string. Shared by every CLI
+/// renderer that prints log lines so the wire-level surface stays uniform.
+pub fn format_level(l: &Level) -> &'static str {
+    match l {
+        Level::Trace => "TRACE",
+        Level::Debug => "DEBUG",
+        Level::Info => "INFO",
+        Level::Warn => "WARN",
+        Level::Error => "ERROR",
+    }
 }
 
 /// Print an error message in the appropriate format. In `--json` mode emits
@@ -150,5 +159,14 @@ mod tests {
     fn error_human_writes_to_stderr_format() {
         // We can't easily capture stderr in a unit test; just ensure it doesn't panic.
         error("test error", false);
+    }
+
+    #[test]
+    fn format_level_uppercase_for_all_variants() {
+        assert_eq!(format_level(&Level::Trace), "TRACE");
+        assert_eq!(format_level(&Level::Debug), "DEBUG");
+        assert_eq!(format_level(&Level::Info), "INFO");
+        assert_eq!(format_level(&Level::Warn), "WARN");
+        assert_eq!(format_level(&Level::Error), "ERROR");
     }
 }

@@ -34,7 +34,7 @@ pub async fn dispatch(broker: &Broker, cmd: SpansCmd, json: bool) -> i32 {
             };
             if json { format::print_json(&result); return 0; }
             let blocks: Vec<String> = result.spans.iter().map(format_span).collect();
-            format::print_blocks(blocks);
+            format::print_blocks(blocks, "(no spans)");
             0
         }
     }

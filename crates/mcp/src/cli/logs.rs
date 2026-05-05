@@ -62,7 +62,7 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
             };
             if json { format::print_json(&result); return 0; }
             let blocks: Vec<String> = result.logs.iter().map(format_entry).collect();
-            format::print_blocks(blocks);
+            format::print_blocks(blocks, "(no logs)");
             if let Some(seq) = result.cursor_advanced_to {
                 println!("\ncursor advanced to seq={seq}");
             }
@@ -80,7 +80,7 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
             };
             if json { format::print_json(&result); return 0; }
             let blocks: Vec<String> = result.logs.iter().map(format_entry).collect();
-            format::print_blocks(blocks);
+            format::print_blocks(blocks, "(no logs)");
             0
         }
         LogsVerb::Export { count, filter, out } => {
@@ -135,7 +135,7 @@ fn format_entry(e: &LogEntry) -> String {
         "[seq={}] {} {} {}: {}",
         e.seq,
         e.timestamp.to_rfc3339(),
-        format_level(&e.level),
+        format::format_level(&e.level),
         e.facility.as_deref().unwrap_or("-"),
         e.message,
     );
@@ -161,9 +161,4 @@ fn format_entry(e: &LogEntry) -> String {
     } else {
         format!("{header}\n  {}", secondary.join(" "))
     }
-}
-
-fn format_level(l: &logmon_broker_protocol::Level) -> &'static str {
-    use logmon_broker_protocol::Level::*;
-    match l { Trace => "TRACE", Debug => "DEBUG", Info => "INFO", Warn => "WARN", Error => "ERROR" }
 }

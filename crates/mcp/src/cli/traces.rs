@@ -76,7 +76,7 @@ pub async fn dispatch(broker: &Broker, cmd: TracesCmd, json: bool) -> i32 {
             if json { format::print_json(&result); return 0; }
             println!("trace: {} ({} spans, {} logs)", result.trace_id, result.span_count, result.log_count);
             let blocks: Vec<String> = result.spans.iter().map(format_span).collect();
-            format::print_blocks(blocks);
+            format::print_blocks(blocks, "(no spans)");
             0
         }
         TrcVerb::Summary { trace_id } => {
@@ -118,7 +118,7 @@ pub async fn dispatch(broker: &Broker, cmd: TracesCmd, json: bool) -> i32 {
             } else if let Some(spans) = &result.spans {
                 if spans.is_empty() { println!("(no slow spans)"); return 0; }
                 let blocks: Vec<String> = spans.iter().map(format_span).collect();
-                format::print_blocks(blocks);
+                format::print_blocks(blocks, "(no slow spans)");
             } else {
                 println!("(empty result)");
             }
@@ -131,7 +131,7 @@ pub async fn dispatch(broker: &Broker, cmd: TracesCmd, json: bool) -> i32 {
             };
             if json { format::print_json(&result); return 0; }
             let blocks: Vec<String> = result.logs.iter().map(format_log_oneline).collect();
-            format::print_blocks(blocks);
+            format::print_blocks(blocks, "(no logs)");
             if let Some(seq) = result.cursor_advanced_to {
                 println!("\ncursor advanced to seq={seq}");
             }
@@ -167,7 +167,7 @@ fn format_span(s: &SpanEntry) -> String {
 
 fn format_log_oneline(e: &LogEntry) -> String {
     format!(
-        "[seq={}] {} {:?} {}",
-        e.seq, e.timestamp.to_rfc3339(), e.level, e.message
+        "[seq={}] {} {} {}",
+        e.seq, e.timestamp.to_rfc3339(), format::format_level(&e.level), e.message
     )
 }
