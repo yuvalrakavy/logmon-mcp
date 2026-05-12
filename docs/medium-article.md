@@ -142,6 +142,8 @@ claude mcp add logmon --scope user -- logmon-mcp
 
 Same idea for Cursor, Windsurf, Copilot, Gemini CLI, Codex CLI — see the README for per-client snippets. Once the broker is running, configure your app to send GELF to `localhost:12201` or OTLP to `localhost:4317`/`4318`, ask your assistant "check the logs", and you're off.
 
+If your app is Rust, `cargo add tracing-init` and a single `TracingInit::builder("myapp").init()` wires both GELF and OTLP up — its defaults match logmon's ports, so there's nothing to configure. ([tracing-init](https://github.com/yuvalrakavy/tracing-init) is a sister crate I maintain for exactly this purpose.)
+
 ## Why open-source
 
 I built logmon because I needed it, and at this point I use it every day. It's stable enough that it makes my own loop measurably faster, and small enough that someone reading it can hold the whole thing in their head. Both felt like good reasons to put it in front of more people.

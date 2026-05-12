@@ -226,12 +226,14 @@ Default port: **12201** (UDP and TCP, same port).
 
 | Language | Library |
 |---|---|
-| Rust | [`tracing-gelf`](https://crates.io/crates/tracing-gelf) |
+| Rust | [`tracing-init`](https://github.com/yuvalrakavy/tracing-init) (sister crate — also handles OTLP), or [`tracing-gelf`](https://crates.io/crates/tracing-gelf) |
 | Python | [`pygelf`](https://pypi.org/project/pygelf/) |
 | Node.js | [`gelf-pro`](https://www.npmjs.com/package/gelf-pro) |
 | Go | [`go-gelf`](https://github.com/Graylog2/go-gelf) |
 | Java | Logback `biz.paluch.logging:logstash-gelf` |
 | Docker | `--log-driver=gelf --log-opt gelf-address=udp://localhost:12201` |
+
+If you're writing your app in Rust, [`tracing-init`](https://github.com/yuvalrakavy/tracing-init) is the path of least resistance: a single `TracingInit::builder("myapp").init()` wires up both GELF and OTLP, with `logging.toml` auto-discovery if you want config-driven overrides. Its defaults already match logmon's ports, so the typical setup is zero-arg.
 
 ### OTLP (logs + traces, correlated by trace_id)
 
