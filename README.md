@@ -71,16 +71,18 @@ If you skip this, the MCP shim auto-starts the broker the first time a client co
 <details>
 <summary><b>Claude Code — plugin install (recommended)</b></summary>
 
-Install the bundled Claude Code plugin from this repo's marketplace. One marketplace add, one plugin install, and you're done — the MCP server registration and the skill come along automatically:
+Install the bundled Claude Code plugin from the `mcps` marketplace hosted in this repo. One marketplace add, one plugin install, and you're done — the MCP server registration and the skill come along automatically:
 
 ```
 /plugin marketplace add yuvalrakavy/logmon-mcp
-/plugin install logmon-mcp@logmon-mcp
+/plugin install logmon-mcp@mcps
 ```
+
+The marketplace alias is `mcps` (plugin-agnostic, so additional plugins can join the same marketplace later). The repo it currently lives in is `yuvalrakavy/logmon-mcp`; if the marketplace later migrates to its own repo, the alias stays the same and you'll only re-run the `marketplace add` step.
 
 Prerequisite: the `logmon-mcp` binary must already be on your `PATH` (`cargo install --path crates/broker --path crates/mcp` or, once published, `cargo install logmon-mcp`). The plugin manifest references the binary; it doesn't bundle it.
 
-To update later: `/plugin marketplace update logmon-mcp`. To remove: `/plugin uninstall logmon-mcp@logmon-mcp`.
+To update later: `/plugin marketplace update mcps`. To remove: `/plugin uninstall logmon-mcp@mcps`.
 
 </details>
 
@@ -222,7 +224,7 @@ logmon-mcp speaks the standard MCP stdio transport. Configure your client to lau
 
 Depending on how you installed logmon, the skill reaches the assistant through one of three channels — pick whichever fits:
 
-1. **Claude Code plugin (recommended for Claude Code).** If you installed via `/plugin install logmon-mcp@logmon-mcp`, the plugin registers the skill alongside the MCP server. Claude Code surfaces it on-demand via the skill's natural-language triggers and exposes the `/logmon-mcp:logmon` slash-namespaced form.
+1. **Claude Code plugin (recommended for Claude Code).** If you installed via `/plugin install logmon-mcp@mcps`, the plugin registers the skill alongside the MCP server. Claude Code surfaces it on-demand via the skill's natural-language triggers and exposes the `/logmon-mcp:logmon` slash-namespaced form.
 2. **Embedded in the MCP server (every other host).** `logmon-mcp` embeds `skill/logmon.md` at compile time and returns it as the MCP server's `instructions`. Any MCP host that honors server instructions (Cursor, Codex, …) picks it up automatically when the server is registered.
 3. **Manual install.** Drop the file into a skills directory for Claude Code if you want to use the skill in a project where the plugin route doesn't apply, or if you want to customize the `/logmon` aliases locally:
 
