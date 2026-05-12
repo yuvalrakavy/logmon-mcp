@@ -1,0 +1,14 @@
+{
+  "name": "mcps",
+  "owner": {
+    "name": "Yuval Rakavy",
+    "url": "https://github.com/yuvalrakavy"
+  },
+  "plugins": [
+    {
+      "name": "logmon-mcp",
+      "source": ".",
+      "description": "Real-time logs and traces for AI coding assistants over MCP."
+    }
+  ]
+}
