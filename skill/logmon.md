@@ -1,7 +1,7 @@
 ---
 name: logmon
 user_invocable: true
-description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available, OR when the `logmon-mcp` CLI is on PATH. Skip for static log files on disk, historical archives, or projects with no live telemetry pipeline.
+description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Skip for static log files on disk, historical archives, or projects with no live telemetry pipeline.
 ---
 
 # Using the log monitor (logmon)
@@ -44,7 +44,7 @@ Skip it (and say so) when:
 
 ## Quick commands (Claude Code slash-command UX)
 
-If the host is Claude Code, the user can type `/logmon <args>`. Execute the matching action immediately; don't echo the menu:
+If the host is Claude Code, the user can type `/logmon <args>`. Execute the matching action immediately; don't echo the menu. The slash-command `count` defaults below (`50`, `10`) intentionally differ from `get_recent_logs`'s underlying default of `100` — pick a sensible size for the action.
 
 - `/logmon` — `get_recent_logs(count=50)`, summarize.
 - `/logmon errors` — `get_recent_logs(filter="l>=ERROR")`, summarize.
@@ -62,7 +62,7 @@ If the host is Claude Code, the user can type `/logmon <args>`. Execute the matc
 - `/logmon <DSL expr>` — if the argument contains `=`, `>=`, `/regex/`, or a known selector (`fa=`, `l>=`, `h=`, `m=`, `sn=`, `sv=`, `d>=`), call `get_recent_logs` (log selectors) or `get_slow_spans` (span selectors) with that filter.
 - `/logmon help` — print this list. Do **not** call any tools.
 
-Other MCP hosts (Cursor, Windsurf, Codex, etc.) don't have slash commands. Same behavior applies — just respond to natural-language phrasing instead.
+On other MCP hosts (Cursor, Windsurf, Codex, etc.) the user invokes via natural language ("show me errors", "what's slow"); the rest of this document applies unchanged.
 
 ## CLI fallback
 
@@ -110,9 +110,9 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 ### Traces (OTLP)
 
 - **`get_recent_traces(count?, filter?)`** — index page: trace id, root span, total duration, error flag.
-- **`get_trace(trace_id, include_logs?, filter?)`** — full span tree + linked logs.
+- **`get_trace(trace_id, include_logs?, filter?)`** — full span tree + linked logs. `include_logs` defaults to **`true`** — only pass `false` if you specifically want just the spans.
 - **`get_trace_summary(trace_id)`** — timing breakdown of the root span's direct children, with percentages.
-- **`get_slow_spans(min_duration_ms?, count?, filter?, group_by?)`** — slow individual spans, or aggregates when `group_by="name"`.
+- **`get_slow_spans(min_duration_ms?, count?, filter?, group_by?)`** — slow individual spans, or aggregates when `group_by="name"`. Defaults: `min_duration_ms=100`, `count=20`.
 - **`get_span_context(seq, before?, after?)`** — spans surrounding a given span.
 - **`get_trace_logs(trace_id, filter?)`** — only the logs linked to one trace.
 
@@ -129,17 +129,21 @@ Comma-separated qualifiers, AND-ed within a filter. Multiple filters on a sessio
 | `text` | case-insensitive substring against all fields |
 | `/regex/` | regex (add `/i` for case-insensitive) |
 | `selector=pattern` | match against a specific field |
-| `l>=LEVEL` | level comparison (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`) |
-| `b>=name` / `b<=name` | bookmark filter, pure read |
-| `c>=name` | cursor filter, read **and** advance |
+| `l>=L` / `l<=L` / `l=L` | level filter (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`) |
+| `b>=name` / `b<=name` | match records strictly after / before the bookmark's seq |
+| `c>=name` | cursor: same as `b>=` but advances the bookmark to the highest returned seq |
 | `"quoted"` | literal — use when the value contains commas or `=` |
 | `ALL` / `NONE` | match everything / nothing |
 
-**Log selectors:** `m` (message), `fm` (full_message), `mfm` (either), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level), or any custom GELF field name.
+Only `>=` and `<=` are accepted for `b`, `d`, and `l`; only `>=` for `c` (`c<=` is rejected by the parser). The level filter additionally allows `l=` for an exact match.
+
+> **Off-by-one note:** despite the `>=` / `<=` syntax, `b>=name` matches records with seq **strictly greater** than the bookmark's seq, and `b<=name` strictly less. The bookmark's own record is never included on either side. Same applies to `c>=`.
+
+**Log selectors:** `m` (message), `fm` (full_message), `mfm` (either), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level). Any other selector (e.g. `user_id`, `request_id`) is treated as a GELF additional field — drop the leading underscore that GELF uses on the wire (`user_id=42`, not `_user_id=42`).
 
 **Span selectors:** `sn` (span name), `sv` (service), `st` (status: `ok|error|unset`), `sk` (kind: `server|client|producer|consumer|internal`), `d>=` / `d<=` (duration ms).
 
-Log selectors and span selectors **cannot mix in the same filter** — they target different stores.
+Log selectors and span selectors **cannot mix in the same filter** — they target different stores. Log filters apply to `get_recent_logs`, `get_log_context`, `export_logs`, `get_trace_logs`; span filters apply to `get_recent_traces`, `get_slow_spans`, `get_span_context`, and to the `filter` argument of `get_trace`.
 
 Examples:
 
@@ -148,9 +152,11 @@ l>=ERROR                      all errors and worse
 fa=mqtt, l>=WARN              warnings+ from the mqtt facility
 connection refused, h=myapp   substring match + host
 /panic|unwrap failed/         regex for panics
+m="POST /users, 200"          literal — needed because of the comma
+user_id=42, l>=WARN           custom GELF field, no underscore prefix
 sn=query_database, d>=100     spans named query_database taking ≥100 ms
 sv=auth, st=error             error spans from the auth service
-b>=before, b<=after           records between two bookmarks
+b>=before, b<=after           records strictly between two bookmarks
 c>=test-run-abc               records since last poll, advances the cursor
 ```
 
@@ -210,11 +216,13 @@ A bookmark is passive metadata; a trigger is an active watcher with windowed con
 ### Pattern: debug a specific module
 
 ```
-add_filter("fa=<module>")           # focus the buffer on this module
+result = add_filter(filter="fa=<module>")   # returns the new filter's id
 # … ask the user to reproduce …
-get_recent_logs(count=100)          # examine
-remove_filter(<id>)                  # restore full capture when done
+get_recent_logs(count=100)                  # examine
+remove_filter(id=result.id)                  # restore full capture when done
 ```
+
+(`add_filter`, `add_trigger`, and `add_bookmark` accept either positional or named arguments; this skill uses named for clarity.)
 
 ### Pattern: before/after a change
 
@@ -251,10 +259,12 @@ get_trace(trace_id="<id>")                 # full span tree + logs interleaved
 
 ### Pattern: log + trace correlation in one shot
 
-When a user reports "this request was broken," and they give you a `trace_id` or a timestamp:
+This pattern only works when the application is exporting OTel traces **and** emitting logs (GELF or otherwise) with a `trace_id` field — e.g. `tracing-init`'s GELF layer, OTel auto-instrumented HTTP middleware, etc. If logs don't carry a trace id, fall back to timestamp-based correlation.
+
+When a user reports "this request was broken" and gives you a `trace_id`:
 
 ```
-get_trace(trace_id="<id>", include_logs=true)
+get_trace(trace_id="<id>")     # include_logs defaults to true
 # Returns the span tree AND every log line linked to that trace.
 # Now you have timing AND log context in one response.
 ```
@@ -275,6 +285,16 @@ loop:
     if r.logs is empty: break
     process(r.logs)
 # Cursor auto-advances each call; oldest-first ordering keeps it monotonic.
+```
+
+### Pattern: zoom in on the context around an error
+
+```
+r = get_recent_logs(filter="l>=ERROR", count=5)   # find the error(s)
+# Each entry carries a `seq`. Pick the one you care about:
+get_log_context(seq=r.logs[0].seq, before=20, after=10)
+# Returns 20 entries before and 10 after, regardless of level/filter —
+# the full unfiltered run-up to and recovery from the error.
 ```
 
 ### Pattern: comparing two test attempts
@@ -305,7 +325,7 @@ In order:
 
 ### "My cursor returned a huge unexpected flood"
 
-A cursor was idle long enough that its seq fell off the ring buffer. The broker auto-recreated it at `seq=0`, so it returned the entire current buffer. WARNing was logged by the broker. Either poll the cursor more often or raise `buffer_size`.
+A cursor was idle long enough that its seq fell off the ring buffer. The broker auto-recreated it at `seq=0`, so it returned the entire current buffer. A WARN-level log entry was emitted by the broker noting the rollover. Either poll the cursor more often or raise `buffer_size`.
 
 ### "A trigger isn't firing"
 

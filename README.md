@@ -219,6 +219,14 @@ Once logs are flowing, ask your assistant:
 - "add a filter for the mqtt module"
 - "set up a trigger for panics"
 
+### Claude Code skill
+
+`skill/logmon.md` is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that teaches the assistant how to use the MCP tools above effectively — when to query for logs vs. traces, the filter DSL, the bookmark/cursor model, the trigger flight-recorder pattern, and a recovery guide for the common failure modes. It also defines a `/logmon` slash command (`/logmon errors`, `/logmon slow`, `/logmon trace <id>`, etc.) for Claude Code users.
+
+The skill is user-invocable: Claude Code picks it up automatically when the logmon MCP server is registered, and it works the same way for any other agent that loads skill files. Other MCP hosts (Cursor, Windsurf, Codex) don't have slash commands but get the same guidance via natural language.
+
+The skill lives in this repo as a single Markdown file so you can read it, fork it, or tweak the `/logmon` aliases for your team.
+
 ### MCP Tools
 
 | Tool | Description |
