@@ -17,7 +17,9 @@ async fn v1_capabilities_advertised() {
         result.capabilities
     );
     assert!(
-        result.capabilities.contains(&"oneshot_triggers".to_string()),
+        result
+            .capabilities
+            .contains(&"oneshot_triggers".to_string()),
         "missing 'oneshot_triggers' in capabilities: {:?}",
         result.capabilities
     );

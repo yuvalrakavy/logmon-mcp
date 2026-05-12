@@ -147,7 +147,10 @@ fn test_multiple_logs_and_spans_same_trace() {
     all_seqs.sort();
     assert_eq!(all_seqs.len(), 5);
     for window in all_seqs.windows(2) {
-        assert!(window[1] > window[0], "seq values must be strictly increasing");
+        assert!(
+            window[1] > window[0],
+            "seq values must be strictly increasing"
+        );
     }
 }
 

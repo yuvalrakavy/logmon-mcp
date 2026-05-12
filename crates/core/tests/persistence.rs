@@ -14,20 +14,25 @@ fn test_state_roundtrip() {
     let path = dir.path().join("state.json");
     let mut state = DaemonState::default();
     state.seq_block = 49000;
-    state.named_sessions.insert("test".to_string(), PersistedSession {
-        triggers: vec![PersistedTrigger {
-            filter: "l>=ERROR".to_string(),
-            pre_window: 500, post_window: 200, notify_context: 5,
-            description: Some("error trigger".to_string()),
-            oneshot: false,
-        }],
-        filters: vec![PersistedFilter {
-            filter: "fa=mqtt".to_string(),
-            description: Some("mqtt only".to_string()),
-        }],
-        client_info: None,
-        bookmarks: vec![],
-    });
+    state.named_sessions.insert(
+        "test".to_string(),
+        PersistedSession {
+            triggers: vec![PersistedTrigger {
+                filter: "l>=ERROR".to_string(),
+                pre_window: 500,
+                post_window: 200,
+                notify_context: 5,
+                description: Some("error trigger".to_string()),
+                oneshot: false,
+            }],
+            filters: vec![PersistedFilter {
+                filter: "fa=mqtt".to_string(),
+                description: Some("mqtt only".to_string()),
+            }],
+            client_info: None,
+            bookmarks: vec![],
+        },
+    );
     save_state(&path, &state).unwrap();
     let loaded = load_state(&path).unwrap();
     assert_eq!(loaded.seq_block, 49000);

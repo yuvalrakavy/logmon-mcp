@@ -134,11 +134,19 @@ fn json_attr_to_json_value(value: &serde_json::Value) -> serde_json::Value {
     if let Some(b) = value.get("boolValue").and_then(|v| v.as_bool()) {
         return serde_json::Value::Bool(b);
     }
-    if let Some(arr) = value.get("arrayValue").and_then(|v| v.get("values")).and_then(|v| v.as_array()) {
+    if let Some(arr) = value
+        .get("arrayValue")
+        .and_then(|v| v.get("values"))
+        .and_then(|v| v.as_array())
+    {
         let items: Vec<serde_json::Value> = arr.iter().map(json_attr_to_json_value).collect();
         return serde_json::Value::Array(items);
     }
-    if let Some(kvs) = value.get("kvlistValue").and_then(|v| v.get("values")).and_then(|v| v.as_array()) {
+    if let Some(kvs) = value
+        .get("kvlistValue")
+        .and_then(|v| v.get("values"))
+        .and_then(|v| v.as_array())
+    {
         let map: serde_json::Map<String, serde_json::Value> = kvs
             .iter()
             .filter_map(|kv| {
@@ -227,10 +235,7 @@ fn parse_json_log_record(
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
 
-    let time_nanos = record
-        .get("timeUnixNano")
-        .map(parse_nanos)
-        .unwrap_or(0);
+    let time_nanos = record.get("timeUnixNano").map(parse_nanos).unwrap_or(0);
 
     let trace_id = record
         .get("traceId")
@@ -357,10 +362,7 @@ fn parse_json_span(span_json: &serde_json::Value, service: &str) -> Option<SpanE
         .and_then(|v| v.as_str())
         .and_then(hex_to_span_id);
 
-    let kind = span_json
-        .get("kind")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let kind = span_json.get("kind").and_then(|v| v.as_i64()).unwrap_or(0);
 
     let start_nanos = span_json
         .get("startTimeUnixNano")
@@ -507,9 +509,14 @@ mod tests {
         let (state, _log_rx, span_rx) = make_state(10, 1);
         // Fill the span channel.
         let dummy_span = crate::span::types::SpanEntry {
-            seq: 0, trace_id: 1, span_id: 1, parent_span_id: None,
-            start_time: chrono::Utc::now(), end_time: chrono::Utc::now(),
-            duration_ms: 0.0, name: "x".into(),
+            seq: 0,
+            trace_id: 1,
+            span_id: 1,
+            parent_span_id: None,
+            start_time: chrono::Utc::now(),
+            end_time: chrono::Utc::now(),
+            duration_ms: 0.0,
+            name: "x".into(),
             kind: crate::span::types::SpanKind::Internal,
             service_name: "s".into(),
             status: crate::span::types::SpanStatus::Unset,
@@ -571,6 +578,10 @@ mod tests {
         // Counter unchanged — entry made it through.
         assert_eq!(state.metrics.snapshot().otlp_http_traces, 0);
         // Channel now contains exactly one span.
-        assert_eq!(state.span_sender.capacity(), 9, "expected one slot consumed");
+        assert_eq!(
+            state.span_sender.capacity(),
+            9,
+            "expected one slot consumed"
+        );
     }
 }

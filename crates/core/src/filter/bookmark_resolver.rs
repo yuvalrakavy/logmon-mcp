@@ -82,8 +82,7 @@ pub fn resolve_bookmarks(
                         qualified,
                     ));
                 }
-                let (lower, commit) =
-                    store.cursor_read_and_advance(target_session, target_name);
+                let (lower, commit) = store.cursor_read_and_advance(target_session, target_name);
                 out.push(Qualifier::SeqFilter {
                     op: SeqOp::Gt,
                     value: lower,
@@ -123,7 +122,13 @@ mod tests {
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved.filter {
             assert_eq!(qs.len(), 1);
-            assert!(matches!(qs[0], Qualifier::SeqFilter { op: SeqOp::Gt, value: 7 }));
+            assert!(matches!(
+                qs[0],
+                Qualifier::SeqFilter {
+                    op: SeqOp::Gt,
+                    value: 7
+                }
+            ));
         } else {
             panic!("expected qualifiers");
         }
@@ -137,7 +142,13 @@ mod tests {
         let filter = parse_filter("b<=B/x").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved.filter {
-            assert!(matches!(qs[0], Qualifier::SeqFilter { op: SeqOp::Lt, value: 12 }));
+            assert!(matches!(
+                qs[0],
+                Qualifier::SeqFilter {
+                    op: SeqOp::Lt,
+                    value: 12
+                }
+            ));
         } else {
             panic!("expected qualifiers");
         }

@@ -2,6 +2,7 @@ use crate::gelf::message::{LogEntry, LogSource};
 use crate::receiver::otlp::mapping::*;
 use crate::receiver::{ReceiverMetrics, ReceiverSource};
 use crate::span::types::*;
+use chrono::Utc;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     logs_service_server::{LogsService, LogsServiceServer},
     ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -14,7 +15,6 @@ use opentelemetry_proto::tonic::common::v1::{any_value::Value, KeyValue};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use chrono::Utc;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
@@ -136,9 +136,7 @@ fn map_span_kind(kind: i32) -> SpanKind {
 }
 
 /// Map the protobuf Status to our SpanStatus enum.
-fn map_span_status(
-    status: &Option<opentelemetry_proto::tonic::trace::v1::Status>,
-) -> SpanStatus {
+fn map_span_status(status: &Option<opentelemetry_proto::tonic::trace::v1::Status>) -> SpanStatus {
     match status {
         Some(s) => match s.code {
             0 => SpanStatus::Unset,
@@ -269,7 +267,9 @@ impl TraceService for OtlpTraceService {
         let req = request.into_inner();
 
         if channel_used_pct(&self.span_sender) >= BACKPRESSURE_THRESHOLD_PCT {
-            return Err(Status::unavailable("broker span channel under backpressure"));
+            return Err(Status::unavailable(
+                "broker span channel under backpressure",
+            ));
         }
 
         for resource_spans in req.resource_spans {
@@ -384,7 +384,13 @@ mod tests {
     use tokio::sync::mpsc;
     use tonic::Request;
 
-    fn make_trace_service(span_cap: usize) -> (OtlpTraceService, mpsc::Receiver<SpanEntry>, Arc<ReceiverMetrics>) {
+    fn make_trace_service(
+        span_cap: usize,
+    ) -> (
+        OtlpTraceService,
+        mpsc::Receiver<SpanEntry>,
+        Arc<ReceiverMetrics>,
+    ) {
         let (span_sender, span_rx) = mpsc::channel(span_cap);
         let metrics = Arc::new(ReceiverMetrics::new());
         let svc = OtlpTraceService {
@@ -420,10 +426,16 @@ mod tests {
 
         // Fill the channel.
         let dummy = SpanEntry {
-            seq: 0, trace_id: 1, span_id: 1, parent_span_id: None,
-            start_time: chrono::Utc::now(), end_time: chrono::Utc::now(),
-            duration_ms: 0.0, name: "x".into(),
-            kind: SpanKind::Internal, service_name: "s".into(),
+            seq: 0,
+            trace_id: 1,
+            span_id: 1,
+            parent_span_id: None,
+            start_time: chrono::Utc::now(),
+            end_time: chrono::Utc::now(),
+            duration_ms: 0.0,
+            name: "x".into(),
+            kind: SpanKind::Internal,
+            service_name: "s".into(),
             status: SpanStatus::Unset,
             attributes: std::collections::HashMap::new(),
             events: vec![],

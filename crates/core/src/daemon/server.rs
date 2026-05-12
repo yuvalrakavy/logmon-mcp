@@ -289,8 +289,13 @@ pub async fn run_with_overrides(
                     grpc_addr: format!("0.0.0.0:{}", config.otlp_grpc_port),
                     http_addr: format!("0.0.0.0:{}", config.otlp_http_port),
                 };
-                let otlp_receiver =
-                    OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx, receiver_metrics.clone()).await?;
+                let otlp_receiver = OtlpReceiver::start(
+                    otlp_config,
+                    log_tx.clone(),
+                    span_tx,
+                    receiver_metrics.clone(),
+                )
+                .await?;
                 let otlp_info = otlp_receiver.listening_on();
                 info!(?otlp_info, "OTLP receiver started");
                 all_receivers_info.extend(otlp_info);
@@ -309,7 +314,12 @@ pub async fn run_with_overrides(
                 sessions.clone(),
                 pipeline.clone(),
             );
-            (log_rx, Some(gelf_receiver), otlp_receiver, all_receivers_info)
+            (
+                log_rx,
+                Some(gelf_receiver),
+                otlp_receiver,
+                all_receivers_info,
+            )
         }
     };
 
@@ -577,11 +587,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(ci) = &params.client_info {
         let serialized = serde_json::to_string(ci).unwrap_or_default();
         if serialized.len() > 4096 {
-            let resp = RpcResponse::error(
-                first_request.id,
-                -32602,
-                "client_info exceeds 4 KB limit",
-            );
+            let resp =
+                RpcResponse::error(first_request.id, -32602, "client_info exceeds 4 KB limit");
             write_message(&mut writer, &resp).await?;
             return Ok(());
         }
@@ -695,7 +702,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     if matches!(session_id, SessionId::Anonymous(_)) {
         let removed = handler.clear_session_bookmarks(&session_id.to_string());
         if removed > 0 {
-            info!(?session_id, removed, "cleared anonymous-session bookmarks on disconnect");
+            info!(
+                ?session_id,
+                removed, "cleared anonymous-session bookmarks on disconnect"
+            );
         }
     }
 

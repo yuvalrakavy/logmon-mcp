@@ -1,8 +1,8 @@
+use chrono::Utc;
 use logmon_broker_core::daemon::log_processor::{process_entry, sync_pre_buffer_size};
 use logmon_broker_core::daemon::session::SessionRegistry;
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -46,7 +46,9 @@ fn test_trigger_fires_and_flushes_pre_buffer() {
     // Session has default error trigger (pre_window=500, post_window=200)
 
     // Add a filter so INFO logs are NOT stored normally
-    sessions.add_filter(&sid, "l>=ERROR", Some("errors")).unwrap();
+    sessions
+        .add_filter(&sid, "l>=ERROR", Some("errors"))
+        .unwrap();
     sync_pre_buffer_size(&pipeline, &sessions);
 
     // Send 10 INFO entries -- go to pre-buffer but not store

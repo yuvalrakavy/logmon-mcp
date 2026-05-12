@@ -169,5 +169,7 @@ pub fn load_config(path: &Path) -> anyhow::Result<DaemonConfig> {
 /// Returns the logmon config directory (~/.config/logmon/)
 pub fn config_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".config").join("logmon")
+    std::path::PathBuf::from(home)
+        .join(".config")
+        .join("logmon")
 }

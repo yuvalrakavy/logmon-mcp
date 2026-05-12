@@ -1,17 +1,25 @@
-use logmon_broker_core::engine::pipeline::LogPipeline;
-use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
-use logmon_broker_core::filter::parser::parse_filter;
 use chrono::Utc;
+use logmon_broker_core::engine::pipeline::LogPipeline;
+use logmon_broker_core::filter::parser::parse_filter;
+use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
 use std::collections::HashMap;
 
 fn make_entry(seq: u64, level: Level, msg: &str) -> LogEntry {
     LogEntry {
-        seq, timestamp: Utc::now(), level,
-        message: msg.to_string(), full_message: None,
-        host: "test".into(), facility: None, file: None, line: None,
+        seq,
+        timestamp: Utc::now(),
+        level,
+        message: msg.to_string(),
+        full_message: None,
+        host: "test".into(),
+        facility: None,
+        file: None,
+        line: None,
         additional_fields: HashMap::new(),
-        trace_id: None, span_id: None,
-        matched_filters: Vec::new(), source: LogSource::Filter,
+        trace_id: None,
+        span_id: None,
+        matched_filters: Vec::new(),
+        source: LogSource::Filter,
     }
 }
 

@@ -642,12 +642,18 @@ pub struct StatusGet {}
 /// Healthy operation keeps all fields at 0.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ReceiverDropCounts {
-    #[serde(default)] pub gelf_udp: u64,
-    #[serde(default)] pub gelf_tcp: u64,
-    #[serde(default)] pub otlp_http_logs: u64,
-    #[serde(default)] pub otlp_http_traces: u64,
-    #[serde(default)] pub otlp_grpc_logs: u64,
-    #[serde(default)] pub otlp_grpc_traces: u64,
+    #[serde(default)]
+    pub gelf_udp: u64,
+    #[serde(default)]
+    pub gelf_tcp: u64,
+    #[serde(default)]
+    pub otlp_http_logs: u64,
+    #[serde(default)]
+    pub otlp_http_traces: u64,
+    #[serde(default)]
+    pub otlp_grpc_logs: u64,
+    #[serde(default)]
+    pub otlp_grpc_traces: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

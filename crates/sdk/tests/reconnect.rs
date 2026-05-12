@@ -143,18 +143,17 @@ async fn resurrection_treated_as_session_lost() {
     // No Reconnected should fire on resurrection — verify the channel
     // doesn't deliver one within a short window. (If reconnect succeeded
     // prematurely we'd see a Reconnected before the SessionLost surfaces.)
-    let saw_reconnected =
-        tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                match sub.recv().await {
-                    Ok(Notification::Reconnected) => return true,
-                    Ok(_) => continue,
-                    Err(_) => return false,
-                }
+    let saw_reconnected = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            match sub.recv().await {
+                Ok(Notification::Reconnected) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
             }
-        })
-        .await
-        .unwrap_or(false);
+        }
+    })
+    .await
+    .unwrap_or(false);
     assert!(
         !saw_reconnected,
         "Reconnected must not fire on daemon resurrection"

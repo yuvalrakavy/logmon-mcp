@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize, Serializer, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
 fn serialize_trace_id<S: Serializer>(id: &u128, s: S) -> Result<S::Ok, S::Error> {
@@ -30,7 +30,9 @@ fn serialize_opt_span_id<S: Serializer>(id: &Option<u64>, s: S) -> Result<S::Ok,
 fn deserialize_opt_span_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     let opt: Option<String> = Option::deserialize(d)?;
     match opt {
-        Some(s) => u64::from_str_radix(&s, 16).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => u64::from_str_radix(&s, 16)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
@@ -38,11 +40,20 @@ fn deserialize_opt_span_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpanEntry {
     pub seq: u64,
-    #[serde(serialize_with = "serialize_trace_id", deserialize_with = "deserialize_trace_id")]
+    #[serde(
+        serialize_with = "serialize_trace_id",
+        deserialize_with = "deserialize_trace_id"
+    )]
     pub trace_id: u128,
-    #[serde(serialize_with = "serialize_span_id", deserialize_with = "deserialize_span_id")]
+    #[serde(
+        serialize_with = "serialize_span_id",
+        deserialize_with = "deserialize_span_id"
+    )]
     pub span_id: u64,
-    #[serde(serialize_with = "serialize_opt_span_id", deserialize_with = "deserialize_opt_span_id")]
+    #[serde(
+        serialize_with = "serialize_opt_span_id",
+        deserialize_with = "deserialize_opt_span_id"
+    )]
     pub parent_span_id: Option<u64>,
 
     pub start_time: DateTime<Utc>,
@@ -87,7 +98,10 @@ pub struct SpanEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceSummary {
-    #[serde(serialize_with = "serialize_trace_id", deserialize_with = "deserialize_trace_id")]
+    #[serde(
+        serialize_with = "serialize_trace_id",
+        deserialize_with = "deserialize_trace_id"
+    )]
     pub trace_id: u128,
     pub root_span_name: String,
     pub service_name: String,

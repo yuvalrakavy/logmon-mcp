@@ -1,10 +1,10 @@
+use chrono::Utc;
 use logmon_broker_core::daemon::session::SessionRegistry;
 use logmon_broker_core::daemon::span_processor::process_span;
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
 use logmon_broker_core::span::store::SpanStore;
 use logmon_broker_core::span::types::*;
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 

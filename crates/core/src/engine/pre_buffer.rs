@@ -1,7 +1,7 @@
 use crate::gelf::message::LogEntry;
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 pub struct PreTriggerBuffer {
     entries: Mutex<VecDeque<LogEntry>>,
@@ -62,7 +62,8 @@ impl PreTriggerBuffer {
     /// Return copies of entries matching the given trace_id.
     pub fn entries_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
         let entries = self.entries.lock().unwrap();
-        entries.iter()
+        entries
+            .iter()
             .filter(|e| e.trace_id == Some(trace_id))
             .cloned()
             .collect()

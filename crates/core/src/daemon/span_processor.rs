@@ -40,12 +40,8 @@ pub fn process_span(
                 if let Ok(filter) = parse_filter(&trigger.filter_string) {
                     if matches_span(&filter, span) {
                         let trace_summary = build_trace_summary(span.trace_id, store);
-                        let event = SessionRegistry::build_span_event(
-                            sid,
-                            span,
-                            trigger,
-                            trace_summary,
-                        );
+                        let event =
+                            SessionRegistry::build_span_event(sid, span, trigger, trace_summary);
                         sessions.send_or_queue_notification(sid, event.clone());
                         pipeline.send_event(event);
                         if trigger.oneshot {

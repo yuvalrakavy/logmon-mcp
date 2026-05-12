@@ -9,14 +9,10 @@
 //!    `oneshot` flag preserved.
 #![cfg(feature = "test-support")]
 
-use logmon_broker_core::daemon::persistence::{
-    DaemonState, PersistedSession, PersistedTrigger,
-};
+use logmon_broker_core::daemon::persistence::{DaemonState, PersistedSession, PersistedTrigger};
 use logmon_broker_core::gelf::message::Level;
 use logmon_broker_core::test_support::*;
-use logmon_broker_protocol::{
-    TriggersAddResult, TriggersListResult,
-};
+use logmon_broker_protocol::{TriggersAddResult, TriggersListResult};
 use serde_json::json;
 use std::time::Duration;
 
@@ -75,7 +71,9 @@ async fn oneshot_trigger_removes_after_first_match() {
 
     // Inject another ERROR — should NOT fire again (the trigger is gone).
     daemon.inject_log(Level::Error, "second error").await;
-    let no_notif = client.try_recv_notification(Duration::from_millis(200)).await;
+    let no_notif = client
+        .try_recv_notification(Duration::from_millis(200))
+        .await;
     assert!(
         no_notif.is_none(),
         "expected no notification after oneshot removal, got: {no_notif:?}"

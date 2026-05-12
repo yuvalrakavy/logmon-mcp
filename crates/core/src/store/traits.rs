@@ -1,5 +1,5 @@
-use crate::gelf::message::LogEntry;
 use crate::filter::parser::ParsedFilter;
+use crate::gelf::message::LogEntry;
 use chrono::{DateTime, Utc};
 use std::time::Duration;
 

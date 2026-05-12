@@ -10,9 +10,9 @@ use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
 use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
 use logmon_broker_core::receiver::ReceiverMetrics;
-use logmon_broker_protocol::RpcRequest;
 use logmon_broker_core::span::store::SpanStore;
 use logmon_broker_core::store::bookmarks::BookmarkStore;
+use logmon_broker_protocol::RpcRequest;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,7 +83,13 @@ fn bookmarks_end_to_end() {
     // 2. Set bookmark "before". Default `start_seq` snaps it to the current
     //    seq counter (= e2's seq), so `b>=before` matches every record with
     //    `entry.seq > e2.seq` — exactly the second-batch entries that follow.
-    let r = call(&handler, &sid_a, "bookmarks.add", json!({ "name": "before" })).unwrap();
+    let r = call(
+        &handler,
+        &sid_a,
+        "bookmarks.add",
+        json!({ "name": "before" }),
+    )
+    .unwrap();
     assert_eq!(r["qualified_name"], "A/before");
     assert_eq!(r["replaced"], false);
 
@@ -116,8 +122,15 @@ fn bookmarks_end_to_end() {
     )
     .unwrap();
     let logs = r["logs"].as_array().unwrap();
-    assert_eq!(logs.len(), 2, "expected only the second-batch entries; got {logs:?}");
-    let messages: Vec<&str> = logs.iter().map(|l| l["message"].as_str().unwrap()).collect();
+    assert_eq!(
+        logs.len(),
+        2,
+        "expected only the second-batch entries; got {logs:?}"
+    );
+    let messages: Vec<&str> = logs
+        .iter()
+        .map(|l| l["message"].as_str().unwrap())
+        .collect();
     assert!(messages.iter().any(|m| m.contains("second batch line 1")));
     assert!(messages.iter().any(|m| m.contains("second batch line 2")));
 
@@ -160,7 +173,10 @@ fn bookmarks_end_to_end() {
         json!({ "filter": "b>=before" }),
     )
     .unwrap_err();
-    assert!(err.contains("not allowed in registered filters"), "got: {err}");
+    assert!(
+        err.contains("not allowed in registered filters"),
+        "got: {err}"
+    );
 
     // 10. list_bookmarks shows both bookmarks alive (data still covers them).
     let r = call(&handler, &sid_a, "bookmarks.list", json!({})).unwrap();

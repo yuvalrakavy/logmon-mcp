@@ -11,7 +11,10 @@ async fn logs_recent_returns_injected_records() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let output = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["logs", "recent", "--count", "10"]).output().unwrap()
+        cli.cmd()
+            .args(["logs", "recent", "--count", "10"])
+            .output()
+            .unwrap()
     })
     .await
     .unwrap();
@@ -29,7 +32,10 @@ async fn logs_recent_json_returns_structured_logs() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let output = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["logs", "recent", "--count", "10", "--json"]).output().unwrap()
+        cli.cmd()
+            .args(["logs", "recent", "--count", "10", "--json"])
+            .output()
+            .unwrap()
     })
     .await
     .unwrap();
@@ -59,7 +65,10 @@ async fn logs_recent_with_filter_passes_through() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("error-line"));
-    assert!(!stdout.contains("info-line"), "expected only ERROR-level; got: {stdout}");
+    assert!(
+        !stdout.contains("info-line"),
+        "expected only ERROR-level; got: {stdout}"
+    );
 }
 
 #[tokio::test]
@@ -68,11 +77,10 @@ async fn logs_clear_succeeds() {
     daemon.inject_log(Level::Info, "to-clear").await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let output = tokio::task::spawn_blocking(move || {
-        cli.cmd().args(["logs", "clear"]).output().unwrap()
-    })
-    .await
-    .unwrap();
+    let output =
+        tokio::task::spawn_blocking(move || cli.cmd().args(["logs", "clear"]).output().unwrap())
+            .await
+            .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -91,11 +99,10 @@ async fn logs_recent_against_missing_broker_fails_with_guidance() {
 
     let mut cmd = Command::cargo_bin("logmon-mcp").unwrap();
     cmd.env("LOGMON_BROKER_SOCKET", &bogus_socket);
-    let output = tokio::task::spawn_blocking(move || {
-        cmd.args(["logs", "recent"]).output().unwrap()
-    })
-    .await
-    .unwrap();
+    let output =
+        tokio::task::spawn_blocking(move || cmd.args(["logs", "recent"]).output().unwrap())
+            .await
+            .unwrap();
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
