@@ -1,123 +1,111 @@
-# logmon-mcp
+# logmon
 
-A log monitoring MCP server that collects structured logs (GELF format) from applications and exposes them to AI coding assistants via the [Model Context Protocol](https://modelcontextprotocol.io/). Multiple sessions share a single log collector daemon.
+**Real-time logs and traces for AI coding assistants. Stop letting your AI debug blind.**
 
-Works with any MCP-compatible client: Claude Code, Cursor, Windsurf, VS Code (Copilot), Gemini CLI, OpenAI Codex CLI, and more.
+logmon is a local broker daemon that collects structured logs and OpenTelemetry traces from your running application and exposes them to AI coding assistants over MCP. Instead of reading source code and guessing, your assistant can pull the actual runtime telemetry — what got logged, which span was slow, what fired the error — the same way a human would tail a log.
+
+It's a single binary you start once. Your apps emit GELF or OTLP. Your assistant connects over MCP. Multiple AI sessions, a CLI, and any Rust process linking the SDK can all observe the same stream in parallel.
+
+## Why logmon
+
+- **Built for AI debugging loops.** Triggers, bookmarks, and cursors give the assistant a way to say "show me everything that happened between *before-fix* and *after-fix*, errors only" — without you copy-pasting log snippets into the chat.
+- **Logs and traces in one place, correlated.** OTLP receivers ingest both; logs and spans share a `trace_id` so the assistant can pivot from a slow span to its log lines and back.
+- **Multi-session by design.** Several Claude Code / Cursor / Windsurf sessions can attach to the same broker simultaneously. Each session has its own triggers and filters; the buffer is shared.
+- **Survives reconnects.** Named sessions persist filters, triggers, and bookmarks across daemon restarts. Disconnected sessions queue notifications.
+- **Backpressure-aware.** UDP gets an 8 MB receive buffer; OTLP returns 429 / UNAVAILABLE at ~80% channel fill; per-source drop counts surface in `status.get`. A misbehaving producer can't take the broker down.
+- **Same surface from MCP, CLI, and Rust.** The `logmon-mcp` binary doubles as a shell-friendly CLI (`logmon-mcp logs recent --json`). The `logmon-broker-sdk` crate gives Rust consumers a typed client. Other languages can codegen from `crates/protocol/protocol-v1.schema.json`.
 
 ## Architecture
 
-logmon is a **broker** for structured logs and OTLP traces. A long-lived daemon ingests via GELF (UDP+TCP) and OTLP (gRPC+HTTP), and serves multiple clients over a Unix domain socket using JSON-RPC 2.0.
-
 ```
-Application(s)        AI Sessions / Test Harnesses / Other Clients
-     |                        |          |          |
-  GELF UDP/TCP           logmon-mcp   logmon-mcp   SDK consumer
-  OTLP gRPC/HTTP             |          |          |
-     |                       v          v          v
-     v                ┌───────────────────────────────┐
-                      │       logmon-broker           │
-                      │   (long-lived daemon, UDS)    │
-                      │  Receivers → Pipeline → Store │
-                      │  Per-session triggers/filters │
-                      └───────────────────────────────┘
+   Your app(s)              AI assistant sessions          Other clients
+                                                       (test harnesses,
+                                                        dashboards, CI)
+   GELF UDP/TCP  ───┐                │  │  │                   │
+   OTLP gRPC/HTTP ──┤                │  │  │                   │
+                    │           logmon-mcp (MCP stdio)         │
+                    │           logmon-mcp (CLI)               │
+                    │           logmon-mcp (CLI)        logmon-broker-sdk
+                    ▼                │  │  │                   │
+            ┌─────────────────────────────────────────────────────┐
+            │                  logmon-broker                      │
+            │       long-lived daemon, JSON-RPC over UDS          │
+            │   receivers → pipeline → ring buffers (logs+spans)  │
+            │   per-session triggers / filters / bookmarks        │
+            └─────────────────────────────────────────────────────┘
 ```
 
-**Binaries:**
+The workspace has four crates that ship as one project:
 
-- `logmon-broker` — the daemon. Run as a system service (launchd / systemd) for always-on availability.
-- `logmon-mcp` — MCP shim. Exposes broker tools to Claude Code / Cursor / etc. Auto-starts the broker if no service is installed.
-
-**Other clients:** anything depending on the public `logmon-broker-sdk` Rust crate, or speaking JSON-RPC against the documented protocol (`crates/protocol/protocol-v1.schema.json`).
-
-## Prerequisites
-
-- [Rust toolchain](https://rustup.rs/) (for building from source)
-- An application that sends logs in [GELF format](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html) over UDP or TCP
+| Crate | What it is |
+|---|---|
+| `logmon-broker` (`crates/broker`) | The daemon. Owns the receivers, ring buffers, and the JSON-RPC UDS server. |
+| `logmon-mcp` (`crates/mcp`) | Dual-mode binary. As a stdio MCP server it bridges AI clients to the broker. With a subcommand it acts as a CLI that mirrors the MCP surface 1:1. |
+| `logmon-broker-sdk` (`crates/sdk`) | Typed Rust client. Talks JSON-RPC against the broker, exposes a typed notification stream, includes a filter-DSL builder and a reconnect state machine. |
+| `logmon-broker-protocol` (`crates/protocol`) | The wire types. Drift-guarded JSON Schema at `crates/protocol/protocol-v1.schema.json` for cross-language clients. |
 
 ## Installation
 
-### Build from source
+### Build
 
 ```bash
 git clone https://github.com/yuvalrakavy/logmon-mcp.git
 cd logmon-mcp
-cargo build --release
-```
-
-The binaries are at `target/release/logmon-broker` and `target/release/logmon-mcp`. You can copy them to a directory on your PATH:
-
-```bash
-cp target/release/logmon-broker target/release/logmon-mcp ~/.local/bin/
-```
-
-Or install via cargo:
-
-```bash
 cargo install --path crates/broker --path crates/mcp
 ```
 
-After `cargo install`, the `logmon-mcp` binary is available in two modes: as the MCP stdio shim (today's behavior) and as a CLI for shell consumers (`logmon-mcp <subcommand>` — see `crates/mcp/README.md`).
+This puts `logmon-broker` and `logmon-mcp` on your PATH (`~/.cargo/bin` by default).
 
-### Run the broker as a system service (recommended)
+### Run the broker as a service (recommended)
 
 ```bash
 logmon-broker install-service --scope user
 ```
 
-Boots the broker via launchd (macOS) or systemd (Linux). Starts at login, restarts on crash. To uninstall: `logmon-broker uninstall-service --scope user`.
+This registers a launchd agent on macOS or a systemd user unit on Linux. The broker starts at login and restarts on crash. To remove it: `logmon-broker uninstall-service --scope user`.
 
-### Configure your AI coding assistant
+If you skip this, the MCP shim auto-starts the broker the first time a client connects.
 
-If a system service is installed, the broker is already running. Otherwise the MCP shim auto-starts it on the first client connection. No manual setup needed.
+### Wire up your AI assistant
 
-#### Claude Code
+<details>
+<summary><b>Claude Code</b></summary>
 
 ```bash
-# Register globally (available in all projects)
+# Global install — available in every project
 claude mcp add logmon --scope user -- logmon-mcp
 
-# Or with a named session (persists triggers/filters across reconnects)
+# Or with a named session that persists triggers/filters across reconnects
 claude mcp add logmon --scope user -- logmon-mcp --session my-session
 
-# Or register for current project only
+# Project-local install
 claude mcp add logmon -- logmon-mcp
 ```
 
-If the binary is not on your PATH, use the full path:
+If `logmon-mcp` isn't on your PATH, give the absolute path: `claude mcp add logmon --scope user -- /full/path/to/logmon-mcp`.
 
-```bash
-claude mcp add logmon --scope user -- /path/to/logmon-mcp
-```
+</details>
 
-#### Cursor
+<details>
+<summary><b>Cursor</b></summary>
 
-Add to your Cursor MCP settings (`.cursor/mcp.json` in your project or `~/.cursor/mcp.json` globally):
-
-```json
-{
-  "mcpServers": {
-    "logmon": {
-      "command": "logmon-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-For a named session:
+Add to `.cursor/mcp.json` in your project, or `~/.cursor/mcp.json` for global:
 
 ```json
 {
   "mcpServers": {
     "logmon": {
       "command": "logmon-mcp",
-      "args": ["--session", "my-session"]
+      "args": ["--session", "cursor"]
     }
   }
 }
 ```
 
-#### Windsurf
+</details>
+
+<details>
+<summary><b>Windsurf</b></summary>
 
 Add to `~/.codeium/windsurf/mcp_config.json`:
 
@@ -132,7 +120,10 @@ Add to `~/.codeium/windsurf/mcp_config.json`:
 }
 ```
 
-#### VS Code (GitHub Copilot)
+</details>
+
+<details>
+<summary><b>VS Code (GitHub Copilot)</b></summary>
 
 Add to your VS Code `settings.json`:
 
@@ -149,7 +140,7 @@ Add to your VS Code `settings.json`:
 }
 ```
 
-Or add to `.vscode/mcp.json` in your project:
+Or, per-project, `.vscode/mcp.json`:
 
 ```json
 {
@@ -162,7 +153,10 @@ Or add to `.vscode/mcp.json` in your project:
 }
 ```
 
-#### Gemini CLI
+</details>
+
+<details>
+<summary><b>Gemini CLI</b></summary>
 
 Add to `~/.gemini/settings.json`:
 
@@ -177,7 +171,10 @@ Add to `~/.gemini/settings.json`:
 }
 ```
 
-#### OpenAI Codex CLI
+</details>
+
+<details>
+<summary><b>OpenAI Codex CLI</b></summary>
 
 Add to `~/.codex/config.json`:
 
@@ -192,274 +189,327 @@ Add to `~/.codex/config.json`:
 }
 ```
 
-#### Any MCP-compatible client
+</details>
 
-logmon-mcp uses the standard MCP stdio transport. Configure your client to run `logmon-mcp` as a stdio MCP server. Optional argument: `--session <name>` for persistent sessions.
+<details>
+<summary><b>Any MCP-compatible client</b></summary>
 
-## Usage
+logmon-mcp speaks the standard MCP stdio transport. Configure your client to launch `logmon-mcp` as a stdio server. The only optional argument is `--session <name>` to attach to a persistent named session.
 
-### Configure your application to send GELF logs
+</details>
 
-Point your application's GELF output to `localhost:12201` (UDP or TCP). Most logging frameworks support GELF:
-
-- **Rust**: `tracing-gelf`
-- **Python**: `pygelf`
-- **Node.js**: `gelf-pro`
-- **Go**: `go-gelf`
-- **Java**: Logback `biz.paluch.logging:logstash-gelf`
-- **Docker**: `--log-driver=gelf --log-opt gelf-address=udp://localhost:12201`
-
-### Use from your AI assistant
-
-Once logs are flowing, ask your assistant:
-
-- "check the logs"
-- "show me recent errors"
-- "what happened around the cache error?"
-- "add a filter for the mqtt module"
-- "set up a trigger for panics"
-
-### Claude Code skill
+### Claude Code skill (recommended)
 
 `skill/logmon.md` is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that teaches the assistant how to use the MCP tools above effectively — when to query for logs vs. traces, the filter DSL, the bookmark/cursor model, the trigger flight-recorder pattern, and a recovery guide for the common failure modes. It also defines a `/logmon` slash command (`/logmon errors`, `/logmon slow`, `/logmon trace <id>`, etc.) for Claude Code users.
 
-The skill is user-invocable: Claude Code picks it up automatically when the logmon MCP server is registered, and it works the same way for any other agent that loads skill files. Other MCP hosts (Cursor, Windsurf, Codex) don't have slash commands but get the same guidance via natural language.
+To activate it for a project, drop the file into the project's skills directory:
 
-The skill lives in this repo as a single Markdown file so you can read it, fork it, or tweak the `/logmon` aliases for your team.
+```bash
+mkdir -p .claude/skills && cp /path/to/logmon-mcp/skill/logmon.md .claude/skills/
+```
 
-### MCP Tools
+Or install once for all projects on the machine:
+
+```bash
+mkdir -p ~/.claude/skills && cp /path/to/logmon-mcp/skill/logmon.md ~/.claude/skills/
+```
+
+Other MCP hosts (Cursor, Windsurf, Codex) don't have a `/logmon` slash command but pick up the same guidance via natural language ("show me errors", "what's slow") — the skill file is plain Markdown and any agent that loads skill files will use it.
+
+## Wire up your application
+
+Point your app's structured-logging output at one of the broker's receivers. GELF is easiest for log-only workloads; OTLP gets you traces too.
+
+### GELF (logs only)
+
+Default port: **12201** (UDP and TCP, same port).
+
+| Language | Library |
+|---|---|
+| Rust | [`tracing-init`](https://github.com/yuvalrakavy/tracing-init) (sister crate — also handles OTLP), or [`tracing-gelf`](https://crates.io/crates/tracing-gelf) |
+| Python | [`pygelf`](https://pypi.org/project/pygelf/) |
+| Node.js | [`gelf-pro`](https://www.npmjs.com/package/gelf-pro) |
+| Go | [`go-gelf`](https://github.com/Graylog2/go-gelf) |
+| Java | Logback `biz.paluch.logging:logstash-gelf` |
+| Docker | `--log-driver=gelf --log-opt gelf-address=udp://localhost:12201` |
+
+If you're writing your app in Rust, [`tracing-init`](https://github.com/yuvalrakavy/tracing-init) is the path of least resistance: a single `TracingInit::builder("myapp").init()` wires up both GELF and OTLP, with `logging.toml` auto-discovery if you want config-driven overrides. Its defaults already match logmon's ports, so the typical setup is zero-arg.
+
+### OTLP (logs + traces, correlated by trace_id)
+
+Default ports: **4317** (gRPC), **4318** (HTTP/protobuf).
+
+Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc://localhost:4317`. logmon accepts both logs and traces on either transport. Spans linked to your logs through `trace_id` / `span_id` show up correlated in `get_trace`.
+
+## MCP tool reference
 
 | Tool | Description |
-| ---- | ----------- |
-| `get_recent_logs` | Fetch recent logs, optionally filtered |
-| `get_log_context` | Get logs surrounding a specific entry by seq number |
-| `export_logs` | Save logs to a file |
-| `clear_logs` | Clear the log buffer |
-| `get_recent_traces` | Index page of recent OTLP traces (trace id, root span, total duration, error flag) |
-| `get_trace` | Full span tree for a trace; `include_logs` (default `true`) interleaves linked logs |
-| `get_trace_summary` | Timing breakdown of the root span's direct children with percentages |
-| `get_slow_spans` | Slow individual spans (default `min_duration_ms=100`, `count=20`); aggregate by name with `group_by="name"` |
-| `get_span_context` | Spans surrounding a given span by seq number |
-| `get_trace_logs` | Only the logs linked to one trace |
-| `add_bookmark` | Set a named seq anchor at the current moment (global, qualified by session name). Optional `start_seq` overrides the default; `replace=true` overwrites existing. |
-| `list_bookmarks` | List all live bookmarks with their seq position |
-| `remove_bookmark` | Remove a bookmark (bare name = current session; `session/name` reaches another session) |
-| `clear_bookmarks` | Clear all bookmarks for the current session |
-| `get_status` | Server status and statistics |
-| `get_filters` | List buffer filters for this session |
-| `add_filter` | Add a buffer filter (OR semantics across filters) |
-| `edit_filter` | Modify a filter |
-| `remove_filter` | Remove a filter |
-| `get_triggers` | List triggers for this session |
-| `add_trigger` | Add a trigger with pre/post capture windows |
-| `edit_trigger` | Modify a trigger |
-| `remove_trigger` | Remove a trigger |
-| `get_sessions` | List all connected sessions |
-| `drop_session` | Remove a named session |
+|---|---|
+| `get_recent_logs` | Fetch recent logs, optionally filtered or scoped to a `trace_id`. |
+| `get_log_context` | Get logs surrounding a specific entry by `seq`. |
+| `export_logs` | Save logs to a file (json or text). |
+| `clear_logs` | Clear the shared log buffer. |
+| `get_recent_traces` | List recent traces with timing and error info. |
+| `get_trace` | Full span tree for a trace; `include_logs` (default `true`) interleaves linked logs. |
+| `get_trace_summary` | Compact timing breakdown highlighting bottlenecks. |
+| `get_slow_spans` | Find slow spans (default `min_duration_ms=100`, `count=20`); aggregate by name with `group_by="name"`. |
+| `get_span_context` | Spans surrounding a given span by `seq`. |
+| `get_trace_logs` | All logs linked to a trace. |
+| `get_filters` / `add_filter` / `edit_filter` / `remove_filter` | Per-session buffer filters. |
+| `get_triggers` / `add_trigger` / `edit_trigger` / `remove_trigger` | Per-session triggers. |
+| `add_bookmark` / `list_bookmarks` / `remove_bookmark` / `clear_bookmarks` | Bookmarks (also act as cursors via `c>=`). |
+| `get_sessions` / `drop_session` | Multi-session inspection. |
+| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts. |
 
 ## Filter DSL
 
-Filters use comma-separated qualifiers (AND semantics):
+Filters are comma-separated qualifier lists. Qualifiers inside one filter are AND-ed; multiple registered filters OR together.
 
 ```
-l>=ERROR                     # all errors and above
-fa=mqtt,l>=WARN              # warnings+ from MQTT module
-connection refused,h=myapp   # substring match + host filter
-/panic|unwrap failed/        # regex match
+l>=ERROR                       all errors and above
+fa=mqtt, l>=WARN               warnings+ from the mqtt facility
+connection refused, h=myapp    substring match scoped to a host
+/panic|unwrap failed/          regex match
+b>=before, b<=after, l>=warn   warnings between two bookmarks
+c>=poll-1, count=500           drain mode (advances the cursor)
 ```
 
-**Log selectors:** `m` (message), `fm` (full_message), `mfm` (message or full_message), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level). Any other key is treated as a GELF additional field (no leading underscore needed — `user_id=42`, not `_user_id=42`).
+### Log selectors
 
-**Span selectors:** `sn` (span name), `sv` (service), `st` (status: `ok|error|unset`), `sk` (kind: `server|client|producer|consumer|internal`), `d>=` / `d<=` (duration ms). Log and span selectors cannot mix in a single filter — log filters apply to log queries, span filters to trace/span queries.
+| Selector | Field |
+|---|---|
+| `m` | message (GELF `short_message`) |
+| `fm` | `full_message` |
+| `mfm` | message or full_message |
+| `h` | host |
+| `fa` | facility |
+| `fi` | file |
+| `ln` | line |
+| `l` | level (`>=`, `<=`, `=`; ERROR/WARN/INFO/DEBUG/TRACE) |
+| `<name>` | any custom GELF field (`_foo` → `foo`) |
 
-**Special filters:** `ALL` (match everything), `NONE` (match nothing)
+Special tokens: `ALL` matches everything; `NONE` matches nothing.
 
-### Bookmarks and cursors
+### Span selectors
 
-Bookmarks are named seq positions in the broker's record stream. Two interaction patterns share the same storage:
+Span filters use the same syntax but with span fields. You can't mix log and span selectors in a single filter.
 
-**Pure-read (`b>=`, `b<=`).** Set a bookmark; read records strictly after it. The bookmark never moves on its own.
+| Selector | Field |
+|---|---|
+| `sn` | span name |
+| `sv` | service name |
+| `st` | status (`ok` / `error` / `unset`) |
+| `sk` | span kind (`server` / `client` / `producer` / `consumer` / `internal`) |
+| `d>=` / `d<=` | duration ms |
+
+### Patterns
+
+- `pattern` — bare text is a case-insensitive substring match against all fields.
+- `/regex/` — regex (case-sensitive). Append `/i` for case-insensitive: `/foo/i`.
+- `"quoted text"` — literal text. Use this when your value contains commas or `=`.
+
+## Bookmarks and cursors
+
+Bookmarks are named positions in the broker's globally-monotonic `seq` stream. Two interaction patterns share the same storage:
+
+### `b>=` / `b<=` — pure read
+
+Set a bookmark, read records strictly after / before it. The bookmark never moves on its own.
 
 ```
 add_bookmark("before")
-# run the operation
+# ... run the operation ...
 add_bookmark("after")
 get_recent_logs(filter="b>=before, b<=after, l>=warn")
 get_recent_traces(filter="b>=before, b<=after, d>=100")
 ```
 
-**Read-and-advance (`c>=`).** Same filter as `b>=`, but atomically updates the bookmark to the max seq returned. The same bookmark can be referenced via either operator — `b>=` reads, `c>=` reads-and-advances. Useful for "what's new since I last checked":
+### `c>=` — read and advance
+
+Same as `b>=`, but atomically advances the bookmark to the max `seq` returned. Use when you want "what's new since I last checked":
 
 ```
-# First call — auto-creates the bookmark at seq=0 if missing,
-# returns everything currently in the buffer matching, advances cursor.
-get_recent_logs(filter="c>=test-run", count=500)
+# First call auto-creates the bookmark at seq=0 if missing,
+# returns everything currently matching, advances the cursor.
+get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 
-# Subsequent calls — return only new records since the previous call
-get_recent_logs(filter="c>=test-run", count=500)
+# Subsequent calls return only records that arrived since the last call.
+get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 ```
 
-When a `c>=` qualifier is present, results are returned **oldest-first within the cursor's window** (so paginated polls drain monotonically). Without `c>=`, results stay newest-first as today.
+When a `c>=` qualifier is present, results come back oldest-first within the cursor's window so paginated polls drain monotonically.
 
-`c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Other query methods (`get_log_context`, `get_recent_traces`, etc.) reject `c>=` because their results aren't seq-streamable.
+`c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Other query methods reject it because their results aren't seq-streamable.
 
-Bookmarks are global across sessions and qualified by the creating session (`session/name`). Bare names in tool calls and DSL expressions resolve to the current session. Bookmarks auto-evict when both the log and span buffers have rolled past their seq.
+### Cross-session
 
-`b>=`, `b<=`, and `c>=` are usable only in query tools — they're rejected by `add_filter` and `add_trigger`.
+Bookmarks are global, qualified by the creating session (`session/name`). A bare name resolves to the calling session.
+
+- `b>=other-session/before` — pure-read across sessions is allowed.
+- `c>=other-session/before` — rejected. Only the owning session can advance its own cursor.
+
+Bookmarks auto-evict when both the log and span buffers have rolled past their `seq`.
+
+`b>=`, `b<=`, and `c>=` are query-only — they're rejected by `add_filter` and `add_trigger`.
 
 ## Triggers
 
 Triggers watch every incoming log and fire when a match occurs, capturing context:
 
-- **pre_window**: Number of logs captured *before* the trigger event (flight recorder pattern)
-- **post_window**: Number of logs captured *after* the trigger event
-- **notify_context**: Number of context entries included in the notification
+- `pre_window` — logs captured *before* the matching event (flight recorder).
+- `post_window` — logs captured *after* the matching event.
+- `notify_context` — how many pre-window entries are inlined into the notification payload.
+- `oneshot` — when `true`, the trigger auto-removes after its first match.
 
-Default triggers are created for each session: `l>=ERROR` and `mfm=panic`.
+Each session automatically gets two triggers on startup: `l>=ERROR` and `mfm=panic`. The pre- and post-trigger captures bypass buffer filters, so context around a fire is never truncated by a narrow filter.
 
-When a trigger fires, the client receives a notification with the matched entry and surrounding context.
+When a trigger fires, the client receives a notification with the matched entry and surrounding context. The trigger fire count is visible in `get_triggers`.
 
-## Multi-Session
+## Multi-session
 
-- All sessions share the same log buffer and GELF receivers
-- Each session has its own triggers and filters
-- **Anonymous sessions** (default): cleaned up on disconnect
-- **Named sessions** (`--session name`): persist across disconnects, queue notifications while disconnected
+- All sessions share the same log and span buffers and the same GELF/OTLP receivers.
+- Each session has its own triggers, filters, and bookmarks.
+- **Anonymous sessions** (default) get a UUID and clean up on disconnect.
+- **Named sessions** (`--session NAME`) persist filters, triggers, and bookmarks across disconnects and across daemon restarts. Notifications are queued while disconnected.
+
+## CLI mode
+
+The same `logmon-mcp` binary is also a shell-friendly CLI. Subcommands mirror the MCP surface 1:1:
+
+```bash
+logmon-mcp logs recent --json | jq '.logs[] | select(.level=="Error")'
+logmon-mcp bookmarks add release-rc1
+logmon-mcp status
+```
+
+Global flags:
+
+- `--session NAME` — connect to a named session. CLI mode defaults to `"cli"` so state persists across invocations.
+- `--json` — emit machine-readable JSON instead of human-readable text.
+
+See `crates/mcp/README.md` for the full command reference.
+
+Useful when:
+
+- You're in a subagent that doesn't inherit MCP servers.
+- The MCP server disconnected mid-session.
+- You want to pipe output through `head`, `jq`, or `grep`.
+
+CLI calls are one-shot: no reconnect, fast-fail with a 5-second call timeout, no auto-start of the broker. Run the broker as a service first.
 
 ## Configuration
 
-Config files are stored in `~/.config/logmon/`:
+Config and state live in `~/.config/logmon/` on both macOS and Linux:
 
-- `config.json` — daemon settings (ports, buffer size, idle timeout)
-- `state.json` — persisted state (seq counter, named sessions)
+| File | Contents |
+|---|---|
+| `config.json` | Daemon settings: ports, buffer sizes, idle timeout. |
+| `state.json` | Persisted state: seq counter, named sessions and their triggers/filters/bookmarks. |
+| `logmon.sock` | The JSON-RPC Unix domain socket. |
+| `daemon.pid` | PID file. |
+| `daemon.log` | Broker log output. |
 
-### CLI
+Defaults:
 
-```bash
-# MCP shim — used by MCP clients
-logmon-mcp [--session <name>]
-
-# Broker daemon — usually run as a service, but you can run it directly
-logmon-broker [--gelf-port 12201] [--buffer-size 10000]
-
-# Broker subcommands
-logmon-broker status                    # query daemon status
-logmon-broker install-service [--scope user|system]
-logmon-broker uninstall-service [--scope user|system]
+```json
+{
+  "gelf_port": 12201,
+  "otlp_grpc_port": 4317,
+  "otlp_http_port": 4318,
+  "buffer_size": 10000,
+  "span_buffer_size": 10000,
+  "idle_timeout_secs": 1800
+}
 ```
 
-### Environment variable overrides
+Environment variable overrides:
 
-- `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (defeats PATH lookup).
-- `LOGMON_BROKER_SOCKET` — explicit broker socket path (used by tests; defaults to `~/.config/logmon/logmon.sock`).
+- `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (skips PATH lookup).
+- `LOGMON_BROKER_SOCKET` — explicit broker socket path. Defaults to `~/.config/logmon/logmon.sock`.
 
-## Testing
+## Backpressure
 
-```bash
-# Run tests
-cargo test
+A noisy producer should slow itself down, not take the broker down. Concretely:
 
-# Send test GELF messages
-./test-gelf.sh              # TCP (default)
-./test-gelf.sh 12201 udp    # UDP
+- GELF receivers use `try_send` into the pipeline channel — full channel means the entry is dropped at the receiver, not enqueued without bound.
+- GELF UDP sets `SO_RCVBUF` to **8 MB** so a slow consumer has a sizeable OS-side cushion before datagrams start falling on the floor.
+- OTLP gRPC and OTLP HTTP both check channel fill before consuming a payload. At **≥ 80% full**, gRPC returns `UNAVAILABLE` and HTTP returns `429`. The producer is expected to retry with backoff. The protocol-level rejection *is* the backpressure signal — per-source drop counters aren't bumped, because nothing was silently dropped.
+- Per-source drop counts surface in `status.get` under `receiver_drops` (`gelf_udp`, `gelf_tcp`, `otlp_http_logs`, `otlp_http_traces`, `otlp_grpc_logs`, `otlp_grpc_traces`). Healthy operation keeps all six at zero.
+
+If you're seeing nonzero drops, the broker is the bottleneck — bump `buffer_size` / `span_buffer_size`, or check whether a runaway producer is genuinely outpacing the consumer.
+
+## SDK and cross-language clients
+
+### Rust: `logmon-broker-sdk`
+
+The typed Rust SDK at `crates/sdk` is the canonical client for non-MCP consumers (test harnesses, archival workers, dashboards). It:
+
+- Returns `Result<R, BrokerError>` for every method.
+- Auto-discovers the socket at `~/.config/logmon/logmon.sock`.
+- Resumes named sessions across daemon restarts with jittered exponential backoff.
+- Emits a typed `Notification` enum (`TriggerFired`, `Reconnected`) on a broadcast channel.
+- Builds filter strings via a typed `Filter` builder (no manual quoting).
+
+```rust
+use logmon_broker_sdk::{Broker, Filter, Level};
+use logmon_broker_protocol::LogsRecent;
+
+let broker = Broker::connect()
+    .session_name("my-tool")
+    .open().await?;
+
+let result = broker.logs_recent(LogsRecent {
+    count: Some(50),
+    filter: Some(Filter::builder().level_at_least(Level::Error).build()),
+    ..Default::default()
+}).await?;
 ```
 
-## Embedding via SDK
+See [`crates/sdk/README.md`](crates/sdk/README.md) for the full guide.
 
-For non-MCP consumers (test harnesses, archival workers, dashboards), use the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). It speaks JSON-RPC 2.0 against the broker's UDS, returns typed `Result<R, BrokerError>` for every method, supports named-session reconnection across daemon restarts, and emits typed `Notification` events (TriggerFired, Reconnected) on a broadcast channel.
+### Other languages
 
-**See [`crates/sdk/README.md`](crates/sdk/README.md) for the canonical SDK guide** — quick start, full method index, filter builder, notification handling, reconnect model, error semantics, and the test-support harness.
+The wire protocol is JSON-RPC 2.0 over a Unix domain socket (newline-delimited frames, no length prefix), formally defined by [`crates/protocol/protocol-v1.schema.json`](crates/protocol/protocol-v1.schema.json) (JSON Schema 2020-12). The schema is drift-guarded — `cargo xtask verify-schema` fails CI when the committed schema disagrees with the Rust struct definitions. Treat it as the authoritative contract for cross-language codegen.
 
-The first SDK consumer outside this repo is `store-test` — see [`docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md`](docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md) for the integration brief.
-
-## Manual smoke tests
-
-These are not run in CI; verify locally before tagging a release. Each
-section is independent — run only what's relevant to your platform.
-
-### Build + binaries
+## Development
 
 ```bash
+# Build the workspace
 cargo build --workspace
-ls -lh target/debug/logmon-broker target/debug/logmon-mcp
+
+# Run the full test suite
+cargo test --workspace
+
+# Lint and format checks (CI runs these)
+cargo fmt --all --check
+cargo clippy --workspace --all-targets
+
+# Regenerate / verify the wire-protocol JSON Schema
+cargo xtask verify-schema
+
+# Quick smoke: send a test GELF message to a running broker
+./test-gelf.sh           # TCP
+./test-gelf.sh 12201 udp # UDP
 ```
 
-Expected: both binaries exist; no warnings.
+The default workspace members (`crates/broker`, `crates/mcp`) are what `cargo build` and `cargo run` target without `-p`.
 
-### Auto-start path (shim spawns broker)
+## Roadmap
 
-```bash
-target/debug/logmon-mcp --session smoke <<'EOF'
-EOF
-```
+- Hot reload of `config.json` without a restart.
+- Span trigger evaluation (currently triggers only watch logs).
+- Persistent buffer rotation on disk for crash-survival debugging.
+- First-class Windows support (today's TCP fallback works but isn't first-class).
+- Additional language SDKs codegen'd from `protocol-v1.schema.json`.
 
-Expected: shim exits cleanly; `daemon.pid` and `logmon.sock` created in
-`~/.config/logmon/`.
+## Contributing
 
-### Status subcommand
+Issues, PRs, and design discussions are welcome. A few ground rules:
 
-```bash
-target/debug/logmon-broker status
-```
-
-Expected:
-- with no daemon running: prints `not running` and exits 1.
-- with a daemon running: prints `running pid=<N> socket=<path>` and exits 0.
-
-### Stale-pid recovery
-
-```bash
-target/debug/logmon-broker &
-PID1=$!
-sleep 1
-kill -9 $PID1                  # leave stale pid + socket
-target/debug/logmon-broker &
-PID2=$!
-sleep 1
-kill -TERM $PID2
-wait
-```
-
-Expected: second start succeeds; `daemon.log` shows
-"removing stale pid file from previous run"; clean exit on SIGTERM.
-
-### Graceful shutdown via SIGTERM and SIGINT
-
-```bash
-target/debug/logmon-broker &
-sleep 1
-kill -TERM $!                  # try -INT too in a separate run
-wait
-```
-
-Expected: broker exits 0; `logmon.sock` and `daemon.pid` removed;
-`daemon.log` records "received SIGTERM" (or "SIGINT").
-
-### System service install (macOS)
-
-```bash
-target/debug/logmon-broker install-service --scope user
-launchctl print gui/$(id -u)/logmon.broker | head -5
-target/debug/logmon-broker status
-target/debug/logmon-broker uninstall-service --scope user
-```
-
-Expected: install succeeds → launchctl shows the agent → status
-reports running → uninstall removes the plist.
-
-### System service install (Linux)
-
-```bash
-target/debug/logmon-broker install-service --scope user
-systemctl --user status logmon-broker
-target/debug/logmon-broker status
-target/debug/logmon-broker uninstall-service --scope user
-```
-
-Expected: install succeeds → `systemctl status` shows
-"active (running)" within 2 s of start (Type=notify) → status reports
-running → uninstall removes the unit.
+- Run `cargo fmt --all`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` before opening a PR.
+- If your change touches `crates/protocol/src/methods.rs` or `notifications.rs`, regenerate the schema with `cargo xtask verify-schema` and commit the result.
+- Keep new features additive on the wire — the protocol uses additive-field discipline.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
