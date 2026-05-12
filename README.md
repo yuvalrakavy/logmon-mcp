@@ -235,6 +235,12 @@ The skill lives in this repo as a single Markdown file so you can read it, fork 
 | `get_log_context` | Get logs surrounding a specific entry by seq number |
 | `export_logs` | Save logs to a file |
 | `clear_logs` | Clear the log buffer |
+| `get_recent_traces` | Index page of recent OTLP traces (trace id, root span, total duration, error flag) |
+| `get_trace` | Full span tree for a trace; `include_logs` (default `true`) interleaves linked logs |
+| `get_trace_summary` | Timing breakdown of the root span's direct children with percentages |
+| `get_slow_spans` | Slow individual spans (default `min_duration_ms=100`, `count=20`); aggregate by name with `group_by="name"` |
+| `get_span_context` | Spans surrounding a given span by seq number |
+| `get_trace_logs` | Only the logs linked to one trace |
 | `add_bookmark` | Set a named seq anchor at the current moment (global, qualified by session name). Optional `start_seq` overrides the default; `replace=true` overwrites existing. |
 | `list_bookmarks` | List all live bookmarks with their seq position |
 | `remove_bookmark` | Remove a bookmark (bare name = current session; `session/name` reaches another session) |
@@ -262,7 +268,9 @@ connection refused,h=myapp   # substring match + host filter
 /panic|unwrap failed/        # regex match
 ```
 
-**Selectors:** `m` (message), `fm` (full_message), `mfm` (message or full_message), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level)
+**Log selectors:** `m` (message), `fm` (full_message), `mfm` (message or full_message), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level). Any other key is treated as a GELF additional field (no leading underscore needed — `user_id=42`, not `_user_id=42`).
+
+**Span selectors:** `sn` (span name), `sv` (service), `st` (status: `ok|error|unset`), `sk` (kind: `server|client|producer|consumer|internal`), `d>=` / `d<=` (duration ms). Log and span selectors cannot mix in a single filter — log filters apply to log queries, span filters to trace/span queries.
 
 **Special filters:** `ALL` (match everything), `NONE` (match nothing)
 
