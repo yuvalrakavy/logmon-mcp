@@ -50,11 +50,11 @@ impl From<Scope> for linux::Scope {
 pub fn install(scope: Scope) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return macos::install(scope.into());
+        macos::install(scope.into())
     }
     #[cfg(target_os = "linux")]
     {
-        return linux::install(scope.into());
+        linux::install(scope.into())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -68,11 +68,11 @@ pub fn install(scope: Scope) -> Result<()> {
 pub fn uninstall(scope: Scope) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return macos::uninstall(scope.into());
+        macos::uninstall(scope.into())
     }
     #[cfg(target_os = "linux")]
     {
-        return linux::uninstall(scope.into());
+        linux::uninstall(scope.into())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

@@ -21,33 +21,23 @@ use std::collections::HashMap;
 
 /// Log severity level. Wire format is the variant name as written
 /// (e.g. `"Info"`, `"Error"`), matching `core::gelf::message::Level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum Level {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
 }
 
-impl Default for Level {
-    fn default() -> Self {
-        Level::Info
-    }
-}
-
 /// Origin of a log entry within the pipeline. Mirrors `core::gelf::message::LogSource`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum LogSource {
+    #[default]
     Filter,
     PreTrigger,
     PostTrigger,
-}
-
-impl Default for LogSource {
-    fn default() -> Self {
-        LogSource::Filter
-    }
 }
 
 /// A single log line as the daemon emits it. Mirrors `core::gelf::message::LogEntry`.
@@ -81,9 +71,10 @@ pub struct LogEntry {
 }
 
 /// Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SpanKind {
+    #[default]
     Unspecified,
     Internal,
     Server,
@@ -92,26 +83,15 @@ pub enum SpanKind {
     Consumer,
 }
 
-impl Default for SpanKind {
-    fn default() -> Self {
-        SpanKind::Unspecified
-    }
-}
-
 /// Span status. Wire format mirrors `core::span::types::SpanStatus`:
 /// `{"type":"unset"}`, `{"type":"ok"}`, `{"type":"error","message":"..."}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "type", content = "message")]
 pub enum SpanStatus {
+    #[default]
     Unset,
     Ok,
     Error(String),
-}
-
-impl Default for SpanStatus {
-    fn default() -> Self {
-        SpanStatus::Unset
-    }
 }
 
 /// A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.

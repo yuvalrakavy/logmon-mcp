@@ -515,6 +515,31 @@ pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
     Ok(ParsedFilter::Qualifiers(qualifiers))
 }
 
+/// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
+/// Used by registration guards to reject bookmark filters and cursor filters in long-lived
+/// registered filters/triggers.
+pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| {
+            matches!(
+                q,
+                Qualifier::BookmarkFilter { .. } | Qualifier::CursorFilter { .. }
+            )
+        }),
+    }
+}
+
+/// Returns true if any qualifier in the filter is a CursorFilter.
+pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs
+            .iter()
+            .any(|q| matches!(q, Qualifier::CursorFilter { .. })),
+    }
+}
+
 #[cfg(test)]
 mod bookmark_tests {
     use super::*;
@@ -696,30 +721,5 @@ mod bookmark_tests {
         assert!(contains_bookmark_qualifier(&f));
         let f = parse_filter("l>=ERROR").unwrap();
         assert!(!contains_bookmark_qualifier(&f));
-    }
-}
-
-/// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
-/// Used by registration guards to reject bookmark filters and cursor filters in long-lived
-/// registered filters/triggers.
-pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
-    match filter {
-        ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| {
-            matches!(
-                q,
-                Qualifier::BookmarkFilter { .. } | Qualifier::CursorFilter { .. }
-            )
-        }),
-    }
-}
-
-/// Returns true if any qualifier in the filter is a CursorFilter.
-pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
-    match filter {
-        ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs
-            .iter()
-            .any(|q| matches!(q, Qualifier::CursorFilter { .. })),
     }
 }

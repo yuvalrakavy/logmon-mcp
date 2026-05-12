@@ -12,8 +12,10 @@ fn test_state_default() {
 fn test_state_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.json");
-    let mut state = DaemonState::default();
-    state.seq_block = 49000;
+    let mut state = DaemonState {
+        seq_block: 49000,
+        ..Default::default()
+    };
     state.named_sessions.insert(
         "test".to_string(),
         PersistedSession {

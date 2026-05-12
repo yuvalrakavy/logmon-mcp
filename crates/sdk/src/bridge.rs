@@ -149,7 +149,7 @@ impl DaemonBridge {
             let mut writer = self.writer.lock().await;
             transport::write_message(&mut *writer, &request)
                 .await
-                .map_err(|e| BridgeError::Transport(io::Error::new(io::ErrorKind::Other, e)))?;
+                .map_err(|e| BridgeError::Transport(io::Error::other(e)))?;
         }
         let response = rx.await.map_err(|_| BridgeError::Closed)?;
         match response.error {
