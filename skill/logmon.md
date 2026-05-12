@@ -1,286 +1,366 @@
 ---
 name: logmon
 user_invocable: true
-description: Use when debugging runtime behavior, investigating errors or crashes, examining log output, or when the user mentions logs, tracing, or asks you to check what happened. Also use when the logmon MCP server tools (get_recent_logs, get_triggers, etc.) are available. Covers any project that uses structured logging (GELF, tracing, syslog).
+description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Skip for static log files on disk, historical archives, or projects with no live telemetry pipeline.
 ---
 
-# Using the Log Monitor (logmon)
+# Using the log monitor (logmon)
 
-You have access to a log collector MCP server that receives structured logs from applications in real-time. It runs as a daemon shared across multiple Claude sessions.
+logmon is a local broker daemon that collects structured logs (GELF over UDP+TCP) and OpenTelemetry traces (OTLP over gRPC+HTTP) from running applications and serves them over a Unix domain socket. You read it via the MCP tools listed below, or via the `logmon-mcp <verb>` CLI.
 
-## Quick Commands
+Use logmon when the user wants to know **what the running program actually did**. Source-level reasoning isn't enough for those questions — open the broker first, then go back to the code.
 
-`/logmon` accepts arguments for common actions. Execute the matching action immediately:
+## When to reach for logmon
 
-- `/logmon` (no args) — call `get_recent_logs` with count 50 and summarize
-- `/logmon errors` — call `get_recent_logs` with filter `l>=ERROR` and summarize findings
-- `/logmon warnings` — call `get_recent_logs` with filter `l>=WARN` and summarize findings
-- `/logmon recent [count]` — call `get_recent_logs` with the given count (default 50)
-- `/logmon status` — call `get_status` and report
-- `/logmon clear` — call `clear_logs`
-- `/logmon fixed` — call `get_recent_logs` with filter `l>=ERROR`, count 10. If no recent errors, report "looks fixed". If errors persist, show them.
-- `/logmon watch <filter>` — call `add_filter` with the given DSL filter expression
-- `/logmon unwatch` — call `get_filters`, then remove all filters
-- `/logmon sessions` — call `get_sessions` and summarize
-- `/logmon traces` — call `get_recent_traces` and summarize
-- `/logmon slow` — call `get_slow_spans` with default threshold and summarize bottlenecks
-- `/logmon trace <trace_id>` — call `get_trace` for a specific trace ID
-- `/logmon <any DSL filter>` — if the argument looks like a filter DSL expression (contains `=`, `>=`, `/regex/`, or known selectors like `fa=`, `l>=`, `h=`, `m=`, `sn=`, `sv=`, `d>=`), call `get_recent_logs` (for log selectors) or `get_slow_spans` (for span selectors) with that filter
-- `/logmon help` — print the Quick Commands list above (do NOT call any tools)
+Reach for it when any of these are true:
 
-## Architecture
+- The user says "logs," "traces," "errors," "panic," "crash," "slow," "timeout," "what happened," "investigate," or "debug at runtime."
+- A test just failed and the failure isn't obviously in the test code.
+- A user-reported bug describes a behavior, not a code path.
+- You're about to insert `println!` / `console.log` / `print` to understand control flow — query logmon first.
 
-logmon uses a **broker + clients** architecture:
+## When NOT to reach for logmon
 
-- **logmon-broker** (daemon): Long-running process that ingests GELF (UDP/TCP) and OTLP (gRPC/HTTP), stores logs and traces in ring buffers, and serves clients over a Unix domain socket via JSON-RPC 2.0. Usually runs as a system service (`logmon-broker install-service`); the shim auto-starts it on demand if no service is installed.
-- **logmon-mcp** (shim): Thin MCP bridge. One per Claude session, all connected to the same broker.
-- **logmon-broker-sdk**: Typed Rust client SDK for non-MCP consumers (test harnesses, dashboards, archival workers). Cross-language clients can codegen from `crates/protocol/protocol-v1.schema.json`.
+Skip it (and say so) when:
 
-Multiple Claude sessions share the same broker and log buffer. Each session has its own triggers and filters; named sessions persist across disconnects.
+- The user is asking about a `.log` file on disk, or an archived log from yesterday — logmon is in-memory and live only.
+- The broker isn't running and the project doesn't ship telemetry. Don't try to invent log lines.
+- The question is purely about source structure or types — read code, not logs.
 
-## CLI alternative (Bash tool)
+## Tool selection at a glance
 
-In addition to the MCP tools above, the same operations are available as `logmon-mcp <subcommand>` invocations. This is useful when:
+| You want to … | Call |
+|---|---|
+| See the most recent activity | `get_recent_logs` |
+| Find errors / panics | `get_recent_logs(filter="l>=ERROR")` or `…mfm=panic` |
+| Investigate a known entry's context | `get_log_context(seq=N)` |
+| Find a slow request | `get_slow_spans(min_duration_ms=100)` |
+| Drill into one request end-to-end | `get_trace(trace_id=…)` |
+| Get the timing breakdown of a trace | `get_trace_summary(trace_id=…)` |
+| Compare before/after a code change | `add_bookmark` → make change → query with `b>=name` |
+| Stream "what's new since I last checked" | `c>=name` filter (cursor — see below) |
+| Get notified when X happens later | `add_trigger(filter=…, pre_window=…, post_window=…)` |
+| See the daemon's health | `get_status` |
 
-- You're in a subagent (subagents launched via the Agent tool don't inherit MCP servers).
-- The MCP server has disconnected mid-session.
-- You want to pipe output through `head`, `jq`, or `grep`.
+## Quick commands (Claude Code slash-command UX)
 
-The mapping is mechanical: `mcp__logmon__get_recent_logs` ⇔ `logmon-mcp logs recent`, `mcp__logmon__add_bookmark` ⇔ `logmon-mcp bookmarks add`, etc. See `crates/mcp/README.md` for the full reference.
+If the host is Claude Code, the user can type `/logmon <args>`. Execute the matching action immediately; don't echo the menu. The slash-command `count` defaults below (`50`, `10`) intentionally differ from `get_recent_logs`'s underlying default of `100` — pick a sensible size for the action.
 
-CLI sessions default to a named session called `"cli"`, so bookmarks and other session state persist across CLI invocations. Use `--session NAME` to isolate.
+- `/logmon` — `get_recent_logs(count=50)`, summarize.
+- `/logmon errors` — `get_recent_logs(filter="l>=ERROR")`, summarize.
+- `/logmon warnings` — `get_recent_logs(filter="l>=WARN")`, summarize.
+- `/logmon recent [count]` — `get_recent_logs(count=<count>)`, default 50.
+- `/logmon status` — `get_status`, report.
+- `/logmon clear` — `clear_logs`. Warn the user this affects every session.
+- `/logmon fixed` — `get_recent_logs(filter="l>=ERROR", count=10)`. If empty, "looks fixed"; else show.
+- `/logmon watch <filter>` — `add_filter(filter=<filter>)`.
+- `/logmon unwatch` — `get_filters`, then remove each one.
+- `/logmon sessions` — `get_sessions`, summarize.
+- `/logmon traces` — `get_recent_traces`, summarize.
+- `/logmon slow` — `get_slow_spans` with default threshold, summarize bottlenecks.
+- `/logmon trace <trace_id>` — `get_trace(trace_id=…)`.
+- `/logmon <DSL expr>` — if the argument contains `=`, `>=`, `/regex/`, or a known selector (`fa=`, `l>=`, `h=`, `m=`, `sn=`, `sv=`, `d>=`), call `get_recent_logs` (log selectors) or `get_slow_spans` (span selectors) with that filter.
+- `/logmon help` — print this list. Do **not** call any tools.
 
-## Available Tools
+On other MCP hosts (Cursor, Windsurf, Codex, etc.) the user invokes via natural language ("show me errors", "what's slow"); the rest of this document applies unchanged.
 
-### Querying Logs
+## CLI fallback
 
-- **get_recent_logs** — Fetch recent logs, optionally filtered. Use `count` (default 100) and `filter` (DSL string).
-- **get_log_context** — Get logs around a specific entry by `seq` number.
-- **export_logs** — Save logs to a file for comparison or sharing.
-- **clear_logs** — Clear the log buffer (affects ALL sessions since buffer is shared).
+The same operations are available as `logmon-mcp <subcommand>`. Use the CLI when:
 
-### Filtering
+- You're inside a subagent — agents spawned via the `Agent` tool don't inherit MCP servers.
+- The MCP connection has dropped mid-session.
+- You want to pipe through `jq`, `grep`, or `head`.
 
-- **get_filters** — List active buffer filters for this session.
-- **add_filter** — Add a buffer filter. Only matching logs are stored. Use when you want to focus on specific components.
-- **edit_filter** — Modify a filter's expression or description.
-- **remove_filter** — Remove a filter. When no filters exist, all logs are buffered.
+Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_bookmark` ↔ `logmon-mcp bookmarks add`. Add `--json` for machine-readable output. CLI invocations default to a named session called `"cli"` so state persists across calls.
 
-### Triggers
+## Architecture (one-paragraph version)
 
-- **get_triggers** — List configured triggers for this session.
-- **add_trigger** — Add a trigger that notifies you when matching logs arrive. Set `pre_window` and `post_window` for context capture.
-- **edit_trigger** — Modify a trigger's filter, windows, or description.
-- **remove_trigger** — Remove a trigger.
+`logmon-broker` is a long-running daemon that ingests GELF (UDP/TCP on `12201`) and OTLP (gRPC `4317`, HTTP `4318`), stores logs and spans in in-memory ring buffers, correlates them by `trace_id`, and serves multiple clients over `~/.config/logmon/logmon.sock` via JSON-RPC 2.0. `logmon-mcp` is the thin MCP shim — one per editor session, all sharing the same broker. Each session owns its triggers, filters, and bookmarks; named sessions persist across reconnects and daemon restarts.
+
+## Available tools
+
+### Logs
+
+- **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=100`.
+- **`get_log_context(seq, before?, after?)`** — logs around a specific entry. Use this when you have a `seq` from another query.
+- **`export_logs(path, count?, filter?, format?)`** — write matching logs to a file (`json` or `text`).
+- **`clear_logs()`** — clear the in-memory buffer. **Shared across all sessions.** Prefer bookmarks for "see only what happens next" — see below.
+
+### Filters (per-session, shape what gets stored)
+
+- **`get_filters` / `add_filter(filter, description?)` / `edit_filter(id, …)` / `remove_filter(id)`** — when any filter exists, only matching records are stored. OR semantics across filters within a session; the union across all sessions is what the broker keeps.
+
+### Triggers (per-session, push notifications)
+
+- **`get_triggers` / `add_trigger(filter, pre_window?, post_window?, notify_context?, oneshot?, description?)` / `edit_trigger(id, …)` / `remove_trigger(id)`**.
+- Defaults on every new session: `l>=ERROR` and `mfm=panic`.
+- `pre_window` captures **unfiltered** context before the match (flight recorder). `post_window` captures after. `notify_context` is how many of the pre-window entries ride along in the notification.
+- `oneshot=true` removes the trigger after the first match — useful for "tell me the next time this happens."
+
+### Bookmarks (named seq positions)
+
+- **`add_bookmark(name, start_seq?, description?, replace?)` / `list_bookmarks(session?)` / `remove_bookmark(name)` / `clear_bookmarks(session?)`**.
+- A bookmark is just a `(session, name) → seq` mapping. Two operators use it: `b>=` (pure read) and `c>=` (read-and-advance).
 
 ### Sessions
 
-- **get_sessions** — List all sessions connected to the daemon.
-- **drop_session** — Remove a named session and all its triggers/filters.
+- **`get_sessions` / `drop_session(name)`** — list connected sessions; remove a named session and its state.
 
-### Traces
+### Traces (OTLP)
 
-- **get_recent_traces** — List recent traces with timing and error info. Use `count` and `filter` (span DSL).
-- **get_trace** — Full trace detail: span tree + linked logs for a given `trace_id`.
-- **get_trace_summary** — Compact timing breakdown highlighting bottlenecks for a trace.
-- **get_slow_spans** — Find slow spans exceeding a duration threshold. Supports `group_by="name"`.
-- **get_span_context** — Get spans surrounding a specific span by `seq` number.
-- **get_trace_logs** — Get all logs linked to a trace by `trace_id`.
+- **`get_recent_traces(count?, filter?)`** — index page: trace id, root span, total duration, error flag.
+- **`get_trace(trace_id, include_logs?, filter?)`** — full span tree + linked logs. `include_logs` defaults to **`true`** — only pass `false` if you specifically want just the spans.
+- **`get_trace_summary(trace_id)`** — timing breakdown of the root span's direct children, with percentages.
+- **`get_slow_spans(min_duration_ms?, count?, filter?, group_by?)`** — slow individual spans, or aggregates when `group_by="name"`. Defaults: `min_duration_ms=100`, `count=20`.
+- **`get_span_context(seq, before?, after?)`** — spans surrounding a given span.
+- **`get_trace_logs(trace_id, filter?)`** — only the logs linked to one trace.
 
 ### Status
 
-- **get_status** — Server status: buffer size, session info, receiver ports, message stats.
-
-## Multi-Session Behavior
-
-- **Shared buffer**: All sessions read from and write to the same log buffer. `clear_logs` clears for everyone.
-- **Per-session filters**: Each session's filters determine what gets stored. The union of all sessions' filters is applied (OR semantics across sessions).
-- **Per-session triggers**: Each session has its own triggers. Default triggers (ERROR and panic) are created automatically.
-- **Named sessions**: Use `--session <name>` when starting logmon for persistent sessions that survive disconnects. Triggers and filters are preserved, and notifications are queued while disconnected.
-- **Anonymous sessions**: Default. Cleaned up on disconnect.
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts. Check the drop counts when investigating "missing logs."
 
 ## Filter DSL
 
-Filters use a comma-separated qualifier syntax (AND semantics within a filter):
+Comma-separated qualifiers, AND-ed within a filter. Multiple filters on a session OR together.
 
 | Pattern | Meaning |
-| ------- | ------- |
-| `text` | Case-insensitive substring match against all fields |
-| `/regex/` | Regex match (case-sensitive, use `/regex/i` for insensitive) |
-| `selector=pattern` | Match against a specific field |
-| `l>=LEVEL` | Level comparison (ERROR, WARN, INFO, DEBUG, TRACE) |
-| `b>=name` / `b<=name` | Bookmark filter (pure read by seq position) |
-| `c>=name` | Cursor filter (read AND advance — see "Cursors" below) |
-| `"quoted"` | Literal text (use for commas or equals in patterns) |
+|---|---|
+| `text` | case-insensitive substring against all fields |
+| `/regex/` | regex (add `/i` for case-insensitive) |
+| `selector=pattern` | match against a specific field |
+| `l>=L` / `l<=L` / `l=L` | level filter (`ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`) |
+| `b>=name` / `b<=name` | match records strictly after / before the bookmark's seq |
+| `c>=name` | cursor: same as `b>=` but advances the bookmark to the highest returned seq |
+| `"quoted"` | literal — use when the value contains commas or `=` |
+| `ALL` / `NONE` | match everything / nothing |
 
-**Selectors:** `m` (message), `fm` (full_message), `mfm` (message or full_message), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level), or any custom GELF field name.
+Only `>=` and `<=` are accepted for `b`, `d`, and `l`; only `>=` for `c` (`c<=` is rejected by the parser). The level filter additionally allows `l=` for an exact match.
 
-**Examples:**
+> **Off-by-one note:** despite the `>=` / `<=` syntax, `b>=name` matches records with seq **strictly greater** than the bookmark's seq, and `b<=name` strictly less. The bookmark's own record is never included on either side. Same applies to `c>=`.
 
-- `l>=ERROR` — all errors
-- `fa=mqtt,l>=WARN` — warnings+ from MQTT module
-- `connection refused,h=myapp` — connection errors from myapp
-- `/panic|unwrap failed/` — regex for panics
+**Log selectors:** `m` (message), `fm` (full_message), `mfm` (either), `h` (host), `fa` (facility), `fi` (file), `ln` (line), `l` (level). Any other selector (e.g. `user_id`, `request_id`) is treated as a GELF additional field — drop the leading underscore that GELF uses on the wire (`user_id=42`, not `_user_id=42`).
 
-## Bookmarks
+**Span selectors:** `sn` (span name), `sv` (service), `st` (status: `ok|error|unset`), `sk` (kind: `server|client|producer|consumer|internal`), `d>=` / `d<=` (duration ms).
 
-Use bookmarks instead of `clear_logs` when you want a clear before/after boundary for an operation but still need the prior history.
+Log selectors and span selectors **cannot mix in the same filter** — they target different stores. Log filters apply to `get_recent_logs`, `get_log_context`, `export_logs`, `get_trace_logs`; span filters apply to `get_recent_traces`, `get_slow_spans`, `get_span_context`, and to the `filter` argument of `get_trace`.
 
-**When to reach for bookmarks:**
-
-- Before starting a flaky operation you want to inspect — you can query just that range later instead of wading through everything.
-- When comparing two attempts of the same operation — bookmark each attempt's start, then query the two ranges side by side.
-- Whenever you'd otherwise reach for `clear_logs` to "see only what happens next" — bookmarks give you the same scoping without losing history.
-
-**Tools:**
-
-- `add_bookmark(name)` — drops a bookmark at the current moment. Pass `replace: true` to overwrite an existing bookmark with the same name.
-- `list_bookmarks()` — shows all live bookmarks, newest first. Optional `session` param to filter.
-- `remove_bookmark(name)` — removes a bookmark. Bare name = current session; `session/name` for cross-session.
-
-**DSL operators:**
-
-Bookmarks plug into the filter DSL as comparison qualifiers, just like `l>=warn` and `d>=100`. Bookmark positions are seq numbers (the broker's globally-monotonic record id), not timestamps:
-
-- `b>=name` — entries with seq strictly greater than the bookmark's seq (pure read)
-- `b<=name` — entries with seq strictly less than the bookmark's seq (pure read)
-- `c>=name` — same filter as `b>=`, BUT atomically advances the bookmark to the max seq returned (read-and-advance — see "Cursors" below)
-- `b>=other-session/name` — reach into another session's bookmarks (pure-read across sessions allowed; `c>=other/name` is rejected — only the owning session can advance)
-
-Combine freely:
+Examples:
 
 ```
-get_recent_logs(filter="b>=before, b<=after, l>=warn")
-get_recent_traces(filter="b>=before, d>=100")
-get_trace_logs(trace_id="...", filter="b>=before")
+l>=ERROR                      all errors and worse
+fa=mqtt, l>=WARN              warnings+ from the mqtt facility
+connection refused, h=myapp   substring match + host
+/panic|unwrap failed/         regex for panics
+m="POST /users, 200"          literal — needed because of the comma
+user_id=42, l>=WARN           custom GELF field, no underscore prefix
+sn=query_database, d>=100     spans named query_database taking ≥100 ms
+sv=auth, st=error             error spans from the auth service
+b>=before, b<=after           records strictly between two bookmarks
+c>=test-run-abc               records since last poll, advances the cursor
 ```
 
-**Naming and lifetime:**
+## Bookmarks: when and how
 
-Bookmarks are global across sessions and stored as `{session_name}/{name}`. Two sessions can both have a bookmark called `before` — they're stored as `A/before` and `B/before` and don't collide. Inside *your* session, a bare `before` means `your-session/before`.
+Use a bookmark instead of `clear_logs` when you want a clear before/after boundary but don't want to lose history.
 
-Bookmarks auto-evict when both the log buffer *and* the span buffer have rolled past their seq. You cannot end up with a stale bookmark pointing at data that no longer exists.
+Reach for them when:
 
-**Restrictions:**
-
-`b>=`, `b<=`, and `c>=` are query-only — they're rejected by `add_filter` and `add_trigger`. Bookmarks anchor a moment in the seq stream; they don't make sense in long-lived registered filters.
-
-## Cursors (read-and-advance bookmarks)
-
-A cursor is a bookmark used via the `c>=` operator instead of `b>=`. Every read advances the bookmark to the max seq returned, so the next read returns only what's new since the previous one. Use cursors when you want "what's new since I last checked" without threading checkpoint values through your own code.
-
-**The same bookmark can be used either way.** `b>=name` reads without moving; `c>=name` reads and advances. There's no flag on the bookmark itself — the operator picks the operation.
-
-**Tools (no new ones — cursors piggyback on bookmarks):**
-
-- `add_bookmark(name)` — explicit creation. Defaults to "stream from now" (`start_seq` = current seq counter), so the next `c>=name` returns only records arriving after this call.
-- `c>=name` on a name you never added — auto-creates the bookmark at `seq = 0`, so the first read returns everything currently in the buffer matching the rest of the filter.
-- `add_bookmark(name, replace=true)` — reset an existing cursor (snaps to current seq counter, skipping any unread records).
-- `list_bookmarks()` — shows the current seq position; useful for inspecting where a cursor is at without advancing it.
-- `remove_bookmark(name)` — delete.
-
-**Where `c>=` is allowed:**
-
-- ✅ `get_recent_logs`, `export_logs`, `get_trace_logs`
-- ❌ `get_log_context`, `get_recent_traces`, `get_trace_summary`, `get_slow_spans`, `get_trace`, `get_span_context` — their results are anchor-driven or aggregated, not seq-streamable.
-
-**Result ordering with cursors:**
-
-When a `c>=` qualifier is present, results come back oldest-first within the cursor's window so paginated polls drain monotonically. (Without `c>=`, results are newest-first as today.) Combine with `count` to page through a large delta:
+- You're about to start a flaky operation and want to inspect just that range later.
+- You're comparing two attempts at the same operation — bookmark each attempt's start.
+- You'd otherwise call `clear_logs` to "see only what happens next."
 
 ```
-# Drain everything matching, in seq order, in pages of 500
+add_bookmark("before-deploy")
+# … run the operation …
+add_bookmark("after-deploy")
+get_recent_logs(filter="b>=before-deploy, b<=after-deploy, l>=warn")
+get_recent_traces(filter="b>=before-deploy, b<=after-deploy, d>=100")
+```
+
+Naming: bookmarks are stored as `{session}/{name}`. Bare `before` in a query resolves to your own session; `other/before` reaches into another session's bookmarks (pure-read across sessions is fine; cross-session **advance** with `c>=` is rejected).
+
+`b>=`, `b<=`, and `c>=` are query-only — rejected by `add_filter` and `add_trigger`.
+
+## Cursors: "what's new since I last checked"
+
+A cursor is a bookmark used with `c>=` instead of `b>=`. Every read with `c>=` atomically advances the bookmark to the highest seq returned, so the next read sees only what's new. No checkpoint state to thread through your own code.
+
+```
+# First call — if the bookmark doesn't exist, it's auto-created at seq=0,
+# so this returns everything currently in the buffer matching the filter.
+get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
+
+# Subsequent calls — only the delta since the previous call.
+get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
+```
+
+Results are returned **oldest-first** when `c>=` is present, so a paginated drain stays monotonic.
+
+`c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Rejected in `get_log_context`, `get_recent_traces`, `get_trace_summary`, `get_slow_spans`, `get_trace`, and `get_span_context` — their results are anchor-driven or aggregated, not seq-streamable. Only one `c>=` per filter.
+
+To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter.
+
+## Triggers vs bookmarks: which one?
+
+| Use a bookmark when… | Use a trigger when… |
+|---|---|
+| You know roughly when the interesting thing happens and want to query that range later. | You don't know when it'll happen and want to be told. |
+| You're doing a manual before/after comparison. | You want pre/post context captured automatically around the event. |
+| You're polling regularly (cursor). | You want push notifications. |
+
+A bookmark is passive metadata; a trigger is an active watcher with windowed context capture.
+
+## Worked patterns
+
+### Pattern: debug a specific module
+
+```
+result = add_filter(filter="fa=<module>")   # returns the new filter's id
+# … ask the user to reproduce …
+get_recent_logs(count=100)                  # examine
+remove_filter(id=result.id)                  # restore full capture when done
+```
+
+(`add_filter`, `add_trigger`, and `add_bookmark` accept either positional or named arguments; this skill uses named for clarity.)
+
+### Pattern: before/after a change
+
+```
+add_bookmark("before-change")
+# … make the change, restart the service, etc …
+get_recent_logs(filter="b>=before-change, l>=warn")
+get_recent_traces(filter="b>=before-change, d>=100")
+```
+
+### Pattern: catch the next occurrence of a rare event
+
+```
+add_trigger(
+    filter   = "mfm=connection refused, fa=db",
+    pre_window  = 500,
+    post_window = 200,
+    notify_context = 10,
+    oneshot = true,
+)
+# Continue working. When it fires, you'll be notified with surrounding context.
+```
+
+### Pattern: investigate a slow request end-to-end
+
+```
+get_slow_spans(min_duration_ms=200, group_by="name")
+# ↑ pick a span name that stands out, then find a specific trace:
+get_recent_traces(filter="sn=<that-name>, d>=200", count=5)
+# ↑ note a trace_id, then:
+get_trace_summary(trace_id="<id>")        # where did the time go?
+get_trace(trace_id="<id>")                 # full span tree + logs interleaved
+```
+
+### Pattern: log + trace correlation in one shot
+
+This pattern only works when the application is exporting OTel traces **and** emitting logs (GELF or otherwise) with a `trace_id` field — e.g. `tracing-init`'s GELF layer, OTel auto-instrumented HTTP middleware, etc. If logs don't carry a trace id, fall back to timestamp-based correlation.
+
+When a user reports "this request was broken" and gives you a `trace_id`:
+
+```
+get_trace(trace_id="<id>")     # include_logs defaults to true
+# Returns the span tree AND every log line linked to that trace.
+# Now you have timing AND log context in one response.
+```
+
+When they only give you a timestamp or symptom, find the trace first:
+
+```
+get_recent_logs(filter="l>=ERROR, h=<host>")     # find the error log
+# Note the trace_id field on the matching entry, then:
+get_trace(trace_id="<that_id>")
+```
+
+### Pattern: paginated drain of a long burst
+
+```
 loop:
     r = get_recent_logs(filter="c>=drain, l>=warn", count=500)
     if r.logs is empty: break
     process(r.logs)
+# Cursor auto-advances each call; oldest-first ordering keeps it monotonic.
 ```
 
-**Eviction quirk:**
-
-If a cursor sits idle long enough that the buffer rolls past its seq, the entry evicts. The next `c>=name` reference auto-recreates at `seq = 0` and returns the entire current buffer — a sudden flood instead of a delta. The broker logs at WARN when this happens. For long-running cursors against high-churn workloads, bump `buffer_size` so the cursor doesn't outpace ingestion, or poll often enough to keep it alive.
-
-**One cursor per filter:**
-
-Multiple `c>=` qualifiers in one filter (`c>=foo, c>=bar`) are rejected at parse time — both would advance to the same seq, defeating the purpose of two distinct cursors. Bookmark *read* qualifiers (`b>=`, `b<=`) can appear any number of times alongside a `c>=`.
-
-**Per-test usage pattern (from store-test design):**
+### Pattern: zoom in on the context around an error
 
 ```
-# At test start (optional — auto-create works too):
-add_bookmark("test-foo-run-abc123")  # stream from now
-
-# During the test, poll for new errors:
-get_recent_logs(filter="c>=test-foo-run-abc123, l>=ERROR")
-
-# At test end:
-get_recent_logs(filter="c>=test-foo-run-abc123")  # everything new since last poll
-remove_bookmark("test-foo-run-abc123")  # cleanup (auto-evicts if you forget)
+r = get_recent_logs(filter="l>=ERROR", count=5)   # find the error(s)
+# Each entry carries a `seq`. Pick the one you care about:
+get_log_context(seq=r.logs[0].seq, before=20, after=10)
+# Returns 20 entries before and 10 after, regardless of level/filter —
+# the full unfiltered run-up to and recovery from the error.
 ```
 
-## Workflow Tips
+### Pattern: comparing two test attempts
 
-### Debugging a specific component
+```
+add_bookmark("attempt-1-start")
+# … run test attempt 1 …
+add_bookmark("attempt-1-end")
+add_bookmark("attempt-2-start")
+# … run test attempt 2 …
+add_bookmark("attempt-2-end")
 
-1. `add_filter` with `fa=<module>` to focus on that module
-2. Ask the user to reproduce the issue
-3. `get_recent_logs` to examine what happened
-4. `remove_filter` when done to go back to capturing everything
+get_recent_logs(filter="b>=attempt-1-start, b<=attempt-1-end")  # 1's logs
+get_recent_logs(filter="b>=attempt-2-start, b<=attempt-2-end")  # 2's logs
+```
 
-### Before/after comparison
+## When things look wrong
 
-1. `clear_logs` to start fresh
-2. `export_logs` with path for "before" state
-3. Make changes
-4. `export_logs` with a different path for "after" state
-5. Compare the two files
+### "I'm getting zero logs back"
 
-### Monitoring across sessions
+In order:
 
-1. Use `get_sessions` to see what other sessions are connected
-2. Named sessions (`--session debug`) let you keep triggers/filters across reconnects
-3. Use `drop_session` to clean up stale named sessions
+1. `get_status` — is the broker even running? Is uptime sensible? Are receivers listed?
+2. Does the application emit telemetry yet? Many projects send GELF only after a feature flag flips. Ask the user to trigger an action that should produce a log.
+3. Is a filter narrowing the buffer? `get_filters` — if filters exist, the buffer only stores matches. Remove them or widen.
+4. Did someone (you, another session) call `clear_logs`? The buffer is shared.
+5. Check `receiver_drops` on `get_status`. Non-zero means the receivers couldn't keep up — the user's app is over-producing; suggest bumping `buffer_size` in `~/.config/logmon/config.json`.
 
-### Investigating slowness
-1. `get_slow_spans` to find bottleneck spans
-2. `get_trace_summary` on the affected trace for timing breakdown
-3. `get_trace` for the full span tree with linked logs
-4. To compare: `get_recent_traces` to find a fast trace for the same endpoint, compare both summaries
+### "My cursor returned a huge unexpected flood"
 
-### Following a request through the system
-1. Find the request in `get_recent_traces`
-2. `get_trace` to see the full span tree with logs interleaved
-3. `get_trace_logs` with a filter to focus on specific log types within the trace
+A cursor was idle long enough that its seq fell off the ring buffer. The broker auto-recreated it at `seq=0`, so it returned the entire current buffer. A WARN-level log entry was emitted by the broker noting the rollover. Either poll the cursor more often or raise `buffer_size`.
 
-### When you receive a trigger notification
+### "A trigger isn't firing"
 
-The notification includes `context_before` entries and the matched log. Use `get_log_context` with the matched entry's `seq` to get more surrounding context if needed.
+1. Triggers evaluate **every** incoming log, regardless of filters. So a filter isn't the cause.
+2. Triggers skip evaluation during another trigger's `post_window` to prevent cascading. If two triggers want overlapping events, expect coalescing.
+3. CLI mode invocations can't receive trigger fires — the CLI process exits before any log can match. Use the MCP shim or the SDK for that.
+4. Confirm the trigger exists: `get_triggers`.
+5. Verify the filter actually matches incoming logs by trying the same filter in `get_recent_logs`.
 
-## Important Notes
+### "The broker isn't running"
 
-- Triggers always evaluate every incoming log, even when filters are active
-- The pre-trigger buffer captures ALL logs regardless of filters — when a trigger fires, you get unfiltered context before the event
-- Post-trigger windows also bypass filters, capturing the aftermath
-- Logs during a post-trigger window skip trigger evaluation (prevents cascading)
-- The daemon listens on GELF UDP/TCP (default port 12201) and OTLP gRPC/HTTP (default ports 4317/4318)
-- Applications can send telemetry via GELF or OpenTelemetry (OTLP)
-- OTLP provides both logs and traces (spans) — enabling request-level debugging
-- Config is stored in `~/.config/logmon/`
+If the MCP shim is connected, the broker is running by definition. If you're hitting the CLI and seeing "broker not running":
 
-## Span Filter DSL
+```
+logmon-broker status                       # check
+logmon-broker install-service --scope user # install as launchd/systemd, start
+```
 
-Span filters use the same comma-separated syntax but with span-specific selectors:
+Don't suggest editing `~/.config/logmon/state.json` or `daemon.pid` by hand unless the user explicitly asks — those are managed.
 
-| Selector | Field | Example |
-| -------- | ----- | ------- |
-| `sn` | span name | `sn=query_database` |
-| `sv` | service name | `sv=store_server` |
-| `st` | status | `st=error` |
-| `sk` | span kind | `sk=server` |
-| `d>=` / `d<=` | duration (ms) | `d>=100` |
+### "I cleared logs and now I have no context"
 
-Cannot mix log selectors and span selectors in the same filter.
+`clear_logs` is shared across all sessions and destructive. There's no undo. Going forward, prefer `add_bookmark("checkpoint")` + `b>=checkpoint` for scoped queries — same outcome, no data loss, and other sessions aren't affected.
 
-## SDK consumers (forward link)
+## Multi-session behavior
 
-For non-MCP clients (test harnesses, archival workers, dashboards), see the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). The first SDK consumer outside this repo is `store-test` — see Spec B handoff at `docs/superpowers/specs/2026-04-30-store-test-integration-handoff.md` for the integration brief.
+- **Shared:** the log/span ring buffers, the receivers, `clear_logs`.
+- **Per-session:** triggers, filters, bookmarks, queued notifications.
+- **Anonymous sessions** (no `--session` flag): cleaned up on disconnect.
+- **Named sessions** (`logmon-mcp --session NAME`): persist across disconnect; trigger fires queue while disconnected and replay on reconnect; state survives daemon restart via `state.json`.
+
+Filters are unioned across sessions (the broker stores anything any session's filters match), so adding a narrow filter in your session doesn't hide records from another session — but if every session has a narrow filter, only the union is stored.
+
+## SDK consumers (non-MCP)
+
+For test harnesses, dashboards, archival workers, anything that isn't an MCP client, point them at the typed Rust SDK at `crates/sdk` (`logmon-broker-sdk`). The SDK speaks the same JSON-RPC protocol, builds filter strings without manual escaping, and includes a reconnect state machine for named sessions. Cross-language clients can codegen from `crates/protocol/protocol-v1.schema.json` (drift-guarded by `cargo xtask verify-schema`).
+
+If a user mentions building a custom integration, redirect them to `crates/sdk/README.md` rather than wrapping the MCP shim.
