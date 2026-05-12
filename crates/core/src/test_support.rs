@@ -183,9 +183,7 @@ impl TestDaemonHandle {
                 .await
                 .is_err()
             {
-                tracing::warn!(
-                    "test daemon did not shut down within 5s; aborting task"
-                );
+                tracing::warn!("test daemon did not shut down within 5s; aborting task");
                 abort_handle.abort();
             }
         }

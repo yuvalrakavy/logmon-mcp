@@ -133,11 +133,7 @@ impl SessionState {
             name: self.name.clone(),
             connected: self.connected.load(Ordering::Relaxed),
             trigger_count: self.triggers.list().len(),
-            filter_count: self
-                .filters
-                .read()
-                .expect("filters lock poisoned")
-                .len(),
+            filter_count: self.filters.read().expect("filters lock poisoned").len(),
             queue_size: self
                 .notification_queue
                 .lock()

@@ -1,5 +1,5 @@
 use crate::gelf::message::Level;
-use chrono::{DateTime, Utc, TimeZone};
+use chrono::{DateTime, TimeZone, Utc};
 
 /// Map OTLP severity_number to our Level enum.
 /// OTLP severity: 1-4=Trace, 5-8=Debug, 9-12=Info, 13-16=Warn, 17-24=Error/Fatal
@@ -20,7 +20,11 @@ pub fn bytes_to_trace_id(bytes: &[u8]) -> Option<u128> {
         return None;
     }
     let val = u128::from_be_bytes(bytes.try_into().ok()?);
-    if val == 0 { None } else { Some(val) }
+    if val == 0 {
+        None
+    } else {
+        Some(val)
+    }
 }
 
 /// Convert 8-byte span_id to u64. Returns None if empty or all zeros.
@@ -29,14 +33,20 @@ pub fn bytes_to_span_id(bytes: &[u8]) -> Option<u64> {
         return None;
     }
     let val = u64::from_be_bytes(bytes.try_into().ok()?);
-    if val == 0 { None } else { Some(val) }
+    if val == 0 {
+        None
+    } else {
+        Some(val)
+    }
 }
 
 /// Convert nanosecond timestamp to DateTime<Utc>.
 pub fn nanos_to_datetime(nanos: u64) -> DateTime<Utc> {
     let secs = (nanos / 1_000_000_000) as i64;
     let nsecs = (nanos % 1_000_000_000) as u32;
-    Utc.timestamp_opt(secs, nsecs).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_opt(secs, nsecs)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 /// Extract service.name and host.name from key-value pairs.

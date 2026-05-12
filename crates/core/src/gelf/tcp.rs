@@ -1,7 +1,7 @@
 use crate::gelf::message::{parse_gelf_message, LogEntry};
 use crate::receiver::{ReceiverMetrics, ReceiverSource};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -114,16 +114,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn full_channel_does_not_park_tcp_listener() {
         let (sender, _rx) = mpsc::channel(1);
-        sender.try_send(crate::gelf::message::LogEntry {
-            seq: 0, timestamp: chrono::Utc::now(),
-            level: crate::gelf::message::Level::Info,
-            message: "filler".into(), full_message: None,
-            host: "h".into(), facility: None, file: None, line: None,
-            additional_fields: std::collections::HashMap::new(),
-            trace_id: None, span_id: None,
-            matched_filters: vec![],
-            source: crate::gelf::message::LogSource::Filter,
-        }).unwrap();
+        sender
+            .try_send(crate::gelf::message::LogEntry {
+                seq: 0,
+                timestamp: chrono::Utc::now(),
+                level: crate::gelf::message::Level::Info,
+                message: "filler".into(),
+                full_message: None,
+                host: "h".into(),
+                facility: None,
+                file: None,
+                line: None,
+                additional_fields: std::collections::HashMap::new(),
+                trace_id: None,
+                span_id: None,
+                matched_filters: vec![],
+                source: crate::gelf::message::LogSource::Filter,
+            })
+            .unwrap();
 
         let metrics = Arc::new(ReceiverMetrics::new());
         let handle = start_tcp_listener("127.0.0.1:0", sender, metrics.clone())
@@ -131,8 +139,11 @@ mod tests {
             .unwrap();
         let port = handle.port();
 
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-        let payload = br#"{"version":"1.1","host":"h","short_message":"x","level":6,"timestamp":1.0}"#;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let payload =
+            br#"{"version":"1.1","host":"h","short_message":"x","level":6,"timestamp":1.0}"#;
         for _ in 0..50 {
             stream.write_all(payload).await.unwrap();
             stream.write_all(&[0u8]).await.unwrap();
@@ -143,6 +154,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         let snap = metrics.snapshot();
-        assert!(snap.gelf_tcp >= 1, "expected at least one drop, got {:?}", snap);
+        assert!(
+            snap.gelf_tcp >= 1,
+            "expected at least one drop, got {:?}",
+            snap
+        );
     }
 }

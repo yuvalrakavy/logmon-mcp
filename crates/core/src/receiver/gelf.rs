@@ -23,8 +23,7 @@ impl GelfReceiver {
     ) -> anyhow::Result<Self> {
         let udp_handle =
             udp::start_udp_listener(&config.udp_addr, sender.clone(), metrics.clone()).await?;
-        let tcp_handle =
-            tcp::start_tcp_listener(&config.tcp_addr, sender, metrics).await?;
+        let tcp_handle = tcp::start_tcp_listener(&config.tcp_addr, sender, metrics).await?;
         Ok(Self {
             udp_handle,
             tcp_handle,

@@ -209,7 +209,9 @@ struct GetTraceLogsParams {
 
 #[rmcp::tool_router]
 impl GelfMcpServer {
-    #[rmcp::tool(description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics")]
+    #[rmcp::tool(
+        description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics"
+    )]
     async fn get_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -223,7 +225,9 @@ impl GelfMcpServer {
 
     // ---- Log Query Tools ----
 
-    #[rmcp::tool(description = "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression.")]
+    #[rmcp::tool(
+        description = "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression."
+    )]
     async fn get_recent_logs(
         &self,
         Parameters(p): Parameters<GetRecentLogsParams>,
@@ -245,7 +249,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Get log entries surrounding a specific entry identified by seq number. Returns context before and after.")]
+    #[rmcp::tool(
+        description = "Get log entries surrounding a specific entry identified by seq number. Returns context before and after."
+    )]
     async fn get_log_context(
         &self,
         Parameters(p): Parameters<GetLogContextParams>,
@@ -345,7 +351,9 @@ impl GelfMcpServer {
 
     // ---- Filter Management Tools ----
 
-    #[rmcp::tool(description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored.")]
+    #[rmcp::tool(
+        description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored."
+    )]
     async fn get_filters(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -357,7 +365,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Add a new buffer filter. Logs matching this filter will be stored. Uses OR semantics with existing filters.")]
+    #[rmcp::tool(
+        description = "Add a new buffer filter. Logs matching this filter will be stored. Uses OR semantics with existing filters."
+    )]
     async fn add_filter(
         &self,
         Parameters(p): Parameters<AddFilterParams>,
@@ -422,7 +432,9 @@ impl GelfMcpServer {
 
     // ---- Trigger Management Tools ----
 
-    #[rmcp::tool(description = "List all triggers. Triggers capture a window of logs around matching entries and emit notifications.")]
+    #[rmcp::tool(
+        description = "List all triggers. Triggers capture a window of logs around matching entries and emit notifications."
+    )]
     async fn get_triggers(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -434,7 +446,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Add a new trigger. When a log matches the filter, the pre/post windows are captured and a notification is emitted.")]
+    #[rmcp::tool(
+        description = "Add a new trigger. When a log matches the filter, the pre/post windows are captured and a notification is emitted."
+    )]
     async fn add_trigger(
         &self,
         Parameters(p): Parameters<AddTriggerParams>,
@@ -458,7 +472,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Edit an existing trigger by ID. Only the provided fields are updated.")]
+    #[rmcp::tool(
+        description = "Edit an existing trigger by ID. Only the provided fields are updated."
+    )]
     async fn edit_trigger(
         &self,
         Parameters(p): Parameters<EditTriggerParams>,
@@ -636,7 +652,9 @@ impl GelfMcpServer {
 
     // ---- Bookmark Tools ----
 
-    #[rmcp::tool(description = "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs.")]
+    #[rmcp::tool(
+        description = "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs."
+    )]
     async fn add_bookmark(
         &self,
         Parameters(p): Parameters<AddBookmarkParams>,
@@ -657,7 +675,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "List all live bookmarks across all sessions, newest first. Optionally filter by session name.")]
+    #[rmcp::tool(
+        description = "List all live bookmarks across all sessions, newest first. Optionally filter by session name."
+    )]
     async fn list_bookmarks(
         &self,
         Parameters(p): Parameters<ListBookmarksParams>,
@@ -675,17 +695,16 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Remove a bookmark by name. Bare name resolves to the current session; use 'session/name' to remove a bookmark from another session.")]
+    #[rmcp::tool(
+        description = "Remove a bookmark by name. Bare name resolves to the current session; use 'session/name' to remove a bookmark from another session."
+    )]
     async fn remove_bookmark(
         &self,
         Parameters(p): Parameters<RemoveBookmarkParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
-            .call(
-                "bookmarks.remove",
-                serde_json::json!({ "name": p.name }),
-            )
+            .call("bookmarks.remove", serde_json::json!({ "name": p.name }))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
@@ -693,7 +712,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Clear all bookmarks for a session at once. Defaults to the calling session. Useful for iterative debugging workflows: wipe all bookmarks, re-add fresh ones, repeat. Pass an explicit session name to clear another session's bookmarks.")]
+    #[rmcp::tool(
+        description = "Clear all bookmarks for a session at once. Defaults to the calling session. Useful for iterative debugging workflows: wipe all bookmarks, re-add fresh ones, repeat. Pass an explicit session name to clear another session's bookmarks."
+    )]
     async fn clear_bookmarks(
         &self,
         Parameters(p): Parameters<ClearBookmarksParams>,

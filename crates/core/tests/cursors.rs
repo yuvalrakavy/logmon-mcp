@@ -6,9 +6,7 @@
 #![cfg(feature = "test-support")]
 
 use logmon_broker_core::test_support::*;
-use logmon_broker_protocol::{
-    BookmarksAddResult, BookmarksListResult,
-};
+use logmon_broker_protocol::{BookmarksAddResult, BookmarksListResult};
 use serde_json::json;
 use std::fs;
 
@@ -30,10 +28,7 @@ async fn add_bookmark_with_explicit_start_seq() {
         .unwrap();
     assert_eq!(added.seq, 42);
 
-    let list: BookmarksListResult = client
-        .call("bookmarks.list", json!({}))
-        .await
-        .unwrap();
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
     let entry = list
         .bookmarks
         .iter()
@@ -49,19 +44,13 @@ async fn add_bookmark_replace_overwrites() {
     let mut client = daemon.connect_anon().await;
 
     let _: BookmarksAddResult = client
-        .call(
-            "bookmarks.add",
-            json!({ "name": "x", "start_seq": 1 }),
-        )
+        .call("bookmarks.add", json!({ "name": "x", "start_seq": 1 }))
         .await
         .unwrap();
 
     // Without `replace: true`, a duplicate must error.
     let err: Result<BookmarksAddResult, _> = client
-        .call(
-            "bookmarks.add",
-            json!({ "name": "x", "start_seq": 2 }),
-        )
+        .call("bookmarks.add", json!({ "name": "x", "start_seq": 2 }))
         .await;
     assert!(err.is_err());
 
@@ -74,10 +63,7 @@ async fn add_bookmark_replace_overwrites() {
         .await
         .unwrap();
 
-    let list: BookmarksListResult = client
-        .call("bookmarks.list", json!({}))
-        .await
-        .unwrap();
+    let list: BookmarksListResult = client.call("bookmarks.list", json!({})).await.unwrap();
     let entry = list
         .bookmarks
         .iter()
@@ -183,9 +169,14 @@ async fn bookmark_persists_across_restart() {
 async fn c_ge_rejected_in_traces_recent() {
     let daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_anon().await;
-    let result: Result<serde_json::Value, _> = client.call("traces.recent", json!({
-        "filter": "c>=mycur"
-    })).await;
+    let result: Result<serde_json::Value, _> = client
+        .call(
+            "traces.recent",
+            json!({
+                "filter": "c>=mycur"
+            }),
+        )
+        .await;
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
 }
@@ -194,10 +185,15 @@ async fn c_ge_rejected_in_traces_recent() {
 async fn c_ge_rejected_in_traces_get() {
     let daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_anon().await;
-    let result: Result<serde_json::Value, _> = client.call("traces.get", json!({
-        "trace_id": "00000000000000000000000000000001",
-        "filter": "c>=mycur"
-    })).await;
+    let result: Result<serde_json::Value, _> = client
+        .call(
+            "traces.get",
+            json!({
+                "trace_id": "00000000000000000000000000000001",
+                "filter": "c>=mycur"
+            }),
+        )
+        .await;
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
 }
@@ -206,9 +202,14 @@ async fn c_ge_rejected_in_traces_get() {
 async fn c_ge_rejected_in_traces_slow() {
     let daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_anon().await;
-    let result: Result<serde_json::Value, _> = client.call("traces.slow", json!({
-        "filter": "c>=mycur"
-    })).await;
+    let result: Result<serde_json::Value, _> = client
+        .call(
+            "traces.slow",
+            json!({
+                "filter": "c>=mycur"
+            }),
+        )
+        .await;
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
 }
@@ -227,10 +228,7 @@ async fn c_ge_rejected_in_logs_recent_with_trace_id() {
         )
         .await;
     let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("cursor qualifier not permitted"),
-        "got: {err}"
-    );
+    assert!(err.contains("cursor qualifier not permitted"), "got: {err}");
 }
 
 // ---------------------------------------------------------------------------

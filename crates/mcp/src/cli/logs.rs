@@ -1,9 +1,7 @@
 //! `logs` subcommand group: recent, context, export, clear.
 
 use clap::{Args, Subcommand};
-use logmon_broker_protocol::{
-    LogEntry, LogsClear, LogsContext, LogsExport, LogsRecent,
-};
+use logmon_broker_protocol::{LogEntry, LogsClear, LogsContext, LogsExport, LogsRecent};
 use logmon_broker_sdk::Broker;
 
 use super::format;
@@ -50,7 +48,11 @@ enum LogsVerb {
 
 pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
     match cmd.verb {
-        LogsVerb::Recent { count, filter, trace_id } => {
+        LogsVerb::Recent {
+            count,
+            filter,
+            trace_id,
+        } => {
             let params = LogsRecent {
                 count: Some(count),
                 filter,
@@ -58,9 +60,15 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
             };
             let result = match broker.logs_recent(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("logs.recent failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("logs.recent failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             let blocks: Vec<String> = result.logs.iter().map(format_entry).collect();
             format::print_blocks(blocks, "(no logs)");
             if let Some(seq) = result.cursor_advanced_to {
@@ -76,9 +84,15 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
             };
             let result = match broker.logs_context(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("logs.context failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("logs.context failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             let blocks: Vec<String> = result.logs.iter().map(format_entry).collect();
             format::print_blocks(blocks, "(no logs)");
             0
@@ -87,7 +101,10 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
             let params = LogsExport { count, filter };
             let result = match broker.logs_export(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("logs.export failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("logs.export failed: {e}"), json);
+                    return 1;
+                }
             };
 
             // Render the output payload first, then redirect to file or stdout.
@@ -120,9 +137,15 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
         LogsVerb::Clear => {
             let result = match broker.logs_clear(LogsClear {}).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("logs.clear failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("logs.clear failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             println!("cleared {} log entries", result.cleared);
             0
         }

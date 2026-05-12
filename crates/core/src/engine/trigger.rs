@@ -1,7 +1,10 @@
-use crate::filter::parser::{ParsedFilter, parse_filter, FilterParseError};
 use crate::filter::matcher::matches_entry;
+use crate::filter::parser::{parse_filter, FilterParseError, ParsedFilter};
 use crate::gelf::message::LogEntry;
-use std::sync::{RwLock, atomic::{AtomicU32, AtomicU64, Ordering}};
+use std::sync::{
+    atomic::{AtomicU32, AtomicU64, Ordering},
+    RwLock,
+};
 use thiserror::Error;
 
 /// Info snapshot of a trigger (for listing/returning to callers)
@@ -258,12 +261,20 @@ mod tests {
 
     fn make_entry(level: Level, msg: &str) -> LogEntry {
         LogEntry {
-            seq: 1, timestamp: Utc::now(), level,
-            message: msg.to_string(), full_message: None,
-            host: "test".into(), facility: None, file: None, line: None,
+            seq: 1,
+            timestamp: Utc::now(),
+            level,
+            message: msg.to_string(),
+            full_message: None,
+            host: "test".into(),
+            facility: None,
+            file: None,
+            line: None,
             additional_fields: HashMap::new(),
-            trace_id: None, span_id: None,
-            matched_filters: Vec::new(), source: LogSource::Filter,
+            trace_id: None,
+            span_id: None,
+            matched_filters: Vec::new(),
+            source: LogSource::Filter,
         }
     }
 

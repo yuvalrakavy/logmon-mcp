@@ -2,8 +2,8 @@ use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::engine::pipeline::LogPipeline;
 use crate::receiver::ReceiverMetrics;
-use logmon_broker_protocol::*;
 use crate::span::store::SpanStore;
+use logmon_broker_protocol::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -125,7 +125,9 @@ impl RpcHandler {
         ),
         String,
     > {
-        let Some(s) = filter_str else { return Ok((None, None)) };
+        let Some(s) = filter_str else {
+            return Ok((None, None));
+        };
         if s.trim().is_empty() {
             return Ok((None, None));
         }
@@ -139,11 +141,7 @@ impl RpcHandler {
         Ok((Some(resolved.filter), resolved.cursor_commit))
     }
 
-    fn handle_logs_recent(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_logs_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
 
@@ -151,21 +149,27 @@ impl RpcHandler {
         if let Some(trace_id_hex) = params.get("trace_id").and_then(|v| v.as_str()) {
             if let Some(s) = filter_str {
                 if !s.trim().is_empty() {
-                    let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
+                    let parsed =
+                        crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
                     if crate::filter::parser::contains_cursor_qualifier(&parsed) {
-                        return Err("cursor qualifier not permitted in logs.recent with trace_id".to_string());
+                        return Err(
+                            "cursor qualifier not permitted in logs.recent with trace_id"
+                                .to_string(),
+                        );
                     }
                 }
             }
-            let trace_id = u128::from_str_radix(trace_id_hex, 16)
-                .map_err(|_| "invalid trace_id")?;
+            let trace_id =
+                u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
             let logs = self.pipeline.logs_by_trace_id(trace_id);
             return Ok(json!({ "logs": logs, "count": logs.len() }));
         }
 
         let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let oldest_first = cursor_commit.is_some();
-        let entries = self.pipeline.recent_logs(count, resolved.as_ref(), oldest_first);
+        let entries = self
+            .pipeline
+            .recent_logs(count, resolved.as_ref(), oldest_first);
 
         // Drive the cursor commit + populate cursor_advanced_to.
         let advanced_to = if let Some(commit) = cursor_commit {
@@ -201,11 +205,7 @@ impl RpcHandler {
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
 
-    fn handle_logs_export(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_logs_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let count = params
             .get("count")
             .and_then(|v| v.as_u64())
@@ -213,7 +213,9 @@ impl RpcHandler {
         let filter_str = params.get("filter").and_then(|v| v.as_str());
         let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let oldest_first = cursor_commit.is_some();
-        let entries = self.pipeline.recent_logs(count, resolved.as_ref(), oldest_first);
+        let entries = self
+            .pipeline
+            .recent_logs(count, resolved.as_ref(), oldest_first);
 
         let advanced_to = if let Some(commit) = cursor_commit {
             let max_seq = entries.iter().map(|e| e.seq).max();
@@ -228,8 +230,7 @@ impl RpcHandler {
             None
         };
 
-        let mut result =
-            json!({ "logs": entries, "count": entries.len(), "format": "json" });
+        let mut result = json!({ "logs": entries, "count": entries.len(), "format": "json" });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);
         }
@@ -298,18 +299,13 @@ impl RpcHandler {
         Ok(json!({ "filters": items }))
     }
 
-    fn handle_filters_add(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_filters_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let filter = params
             .get("filter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
         // Reject bookmark filters in registered (long-lived) filters.
-        let parsed = crate::filter::parser::parse_filter(filter)
-            .map_err(|e| e.to_string())?;
+        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
             return Err(
                 "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
@@ -325,11 +321,7 @@ impl RpcHandler {
         Ok(json!({ "id": id }))
     }
 
-    fn handle_filters_edit(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_filters_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let filter_id = params
             .get("id")
             .and_then(|v| v.as_u64())
@@ -389,26 +381,27 @@ impl RpcHandler {
         Ok(json!({ "triggers": items }))
     }
 
-    fn handle_triggers_add(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_triggers_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let filter = params
             .get("filter")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
         // Reject bookmark filters in registered (long-lived) triggers.
-        let parsed = crate::filter::parser::parse_filter(filter)
-            .map_err(|e| e.to_string())?;
+        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
             return Err(
                 "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
                     .to_string(),
             );
         }
-        let pre = params.get("pre_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let post = params.get("post_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let pre = params
+            .get("pre_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let post = params
+            .get("post_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         let ctx = params
             .get("notify_context")
             .and_then(|v| v.as_u64())
@@ -437,8 +430,14 @@ impl RpcHandler {
             .ok_or_else(|| "missing required parameter: id".to_string())?
             as u32;
         let filter = params.get("filter").and_then(|v| v.as_str());
-        let pre = params.get("pre_window").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let post = params.get("post_window").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let pre = params
+            .get("pre_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let post = params
+            .get("post_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         let ctx = params
             .get("notify_context")
             .and_then(|v| v.as_u64())
@@ -447,7 +446,9 @@ impl RpcHandler {
         let oneshot = params.get("oneshot").and_then(|v| v.as_bool());
         let info = self
             .sessions
-            .edit_trigger(session_id, trigger_id, filter, pre, post, ctx, desc, oneshot)
+            .edit_trigger(
+                session_id, trigger_id, filter, pre, post, ctx, desc, oneshot,
+            )
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size(&self.pipeline, &self.sessions);
         Ok(json!({
@@ -496,19 +497,15 @@ impl RpcHandler {
         }
 
         let pipeline = &self.pipeline;
-        let summaries = self.span_store.recent_traces(
-            count,
-            resolved.as_ref(),
-            |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
-        );
+        let summaries = self
+            .span_store
+            .recent_traces(count, resolved.as_ref(), |trace_id| {
+                pipeline.count_by_trace_id(trace_id) as u32
+            });
         Ok(json!({ "traces": summaries, "count": summaries.len() }))
     }
 
-    fn handle_traces_get(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_get(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
@@ -551,8 +548,7 @@ impl RpcHandler {
             .get("trace_id")
             .and_then(|v| v.as_str())
             .ok_or("missing required parameter: trace_id")?;
-        let trace_id =
-            u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
+        let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let spans = self.span_store.get_trace(trace_id);
         if spans.is_empty() {
@@ -621,11 +617,7 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_slow(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_slow(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let min_duration = params
             .get("min_duration_ms")
             .and_then(|v| v.as_f64())
@@ -648,18 +640,19 @@ impl RpcHandler {
                 let mut groups: std::collections::HashMap<String, Vec<f64>> =
                     std::collections::HashMap::new();
                 for s in &slow {
-                    groups.entry(s.name.clone()).or_default().push(s.duration_ms);
+                    groups
+                        .entry(s.name.clone())
+                        .or_default()
+                        .push(s.duration_ms);
                 }
                 let mut result: Vec<Value> = groups
                     .iter()
                     .map(|(name, durations)| {
                         let mut sorted = durations.clone();
-                        sorted.sort_by(|a, b| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        sorted
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
-                        let p95_idx =
-                            ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
+                        let p95_idx = ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
                         json!({
                             "name": name,
                             "avg_ms": (avg * 10.0).round() / 10.0,
@@ -681,17 +674,12 @@ impl RpcHandler {
         }
     }
 
-    fn handle_traces_logs(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_logs(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
             .ok_or("missing required parameter: trace_id")?;
-        let trace_id =
-            u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
+        let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let filter_str = params.get("filter").and_then(|v| v.as_str());
         let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;

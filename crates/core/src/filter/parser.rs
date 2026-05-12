@@ -13,20 +13,31 @@ pub enum ParsedFilter {
 pub enum Qualifier {
     BarePattern(Pattern),
     SelectorPattern(Selector, Pattern),
-    LevelFilter { op: LevelOp, level: Level },
+    LevelFilter {
+        op: LevelOp,
+        level: Level,
+    },
     DurationFilter(DurationOp, f64),
-    BookmarkFilter { op: BookmarkOp, name: String },
+    BookmarkFilter {
+        op: BookmarkOp,
+        name: String,
+    },
     /// Read-and-advance bookmark reference. Resolved to `SeqFilter` by
     /// `bookmark_resolver::resolve_bookmarks` (which also acquires the
     /// CursorCommit handle from the BookmarkStore).
-    CursorFilter { name: String },
+    CursorFilter {
+        name: String,
+    },
     /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`
     /// (and from `CursorFilter` once Task 6/7 lands). Never emitted by the
     /// parser, never serialized in user-facing wire shapes.
     /// Uses `SeqOp` (strict `Gt`/`Lt`) — distinct from `BookmarkOp` because the
     /// cursor design resolves `b>=name` / `b<=name` to STRICT `>` / `<` against
     /// the bookmark's seq (not ≥/≤).
-    SeqFilter { op: SeqOp, value: u64 },
+    SeqFilter {
+        op: SeqOp,
+        value: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,18 +164,18 @@ impl<'de> Deserialize<'de> for Pattern {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Selector {
-    Message,                   // m
-    FullMessage,               // fm
-    MessageOrFull,             // mfm
-    Host,                      // h
-    Facility,                  // fa
-    File,                      // fi
-    Line,                      // ln
-    SpanName,                  // sn
-    ServiceName,               // sv
-    SpanStatus,                // st
-    SpanKind,                  // sk
-    AdditionalField(String),   // anything else
+    Message,                 // m
+    FullMessage,             // fm
+    MessageOrFull,           // mfm
+    Host,                    // h
+    Facility,                // fa
+    File,                    // fi
+    Line,                    // ln
+    SpanName,                // sn
+    ServiceName,             // sv
+    SpanStatus,              // st
+    SpanKind,                // sk
+    AdditionalField(String), // anything else
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -205,7 +216,8 @@ fn is_valid_bookmark_token(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'/')
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'/')
 }
 
 /// Split the input on commas, but respect double-quoted strings (don't split inside quotes).
@@ -318,13 +330,15 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
 
     // Duration filter: d>=N, d<=N
     if let Some(rest) = token.strip_prefix("d>=") {
-        let value: f64 = rest.parse()
-            .map_err(|_| FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest)))?;
+        let value: f64 = rest.parse().map_err(|_| {
+            FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest))
+        })?;
         return Ok(Qualifier::DurationFilter(DurationOp::Gte, value));
     }
     if let Some(rest) = token.strip_prefix("d<=") {
-        let value: f64 = rest.parse()
-            .map_err(|_| FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest)))?;
+        let value: f64 = rest.parse().map_err(|_| {
+            FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest))
+        })?;
         return Ok(Qualifier::DurationFilter(DurationOp::Lte, value));
     }
 
@@ -501,6 +515,31 @@ pub fn parse_filter(input: &str) -> Result<ParsedFilter, FilterParseError> {
     Ok(ParsedFilter::Qualifiers(qualifiers))
 }
 
+/// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
+/// Used by registration guards to reject bookmark filters and cursor filters in long-lived
+/// registered filters/triggers.
+pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| {
+            matches!(
+                q,
+                Qualifier::BookmarkFilter { .. } | Qualifier::CursorFilter { .. }
+            )
+        }),
+    }
+}
+
+/// Returns true if any qualifier in the filter is a CursorFilter.
+pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
+    match filter {
+        ParsedFilter::All | ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs
+            .iter()
+            .any(|q| matches!(q, Qualifier::CursorFilter { .. })),
+    }
+}
+
 #[cfg(test)]
 mod bookmark_tests {
     use super::*;
@@ -515,7 +554,10 @@ mod bookmark_tests {
     #[test]
     fn parses_bookmark_gte_bare_name() {
         match parse_one("b>=before") {
-            Qualifier::BookmarkFilter { op: BookmarkOp::Gte, name } => {
+            Qualifier::BookmarkFilter {
+                op: BookmarkOp::Gte,
+                name,
+            } => {
                 assert_eq!(name, "before");
             }
             other => panic!("unexpected: {other:?}"),
@@ -525,7 +567,10 @@ mod bookmark_tests {
     #[test]
     fn parses_bookmark_lte_bare_name() {
         match parse_one("b<=after") {
-            Qualifier::BookmarkFilter { op: BookmarkOp::Lte, name } => {
+            Qualifier::BookmarkFilter {
+                op: BookmarkOp::Lte,
+                name,
+            } => {
                 assert_eq!(name, "after");
             }
             other => panic!("unexpected: {other:?}"),
@@ -535,7 +580,10 @@ mod bookmark_tests {
     #[test]
     fn parses_bookmark_qualified_name() {
         match parse_one("b>=session-A/before") {
-            Qualifier::BookmarkFilter { op: BookmarkOp::Gte, name } => {
+            Qualifier::BookmarkFilter {
+                op: BookmarkOp::Gte,
+                name,
+            } => {
                 assert_eq!(name, "session-A/before");
             }
             other => panic!("unexpected: {other:?}"),
@@ -673,28 +721,5 @@ mod bookmark_tests {
         assert!(contains_bookmark_qualifier(&f));
         let f = parse_filter("l>=ERROR").unwrap();
         assert!(!contains_bookmark_qualifier(&f));
-    }
-}
-
-/// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
-/// Used by registration guards to reject bookmark filters and cursor filters in long-lived
-/// registered filters/triggers.
-pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
-    match filter {
-        ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| {
-            matches!(
-                q,
-                Qualifier::BookmarkFilter { .. } | Qualifier::CursorFilter { .. }
-            )
-        }),
-    }
-}
-
-/// Returns true if any qualifier in the filter is a CursorFilter.
-pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
-    match filter {
-        ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| matches!(q, Qualifier::CursorFilter { .. })),
     }
 }

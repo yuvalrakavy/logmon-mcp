@@ -107,7 +107,9 @@ fn matches_selector(selector: &Selector, pattern: &Pattern, entry: &LogEntry) ->
                 matches_pattern(pattern, &s)
             })
             .unwrap_or(false),
-        Selector::SpanName | Selector::ServiceName | Selector::SpanStatus | Selector::SpanKind => false,
+        Selector::SpanName | Selector::ServiceName | Selector::SpanStatus | Selector::SpanKind => {
+            false
+        }
     }
 }
 
@@ -123,7 +125,11 @@ fn matches_pattern(pattern: &Pattern, text: &str) -> bool {
     }
 }
 
-fn matches_level(op: LevelOp, filter_level: crate::gelf::message::Level, entry_level: crate::gelf::message::Level) -> bool {
+fn matches_level(
+    op: LevelOp,
+    filter_level: crate::gelf::message::Level,
+    entry_level: crate::gelf::message::Level,
+) -> bool {
     match op {
         LevelOp::Eq => entry_level == filter_level,
         LevelOp::Gte => entry_level >= filter_level,
@@ -144,9 +150,7 @@ pub fn matches_span(filter: &ParsedFilter, span: &SpanEntry) -> bool {
 
 fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
     match qualifier {
-        Qualifier::BarePattern(pattern) => {
-            matches_pattern(pattern, &span.name)
-        }
+        Qualifier::BarePattern(pattern) => matches_pattern(pattern, &span.name),
         Qualifier::SelectorPattern(selector, pattern) => {
             match selector {
                 Selector::SpanName => matches_pattern(pattern, &span.name),
@@ -168,20 +172,18 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
                     let kind_str = format!("{:?}", span.kind).to_lowercase();
                     matches_pattern(pattern, &kind_str)
                 }
-                Selector::AdditionalField(key) => {
-                    span.attributes.get(key)
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|v| matches_pattern(pattern, v))
-                }
+                Selector::AdditionalField(key) => span
+                    .attributes
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| matches_pattern(pattern, v)),
                 _ => false, // log selectors don't match spans
             }
         }
-        Qualifier::DurationFilter(op, threshold) => {
-            match op {
-                DurationOp::Gte => span.duration_ms >= *threshold,
-                DurationOp::Lte => span.duration_ms <= *threshold,
-            }
-        }
+        Qualifier::DurationFilter(op, threshold) => match op {
+            DurationOp::Gte => span.duration_ms >= *threshold,
+            DurationOp::Lte => span.duration_ms <= *threshold,
+        },
         Qualifier::LevelFilter { .. } => false, // log-only
         Qualifier::BookmarkFilter { .. } => false,
         Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to SeqFilter
@@ -195,7 +197,7 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
 #[cfg(test)]
 mod seq_tests {
     use super::*;
-    use crate::gelf::message::{LogEntry, Level, LogSource};
+    use crate::gelf::message::{Level, LogEntry, LogSource};
     use chrono::Utc;
     use std::collections::HashMap;
 
@@ -220,17 +222,29 @@ mod seq_tests {
 
     #[test]
     fn seq_gt_matches_entries_strictly_after_bookmark() {
-        let q = Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 };
+        let q = Qualifier::SeqFilter {
+            op: SeqOp::Gt,
+            value: 10,
+        };
         assert!(matches_qualifier(&q, &log_entry_with_seq(11)));
-        assert!(!matches_qualifier(&q, &log_entry_with_seq(10)), "strict gt — bookmark seq itself excluded");
+        assert!(
+            !matches_qualifier(&q, &log_entry_with_seq(10)),
+            "strict gt — bookmark seq itself excluded"
+        );
         assert!(!matches_qualifier(&q, &log_entry_with_seq(5)));
     }
 
     #[test]
     fn seq_lt_matches_entries_strictly_before_bookmark() {
-        let q = Qualifier::SeqFilter { op: SeqOp::Lt, value: 10 };
+        let q = Qualifier::SeqFilter {
+            op: SeqOp::Lt,
+            value: 10,
+        };
         assert!(matches_qualifier(&q, &log_entry_with_seq(9)));
-        assert!(!matches_qualifier(&q, &log_entry_with_seq(10)), "strict lt — bookmark seq itself excluded");
+        assert!(
+            !matches_qualifier(&q, &log_entry_with_seq(10)),
+            "strict lt — bookmark seq itself excluded"
+        );
         assert!(!matches_qualifier(&q, &log_entry_with_seq(15)));
     }
 

@@ -1,7 +1,7 @@
 use crate::engine::seq_counter::SeqCounter;
-use crate::span::types::*;
-use crate::filter::parser::ParsedFilter;
 use crate::filter::matcher::matches_span;
+use crate::filter::parser::ParsedFilter;
+use crate::span::types::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
@@ -50,7 +50,11 @@ impl SpanStore {
             }
         }
 
-        inner.trace_index.entry(span.trace_id).or_default().push(span.seq);
+        inner
+            .trace_index
+            .entry(span.trace_id)
+            .or_default()
+            .push(span.seq);
         inner.buffer.push_back(span);
         seq
     }
@@ -61,7 +65,9 @@ impl SpanStore {
             Some(s) => s,
             None => return vec![],
         };
-        let mut spans: Vec<SpanEntry> = inner.buffer.iter()
+        let mut spans: Vec<SpanEntry> = inner
+            .buffer
+            .iter()
             .filter(|s| seqs.contains(&s.seq))
             .cloned()
             .collect();
@@ -69,27 +75,46 @@ impl SpanStore {
         spans
     }
 
-    pub fn slow_spans(&self, min_duration_ms: f64, count: usize, filter: Option<&ParsedFilter>) -> Vec<SpanEntry> {
+    pub fn slow_spans(
+        &self,
+        min_duration_ms: f64,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+    ) -> Vec<SpanEntry> {
         let inner = self.inner.read().unwrap();
-        let mut matching: Vec<SpanEntry> = inner.buffer.iter()
+        let mut matching: Vec<SpanEntry> = inner
+            .buffer
+            .iter()
             .filter(|s| s.duration_ms >= min_duration_ms)
             .filter(|s| filter.is_none_or(|f| matches_span(f, s)))
             .cloned()
             .collect();
-        matching.sort_by(|a, b| b.duration_ms.partial_cmp(&a.duration_ms).unwrap_or(std::cmp::Ordering::Equal));
+        matching.sort_by(|a, b| {
+            b.duration_ms
+                .partial_cmp(&a.duration_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         matching.truncate(count);
         matching
     }
 
-    pub fn recent_traces<F>(&self, count: usize, filter: Option<&ParsedFilter>, linked_log_count: F) -> Vec<TraceSummary>
-    where F: Fn(u128) -> u32,
+    pub fn recent_traces<F>(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        linked_log_count: F,
+    ) -> Vec<TraceSummary>
+    where
+        F: Fn(u128) -> u32,
     {
         let inner = self.inner.read().unwrap();
         let mut trace_max_seq: HashMap<u128, u64> = HashMap::new();
         for span in inner.buffer.iter() {
             if filter.is_none_or(|f| matches_span(f, span)) {
                 let entry = trace_max_seq.entry(span.trace_id).or_insert(0);
-                if span.seq > *entry { *entry = span.seq; }
+                if span.seq > *entry {
+                    *entry = span.seq;
+                }
             }
         }
 
@@ -97,20 +122,29 @@ impl SpanStore {
         traces.sort_by(|a, b| b.1.cmp(&a.1));
         traces.truncate(count);
 
-        traces.iter().map(|&(trace_id, _)| {
-            let spans: Vec<&SpanEntry> = inner.buffer.iter().filter(|s| s.trace_id == trace_id).collect();
-            let root = spans.iter().find(|s| s.parent_span_id.is_none());
-            TraceSummary {
-                trace_id,
-                root_span_name: root.map_or("[no root]".to_string(), |r| r.name.clone()),
-                service_name: root.map_or("unknown".to_string(), |r| r.service_name.clone()),
-                start_time: root.map_or(spans[0].start_time, |r| r.start_time),
-                total_duration_ms: root.map_or(0.0, |r| r.duration_ms),
-                span_count: spans.len() as u32,
-                has_errors: spans.iter().any(|s| matches!(s.status, SpanStatus::Error(_))),
-                linked_log_count: linked_log_count(trace_id),
-            }
-        }).collect()
+        traces
+            .iter()
+            .map(|&(trace_id, _)| {
+                let spans: Vec<&SpanEntry> = inner
+                    .buffer
+                    .iter()
+                    .filter(|s| s.trace_id == trace_id)
+                    .collect();
+                let root = spans.iter().find(|s| s.parent_span_id.is_none());
+                TraceSummary {
+                    trace_id,
+                    root_span_name: root.map_or("[no root]".to_string(), |r| r.name.clone()),
+                    service_name: root.map_or("unknown".to_string(), |r| r.service_name.clone()),
+                    start_time: root.map_or(spans[0].start_time, |r| r.start_time),
+                    total_duration_ms: root.map_or(0.0, |r| r.duration_ms),
+                    span_count: spans.len() as u32,
+                    has_errors: spans
+                        .iter()
+                        .any(|s| matches!(s.status, SpanStatus::Error(_))),
+                    linked_log_count: linked_log_count(trace_id),
+                }
+            })
+            .collect()
     }
 
     pub fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<SpanEntry> {
@@ -132,8 +166,14 @@ impl SpanStore {
         let traces = inner.trace_index.len();
         let avg = if total > 0 {
             inner.buffer.iter().map(|s| s.duration_ms).sum::<f64>() / total as f64
-        } else { 0.0 };
-        SpanStoreStats { total_stored: total, total_traces: traces, avg_duration_ms: avg }
+        } else {
+            0.0
+        };
+        SpanStoreStats {
+            total_stored: total,
+            total_traces: traces,
+            avg_duration_ms: avg,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -145,7 +185,12 @@ impl SpanStore {
     }
 
     pub fn oldest_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.inner.read().unwrap().buffer.front().map(|s| s.start_time)
+        self.inner
+            .read()
+            .unwrap()
+            .buffer
+            .front()
+            .map(|s| s.start_time)
     }
 
     /// Seq of the oldest span currently in the buffer, or `None` if empty.
