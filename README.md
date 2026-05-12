@@ -198,23 +198,23 @@ logmon-mcp speaks the standard MCP stdio transport. Configure your client to lau
 
 </details>
 
-### Claude Code skill (recommended)
+### The skill ships with the server
 
-`skill/logmon.md` is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills) that teaches the assistant how to use the MCP tools above effectively — when to query for logs vs. traces, the filter DSL, the bookmark/cursor model, the trigger flight-recorder pattern, and a recovery guide for the common failure modes. It also defines a `/logmon` slash command (`/logmon errors`, `/logmon slow`, `/logmon trace <id>`, etc.) for Claude Code users.
+`skill/logmon.md` is a structured guide that teaches the assistant how to use the MCP tools above effectively — when to query for logs vs. traces, the filter DSL, the bookmark/cursor model, the trigger flight-recorder pattern, a Claude-Code-only `/logmon` slash-command reference, and a recovery guide for the common failure modes.
 
-To activate it for a project, drop the file into the project's skills directory:
+The file is **embedded into the `logmon-mcp` binary at compile time and shipped as the MCP server's `instructions`**. Any MCP host that surfaces server instructions (Claude Code, Cursor, Codex, …) picks it up automatically when the server is registered — no `.claude/skills/` copy, no manual setup.
+
+For Claude Code users who'd rather have the skill load on-demand (via Claude Code's skill `description:` triggers) instead of as ambient server-level context, you can additionally drop the file into a skills directory — that's optional, not required:
 
 ```bash
+# Per project
 mkdir -p .claude/skills && cp /path/to/logmon-mcp/skill/logmon.md .claude/skills/
-```
 
-Or install once for all projects on the machine:
-
-```bash
+# Or once for all projects on the machine
 mkdir -p ~/.claude/skills && cp /path/to/logmon-mcp/skill/logmon.md ~/.claude/skills/
 ```
 
-Other MCP hosts (Cursor, Windsurf, Codex) don't have a `/logmon` slash command but pick up the same guidance via natural language ("show me errors", "what's slow") — the skill file is plain Markdown and any agent that loads skill files will use it.
+If you tweak the skill (e.g. customize the `/logmon` aliases), the on-disk copy takes precedence over the embedded version for hosts that honor it.
 
 ## Wire up your application
 

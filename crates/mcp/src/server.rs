@@ -767,9 +767,45 @@ impl GelfMcpServer {
     }
 }
 
+/// Skill content shipped as MCP `instructions` so any compliant client
+/// (Claude Code, Cursor, etc.) surfaces it as server-level guidance
+/// without the user installing the file by hand. The file lives at
+/// `skill/logmon.md` at the workspace root and is embedded at compile
+/// time.
+const SKILL_INSTRUCTIONS: &str = include_str!("../../../skill/logmon.md");
+
 #[rmcp::tool_handler]
 impl ServerHandler for GelfMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SKILL_INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SKILL_INSTRUCTIONS;
+
+    #[test]
+    fn skill_instructions_is_embedded_and_non_empty() {
+        // Catches `skill/logmon.md` going missing, getting truncated, or
+        // losing its YAML frontmatter at compile/test time rather than at
+        // runtime in a client's session.
+        assert!(
+            !SKILL_INSTRUCTIONS.is_empty(),
+            "skill/logmon.md is empty — embedding failed"
+        );
+        assert!(
+            SKILL_INSTRUCTIONS.starts_with("---\n"),
+            "skill/logmon.md must start with YAML frontmatter"
+        );
+        assert!(
+            SKILL_INSTRUCTIONS.contains("name: logmon"),
+            "skill/logmon.md frontmatter must declare `name: logmon`"
+        );
+        assert!(
+            SKILL_INSTRUCTIONS.contains("## When to reach for logmon"),
+            "skill/logmon.md must contain the `When to reach for logmon` section"
+        );
     }
 }
