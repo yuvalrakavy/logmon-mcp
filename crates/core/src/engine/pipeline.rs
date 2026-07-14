@@ -187,6 +187,11 @@ impl LogPipeline {
         self.store.oldest_seq()
     }
 
+    /// Seq of the newest log entry currently in the store, or `None` if empty.
+    pub fn newest_log_seq(&self) -> Option<u64> {
+        self.store.newest_seq()
+    }
+
     pub fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry> {
         self.store.context_by_seq(seq, before, after)
     }

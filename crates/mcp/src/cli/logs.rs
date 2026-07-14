@@ -63,6 +63,12 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
             if json { format::print_json(&result); return 0; }
             let blocks: Vec<String> = result.logs.iter().map(format_entry).collect();
             format::print_blocks(blocks, "(no logs)");
+            print_query_diagnostics(
+                result.truncated,
+                result.evicted_before_window,
+                result.logs.is_empty(),
+                result.scanned,
+            );
             if let Some(seq) = result.cursor_advanced_to {
                 println!("\ncursor advanced to seq={seq}");
             }
@@ -89,6 +95,14 @@ pub async fn dispatch(broker: &Broker, cmd: LogsCmd, json: bool) -> i32 {
                 Ok(r) => r,
                 Err(e) => { format::error(&format!("logs.export failed: {e}"), json); return 1; }
             };
+            if !json {
+                print_query_diagnostics(
+                    result.truncated,
+                    result.evicted_before_window,
+                    result.logs.is_empty(),
+                    result.scanned,
+                );
+            }
 
             // Render the output payload first, then redirect to file or stdout.
             let payload = if json {
@@ -160,5 +174,23 @@ fn format_entry(e: &LogEntry) -> String {
         header
     } else {
         format!("{header}\n  {}", secondary.join(" "))
+    }
+}
+
+/// Print B2/B5 query diagnostics to stderr (so piped stdout stays clean): a
+/// truncation warning when a bookmark/cursor window rolled off the buffer, and a
+/// "matched nothing but data is flowing" note that distinguishes a bad filter
+/// from an empty buffer.
+fn print_query_diagnostics(truncated: bool, evicted: Option<u64>, empty: bool, scanned: usize) {
+    if truncated {
+        let n = evicted.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string());
+        eprintln!(
+            "warning: window truncated — ~{n} record(s) rolled off before the oldest retained log; results are incomplete"
+        );
+    }
+    if empty && scanned > 0 {
+        eprintln!(
+            "note: filter matched 0 of {scanned} scanned records — data is flowing, so check the filter"
+        );
     }
 }

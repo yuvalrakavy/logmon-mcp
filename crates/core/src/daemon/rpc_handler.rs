@@ -160,7 +160,19 @@ impl RpcHandler {
             let trace_id = u128::from_str_radix(trace_id_hex, 16)
                 .map_err(|_| "invalid trace_id")?;
             let logs = self.pipeline.logs_by_trace_id(trace_id);
-            return Ok(json!({ "logs": logs, "count": logs.len() }));
+            let count = logs.len();
+            // trace_id is an index lookup over the whole buffer, not a filter
+            // scan — report buffer stats so B2's `scanned==0 ⇒ empty buffer`
+            // heuristic still holds (never a misleading 0 on a non-empty store).
+            let buffer_total = self.pipeline.store_len();
+            return Ok(json!({
+                "logs": logs,
+                "count": count,
+                "scanned": buffer_total,
+                "buffer_total": buffer_total,
+                "buffer_oldest_seq": self.pipeline.oldest_log_seq(),
+                "buffer_newest_seq": self.pipeline.newest_log_seq(),
+            }));
         }
 
         let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
@@ -531,7 +543,10 @@ impl RpcHandler {
             resolved.as_ref(),
             |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
         );
-        // recent_traces walks the whole span buffer, so scanned == buffer_total.
+        // recent_traces walks the whole span buffer, so scanned == buffer_total
+        // for this query. (Buffer stats are read separately from the scan — a
+        // concurrent write can make them momentarily differ; a diagnostic count,
+        // not a strict snapshot.)
         let buffer_total = self.span_store.len();
         Ok(json!({
             "traces": summaries,
