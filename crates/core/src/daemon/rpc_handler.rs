@@ -185,6 +185,10 @@ impl RpcHandler {
             None
         };
 
+        let evicted_before_window = resolved
+            .as_ref()
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.buffer_oldest_seq));
+
         let mut result = json!({
             "logs": entries,
             "count": entries.len(),
@@ -192,6 +196,8 @@ impl RpcHandler {
             "buffer_total": stats.buffer_total,
             "buffer_oldest_seq": stats.buffer_oldest_seq,
             "buffer_newest_seq": stats.buffer_newest_seq,
+            "truncated": evicted_before_window.is_some(),
+            "evicted_before_window": evicted_before_window,
         });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);
@@ -239,6 +245,10 @@ impl RpcHandler {
             None
         };
 
+        let evicted_before_window = resolved
+            .as_ref()
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.buffer_oldest_seq));
+
         let mut result = json!({
             "logs": entries,
             "count": entries.len(),
@@ -247,6 +257,8 @@ impl RpcHandler {
             "buffer_total": stats.buffer_total,
             "buffer_oldest_seq": stats.buffer_oldest_seq,
             "buffer_newest_seq": stats.buffer_newest_seq,
+            "truncated": evicted_before_window.is_some(),
+            "evicted_before_window": evicted_before_window,
         });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);

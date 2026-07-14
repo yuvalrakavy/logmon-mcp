@@ -715,6 +715,30 @@ pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
     }
 }
 
+/// The lower-bound seq of a resolved query window — the value of a strict
+/// `SeqFilter::Gt` produced by resolving a `b>=` / `c>=` cursor — or `None`
+/// if the query has no lower bound.
+fn resolved_lower_bound(filter: &ParsedFilter) -> Option<u64> {
+    match filter {
+        ParsedFilter::Qualifiers(qs) => qs.iter().find_map(|q| match q {
+            Qualifier::SeqFilter { op: SeqOp::Gt, value } => Some(*value),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// B5: `Some(gap)` when the query's lower bound predates the retained buffer
+/// (records were evicted from the window), else `None`. `gap = oldest - lb` is
+/// the number of seqs between the window start and the oldest retained record —
+/// an upper bound on missed records (logs and spans share the seq axis).
+pub fn evicted_before_window(filter: &ParsedFilter, buffer_oldest_seq: Option<u64>) -> Option<u64> {
+    match (resolved_lower_bound(filter), buffer_oldest_seq) {
+        (Some(lb), Some(oldest)) if lb < oldest => Some(oldest - lb),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod strict_selector_tests {
     //! B1: reject only PROVABLE selector typos (`<ident>>=` / `<ident><=` where
@@ -805,5 +829,43 @@ mod strict_selector_tests {
             msg.contains("quote") || msg.contains("regex"),
             "should point to the escape hatch: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    //! B5: detect a query window (b>= / c>= lower bound) that predates the
+    //! retained buffer, so a rolled-off window can't masquerade as complete.
+    use super::*;
+
+    fn gt(seq: u64) -> ParsedFilter {
+        ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter { op: SeqOp::Gt, value: seq }])
+    }
+
+    #[test]
+    fn flags_window_older_than_buffer() {
+        // window starts after seq 5; oldest retained is 10 → seqs (5,10] rolled off
+        assert_eq!(evicted_before_window(&gt(5), Some(10)), Some(5));
+    }
+
+    #[test]
+    fn none_when_window_within_buffer() {
+        assert_eq!(evicted_before_window(&gt(10), Some(5)), None);
+        assert_eq!(evicted_before_window(&gt(10), Some(10)), None); // equal → not truncated
+    }
+
+    #[test]
+    fn none_on_empty_buffer() {
+        assert_eq!(evicted_before_window(&gt(5), None), None);
+    }
+
+    #[test]
+    fn none_without_a_lower_bound() {
+        let bare =
+            ParsedFilter::Qualifiers(vec![Qualifier::BarePattern(Pattern::Substring("x".into()))]);
+        assert_eq!(evicted_before_window(&bare, Some(100)), None);
+        // b<= (upper bound → SeqOp::Lt) is NOT a lower bound
+        let lt = ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter { op: SeqOp::Lt, value: 5 }]);
+        assert_eq!(evicted_before_window(&lt, Some(100)), None);
     }
 }

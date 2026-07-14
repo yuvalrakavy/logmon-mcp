@@ -265,6 +265,15 @@ pub struct LogsRecentResult {
     pub buffer_oldest_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_newest_seq: Option<u64>,
+    /// B5: true when the query's lower bound (a `b>=` / `c>=` cursor) predates
+    /// the oldest retained record — some in-window records were evicted, so this
+    /// result is not the complete window.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Seqs between the requested window start and the oldest retained record
+    /// (an upper bound on how many records rolled off), when `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
 }
@@ -305,6 +314,10 @@ pub struct LogsExportResult {
     pub buffer_oldest_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buffer_newest_seq: Option<u64>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
 }
