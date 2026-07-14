@@ -482,3 +482,37 @@ addressing). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+
 - Store dev-tracks design: Store repo
   `docs/superpowers/specs/2026-06-29-multi-worktree-dev-tracks-design.md` §6.9.
 - Generic logmon guide (Store repo) `docs/guides/logmon.md` — update once landed.
+
+## 15. §9 re-verify addenda (fold in during Wave 2 build)
+
+A fresh pre-build re-gate confirmed §9.1's three-site scoping is COMPLETE for the live
+path (`evaluate_filters`, `active_session_ids_sorted_by_pre_window`, `active_session_ids`
+— plus `max_pre_window` in §9.2 = the fourth) and the resolve-at-boundary mechanism is
+sound. Localized fixes to fold in:
+
+- **F1 (isolation) — notification queue is domain-agnostic.** §9.1 scopes producers, not
+  the per-session `notification_queue` (`session.rs:87`; unconditional drain at
+  `server.rs:634`). A cross-domain reconnect (`session.start{name:S, domain:B}` for an S
+  that queued events while bound to A) ships A's payload to a B client. Fix: `set_domain`
+  clears `notification_queue` when the binding actually changes. → §11 isolation suite.
+- **F2 (footgun) — dead cross-domain scans.** `any_post_window_active` (`session.rs:591`)
+  and `queue_notification` (`session.rs:635`) are prod-DEAD (test-only callers). When
+  adding the `_for_domain` variants, delete them or give them domain-scoped signatures so
+  the un-scoped forms can't be reached for.
+- **F3 (wart) — post-window carryover on rebind.** `post_window_remaining` (`session.rs:89`)
+  follows the session across domains; a trigger that fired on A then shapes B's PostTrigger
+  storage. Fix: reset to 0 in `set_domain` (or accept + document). → §11.
+- **F4 (buildability) — `sync_pre_buffer_size` fan-out.** Called from **8 sites** (5 RPC
+  handlers → `&d`; 2 processors → captured domain-id; boot-restore `server.rs:324` →
+  default); gains a `domain: &DomainId` param. In `use_domain`, `set_domain` MUST run
+  BEFORE syncing both old+new domains (else A won't shrink / B won't grow).
+- **F5 (wording).** Drop §9.1's "plus `evaluate_trigger`" bullet — `evaluate_triggers`
+  (`session.rs:344`) is already per-`SessionId`, auto-scoped once sites 1/3 are.
+- **F6 (keystone/stage 2.1).** Fold `run_with_overrides`'s pipeline (`server.rs:204`),
+  span_store (`:211`), seq (`:204`), bookmarks (`:225`), receiver_metrics (`:233`), the 3
+  processor spawns (log `:321`, span `:306`) and BOTH receiver arms (injected `:247` vs
+  real `:262`) into `default`'s Domain. Initialize `event_rx` (`server.rs:642`) and §9.4's
+  re-subscribe cache from the CONNECT-TIME domain (a reconnecting named session may already
+  be bound non-default). Make the contract explicit: `DomainRegistry::get` clones the
+  `Arc<Domain>` OUT of the `RwLock` guard so queries never hold the registry lock during
+  execution — this is what makes delete-while-bound Arc-graceful.
