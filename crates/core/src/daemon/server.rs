@@ -458,8 +458,14 @@ pub async fn run_with_overrides(
         // bookmarks) before tearing down. Best-effort: failures are logged but
         // do not block shutdown.
         let snapshot = sessions.snapshot_named_for_persistence(&bookmark_store);
+        // Seq-block high-water fix (§8): persist the GREATER of the reserved
+        // block and the live counter. A run emitting >SEQ_BLOCK_SIZE records
+        // advances the counter past the boot-time reservation; persisting only
+        // the reservation would let the next boot re-hand-out those seqs and
+        // alias any persisted cursor. `max(...)` guarantees seqs never rewind.
+        let final_seq_block = reserved_seq_block.max(seq_counter.current());
         let final_state = DaemonState {
-            seq_block: reserved_seq_block,
+            seq_block: final_seq_block,
             named_sessions: snapshot,
         };
         if let Err(e) = save_state(&state_path, &final_state) {
@@ -533,8 +539,14 @@ pub async fn run_with_overrides(
         // bookmarks) before tearing down. Best-effort: failures are logged but
         // do not block shutdown.
         let snapshot = sessions.snapshot_named_for_persistence(&bookmark_store);
+        // Seq-block high-water fix (§8): persist the GREATER of the reserved
+        // block and the live counter. A run emitting >SEQ_BLOCK_SIZE records
+        // advances the counter past the boot-time reservation; persisting only
+        // the reservation would let the next boot re-hand-out those seqs and
+        // alias any persisted cursor. `max(...)` guarantees seqs never rewind.
+        let final_seq_block = reserved_seq_block.max(seq_counter.current());
         let final_state = DaemonState {
-            seq_block: reserved_seq_block,
+            seq_block: final_seq_block,
             named_sessions: snapshot,
         };
         if let Err(e) = save_state(&state_path, &final_state) {

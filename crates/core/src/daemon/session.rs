@@ -733,7 +733,7 @@ impl SessionRegistry {
             })
             .map(|(id, state)| (id.clone(), state.triggers.max_pre_window()))
             .collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.sort_by_key(|(_, pre)| std::cmp::Reverse(*pre));
         pairs.into_iter().map(|(id, _)| id).collect()
     }
 
