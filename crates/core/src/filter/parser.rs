@@ -400,18 +400,17 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
 
         // lhs must not be empty; if it's empty treat as bare substring
         if !lhs.is_empty() {
-            // B1: a `<ident>>=` / `<ident><=` whose ident isn't a comparison
-            // selector is a PROVABLE typo — field names never contain >= / <=,
-            // so this can't be a legitimate additional-field filter. Reject only
-            // this provable case (keyed off the first-`=` split's lhs, so the
-            // valid escape hatch `"a>=b"` / `/a>=b/` and `_url=a>=b` — where >=
-            // is in the value — are untouched). Ambiguous `ident=value` stays a
-            // valid additional-field filter. The l/d/b/c bases are already
-            // consumed by the strip_prefix checks above; this exemption is
-            // belt-and-suspenders against a future reorder — do NOT remove it.
-            if (lhs.ends_with('>') || lhs.ends_with('<'))
-                && !matches!(&lhs[..lhs.len() - 1], "l" | "d" | "b" | "c")
-            {
+            // B1: an lhs ending in `>` or `<` (the token is `<ident><op>=…`) is a
+            // PROVABLE selector typo — field names never contain >= / <=, so it
+            // can't be a legitimate additional-field filter. Keyed off the
+            // first-`=` split's lhs, so the escape hatch `"a>=b"` / `/a>=b/` and
+            // value-side operators (`_url=a>=b`) are untouched; ambiguous
+            // `ident=value` stays a valid additional-field filter.
+            // NO l/d/b/c exemption: legit comparison selectors are consumed by the
+            // strip_prefix checks ABOVE and never reach here, so anything that does
+            // reach here with a trailing >/< is a typo — including a space-corrupted
+            // `l> =foo`, which the exact strip_prefix("l>=") misses.
+            if lhs.ends_with('>') || lhs.ends_with('<') {
                 return Err(FilterParseError::UnknownComparisonSelector(lhs.to_string()));
             }
             let selector = parse_selector(lhs);
@@ -720,10 +719,16 @@ pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
 /// if the query has no lower bound.
 fn resolved_lower_bound(filter: &ParsedFilter) -> Option<u64> {
     match filter {
-        ParsedFilter::Qualifiers(qs) => qs.iter().find_map(|q| match q {
-            Qualifier::SeqFilter { op: SeqOp::Gt, value } => Some(*value),
-            _ => None,
-        }),
+        // The matcher AND-combines qualifiers, so with multiple lower bounds the
+        // EFFECTIVE bound is the max — not whichever appears first (which would be
+        // order-dependent and could false-positive on truncation).
+        ParsedFilter::Qualifiers(qs) => qs
+            .iter()
+            .filter_map(|q| match q {
+                Qualifier::SeqFilter { op: SeqOp::Gt, value } => Some(*value),
+                _ => None,
+            })
+            .max(),
         _ => None,
     }
 }
@@ -822,6 +827,18 @@ mod strict_selector_tests {
     }
 
     #[test]
+    fn operator_space_equals_typo_errors() {
+        // `l> =foo` (space AFTER the operator) must not slip through the l/d/b/c
+        // exemption as AdditionalField("l>") — it's a comparison-shaped typo.
+        for t in ["l> =foo", "d> =foo", "b> =foo", "c> =foo", "l< =foo"] {
+            assert!(
+                matches!(err(t), FilterParseError::UnknownComparisonSelector(_)),
+                "expected `{t}` to be rejected as a typo"
+            );
+        }
+    }
+
+    #[test]
     fn error_names_token_and_points_to_escape_hatch() {
         let msg = err("level>=WARN").to_string();
         assert!(msg.contains("level>"), "should name the offending token: {msg}");
@@ -867,5 +884,29 @@ mod truncation_tests {
         // b<= (upper bound → SeqOp::Lt) is NOT a lower bound
         let lt = ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter { op: SeqOp::Lt, value: 5 }]);
         assert_eq!(evicted_before_window(&lt, Some(100)), None);
+    }
+
+    #[test]
+    fn multiple_lower_bounds_use_the_effective_max_not_the_first() {
+        // The matcher AND-combines qualifiers, so two b>= bounds mean the window
+        // is seq > max(both). Picking the FIRST would false-positive on truncation.
+        // Effective bound 300 > oldest 100 → nothing in the real window evicted.
+        let old_then_new = ParsedFilter::Qualifiers(vec![
+            Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 },
+            Qualifier::SeqFilter { op: SeqOp::Gt, value: 300 },
+        ]);
+        assert_eq!(evicted_before_window(&old_then_new, Some(100)), None);
+        // And order-independent (AND is commutative; the field must be too).
+        let new_then_old = ParsedFilter::Qualifiers(vec![
+            Qualifier::SeqFilter { op: SeqOp::Gt, value: 300 },
+            Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 },
+        ]);
+        assert_eq!(evicted_before_window(&new_then_old, Some(100)), None);
+        // When the MAX bound is genuinely evicted, report the gap against IT.
+        let both_evicted = ParsedFilter::Qualifiers(vec![
+            Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 },
+            Qualifier::SeqFilter { op: SeqOp::Gt, value: 50 },
+        ]);
+        assert_eq!(evicted_before_window(&both_evicted, Some(100)), Some(50));
     }
 }

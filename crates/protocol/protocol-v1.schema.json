@@ -43,8 +43,53 @@
           }
         },
         "count": {
+          "description": "Number of records that MATCHED the filter and were returned (capped by\nthe requested `count`). This is the \"matched\" count in B2's vocabulary.",
           "type": "integer",
           "format": "uint",
+          "minimum": 0
+        },
+        "scanned": {
+          "description": "Number of buffered records EXAMINED to produce this result (B2). With\n`count == 0`, `scanned > 0` means \"filter's fault, data is flowing\",\nwhile `scanned == 0` means an empty buffer / dead pipeline.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "buffer_total": {
+          "description": "Total records currently in the queried buffer.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "buffer_oldest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "truncated": {
+          "description": "B5: true when the query's lower bound (a `b>=` / `c>=` cursor) predates\nthe oldest retained record — some in-window records were evicted, so this\nresult is not the complete window.",
+          "type": "boolean",
+          "default": false
+        },
+        "evicted_before_window": {
+          "description": "Seqs between the requested window start and the oldest retained record\n(an upper bound on how many records rolled off), when `truncated`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
           "minimum": 0
         },
         "cursor_advanced_to": {
@@ -369,6 +414,46 @@
         },
         "format": {
           "type": "string"
+        },
+        "scanned": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "buffer_total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "buffer_oldest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false
+        },
+        "evicted_before_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "cursor_advanced_to": {
           "type": [
@@ -988,8 +1073,39 @@
           }
         },
         "count": {
+          "description": "Number of traces MATCHED and returned (capped by `count`).",
           "type": "integer",
           "format": "uint",
+          "minimum": 0
+        },
+        "scanned": {
+          "description": "Spans examined to build these traces. `recent_traces` walks the whole\nspan buffer, so for traces this equals `buffer_total` (B2): `count==0,\nscanned>0` means \"filter's fault\", `scanned==0` means empty span buffer.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "buffer_total": {
+          "description": "Total spans currently in the span buffer.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "buffer_oldest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
           "minimum": 0
         }
       },
