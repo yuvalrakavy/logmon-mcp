@@ -1,3 +1,4 @@
+use crate::daemon::domain::DomainId;
 use crate::engine::pipeline::PipelineEvent;
 use crate::engine::trigger::{TriggerError, TriggerInfo, TriggerManager, TriggerMatch};
 use crate::filter::matcher::matches_entry;
@@ -92,6 +93,10 @@ struct SessionState {
     /// Caller-supplied identity/metadata blob from `session.start`. The
     /// daemon validates a ≤ 4 KB cap before writing here.
     client_info: RwLock<Option<Value>>,
+    /// The domain this session is currently bound to (sticky `use_domain`
+    /// state). Mutable — unlike `name` — because `use_domain` switches it.
+    /// Defaults to `default`; never persisted (connect-time state, §4).
+    domain: RwLock<DomainId>,
 }
 
 impl SessionState {
@@ -107,6 +112,7 @@ impl SessionState {
             connected: AtomicBool::new(true),
             last_seen: Mutex::new(Instant::now()),
             client_info: RwLock::new(None),
+            domain: RwLock::new(DomainId::default_domain()),
         }
     }
 
@@ -122,6 +128,7 @@ impl SessionState {
             connected: AtomicBool::new(true),
             last_seen: Mutex::new(Instant::now()),
             client_info: RwLock::new(None),
+            domain: RwLock::new(DomainId::default_domain()),
         }
     }
 
@@ -161,7 +168,10 @@ impl SessionState {
 // Session name validation
 // ---------------------------------------------------------------------------
 
-fn is_valid_session_name(name: &str) -> bool {
+/// Shared name-charset validator for session names AND domain names
+/// (`[A-Za-z0-9_-]`, non-empty). `pub(crate)` so [`super::domain::DomainId`]
+/// reuses the exact same rule (spec §9.10).
+pub(crate) fn is_valid_name(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -206,7 +216,7 @@ impl SessionRegistry {
     /// disconnected session should resume with `is_new=false` so the SDK
     /// knows the daemon's named-session state is intact.
     pub fn create_named(&self, name: &str) -> Result<SessionId, SessionError> {
-        if !is_valid_session_name(name) {
+        if !is_valid_name(name) {
             return Err(SessionError::InvalidName(name.to_string()));
         }
 
@@ -277,6 +287,47 @@ impl SessionRegistry {
                 .client_info
                 .write()
                 .expect("client_info lock poisoned") = info;
+        }
+    }
+
+    // --- Domain binding (sticky `use_domain`) ---
+
+    /// The domain this session is currently bound to. Returns `default` for an
+    /// unknown session, so a query against a since-vanished session degrades to
+    /// the default domain rather than erroring.
+    pub fn domain_of(&self, id: &SessionId) -> DomainId {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        match sessions.get(id) {
+            Some(state) => state.domain.read().expect("domain lock poisoned").clone(),
+            None => DomainId::default_domain(),
+        }
+    }
+
+    /// Bind a session to `domain` (mirrors [`Self::set_client_info`]). No-op if
+    /// `id` is unknown. Idempotent: re-binding to the same domain changes
+    /// nothing.
+    ///
+    /// When the binding actually CHANGES, the session's cross-domain carryover
+    /// is dropped so no data from the old domain bleeds into the new one:
+    /// - the notification queue is cleared (F1) — a queued event references the
+    ///   old domain's records and must not reach a client now reading another
+    ///   domain;
+    /// - the post-trigger window is reset to 0 (F3) — a window opened by a
+    ///   trigger that fired on the old domain must not shape storage in the new.
+    pub fn set_domain(&self, id: &SessionId, domain: DomainId) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        if let Some(state) = sessions.get(id) {
+            let mut current = state.domain.write().expect("domain lock poisoned");
+            if *current != domain {
+                *current = domain;
+                // Binding changed — drop old-domain carryover (F1 + F3).
+                state
+                    .notification_queue
+                    .lock()
+                    .expect("queue lock poisoned")
+                    .clear();
+                state.post_window_remaining.store(0, Ordering::Relaxed);
+            }
         }
     }
 

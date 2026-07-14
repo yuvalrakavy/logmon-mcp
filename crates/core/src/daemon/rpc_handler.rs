@@ -1,49 +1,54 @@
+use crate::daemon::domain::{Domain, DomainRegistry};
 use crate::daemon::log_processor::sync_pre_buffer_size;
 use crate::daemon::session::{SessionId, SessionRegistry};
-use crate::engine::pipeline::LogPipeline;
-use crate::receiver::ReceiverMetrics;
 use logmon_broker_protocol::*;
-use crate::span::store::SpanStore;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub struct RpcHandler {
-    pipeline: Arc<LogPipeline>,
-    span_store: Arc<SpanStore>,
+    /// The set of live domains. Every query resolves its bound domain out of
+    /// here at the RPC boundary (see [`Self::resolve_domain`]); the store-level
+    /// code then runs against that domain's pipeline / span store / bookmarks
+    /// unchanged.
+    domains: Arc<DomainRegistry>,
     sessions: Arc<SessionRegistry>,
-    bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
-    metrics: Arc<ReceiverMetrics>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
 }
 
 impl RpcHandler {
     pub fn new(
-        pipeline: Arc<LogPipeline>,
-        span_store: Arc<SpanStore>,
+        domains: Arc<DomainRegistry>,
         sessions: Arc<SessionRegistry>,
-        bookmarks: Arc<crate::store::bookmarks::BookmarkStore>,
-        metrics: Arc<ReceiverMetrics>,
         receivers_info: Vec<String>,
     ) -> Self {
         Self {
-            pipeline,
-            span_store,
+            domains,
             sessions,
-            bookmarks,
-            metrics,
             start_time: std::time::Instant::now(),
             receivers_info,
         }
+    }
+
+    /// Resolve the [`Domain`] the session is currently bound to, cloning its
+    /// `Arc` OUT of the registry guard (F6 contract) so query execution never
+    /// holds the registry lock — that is what makes delete-while-bound
+    /// graceful. Returns the reader-side vanished-domain error (no silent
+    /// fallback to `default`, §5) if the binding points at a deleted domain.
+    fn resolve_domain(&self, session_id: &SessionId) -> Result<Arc<Domain>, String> {
+        let id = self.sessions.domain_of(session_id);
+        self.domains
+            .get(&id)
+            .ok_or_else(|| format!("domain \"{id}\" no longer exists — use_domain to rebind"))
     }
 
     /// Handle an RPC request for a given session.
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         let result = match request.method.as_str() {
             "logs.recent" => self.handle_logs_recent(session_id, &request.params),
-            "logs.context" => self.handle_logs_context(&request.params),
+            "logs.context" => self.handle_logs_context(session_id, &request.params),
             "logs.export" => self.handle_logs_export(session_id, &request.params),
-            "logs.clear" => self.handle_logs_clear(),
+            "logs.clear" => self.handle_logs_clear(session_id),
             "status.get" => self.handle_status(session_id),
             "filters.list" => self.handle_filters_list(session_id),
             "filters.add" => self.handle_filters_add(session_id, &request.params),
@@ -57,12 +62,12 @@ impl RpcHandler {
             "session.drop" => self.handle_session_drop(&request.params),
             "traces.recent" => self.handle_traces_recent(session_id, &request.params),
             "traces.get" => self.handle_traces_get(session_id, &request.params),
-            "traces.summary" => self.handle_traces_summary(&request.params),
+            "traces.summary" => self.handle_traces_summary(session_id, &request.params),
             "traces.slow" => self.handle_traces_slow(session_id, &request.params),
             "traces.logs" => self.handle_traces_logs(session_id, &request.params),
-            "spans.context" => self.handle_spans_context(&request.params),
+            "spans.context" => self.handle_spans_context(session_id, &request.params),
             "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
-            "bookmarks.list" => self.handle_bookmarks_list(&request.params),
+            "bookmarks.list" => self.handle_bookmarks_list(session_id, &request.params),
             "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
             "bookmarks.clear" => self.handle_bookmarks_clear(session_id, &request.params),
             _ => Err(format!("unknown method: {}", request.method)),
@@ -76,6 +81,11 @@ impl RpcHandler {
 
     pub fn build_session_start_result(&self, session_id: &SessionId) -> SessionStartResult {
         let info = self.sessions.get(session_id);
+        // `buffer_size` reflects the connect-time domain's current store size.
+        let buffer_size = self
+            .domains
+            .get(&self.sessions.domain_of(session_id))
+            .map_or(0, |d| d.pipeline.store_len());
         SessionStartResult {
             session_id: session_id.to_string(),
             is_new: true, // caller can override for reconnects
@@ -83,7 +93,7 @@ impl RpcHandler {
             trigger_count: info.as_ref().map_or(0, |i| i.trigger_count),
             filter_count: info.as_ref().map_or(0, |i| i.filter_count),
             daemon_uptime_secs: self.start_time.elapsed().as_secs(),
-            buffer_size: self.pipeline.store_len(),
+            buffer_size,
             receivers: self.receivers_info.clone(),
             capabilities: vec![
                 "bookmarks".into(),
@@ -98,7 +108,7 @@ impl RpcHandler {
     // -----------------------------------------------------------------------
 
     /// Parse a filter string and resolve any bookmark qualifiers against the
-    /// bookmark store using `session_id` as the current session.
+    /// given domain's bookmark store using `session_id` as the current session.
     /// Returns `Ok((None, None))` if the input is `None` or an
     /// empty/whitespace-only string — this matches the previous
     /// `recent_logs_str` behavior, which silently treated empty/parse-failed
@@ -110,14 +120,12 @@ impl RpcHandler {
     /// contained a `c>=` qualifier. Callers that support cursor semantics
     /// (`logs.recent`, `logs.export`, `traces.logs`) capture it and call
     /// `commit_handle.commit(max_seq)` after the lock-free query phase. For
-    /// non-cursor handlers, the value is always `None`. Task 9 will add an
-    /// explicit reject-with-error path for handlers that disallow cursor
-    /// qualifiers (e.g. `traces.recent`, `traces.get`, `traces.slow`); for
-    /// now non-cursor handlers simply ignore the field.
+    /// non-cursor handlers, the value is always `None`.
     fn parse_and_resolve_filter(
         &self,
         filter_str: Option<&str>,
         session_id: &SessionId,
+        bookmarks: &crate::store::bookmarks::BookmarkStore,
     ) -> Result<
         (
             Option<crate::filter::parser::ParsedFilter>,
@@ -132,18 +140,15 @@ impl RpcHandler {
         let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
         let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
             parsed,
-            &self.bookmarks,
+            bookmarks,
             &session_id.to_string(),
         )
         .map_err(|e| e.to_string())?;
         Ok((Some(resolved.filter), resolved.cursor_commit))
     }
 
-    fn handle_logs_recent(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_logs_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
 
@@ -159,26 +164,27 @@ impl RpcHandler {
             }
             let trace_id = u128::from_str_radix(trace_id_hex, 16)
                 .map_err(|_| "invalid trace_id")?;
-            let logs = self.pipeline.logs_by_trace_id(trace_id);
+            let logs = d.pipeline.logs_by_trace_id(trace_id);
             let count = logs.len();
             // trace_id is an index lookup over the whole buffer, not a filter
             // scan — report buffer stats so B2's `scanned==0 ⇒ empty buffer`
             // heuristic still holds (never a misleading 0 on a non-empty store).
-            let buffer_total = self.pipeline.store_len();
+            let buffer_total = d.pipeline.store_len();
             return Ok(json!({
                 "logs": logs,
                 "count": count,
                 "scanned": buffer_total,
                 "buffer_total": buffer_total,
-                "buffer_oldest_seq": self.pipeline.oldest_log_seq(),
-                "buffer_newest_seq": self.pipeline.newest_log_seq(),
+                "buffer_oldest_seq": d.pipeline.oldest_log_seq(),
+                "buffer_newest_seq": d.pipeline.newest_log_seq(),
             }));
         }
 
-        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         let oldest_first = cursor_commit.is_some();
         let (entries, stats) =
-            self.pipeline
+            d.pipeline
                 .recent_logs_with_stats(count, resolved.as_ref(), oldest_first);
 
         // Drive the cursor commit + populate cursor_advanced_to.
@@ -217,31 +223,30 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_logs_context(&self, params: &Value) -> Result<Value, String> {
+    fn handle_logs_context(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let seq = params
             .get("seq")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| "missing required parameter: seq".to_string())?;
         let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
         let after = params.get("after").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-        let entries = self.pipeline.context_by_seq(seq, before, after);
+        let entries = d.pipeline.context_by_seq(seq, before, after);
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
 
-    fn handle_logs_export(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_logs_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let count = params
             .get("count")
             .and_then(|v| v.as_u64())
             .unwrap_or(u64::MAX) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         let oldest_first = cursor_commit.is_some();
         let (entries, stats) =
-            self.pipeline
+            d.pipeline
                 .recent_logs_with_stats(count, resolved.as_ref(), oldest_first);
 
         let advanced_to = if let Some(commit) = cursor_commit {
@@ -278,8 +283,9 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_logs_clear(&self) -> Result<Value, String> {
-        let cleared = self.pipeline.clear_logs();
+    fn handle_logs_clear(&self, session_id: &SessionId) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let cleared = d.pipeline.clear_logs();
         Ok(json!({ "cleared": cleared }))
     }
 
@@ -288,9 +294,10 @@ impl RpcHandler {
     // -----------------------------------------------------------------------
 
     fn handle_status(&self, session_id: &SessionId) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let session_info = self.sessions.get(session_id);
-        let stats = self.pipeline.store_stats();
-        let drops = self.metrics.snapshot();
+        let stats = d.pipeline.store_stats();
+        let drops = d.metrics.snapshot();
         Ok(json!({
             "session": session_info.map(|s| json!({
                 "id": s.id.to_string(),
@@ -308,7 +315,7 @@ impl RpcHandler {
                 "total_received": stats.total_received,
                 "total_stored": stats.total_stored,
                 "malformed_count": stats.malformed_count,
-                "current_size": self.pipeline.store_len(),
+                "current_size": d.pipeline.store_len(),
             },
             "receiver_drops": {
                 "gelf_udp": drops.gelf_udp,
@@ -340,11 +347,8 @@ impl RpcHandler {
         Ok(json!({ "filters": items }))
     }
 
-    fn handle_filters_add(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_filters_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let filter = params
             .get("filter")
             .and_then(|v| v.as_str())
@@ -363,15 +367,11 @@ impl RpcHandler {
             .sessions
             .add_filter(session_id, filter, desc)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&self.pipeline, &self.sessions);
+        sync_pre_buffer_size(&d.pipeline, &self.sessions);
         Ok(json!({ "id": id }))
     }
 
-    fn handle_filters_edit(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_filters_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let filter_id = params
             .get("id")
             .and_then(|v| v.as_u64())
@@ -390,11 +390,8 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_filters_remove(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_filters_remove(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let filter_id = params
             .get("id")
             .and_then(|v| v.as_u64())
@@ -403,7 +400,7 @@ impl RpcHandler {
         self.sessions
             .remove_filter(session_id, filter_id)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&self.pipeline, &self.sessions);
+        sync_pre_buffer_size(&d.pipeline, &self.sessions);
         Ok(json!({ "removed": filter_id }))
     }
 
@@ -431,11 +428,8 @@ impl RpcHandler {
         Ok(json!({ "triggers": items }))
     }
 
-    fn handle_triggers_add(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_triggers_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let filter = params
             .get("filter")
             .and_then(|v| v.as_str())
@@ -464,15 +458,12 @@ impl RpcHandler {
             .sessions
             .add_trigger(session_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&self.pipeline, &self.sessions);
+        sync_pre_buffer_size(&d.pipeline, &self.sessions);
         Ok(json!({ "id": id }))
     }
 
-    fn handle_triggers_edit(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_triggers_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let trigger_id = params
             .get("id")
             .and_then(|v| v.as_u64())
@@ -491,7 +482,7 @@ impl RpcHandler {
             .sessions
             .edit_trigger(session_id, trigger_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&self.pipeline, &self.sessions);
+        sync_pre_buffer_size(&d.pipeline, &self.sessions);
         Ok(json!({
             "id": info.id,
             "filter": info.filter_string,
@@ -504,11 +495,8 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_triggers_remove(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_triggers_remove(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let trigger_id = params
             .get("id")
             .and_then(|v| v.as_u64())
@@ -517,7 +505,7 @@ impl RpcHandler {
         self.sessions
             .remove_trigger(session_id, trigger_id)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&self.pipeline, &self.sessions);
+        sync_pre_buffer_size(&d.pipeline, &self.sessions);
         Ok(json!({ "removed": trigger_id }))
     }
 
@@ -525,20 +513,18 @@ impl RpcHandler {
     // traces.* / spans.*
     // -----------------------------------------------------------------------
 
-    fn handle_traces_recent(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
             return Err("cursor qualifier not permitted in traces.recent".to_string());
         }
 
-        let pipeline = &self.pipeline;
-        let summaries = self.span_store.recent_traces(
+        let pipeline = &d.pipeline;
+        let summaries = d.span_store.recent_traces(
             count,
             resolved.as_ref(),
             |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
@@ -547,22 +533,19 @@ impl RpcHandler {
         // for this query. (Buffer stats are read separately from the scan — a
         // concurrent write can make them momentarily differ; a diagnostic count,
         // not a strict snapshot.)
-        let buffer_total = self.span_store.len();
+        let buffer_total = d.span_store.len();
         Ok(json!({
             "traces": summaries,
             "count": summaries.len(),
             "scanned": buffer_total,
             "buffer_total": buffer_total,
-            "buffer_oldest_seq": self.span_store.oldest_seq(),
-            "buffer_newest_seq": self.span_store.newest_seq(),
+            "buffer_oldest_seq": d.span_store.oldest_seq(),
+            "buffer_newest_seq": d.span_store.newest_seq(),
         }))
     }
 
-    fn handle_traces_get(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_get(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
@@ -576,17 +559,18 @@ impl RpcHandler {
 
         // Resolve filter (used to filter spans within the trace below)
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
             return Err("cursor qualifier not permitted in traces.get".to_string());
         }
 
-        let mut spans = self.span_store.get_trace(trace_id);
+        let mut spans = d.span_store.get_trace(trace_id);
         if let Some(f) = resolved.as_ref() {
             spans.retain(|s| crate::filter::matcher::matches_span(f, s));
         }
         let logs = if include_logs {
-            self.pipeline.logs_by_trace_id(trace_id)
+            d.pipeline.logs_by_trace_id(trace_id)
         } else {
             vec![]
         };
@@ -600,7 +584,8 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_summary(&self, params: &Value) -> Result<Value, String> {
+    fn handle_traces_summary(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
@@ -608,7 +593,7 @@ impl RpcHandler {
         let trace_id =
             u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
-        let spans = self.span_store.get_trace(trace_id);
+        let spans = d.span_store.get_trace(trace_id);
         if spans.is_empty() {
             return Err(format!("no spans found for trace {trace_id_hex}"));
         }
@@ -675,24 +660,22 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_slow(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_slow(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let min_duration = params
             .get("min_duration_ms")
             .and_then(|v| v.as_f64())
             .unwrap_or(100.0);
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
             return Err("cursor qualifier not permitted in traces.slow".to_string());
         }
         let group_by = params.get("group_by").and_then(|v| v.as_str());
 
-        let slow = self
+        let slow = d
             .span_store
             .slow_spans(min_duration, count, resolved.as_ref());
 
@@ -735,11 +718,8 @@ impl RpcHandler {
         }
     }
 
-    fn handle_traces_logs(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_traces_logs(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
@@ -748,12 +728,13 @@ impl RpcHandler {
             u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let filter_str = params.get("filter").and_then(|v| v.as_str());
-        let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
 
         // logs_by_trace_id already returns logs in stored (seq-ascending) order
         // — that's the same order cursor pagination wants — so no ordering
         // switch is needed on this code path.
-        let mut logs = self.pipeline.logs_by_trace_id(trace_id);
+        let mut logs = d.pipeline.logs_by_trace_id(trace_id);
         if let Some(f) = resolved.as_ref() {
             logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
         }
@@ -778,7 +759,8 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_spans_context(&self, params: &Value) -> Result<Value, String> {
+    fn handle_spans_context(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let seq = params
             .get("seq")
             .and_then(|v| v.as_u64())
@@ -786,13 +768,16 @@ impl RpcHandler {
         let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
         let after = params.get("after").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
-        let spans = self.span_store.context_by_seq(seq, before, after);
+        let spans = d.span_store.context_by_seq(seq, before, after);
         Ok(json!({ "spans": spans, "count": spans.len() }))
     }
 
     // -----------------------------------------------------------------------
     // session.*
     // -----------------------------------------------------------------------
+    //
+    // Session methods intentionally span domains — config is global, only data
+    // is partitioned (spec §2). They resolve no domain.
 
     fn handle_session_list(&self) -> Result<Value, String> {
         let sessions = self.sessions.list();
@@ -829,11 +814,8 @@ impl RpcHandler {
     // bookmarks.*
     // -----------------------------------------------------------------------
 
-    fn handle_bookmarks_add(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_bookmarks_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
@@ -848,8 +830,8 @@ impl RpcHandler {
         // "absent / null" (use default) from "present but wrong type/range"
         // (error, don't silently coerce).
         let start_seq = match params.get("start_seq") {
-            None => self.pipeline.current_seq(),
-            Some(v) if v.is_null() => self.pipeline.current_seq(),
+            None => d.pipeline.current_seq(),
+            Some(v) if v.is_null() => d.pipeline.current_seq(),
             Some(v) => v
                 .as_u64()
                 .ok_or_else(|| "start_seq must be a non-negative integer".to_string())?,
@@ -857,10 +839,10 @@ impl RpcHandler {
         let description = params.get("description").and_then(|v| v.as_str());
 
         // Sweep before adding so the store stays tidy.
-        self.sweep_bookmarks();
+        self.sweep_bookmarks(&d);
 
         let session = session_id.to_string();
-        let (bookmark, replaced) = self
+        let (bookmark, replaced) = d
             .bookmarks
             .add(&session, name, start_seq, description, replace)
             .map_err(|e| e.to_string())?;
@@ -871,11 +853,12 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_bookmarks_list(&self, params: &Value) -> Result<Value, String> {
-        self.sweep_bookmarks();
+    fn handle_bookmarks_list(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        self.sweep_bookmarks(&d);
         let session_filter = params.get("session").and_then(|v| v.as_str());
 
-        let items: Vec<Value> = self
+        let items: Vec<Value> = d
             .bookmarks
             .list()
             .into_iter()
@@ -895,46 +878,46 @@ impl RpcHandler {
         Ok(json!({ "bookmarks": items, "count": items.len() }))
     }
 
-    fn handle_bookmarks_remove(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_bookmarks_remove(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: name".to_string())?;
         let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
-        self.bookmarks
+        d.bookmarks
             .remove(&qualified)
             .map_err(|e| e.to_string())?;
         Ok(json!({ "removed": qualified }))
     }
 
-    fn handle_bookmarks_clear(
-        &self,
-        session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+    fn handle_bookmarks_clear(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
         // Default to the calling session if no explicit session is given.
         let session = params
             .get("session")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| session_id.to_string());
-        let removed_count = self.bookmarks.clear_session(&session);
+        let removed_count = d.bookmarks.clear_session(&session);
         Ok(json!({ "removed_count": removed_count, "session": session }))
     }
 
-    /// Clear all bookmarks for a given session. Used when anonymous sessions disconnect
-    /// to drop their ephemeral bookmarks. (Named sessions preserve bookmarks via snapshot.)
-    pub fn clear_session_bookmarks(&self, session: &str) -> usize {
-        self.bookmarks.clear_session(session)
+    /// Clear all bookmarks for a given session in the domain it is currently
+    /// bound to. Used when anonymous sessions disconnect to drop their
+    /// ephemeral bookmarks. (Named sessions preserve bookmarks via snapshot.)
+    /// No-op if the bound domain has since been deleted (its bookmarks went
+    /// with it).
+    pub fn clear_session_bookmarks(&self, session_id: &SessionId) -> usize {
+        match self.domains.get(&self.sessions.domain_of(session_id)) {
+            Some(d) => d.bookmarks.clear_session(&session_id.to_string()),
+            None => 0,
+        }
     }
 
-    fn sweep_bookmarks(&self) {
-        let oldest_log = self.pipeline.oldest_log_seq();
-        let oldest_span = self.span_store.oldest_seq();
-        self.bookmarks.sweep(oldest_log, oldest_span);
+    fn sweep_bookmarks(&self, d: &Domain) {
+        let oldest_log = d.pipeline.oldest_log_seq();
+        let oldest_span = d.span_store.oldest_seq();
+        d.bookmarks.sweep(oldest_log, oldest_span);
     }
 }

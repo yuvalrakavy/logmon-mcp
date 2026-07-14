@@ -1,3 +1,4 @@
+use crate::daemon::domain::{Domain, DomainConfig, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::log_processor::{spawn_log_processor, sync_pre_buffer_size};
 use crate::daemon::persistence::{
     config_dir, load_state, save_state, DaemonConfig, DaemonState, SEQ_BLOCK_SIZE,
@@ -323,14 +324,32 @@ pub async fn run_with_overrides(
     // 12. Sync pre-buffer size after restoring sessions
     sync_pre_buffer_size(&pipeline, &sessions);
 
-    // 13. Create RpcHandler (BookmarkStore created earlier in step 7 so
-    //     persisted bookmarks can be restored alongside triggers/filters).
-    let handler = Arc::new(RpcHandler::new(
+    // 12b. Assemble the `default` domain (Model A, N=1). Its machinery was
+    //      built above — seeded from `state.json`'s seq_block and already used
+    //      to restore named sessions — so we wrap the existing Arcs via
+    //      `from_parts` rather than allocating fresh. `default` is a
+    //      config-declared domain (`domains.delete` refuses it). Runtime
+    //      `domains.create`/`delete` and additional domains arrive in a later
+    //      stage; for now the registry holds exactly this one.
+    let domains = Arc::new(DomainRegistry::new());
+    domains.insert(Arc::new(Domain::from_parts(
+        DomainConfig {
+            name: DomainId::default_domain(),
+            log_buffer_size: config.buffer_size,
+            span_buffer_size: config.span_buffer_size,
+            source: DomainSource::Config,
+        },
         pipeline.clone(),
         span_store.clone(),
-        sessions.clone(),
         bookmark_store.clone(),
         receiver_metrics.clone(),
+    )));
+
+    // 13. Create RpcHandler. It resolves each request's bound domain out of the
+    //     registry (once, at the boundary) and runs the store code against it.
+    let handler = Arc::new(RpcHandler::new(
+        domains.clone(),
+        sessions.clone(),
         all_receivers_info,
     ));
 
@@ -399,10 +418,10 @@ pub async fn run_with_overrides(
                     match result {
                         Ok((stream, _addr)) => {
                             let handler = handler.clone();
-                            let pipeline = pipeline.clone();
+                            let domains = domains.clone();
                             let sessions = sessions.clone();
                             connection_tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, handler, pipeline, sessions).await {
+                                if let Err(e) = handle_connection(stream, handler, domains, sessions).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -479,10 +498,10 @@ pub async fn run_with_overrides(
                         Ok((stream, addr)) => {
                             info!(?addr, "new TCP connection");
                             let handler = handler.clone();
-                            let pipeline = pipeline.clone();
+                            let domains = domains.clone();
                             let sessions = sessions.clone();
                             connection_tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, handler, pipeline, sessions).await {
+                                if let Err(e) = handle_connection(stream, handler, domains, sessions).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -529,7 +548,7 @@ pub async fn run_with_overrides(
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     handler: Arc<RpcHandler>,
-    pipeline: Arc<LogPipeline>,
+    domains: Arc<DomainRegistry>,
     sessions: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -638,8 +657,19 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         write_message(&mut writer, &notification).await?;
     }
 
-    // 6. Subscribe to pipeline events for live trigger notifications
-    let mut event_rx = pipeline.subscribe_events();
+    // 6. Subscribe to the CONNECT-TIME domain's pipeline events for live
+    //    trigger notifications (F6). A reconnecting named session may already
+    //    be bound to a non-default domain; resolve it rather than assume. If
+    //    the bound domain has vanished, fall back to `default` (always present)
+    //    — the handler still surfaces the vanished-domain error on data
+    //    requests. (Re-subscribe on `use_domain` arrives with binding, §9.4.)
+    let connect_domain = sessions.domain_of(&session_id);
+    let mut event_rx = domains
+        .get(&connect_domain)
+        .or_else(|| domains.get(&DomainId::default_domain()))
+        .expect("default domain is always present")
+        .pipeline
+        .subscribe_events();
 
     // 7. Main loop
     loop {
@@ -693,7 +723,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via snapshot).
     if matches!(session_id, SessionId::Anonymous(_)) {
-        let removed = handler.clear_session_bookmarks(&session_id.to_string());
+        let removed = handler.clear_session_bookmarks(&session_id);
         if removed > 0 {
             info!(?session_id, removed, "cleared anonymous-session bookmarks on disconnect");
         }

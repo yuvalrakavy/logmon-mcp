@@ -3,6 +3,9 @@
 //! and exercises the full RPC path: parse → resolve bookmarks → match → return.
 
 use chrono::Utc;
+use logmon_broker_core::daemon::domain::{
+    Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
+};
 use logmon_broker_core::daemon::log_processor::process_entry;
 use logmon_broker_core::daemon::rpc_handler::RpcHandler;
 use logmon_broker_core::daemon::session::SessionRegistry;
@@ -43,14 +46,20 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
     let sessions = Arc::new(SessionRegistry::new());
     let bookmarks = Arc::new(BookmarkStore::new());
     let metrics = Arc::new(ReceiverMetrics::new());
-    let handler = Arc::new(RpcHandler::new(
+    let domains = Arc::new(DomainRegistry::new());
+    domains.insert(Arc::new(Domain::from_parts(
+        DomainConfig {
+            name: DomainId::default_domain(),
+            log_buffer_size: 1000,
+            span_buffer_size: 1000,
+            source: DomainSource::Config,
+        },
         pipeline.clone(),
         span_store,
-        sessions.clone(),
         bookmarks,
         metrics,
-        vec!["test".into()],
-    ));
+    )));
+    let handler = Arc::new(RpcHandler::new(domains, sessions.clone(), vec!["test".into()]));
     (handler, pipeline, sessions)
 }
 

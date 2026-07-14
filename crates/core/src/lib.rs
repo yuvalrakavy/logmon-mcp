@@ -5,6 +5,7 @@ pub mod receiver;
 pub mod span;
 pub mod store;
 pub mod daemon {
+    pub mod domain;
     pub mod log_processor;
     pub mod persistence;
     pub mod process;
