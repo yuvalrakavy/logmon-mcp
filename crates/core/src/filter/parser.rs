@@ -196,6 +196,8 @@ pub enum FilterParseError {
     MultipleCursorQualifiers,
     #[error("c<= is not a valid qualifier; cursors only support read-and-advance via c>=. For a read-only snapshot of past records, use b<=name.")]
     CursorLteNotSupported,
+    #[error("unknown selector \"{0}\": only l/d (level/duration) and b/c (bookmark/cursor) use >= or <=. For a literal text search, quote it or use a /regex/. Valid selectors: m, fm, mfm, h, fa, fi, ln, l, sn, sv, st, sk")]
+    UnknownComparisonSelector(String),
 }
 
 /// Validate a bookmark name as it appears inside a DSL filter token.
@@ -398,6 +400,20 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
 
         // lhs must not be empty; if it's empty treat as bare substring
         if !lhs.is_empty() {
+            // B1: a `<ident>>=` / `<ident><=` whose ident isn't a comparison
+            // selector is a PROVABLE typo — field names never contain >= / <=,
+            // so this can't be a legitimate additional-field filter. Reject only
+            // this provable case (keyed off the first-`=` split's lhs, so the
+            // valid escape hatch `"a>=b"` / `/a>=b/` and `_url=a>=b` — where >=
+            // is in the value — are untouched). Ambiguous `ident=value` stays a
+            // valid additional-field filter. The l/d/b/c bases are already
+            // consumed by the strip_prefix checks above; this exemption is
+            // belt-and-suspenders against a future reorder — do NOT remove it.
+            if (lhs.ends_with('>') || lhs.ends_with('<'))
+                && !matches!(&lhs[..lhs.len() - 1], "l" | "d" | "b" | "c")
+            {
+                return Err(FilterParseError::UnknownComparisonSelector(lhs.to_string()));
+            }
             let selector = parse_selector(lhs);
             // Strip surrounding quotes from pattern value
             let rhs = if rhs.starts_with('"') && rhs.ends_with('"') && rhs.len() >= 2 {
@@ -696,5 +712,98 @@ pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,
         ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| matches!(q, Qualifier::CursorFilter { .. })),
+    }
+}
+
+#[cfg(test)]
+mod strict_selector_tests {
+    //! B1: reject only PROVABLE selector typos (`<ident>>=` / `<ident><=` where
+    //! ident isn't a comparison selector), never the valid quote/regex escape
+    //! hatch or a legitimate additional-field filter.
+    use super::*;
+
+    fn first(s: &str) -> Qualifier {
+        match parse_filter(s).unwrap_or_else(|e| panic!("expected `{s}` to parse, got: {e}")) {
+            ParsedFilter::Qualifiers(mut qs) => qs.remove(0),
+            other => panic!("expected qualifiers for `{s}`, got {other:?}"),
+        }
+    }
+    fn err(s: &str) -> FilterParseError {
+        parse_filter(s).expect_err(&format!("expected `{s}` to be rejected as a typo"))
+    }
+
+    // --- FALSE POSITIVES: valid today, MUST stay valid ---
+
+    #[test]
+    fn bare_quoted_pattern_with_operators_stays_valid() {
+        // The documented escape hatch for literal text containing >= / <=.
+        assert!(matches!(first(r#""a>=b""#), Qualifier::BarePattern(_)));
+        assert!(matches!(first(r#""retries<=0""#), Qualifier::BarePattern(_)));
+    }
+
+    #[test]
+    fn bare_regex_with_operators_stays_valid() {
+        assert!(matches!(first("/a>=b/"), Qualifier::BarePattern(_)));
+        assert!(matches!(first("/x<=y/"), Qualifier::BarePattern(_)));
+    }
+
+    #[test]
+    fn operator_in_value_stays_valid() {
+        // The first `=` is the selector split; the >= / <= lives in the VALUE.
+        assert!(matches!(
+            first("_url=a>=b"),
+            Qualifier::SelectorPattern(Selector::AdditionalField(_), _)
+        ));
+        assert!(matches!(first("m=x>=y"), Qualifier::SelectorPattern(Selector::Message, _)));
+        assert!(matches!(first("fa=a<=b"), Qualifier::SelectorPattern(Selector::Facility, _)));
+    }
+
+    #[test]
+    fn additional_field_and_bareword_stay_valid() {
+        assert!(matches!(
+            first("_track=t3"),
+            Qualifier::SelectorPattern(Selector::AdditionalField(_), _)
+        ));
+        assert!(matches!(first("nonexistent"), Qualifier::BarePattern(_)));
+    }
+
+    #[test]
+    fn comparison_selectors_still_parse() {
+        assert!(matches!(first("l>=ERROR"), Qualifier::LevelFilter { .. }));
+        assert!(matches!(first("d>=100"), Qualifier::DurationFilter(..)));
+        assert!(matches!(first("b>=anchor"), Qualifier::BookmarkFilter { .. }));
+        assert!(matches!(first("c>=cur"), Qualifier::CursorFilter { .. }));
+    }
+
+    // --- PROVABLE TYPOS: MUST hard-error ---
+
+    #[test]
+    fn typo_long_form_selectors_error() {
+        assert!(matches!(err("level>=WARN"), FilterParseError::UnknownComparisonSelector(_)));
+        assert!(matches!(err("duration>=100"), FilterParseError::UnknownComparisonSelector(_)));
+        assert!(matches!(err("retries>=3"), FilterParseError::UnknownComparisonSelector(_)));
+        assert!(matches!(err("foo<=bar"), FilterParseError::UnknownComparisonSelector(_)));
+    }
+
+    #[test]
+    fn typo_capital_level_selector_errors() {
+        // strip_prefix("l>=") is case-sensitive, so `L>=` falls through to the rule.
+        assert!(matches!(err("L>=warn"), FilterParseError::UnknownComparisonSelector(_)));
+    }
+
+    #[test]
+    fn spaced_operator_errors_not_silent_no_match() {
+        // `l >= warn` must NOT silently become AdditionalField("l >") → 0 matches.
+        assert!(matches!(err("l >= warn"), FilterParseError::UnknownComparisonSelector(_)));
+    }
+
+    #[test]
+    fn error_names_token_and_points_to_escape_hatch() {
+        let msg = err("level>=WARN").to_string();
+        assert!(msg.contains("level>"), "should name the offending token: {msg}");
+        assert!(
+            msg.contains("quote") || msg.contains("regex"),
+            "should point to the escape hatch: {msg}"
+        );
     }
 }
