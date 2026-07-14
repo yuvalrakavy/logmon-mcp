@@ -38,7 +38,8 @@ domains' bookmarks (decision #1).
 
 **Deferred (named):** B3/B4 (ack + signature-dedup); B6 (trigger TTL); per-query
 `domain=` override; per-domain trigger-window defaults; idle-domain reaping; proactive
-(push) stall alerts; runtime/ephemeral-domain bookmark persistence.
+(push) stall alerts. (Ephemeral domains persist nothing — that's their definition, not a
+deferred gap; durable `config`/`persistent` domains persist bookmarks, §5.)
 
 **Grounding:** every `file:line` verified against the tree on 2026-07-14 (initial pass +
 4-reviewer gate). Anchors drift; re-confirm before editing.
@@ -108,7 +109,7 @@ struct Domain {
     metrics:    ReceiverMetrics,  // per-domain (was one global Arc); B7 liveness fields live here
     receivers:  DomainReceivers,  // GelfReceiver + OtlpReceiver + spawned processors for this domain
     config:     DomainConfig,     // name, gelf_port, otlp_grpc_port, otlp_http_port,
-                                  //   log_buffer_size, span_buffer_size, source: Config|Runtime
+                                  //   log_buffer_size, span_buffer_size, source: Config|Persistent|Ephemeral
     // B7 liveness: last_log_received_at / last_span_received_at (AtomicU64 epoch-ms)
 }
 struct DomainRegistry { domains: RwLock<HashMap<DomainId, Arc<Domain>>> }  // DomainId = validated name
@@ -148,10 +149,15 @@ Method names follow the enforced `<group>.<verb>` convention (wire →
 
 ```
 domains.create(name, gelf_port?, otlp_grpc_port?, otlp_http_port?,
-               log_buffer_size?, span_buffer_size?)
+               log_buffer_size?, span_buffer_size?, persist?=false)
   -> { name, gelf_port, otlp_grpc_port, otlp_http_port,
-       log_buffer_size, span_buffer_size, source:"runtime" }
-  # Idempotent ensure; EPHEMERAL runtime domain. gelf_port serves UDP+TCP.
+       log_buffer_size, span_buffer_size, source:"ephemeral"|"persistent" }
+  # Idempotent ensure. gelf_port serves UDP+TCP.
+  # persist=false (default) → EPHEMERAL runtime domain (gone on restart; dev-tracks).
+  # persist=true → DURABLE: also recorded in a machine-owned domains store so it is
+  #   re-created on the next boot. Promotes an existing ephemeral domain in place.
+  #   (HOW it persists is an implementation detail — a machine-owned store, NOT
+  #    config.json, which stays user-authored and read-only.)
   # provided ports → bind (error if a DIFFERENT domain holds any); omitted → allocate.
   # A port explicitly set to 0 DISABLES that receiver for the domain (mirrors the
   #   daemon-level `otlp_grpc_port>0 || otlp_http_port>0` gate, server.rs:287).
@@ -159,7 +165,9 @@ domains.create(name, gelf_port?, otlp_grpc_port?, otlp_http_port?,
   # Ports acquired SYNCHRONOUSLY (incl. OTLP pre-bind, §9.3) → clean conflict errors.
 
 domains.delete(name) -> { name, deleted:true }
-  # Runtime only; refuse config-declared (incl. default). Arc-graceful teardown.
+  # Deletes ephemeral OR persistent (API-created) domains — for a persistent one it
+  #   also removes it from the machine-owned store. Refuses `config`-declared domains
+  #   (incl. default): those are user-authored — edit config.json. Arc-graceful teardown.
 
 domains.use(name)          # session-scoped sticky bind; switchable; error if absent; none → default.
                            # Also a `domain` param on session.start (atomic connect-time bind).
@@ -172,7 +180,7 @@ domains.clear()            # NEW method. Dispose the BOUND domain's DATA: logs +
 
 domains.list()
   -> { domains: [ { name, gelf_port, otlp_grpc_port, otlp_http_port,
-                    source:"config"|"runtime", log_buffer_size, span_buffer_size,
+                    source:"config"|"persistent"|"ephemeral", log_buffer_size, span_buffer_size,
                     log_count, span_count, oldest_seq, newest_seq,
                     last_log_received_at, last_span_received_at, idle_secs, stale } ] }
   # Pure registry view — no session context. (Liveness fields populated in Wave 3 / B7;
@@ -180,31 +188,37 @@ domains.list()
 ```
 
 **Flag-backs to the Store dev-tracks spec (§13):** 3 ports not 4 (`gelf_port` = UDP+TCP);
-method names `domains.create/use/...`; `session.start` `domain` param; `domains.clear`;
-liveness fields; the OTLP beacon caveat (§9.8). Derivation stays `gelf 12201+N /
-otlp_grpc 4317+N / otlp_http 4318+N`.
+method names `domains.create/use/...`; the `persist` flag + `source:config|persistent|ephemeral`
+taxonomy; `session.start` `domain` param; `domains.clear`; liveness fields; the OTLP beacon
+caveat (§9.8). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+N`.
 
 **Capabilities:** add `"domains"` (`rpc_handler.rs:88-92`).
 
 ## 5. Lifecycle & persistence
 
-Two sources, no domain-*registry* persistence machinery:
-- **Config-declared** — `DaemonConfig` grows an optional `domains` array (JSON — the
-  config is `serde_json`, `persistence.rs:161`, **not** TOML). `default` is the implicit
-  entry. Durable via the config file. `domains.delete` refuses these.
-- **Runtime-created** — `domains.create` domains are ephemeral (gone on restart,
-  re-ensured by the producer; `dev-server.sh` already does this). Bounded by the finite
-  preconfigured track set; `max_domains` (config, default 32) caps **runtime** domains
-  only (default + config-declared always honored, don't count against it). Chosen for
-  dev-tracks because it binds ports only for tracks actually running.
+Three sources → the `source` field. A **machine-owned domains store** holds API-created
+durable domains, so `config.json` stays user-authored and read-only:
+- **`config`** — `DaemonConfig` grows an optional `domains` array (JSON — the config is
+  `serde_json`, `persistence.rs:161`, **not** TOML). `default` is the implicit entry.
+  Durable; `domains.delete` refuses these (edit the file).
+- **`persistent`** — `domains.create(..., persist=true)`. **The MCP/CLI path to a durable
+  domain.** Broker-managed: recorded in a machine-owned domains store (a small
+  `{name, ports, sizes}` declaration file, re-created fresh at boot like a config domain —
+  so it needs no `seq_block`/state machinery and can't reintroduce the restart-seq edge
+  cases). `domains.delete` removes it.
+- **`ephemeral`** — `domains.create` (default `persist=false`). Gone on restart, re-ensured
+  by the producer (`dev-server.sh` does this) — the dev-tracks default; binds ports only
+  for tracks actually running.
 
-**Bookmark durability follows domain source (decision #1).** Config-declared domains
-(default + `production` + any listed) **persist their `BookmarkStore`** to `state.json`;
-runtime/ephemeral domains do not. Concretely: `snapshot_named_for_persistence`
-(`session.rs:779-848`) / `restore_named` (`:703-774`) iterate the config-declared
-domains' bookmark stores (today they touch one global store; the call site is
-`server.rs:227`). This keeps a durable domain's user annotations durable, consistent with
-its config-declared durability, without persisting the ephemeral domains.
+`max_domains` (config, default 32) caps the **API-created** domains (ephemeral +
+persistent); `config` + `default` are always honored and don't count against it.
+
+**Bookmark durability follows domain durability (decision #1).** DURABLE domains
+(`config` + `persistent`) **persist their `BookmarkStore`** to `state.json`; `ephemeral`
+domains do not. Concretely: `snapshot_named_for_persistence` (`session.rs:779-848`) /
+`restore_named` (`:703-774`) iterate the durable domains' bookmark stores (today they
+touch one global store; the call site is `server.rs:227`). A durable domain's user
+annotations survive restart, consistent with the domain itself surviving.
 
 **Delete-while-bound, reader side:** a query against a deleted domain returns
 `domain "t3" no longer exists — use_domain to rebind` — **no** silent fallback to
@@ -305,7 +319,7 @@ correctly.
    (`server.rs:55-60,297`) is a fixed multicast with no port/domain — with N domains a
    producer keying off it can be released by the wrong domain's OTLP. Making it
    per-domain-meaningful requires adding port/domain to the payload — a wire change; flag
-   to Store (§13). Interim: suppress the beacon for runtime domains, or leave it default-only.
+   to Store (§13). Interim: suppress the beacon for API-created domains, or leave it default-only.
 9. **Port allocation** (omitted mode): allocate from an ephemeral range, bind
    synchronously, retry on race, return chosen ports.
 10. **Name validation** reuse `is_valid_session_name` (`session.rs:164`, `[A-Za-z0-9_-]`);
@@ -421,11 +435,13 @@ lands; only the field access changes.
 - **Migration:** old `state.json` → default domain, seqs preserved, bookmarks resolvable
   against `default`; `default` re-reserves+persists the seq block on boot.
 - **Seq-block fix:** >1000-record run, restart, a pre-restart cursor still resolves correctly.
-- **Production bookmark durability:** a bookmark in a config-declared `production` domain
-  survives restart; a runtime-domain bookmark does not.
+- **Durable domains + bookmarks:** `domains.create(persist=true)` returns
+  `source:"persistent"` and the domain is re-created from the machine store after restart;
+  `domains.delete` removes it. A bookmark in a durable domain (`config` or `persistent`)
+  survives restart; an `ephemeral` domain's does not.
 - Lifecycle: idempotent create (same/different/held ports); delete refused on config/default;
   Arc-graceful delete-while-bound; query-after-delete → rebind error (no silent fallback).
-- `max_domains` refusal (runtime only); omitted-ports allocation; **OTLP port clash → clean
+- `max_domains` refusal (API-created only); omitted-ports allocation; **OTLP port clash → clean
   synchronous error** (prove the pre-bind catches it, not a dead task); `port=0` disables that receiver.
 - `domains.clear` empties logs+spans, keeps receivers, seq monotonic.
 - Lazy alloc: created-but-idle domain allocates ~0 buffer; first record allocates once.
@@ -453,10 +469,12 @@ full diff before merge still apply.
 ## 13. Flag-backs to the Store dev-tracks spec
 
 Contract deltas Store must absorb: **3 ports not 4**; method names `domains.create/use/
-delete/list/clear`; `session.start` `domain` param; `domains.list` shape; stall/liveness
-fields; and the **OTLP beacon caveat** (§9.8 — the current `OTEL:ONLINE` beacon can't
-distinguish domains without a payload/wire change; if dev-tracks' tracing-init keys off it,
-that needs addressing). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+N`.
+delete/list/clear`; the **`persist` flag** on `domains.create` + the
+`source:config|persistent|ephemeral` taxonomy (so MCP/CLI can create durable domains);
+`session.start` `domain` param; `domains.list` shape; stall/liveness fields; and the
+**OTLP beacon caveat** (§9.8 — the current `OTEL:ONLINE` beacon can't distinguish domains
+without a payload/wire change; if dev-tracks' tracing-init keys off it, that needs
+addressing). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+N`.
 
 ## 14. Cross-references
 
