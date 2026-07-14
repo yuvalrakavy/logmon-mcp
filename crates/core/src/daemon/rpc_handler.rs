@@ -165,7 +165,9 @@ impl RpcHandler {
 
         let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let oldest_first = cursor_commit.is_some();
-        let entries = self.pipeline.recent_logs(count, resolved.as_ref(), oldest_first);
+        let (entries, stats) =
+            self.pipeline
+                .recent_logs_with_stats(count, resolved.as_ref(), oldest_first);
 
         // Drive the cursor commit + populate cursor_advanced_to.
         let advanced_to = if let Some(commit) = cursor_commit {
@@ -183,7 +185,14 @@ impl RpcHandler {
             None
         };
 
-        let mut result = json!({ "logs": entries, "count": entries.len() });
+        let mut result = json!({
+            "logs": entries,
+            "count": entries.len(),
+            "scanned": stats.scanned,
+            "buffer_total": stats.buffer_total,
+            "buffer_oldest_seq": stats.buffer_oldest_seq,
+            "buffer_newest_seq": stats.buffer_newest_seq,
+        });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);
         }
@@ -213,7 +222,9 @@ impl RpcHandler {
         let filter_str = params.get("filter").and_then(|v| v.as_str());
         let (resolved, cursor_commit) = self.parse_and_resolve_filter(filter_str, session_id)?;
         let oldest_first = cursor_commit.is_some();
-        let entries = self.pipeline.recent_logs(count, resolved.as_ref(), oldest_first);
+        let (entries, stats) =
+            self.pipeline
+                .recent_logs_with_stats(count, resolved.as_ref(), oldest_first);
 
         let advanced_to = if let Some(commit) = cursor_commit {
             let max_seq = entries.iter().map(|e| e.seq).max();
@@ -228,8 +239,15 @@ impl RpcHandler {
             None
         };
 
-        let mut result =
-            json!({ "logs": entries, "count": entries.len(), "format": "json" });
+        let mut result = json!({
+            "logs": entries,
+            "count": entries.len(),
+            "format": "json",
+            "scanned": stats.scanned,
+            "buffer_total": stats.buffer_total,
+            "buffer_oldest_seq": stats.buffer_oldest_seq,
+            "buffer_newest_seq": stats.buffer_newest_seq,
+        });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);
         }
@@ -501,7 +519,16 @@ impl RpcHandler {
             resolved.as_ref(),
             |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
         );
-        Ok(json!({ "traces": summaries, "count": summaries.len() }))
+        // recent_traces walks the whole span buffer, so scanned == buffer_total.
+        let buffer_total = self.span_store.len();
+        Ok(json!({
+            "traces": summaries,
+            "count": summaries.len(),
+            "scanned": buffer_total,
+            "buffer_total": buffer_total,
+            "buffer_oldest_seq": self.span_store.oldest_seq(),
+            "buffer_newest_seq": self.span_store.newest_seq(),
+        }))
     }
 
     fn handle_traces_get(

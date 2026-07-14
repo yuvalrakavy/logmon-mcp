@@ -250,7 +250,21 @@ pub struct LogsRecent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct LogsRecentResult {
     pub logs: Vec<LogEntry>,
+    /// Number of records that MATCHED the filter and were returned (capped by
+    /// the requested `count`). This is the "matched" count in B2's vocabulary.
     pub count: usize,
+    /// Number of buffered records EXAMINED to produce this result (B2). With
+    /// `count == 0`, `scanned > 0` means "filter's fault, data is flowing",
+    /// while `scanned == 0` means an empty buffer / dead pipeline.
+    #[serde(default)]
+    pub scanned: usize,
+    /// Total records currently in the queried buffer.
+    #[serde(default)]
+    pub buffer_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_newest_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
 }
@@ -283,6 +297,14 @@ pub struct LogsExportResult {
     pub logs: Vec<LogEntry>,
     pub count: usize,
     pub format: String,
+    #[serde(default)]
+    pub scanned: usize,
+    #[serde(default)]
+    pub buffer_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_newest_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
 }
@@ -436,7 +458,20 @@ pub struct TracesRecent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TracesRecentResult {
     pub traces: Vec<TraceSummary>,
+    /// Number of traces MATCHED and returned (capped by `count`).
     pub count: usize,
+    /// Spans examined to build these traces. `recent_traces` walks the whole
+    /// span buffer, so for traces this equals `buffer_total` (B2): `count==0,
+    /// scanned>0` means "filter's fault", `scanned==0` means empty span buffer.
+    #[serde(default)]
+    pub scanned: usize,
+    /// Total spans currently in the span buffer.
+    #[serde(default)]
+    pub buffer_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_newest_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

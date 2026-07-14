@@ -32,4 +32,7 @@ pub trait LogStore: Send + Sync {
     /// Seq of the oldest entry currently in the buffer, or `None` if empty.
     /// Used by the bookmark sweep — see `crate::store::bookmarks::should_evict`.
     fn oldest_seq(&self) -> Option<u64>;
+    /// Seq of the newest entry currently in the buffer, or `None` if empty.
+    /// Powers B2's `buffer_newest_seq` response field.
+    fn newest_seq(&self) -> Option<u64>;
 }

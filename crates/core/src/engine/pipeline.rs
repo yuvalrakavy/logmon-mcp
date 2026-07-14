@@ -61,6 +61,16 @@ pub struct LogPipeline {
     event_sender: broadcast::Sender<PipelineEvent>,
 }
 
+/// Buffer/scan statistics returned alongside a `recent_logs_with_stats` query,
+/// powering the B2 `scanned` / `buffer_*` response fields.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecentStats {
+    pub scanned: usize,
+    pub buffer_total: usize,
+    pub buffer_oldest_seq: Option<u64>,
+    pub buffer_newest_seq: Option<u64>,
+}
+
 impl LogPipeline {
     pub fn new(store_capacity: usize) -> Self {
         let (event_sender, _) = broadcast::channel(100);
@@ -146,6 +156,25 @@ impl LogPipeline {
         oldest_first: bool,
     ) -> Vec<LogEntry> {
         self.store.recent(count, filter, oldest_first)
+    }
+
+    /// Like `recent_logs`, but also returns buffer/scan stats for B2's
+    /// `scanned` / `buffer_*` response fields (one query; snapshot-consistent
+    /// enough for a diagnostic count).
+    pub fn recent_logs_with_stats(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        oldest_first: bool,
+    ) -> (Vec<LogEntry>, RecentStats) {
+        let (entries, scanned) = self.store.recent_with_scanned(count, filter, oldest_first);
+        let stats = RecentStats {
+            scanned,
+            buffer_total: self.store.len(),
+            buffer_oldest_seq: self.store.oldest_seq(),
+            buffer_newest_seq: self.store.newest_seq(),
+        };
+        (entries, stats)
     }
 
     pub fn oldest_log_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {

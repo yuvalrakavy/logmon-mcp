@@ -47,6 +47,55 @@ impl InMemoryStore {
     pub fn increment_malformed(&self) {
         self.malformed_count.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Like the `recent` query, but also returns how many buffered records were
+    /// EXAMINED to produce the result (respecting the early-stop at `count`).
+    /// Powers B2's `scanned` field: `matched=0, scanned>0` means "filter's
+    /// fault, data is flowing", whereas `scanned=0` means an empty buffer.
+    pub fn recent_with_scanned(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        oldest_first: bool,
+    ) -> (Vec<LogEntry>, usize) {
+        let inner = self.inner.read().unwrap();
+        let mut result = Vec::new();
+        let mut scanned = 0usize;
+
+        if oldest_first {
+            // Cursor-driven path: walk forward (oldest → newest) and take the
+            // first `count` filter-matching records. Pagination drains
+            // monotonically across calls.
+            for entry in inner.entries.iter() {
+                scanned += 1;
+                if let Some(f) = filter {
+                    if !matches_entry(f, entry) {
+                        continue;
+                    }
+                }
+                result.push(entry.clone());
+                if result.len() >= count {
+                    break;
+                }
+            }
+        } else {
+            // Default path: newest-first, preserves prior behavior.
+            for entry in inner.entries.iter().rev() {
+                scanned += 1;
+                if let Some(f) = filter {
+                    if !matches_entry(f, entry) {
+                        continue;
+                    }
+                }
+                result.push(entry.clone());
+                if result.len() >= count {
+                    break;
+                }
+            }
+        }
+
+        (result, scanned)
+    }
 }
 
 impl LogStore for InMemoryStore {
@@ -85,40 +134,7 @@ impl LogStore for InMemoryStore {
         filter: Option<&ParsedFilter>,
         oldest_first: bool,
     ) -> Vec<LogEntry> {
-        let inner = self.inner.read().unwrap();
-        let mut result = Vec::new();
-
-        if oldest_first {
-            // Cursor-driven path: walk forward (oldest → newest) and take the
-            // first `count` filter-matching records. Pagination drains
-            // monotonically across calls.
-            for entry in inner.entries.iter() {
-                if let Some(f) = filter {
-                    if !matches_entry(f, entry) {
-                        continue;
-                    }
-                }
-                result.push(entry.clone());
-                if result.len() >= count {
-                    break;
-                }
-            }
-        } else {
-            // Default path: newest-first, preserves prior behavior.
-            for entry in inner.entries.iter().rev() {
-                if let Some(f) = filter {
-                    if !matches_entry(f, entry) {
-                        continue;
-                    }
-                }
-                result.push(entry.clone());
-                if result.len() >= count {
-                    break;
-                }
-            }
-        }
-
-        result
+        self.recent_with_scanned(count, filter, oldest_first).0
     }
 
     fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry> {
@@ -198,6 +214,10 @@ impl LogStore for InMemoryStore {
     fn oldest_seq(&self) -> Option<u64> {
         self.inner.read().unwrap().entries.front().map(|e| e.seq)
     }
+
+    fn newest_seq(&self) -> Option<u64> {
+        self.inner.read().unwrap().entries.back().map(|e| e.seq)
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +262,33 @@ mod oldest_ts_tests {
         store.append(e1.clone());
         store.append(e2);
         assert_eq!(store.oldest_timestamp(), Some(e1.timestamp));
+    }
+
+    #[test]
+    fn recent_with_scanned_reports_all_records_examined_when_filter_matches_none() {
+        use crate::filter::parser::parse_filter;
+        let store = InMemoryStore::new(10);
+        for i in 1..=5 {
+            store.append(entry(i)); // Level::Info
+        }
+        // No Info record matches l>=ERROR, so the query walks the whole buffer.
+        // This is the exact 0-result case B2 must make self-diagnosing:
+        // matched=0 but scanned>0 means "filter's fault", not "empty buffer".
+        let filter = parse_filter("l>=ERROR").unwrap();
+        let (matched, scanned) = store.recent_with_scanned(50, Some(&filter), false);
+        assert_eq!(matched.len(), 0, "no Info record matches l>=ERROR");
+        assert_eq!(scanned, 5, "all 5 buffered records were examined");
+    }
+
+    #[test]
+    fn newest_seq_returns_back_entry_seq_not_front() {
+        let store = InMemoryStore::new(10);
+        assert!(store.newest_seq().is_none());
+        store.append(entry(1));
+        store.append(entry(2));
+        store.append(entry(3));
+        assert_eq!(store.newest_seq(), Some(3), "newest = back of the deque");
+        assert_eq!(store.oldest_seq(), Some(1), "oldest = front (guards a mixup)");
     }
 }
 

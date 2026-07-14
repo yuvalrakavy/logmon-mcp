@@ -140,6 +140,12 @@ impl SpanStore {
         self.inner.read().unwrap().buffer.len()
     }
 
+    /// Seq of the newest span currently buffered, or `None` if empty.
+    /// Powers B2's `buffer_newest_seq` field on `traces.recent`.
+    pub fn newest_seq(&self) -> Option<u64> {
+        self.inner.read().unwrap().buffer.back().map(|s| s.seq)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

@@ -61,6 +61,21 @@ fn test_slow_spans() {
 }
 
 #[test]
+fn newest_seq_returns_back_span_seq() {
+    let seq = Arc::new(SeqCounter::new());
+    let store = SpanStore::new(100, seq);
+    assert!(store.newest_seq().is_none(), "empty store has no newest seq");
+    store.insert(make_span("a", 0x1, 10.0));
+    store.insert(make_span("b", 0x2, 20.0));
+    let last = store.insert(make_span("c", 0x3, 30.0)); // insert() returns the assigned seq
+    assert_eq!(store.newest_seq(), Some(last), "newest = back of the buffer");
+    assert!(
+        store.oldest_seq().unwrap() < last,
+        "oldest (front) must be < newest (back) — guards a mixup"
+    );
+}
+
+#[test]
 fn test_recent_traces() {
     let seq = Arc::new(SeqCounter::new());
     let store = SpanStore::new(100, seq);
