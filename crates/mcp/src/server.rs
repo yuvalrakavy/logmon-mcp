@@ -223,7 +223,7 @@ impl GelfMcpServer {
 
     // ---- Log Query Tools ----
 
-    #[rmcp::tool(description = "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression.")]
+    #[rmcp::tool(description = "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression. Response carries matched/scanned/buffer_total diagnostics (scanned=0 = empty buffer; matched=0 with scanned>0 = filter matched nothing while data flows) plus truncated/evicted_before_window when a bookmark/cursor window rolled off. Unknown-selector comparison typos like level>=WARN are rejected with a suggestion.")]
     async fn get_recent_logs(
         &self,
         Parameters(p): Parameters<GetRecentLogsParams>,

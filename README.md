@@ -258,6 +258,10 @@ connection refused,h=myapp   # substring match + host filter
 
 **Special filters:** `ALL` (match everything), `NONE` (match nothing)
 
+**Strict selectors:** a `selector>=value` / `selector<=value` with an unknown selector (e.g. `level>=WARN` — the level selector is `l`) is rejected as a typo rather than silently matching nothing. Quote it (`"level>=WARN"`) or use `/regex/` for a literal search.
+
+**Response diagnostics:** `logs.recent` / `logs.export` / `traces.recent` responses carry `matched` / `scanned` / `buffer_total` — so `scanned=0` (empty buffer) is distinguishable from `matched=0, scanned>0` (filter matched nothing, data flowing) — plus `truncated` / `evicted_before_window` when a bookmark/cursor window predates the retained buffer.
+
 ### Bookmarks and cursors
 
 Bookmarks are named seq positions in the broker's record stream. Two interaction patterns share the same storage:

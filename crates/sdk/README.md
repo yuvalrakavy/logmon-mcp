@@ -218,6 +218,8 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 
 All methods return `Result<R, BrokerError>`.
 
+The `logs_recent` / `logs_export` / `traces_recent` result types carry query **diagnostics**: `matched` (the returned `count`) alongside `scanned` (records examined), `buffer_total`, and `buffer_oldest_seq` / `buffer_newest_seq` — so `scanned == 0` (empty buffer / dead pipeline) is distinguishable from `matched == 0, scanned > 0` (filter matched nothing while data flows). `logs_recent` / `logs_export` additionally set `truncated` / `evicted_before_window` when a `b>=` / `c>=` window predates the retained buffer. All are `#[serde(default)]`, so older servers that omit them deserialize cleanly.
+
 ### Untyped escape hatches
 
 For quick experimentation or when a method isn't yet typed:
@@ -481,6 +483,8 @@ let f = Filter::builder()
 | `bookmark_after(name)` / `bookmark_before(name)` | `b>=name` / `b<=name` |
 | `cursor(name)` | `c>=name` (read-and-advance — see "Cursors" below) |
 | `additional_field(name, value)` / `additional_field_regex(name, r, ci)` | `name=...` (custom GELF fields) |
+
+The builder always emits valid DSL. When building filter strings by hand (or via `call` / `call_typed`), note the parser **rejects unknown-selector comparison typos**: a `<ident>>=value` / `<ident><=value` whose `<ident>` isn't `l` / `d` / `b` / `c` (e.g. `level>=WARN`, `duration>=100`) is an error, not a silent no-match — quote it or use `/regex/` for a literal search. `additional_field` (`name=value`) with a custom name is unaffected.
 
 `Level` covers ERROR/WARN/INFO/DEBUG/TRACE. `FilterSpanStatus` and `FilterSpanKind` are payload-free enums distinct from `protocol::SpanStatus` / `protocol::SpanKind`, which carry payloads — these names are intentionally `Filter`-prefixed to avoid import shadowing.
 

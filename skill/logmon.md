@@ -54,7 +54,7 @@ CLI sessions default to a named session called `"cli"`, so bookmarks and other s
 
 ### Querying Logs
 
-- **get_recent_logs** — Fetch recent logs, optionally filtered. Use `count` (default 100) and `filter` (DSL string).
+- **get_recent_logs** — Fetch recent logs, optionally filtered. Use `count` (default 100) and `filter` (DSL string). Responses also carry diagnostic counts (`matched`/`scanned`/`buffer_total`) and a `truncated` flag — see "Diagnosing empty results" below.
 - **get_log_context** — Get logs around a specific entry by `seq` number.
 - **export_logs** — Save logs to a file for comparison or sharing.
 - **clear_logs** — Clear the log buffer (affects ALL sessions since buffer is shared).
@@ -121,6 +121,16 @@ Filters use a comma-separated qualifier syntax (AND semantics within a filter):
 - `fa=mqtt,l>=WARN` — warnings+ from MQTT module
 - `connection refused,h=myapp` — connection errors from myapp
 - `/panic|unwrap failed/` — regex for panics
+
+**Strict selectors:** a `selector>=value` / `selector<=value` whose selector isn't a comparison selector (`l`, `d`, `b`, `c`) is rejected as a typo — e.g. `level>=WARN` errors with a suggestion (did you mean `l>=`?) instead of being silently read as a nonexistent custom field and matching nothing. Barewords, and quoted/regex patterns that contain operators (`"a>=b"`, `/a>=b/`), are still valid literal searches.
+
+**Diagnosing empty results:** a 0-result is no longer ambiguous. Every `get_recent_logs` / `get_recent_traces` response includes `scanned` (records examined) and `buffer_total`:
+
+- `matched=0, scanned>0` → the filter matched nothing but **data is flowing** — check the filter.
+- `scanned=0` → the **buffer is empty** / the pipeline is dead.
+- `truncated=true` (with `evicted_before_window`) → when paging with a bookmark/cursor, part of your window has **rolled off** the buffer, so the result is incomplete.
+
+(The `logmon` CLI surfaces `truncated` and the matched-0-of-N case as `stderr` warnings.)
 
 ## Bookmarks
 
