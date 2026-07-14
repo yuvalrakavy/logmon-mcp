@@ -1,5 +1,5 @@
 use crate::daemon::domain::{Domain, DomainRegistry};
-use crate::daemon::log_processor::sync_pre_buffer_size;
+use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use logmon_broker_protocol::*;
 use serde_json::{json, Value};
@@ -367,7 +367,7 @@ impl RpcHandler {
             .sessions
             .add_filter(session_id, filter, desc)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&d.pipeline, &self.sessions);
+        sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "id": id }))
     }
 
@@ -400,7 +400,7 @@ impl RpcHandler {
         self.sessions
             .remove_filter(session_id, filter_id)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&d.pipeline, &self.sessions);
+        sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "removed": filter_id }))
     }
 
@@ -458,7 +458,7 @@ impl RpcHandler {
             .sessions
             .add_trigger(session_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&d.pipeline, &self.sessions);
+        sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "id": id }))
     }
 
@@ -482,7 +482,7 @@ impl RpcHandler {
             .sessions
             .edit_trigger(session_id, trigger_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&d.pipeline, &self.sessions);
+        sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({
             "id": info.id,
             "filter": info.filter_string,
@@ -505,7 +505,7 @@ impl RpcHandler {
         self.sessions
             .remove_trigger(session_id, trigger_id)
             .map_err(|e| e.to_string())?;
-        sync_pre_buffer_size(&d.pipeline, &self.sessions);
+        sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "removed": trigger_id }))
     }
 

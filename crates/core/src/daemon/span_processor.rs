@@ -1,4 +1,5 @@
-use crate::daemon::log_processor::sync_pre_buffer_size;
+use crate::daemon::domain::DomainId;
+use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::SessionRegistry;
 use crate::engine::pipeline::LogPipeline;
 use crate::filter::matcher::matches_span;
@@ -8,30 +9,37 @@ use crate::span::types::{SpanEntry, SpanStatus, TraceSummary};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Spawns the span processing loop for a single domain. Spans are stored in
+/// `span_store` (this domain's) and evaluated only against `domain`'s sessions.
 pub fn spawn_span_processor(
     mut receiver: mpsc::Receiver<SpanEntry>,
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
     pipeline: Arc<LogPipeline>,
+    domain: DomainId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(span) = receiver.recv().await {
-            process_span(&span, &span_store, &sessions, &pipeline);
+            process_span_for_domain(&span, &span_store, &sessions, &pipeline, &domain);
         }
     })
 }
 
-pub fn process_span(
+/// Process one span against `domain`: store it, then evaluate the span triggers
+/// of the sessions bound to `domain` only. A B-bound session's span trigger
+/// must not fire on — nor deliver — an A-domain span (spec §2, §9.1 site 3).
+pub fn process_span_for_domain(
     span: &SpanEntry,
     store: &SpanStore,
     sessions: &SessionRegistry,
     pipeline: &LogPipeline,
+    domain: &DomainId,
 ) {
     // 1. Store unconditionally (SpanStore assigns seq)
     store.insert(span.clone());
 
-    // 2. Evaluate span triggers for each session
-    let session_ids = sessions.active_session_ids();
+    // 2. Evaluate span triggers for each session bound to this domain
+    let session_ids = sessions.active_session_ids_for_domain(domain);
     let mut any_oneshot_removed = false;
     for sid in &session_ids {
         let triggers = sessions.list_triggers(sid);
@@ -58,11 +66,23 @@ pub fn process_span(
         }
     }
 
-    // Pre-buffer size is driven by triggers' max pre_window across all sessions,
-    // so we resync if any oneshot trigger was just auto-removed.
+    // Pre-buffer size is driven by triggers' max pre_window across this
+    // domain's sessions, so we resync if any oneshot trigger was just
+    // auto-removed.
     if any_oneshot_removed {
-        sync_pre_buffer_size(pipeline, sessions);
+        sync_pre_buffer_size_for_domain(pipeline, sessions, domain);
     }
+}
+
+/// Convenience: process one span in the `default` domain. Used by single-domain
+/// unit tests.
+pub fn process_span(
+    span: &SpanEntry,
+    store: &SpanStore,
+    sessions: &SessionRegistry,
+    pipeline: &LogPipeline,
+) {
+    process_span_for_domain(span, store, sessions, pipeline, &DomainId::default_domain());
 }
 
 fn is_span_filter_str(filter_str: &str) -> bool {

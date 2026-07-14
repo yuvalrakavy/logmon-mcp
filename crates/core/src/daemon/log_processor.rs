@@ -1,39 +1,64 @@
+use crate::daemon::domain::DomainId;
 use crate::daemon::session::SessionRegistry;
 use crate::engine::pipeline::{LogPipeline, PipelineEvent};
 use crate::gelf::message::{LogEntry, LogSource};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Spawns the main log processing loop.
+/// Spawns the main log processing loop for a single domain. Every entry off
+/// `receiver` is processed against `pipeline` (this domain's store) and only
+/// the sessions bound to `domain`.
 pub fn spawn_log_processor(
     mut receiver: mpsc::Receiver<LogEntry>,
     pipeline: Arc<LogPipeline>,
     sessions: Arc<SessionRegistry>,
+    domain: DomainId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(mut entry) = receiver.recv().await {
-            process_entry(&mut entry, &pipeline, &sessions);
+            process_entry_for_domain(&mut entry, &pipeline, &sessions, &domain);
         }
     })
 }
 
-/// Call after adding/editing/removing triggers to resize the pre-buffer.
-pub fn sync_pre_buffer_size(pipeline: &LogPipeline, sessions: &SessionRegistry) {
-    let max_pre = sessions.max_pre_window() as usize;
+/// Resize `pipeline`'s pre-buffer to the largest pre_window across the sessions
+/// bound to `domain`. Call after adding/editing/removing triggers.
+pub fn sync_pre_buffer_size_for_domain(
+    pipeline: &LogPipeline,
+    sessions: &SessionRegistry,
+    domain: &DomainId,
+) {
+    let max_pre = sessions.max_pre_window_for_domain(domain) as usize;
     pipeline.resize_pre_buffer(max_pre);
 }
 
-pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &SessionRegistry) {
+/// Convenience: sync the pre-buffer for the `default` domain. Used by the boot
+/// restore path and by single-domain unit tests.
+pub fn sync_pre_buffer_size(pipeline: &LogPipeline, sessions: &SessionRegistry) {
+    sync_pre_buffer_size_for_domain(pipeline, sessions, &DomainId::default_domain());
+}
+
+/// Process one entry against `domain`: assign seq, buffer it, evaluate the
+/// triggers/filters of the sessions bound to `domain`, and store per the
+/// trigger/post-window/filter rules. Considers ONLY `domain`'s sessions —
+/// a filter or trigger in another domain can neither suppress storage here nor
+/// fire on this record (spec §2 isolation, §9.1).
+pub fn process_entry_for_domain(
+    entry: &mut LogEntry,
+    pipeline: &LogPipeline,
+    sessions: &SessionRegistry,
+    domain: &DomainId,
+) {
     // 1. Assign seq
     entry.seq = pipeline.assign_seq();
 
     // 2. Append to pre-trigger buffer
     pipeline.pre_buffer_append(entry.clone());
 
-    // 3. Evaluate triggers per session
+    // 3. Evaluate triggers per session (scoped to this domain)
     let mut any_post_window_active = false;
 
-    let session_ids = sessions.active_session_ids_sorted_by_pre_window();
+    let session_ids = sessions.active_session_ids_sorted_by_pre_window_for_domain(domain);
 
     for sid in &session_ids {
         // 4a. Check post-window
@@ -118,11 +143,12 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
             }
 
             // If we removed a oneshot trigger whose pre_window was the
-            // session-wide max, the pre-buffer can shrink. sync_pre_buffer_size
-            // computes the new max across all sessions so this is correct
-            // regardless of which session/trigger was the previous max.
+            // domain-wide max, the pre-buffer can shrink.
+            // sync_pre_buffer_size_for_domain computes the new max across this
+            // domain's sessions so this is correct regardless of which
+            // session/trigger was the previous max.
             if any_oneshot_removed {
-                sync_pre_buffer_size(pipeline, sessions);
+                sync_pre_buffer_size_for_domain(pipeline, sessions, domain);
             }
         }
     }
@@ -135,8 +161,9 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
             store_entry.source = LogSource::PostTrigger;
             pipeline.append_to_store(store_entry);
         } else {
-            // Evaluate union of all sessions' filters
-            let (should_store, matched_descriptions) = sessions.evaluate_filters(entry);
+            // Evaluate union of this domain's sessions' filters
+            let (should_store, matched_descriptions) =
+                sessions.evaluate_filters_for_domain(domain, entry);
             if should_store {
                 let mut store_entry = entry.clone();
                 store_entry.matched_filters = matched_descriptions;
@@ -145,4 +172,10 @@ pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &Se
             }
         }
     }
+}
+
+/// Convenience: process one entry in the `default` domain. Used by
+/// single-domain unit tests.
+pub fn process_entry(entry: &mut LogEntry, pipeline: &LogPipeline, sessions: &SessionRegistry) {
+    process_entry_for_domain(entry, pipeline, sessions, &DomainId::default_domain());
 }

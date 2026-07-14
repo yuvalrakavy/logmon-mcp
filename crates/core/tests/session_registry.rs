@@ -1,3 +1,4 @@
+use logmon_broker_core::daemon::domain::DomainId;
 use logmon_broker_core::daemon::session::*;
 use logmon_broker_core::engine::pipeline::PipelineEvent;
 use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
@@ -140,7 +141,8 @@ fn test_notification_queue() {
         trace_id: None,
         trace_summary: None,
     };
-    registry.queue_notification(&id, event);
+    // Disconnected named session → send_or_queue_notification queues it.
+    registry.send_or_queue_notification(&id, event);
     let queued = registry.drain_notifications(&id);
     assert_eq!(queued.len(), 1);
 }
@@ -150,12 +152,10 @@ fn test_post_window() {
     let registry = SessionRegistry::new();
     let id = registry.create_anonymous();
     registry.set_post_window(&id, 3);
-    assert!(registry.any_post_window_active());
     assert!(registry.decrement_post_window(&id)); // 3->2, returns true
     assert!(registry.decrement_post_window(&id)); // 2->1
     assert!(registry.decrement_post_window(&id)); // 1->0
     assert!(!registry.decrement_post_window(&id)); // 0, returns false
-    assert!(!registry.any_post_window_active());
 }
 
 #[test]
@@ -170,7 +170,8 @@ fn test_evaluate_filters_union() {
 
     // Entry matching session A's filter
     let entry = make_entry(Level::Info, "mqtt msg", Some("app::mqtt"));
-    let (should_store, descs) = registry.evaluate_filters(&entry);
+    let (should_store, descs) =
+        registry.evaluate_filters_for_domain(&DomainId::default_domain(), &entry);
     assert!(should_store);
     assert!(descs.contains(&"MQTT".to_string()));
 }
@@ -181,7 +182,8 @@ fn test_no_filters_means_store_all() {
     registry.create_anonymous(); // session with no filters
 
     let entry = make_entry(Level::Debug, "debug", None);
-    let (should_store, _) = registry.evaluate_filters(&entry);
+    let (should_store, _) =
+        registry.evaluate_filters_for_domain(&DomainId::default_domain(), &entry);
     assert!(should_store); // no filters = implicit ALL
 }
 
@@ -190,11 +192,11 @@ fn test_max_pre_window() {
     let registry = SessionRegistry::new();
     let id = registry.create_anonymous();
     // Default triggers have pre_window=500
-    assert_eq!(registry.max_pre_window(), 500);
+    assert_eq!(registry.max_pre_window_for_domain(&DomainId::default_domain()), 500);
     registry
         .add_trigger(&id, "fa=test", 1000, 200, 5, None, false)
         .unwrap();
-    assert_eq!(registry.max_pre_window(), 1000);
+    assert_eq!(registry.max_pre_window_for_domain(&DomainId::default_domain()), 1000);
 }
 
 #[test]

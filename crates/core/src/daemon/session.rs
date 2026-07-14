@@ -162,6 +162,12 @@ impl SessionState {
     fn touch(&self) {
         *self.last_seen.lock().expect("last_seen lock poisoned") = Instant::now();
     }
+
+    /// True if this session is currently bound to `domain`. The domain-scoped
+    /// scans (spec §9.1) use this to consider only their own domain's sessions.
+    fn is_in_domain(&self, domain: &DomainId) -> bool {
+        *self.domain.read().expect("domain lock poisoned") == *domain
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -375,21 +381,6 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// Returns all session IDs that should be evaluated (connected + disconnected named).
-    /// Sorted by largest max pre_window first (optimization for pre-buffer flush).
-    pub fn active_session_ids_sorted_by_pre_window(&self) -> Vec<SessionId> {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-        let mut pairs: Vec<(SessionId, u32)> = sessions
-            .iter()
-            .filter(|(id, state)| {
-                state.connected.load(Ordering::Relaxed) || matches!(id, SessionId::Named(_))
-            })
-            .map(|(id, state)| (id.clone(), state.triggers.max_pre_window()))
-            .collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
-        pairs.into_iter().map(|(id, _)| id).collect()
-    }
-
     // --- Trigger operations (per-session) ---
 
     pub fn evaluate_triggers(&self, id: &SessionId, entry: &LogEntry) -> Vec<TriggerMatch> {
@@ -453,17 +444,6 @@ impl SessionRegistry {
             .get(id)
             .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
         Ok(state.triggers.remove(trigger_id)?)
-    }
-
-    /// Returns the maximum pre_window across ALL sessions' triggers.
-    pub fn max_pre_window(&self) -> u32 {
-        self.sessions
-            .read()
-            .expect("sessions lock poisoned")
-            .values()
-            .map(|s| s.triggers.max_pre_window())
-            .max()
-            .unwrap_or(0)
     }
 
     // --- Filter operations (per-session) ---
@@ -566,40 +546,6 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// Evaluate all sessions' filters against an entry (union/OR semantics).
-    /// Returns (should_store, matched_descriptions).
-    /// If no sessions have any filters, returns (true, vec![]) -- implicit ALL.
-    pub fn evaluate_filters(&self, entry: &LogEntry) -> (bool, Vec<String>) {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-
-        let mut any_filter_exists = false;
-        let mut matched = false;
-        let mut descriptions = Vec::new();
-
-        for state in sessions.values() {
-            let filters = state.filters.read().expect("filters lock poisoned");
-            if filters.is_empty() {
-                continue;
-            }
-            any_filter_exists = true;
-            for f in filters.iter() {
-                if matches_entry(&f.condition, entry) {
-                    matched = true;
-                    if let Some(ref desc) = f.description {
-                        descriptions.push(desc.clone());
-                    }
-                }
-            }
-        }
-
-        if !any_filter_exists {
-            // No filters defined anywhere => store everything
-            return (true, Vec::new());
-        }
-
-        (matched, descriptions)
-    }
-
     // --- Post-trigger window (per-session) ---
 
     /// Decrement post-window counter. Returns true if post-window was active (entry should skip triggers).
@@ -638,15 +584,6 @@ impl SessionRegistry {
         }
     }
 
-    /// Returns true if ANY session has an active post-window.
-    pub fn any_post_window_active(&self) -> bool {
-        self.sessions
-            .read()
-            .expect("sessions lock poisoned")
-            .values()
-            .any(|s| s.post_window_remaining.load(Ordering::Relaxed) > 0)
-    }
-
     // --- Notification queue ---
 
     /// If disconnected named session, push to queue. If connected, do nothing
@@ -680,19 +617,6 @@ impl SessionRegistry {
                 queue.drain(..).collect()
             }
             None => Vec::new(),
-        }
-    }
-
-    pub fn queue_notification(&self, id: &SessionId, event: PipelineEvent) {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-        if let Some(state) = sessions.get(id) {
-            let mut queue = state
-                .notification_queue
-                .lock()
-                .expect("queue lock poisoned");
-            if queue.len() < state.max_queue_size {
-                queue.push_back(event);
-            }
         }
     }
 
@@ -743,10 +667,98 @@ impl SessionRegistry {
         }
     }
 
-    /// Get all session IDs (connected + disconnected named sessions).
-    pub fn active_session_ids(&self) -> Vec<SessionId> {
-        let sessions = self.sessions.read().unwrap();
-        sessions.keys().cloned().collect()
+    // --- Domain-scoped variants (spec §9.1) --------------------------------
+    //
+    // The per-domain processors must consider ONLY the sessions bound to their
+    // domain. Using the un-scoped scans above would let a filter or trigger in
+    // one domain suppress storage of — or fire on — another domain's records
+    // (cross-domain data-loss + payload leak; the load-bearing gate finding).
+    // Each mirrors its global counterpart but filters by `SessionState.domain`
+    // via `is_in_domain`.
+
+    /// Union of the filters of sessions bound to `domain` — the domain-scoped
+    /// form of [`Self::evaluate_filters`]. Returns `(should_store,
+    /// matched_descriptions)`; `(true, [])` when no bound session has a filter.
+    pub fn evaluate_filters_for_domain(
+        &self,
+        domain: &DomainId,
+        entry: &LogEntry,
+    ) -> (bool, Vec<String>) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+
+        let mut any_filter_exists = false;
+        let mut matched = false;
+        let mut descriptions = Vec::new();
+
+        for state in sessions.values() {
+            if !state.is_in_domain(domain) {
+                continue;
+            }
+            let filters = state.filters.read().expect("filters lock poisoned");
+            if filters.is_empty() {
+                continue;
+            }
+            any_filter_exists = true;
+            for f in filters.iter() {
+                if matches_entry(&f.condition, entry) {
+                    matched = true;
+                    if let Some(ref desc) = f.description {
+                        descriptions.push(desc.clone());
+                    }
+                }
+            }
+        }
+
+        if !any_filter_exists {
+            // No filters defined in this domain => store everything
+            return (true, Vec::new());
+        }
+
+        (matched, descriptions)
+    }
+
+    /// Sessions bound to `domain` (connected + disconnected named), ordered by
+    /// largest pre_window first — the domain-scoped form of
+    /// [`Self::active_session_ids_sorted_by_pre_window`].
+    pub fn active_session_ids_sorted_by_pre_window_for_domain(
+        &self,
+        domain: &DomainId,
+    ) -> Vec<SessionId> {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let mut pairs: Vec<(SessionId, u32)> = sessions
+            .iter()
+            .filter(|(id, state)| {
+                (state.connected.load(Ordering::Relaxed) || matches!(id, SessionId::Named(_)))
+                    && state.is_in_domain(domain)
+            })
+            .map(|(id, state)| (id.clone(), state.triggers.max_pre_window()))
+            .collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// All session IDs bound to `domain` — the domain-scoped form of
+    /// [`Self::active_session_ids`].
+    pub fn active_session_ids_for_domain(&self, domain: &DomainId) -> Vec<SessionId> {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        sessions
+            .iter()
+            .filter(|(_, state)| state.is_in_domain(domain))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// The largest pre_window across the triggers of sessions bound to
+    /// `domain` — the domain-scoped form of [`Self::max_pre_window`].
+    pub fn max_pre_window_for_domain(&self, domain: &DomainId) -> u32 {
+        self.sessions
+            .read()
+            .expect("sessions lock poisoned")
+            .values()
+            .filter(|state| state.is_in_domain(domain))
+            .map(|s| s.triggers.max_pre_window())
+            .max()
+            .unwrap_or(0)
     }
 
     // --- Persistence helpers ---

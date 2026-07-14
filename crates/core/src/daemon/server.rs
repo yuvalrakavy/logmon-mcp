@@ -257,6 +257,7 @@ pub async fn run_with_overrides(
                 span_store.clone(),
                 sessions.clone(),
                 pipeline.clone(),
+                DomainId::default_domain(),
             );
             (rx, None, None, Vec::<String>::new())
         }
@@ -309,6 +310,7 @@ pub async fn run_with_overrides(
                 span_store.clone(),
                 sessions.clone(),
                 pipeline.clone(),
+                DomainId::default_domain(),
             );
             (log_rx, Some(gelf_receiver), otlp_receiver, all_receivers_info)
         }
@@ -319,7 +321,8 @@ pub async fn run_with_overrides(
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
     // 11. Start log processor
-    let _processor_handle = spawn_log_processor(log_rx, pipeline.clone(), sessions.clone());
+    let _processor_handle =
+        spawn_log_processor(log_rx, pipeline.clone(), sessions.clone(), DomainId::default_domain());
 
     // 12. Sync pre-buffer size after restoring sessions
     sync_pre_buffer_size(&pipeline, &sessions);
