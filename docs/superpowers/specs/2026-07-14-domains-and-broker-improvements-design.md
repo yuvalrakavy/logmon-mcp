@@ -1,0 +1,466 @@
+# Logmon Domains + Broker Improvements — Design Spec
+
+**Date:** 2026-07-14 (rev 2 — post design-gate)
+**Status:** DESIGN — passed the T3 design gate (4 fresh-context reviewers); blockers
+resolved in this revision; ready to build.
+**Tier:** **T3** — first data partition, an externally-binding contract (Store dev-tracks
+builds against it), and a back-compat state migration. Failing-test-first + blast-radius
+review apply to the core.
+
+> **Design-gate resolution log (rev 1 → rev 2).** Four blind reviewers (soundness/
+> blast-radius, migration, B1-false-positive, buildability). Model A's *core*
+> (replicate-don't-split) was confirmed sound by all three technical reviewers and is
+> NOT reopened. Convergent findings drove the changes:
+> - **★ Session-scoping breach (soundness + buildability, independently):** rev-1 §9.1
+>   named 1 of **3** global cross-session scan sites. Fixed — §3 + §9.1 now specify the
+>   `SessionState.domain` mechanism and scope all three (`evaluate_filters`,
+>   `active_session_ids_sorted_by_pre_window`, span `active_session_ids`). This was a
+>   cross-domain data-loss + payload-leak trap.
+> - **★ Migration seq-block (soundness + migration):** default must replicate the
+>   reserve-block-and-persist; and a **pre-existing** `seq_block` high-water bug (>1000
+>   records/run → seq reuse on restart) is now **fixed in-scope** (§8, decision #2).
+> - **★ Production bookmark durability (migration + buildability):** config-declared
+>   domains now persist their bookmarks (§5, decision #1).
+> - **B1 wording (false-positive lens):** rev-1's "earliest of `>=`,`<=`,`=`" wording
+>   would reject the valid escape hatch `"a>=b"` / `/a>=b/`. Fixed — §B1 pins the rule
+>   to the `selector=`-split path.
+> - Buildability blockers (session→store plumbing, RPC naming) + concretizations
+>   (OTLP dep, event re-subscribe, trigger-default conflation) folded into §3/§4/§9.
+
+---
+
+## 0. Scope
+
+**In:** Part A (Domains, Model A) + B1 (strict filter parsing), B2 (matched/scanned), B5
+(truncation), B7 (richer status + stall). **Plus (added at the gate):** fix the
+pre-existing `seq_block` high-water-mark bug (decision #2), and persist config-declared
+domains' bookmarks (decision #1).
+
+**Deferred (named):** B3/B4 (ack + signature-dedup); B6 (trigger TTL); per-query
+`domain=` override; per-domain trigger-window defaults; idle-domain reaping; proactive
+(push) stall alerts; runtime/ephemeral-domain bookmark persistence.
+
+**Grounding:** every `file:line` verified against the tree on 2026-07-14 (initial pass +
+4-reviewer gate). Anchors drift; re-confirm before editing.
+
+---
+
+## 1. Current architecture (the seams we build on)
+
+- **Ingestion** — GELF (UDP+TCP) + OTLP (gRPC+HTTP) receivers built in
+  `daemon/server.rs:262-314` from scalar ports on `DaemonConfig`
+  (`daemon/persistence.rs:87-107`), bound to `0.0.0.0:{port}`, all fanning into one
+  `log_tx`/`span_tx` (`server.rs:271-272`). No per-listener identity on the channel item.
+- **Log store** — one global `InMemoryStore` (`store/memory.rs:24-30`): single
+  `RwLock<StoreInner>` over `{ entries: VecDeque<LogEntry>, seq_set, trace_index }`. FIFO
+  eviction (`:61-73`); `clear()` (`:175`); **pre-allocates** via `with_capacity` (`:36`).
+- **Span store** — one global `SpanStore` (`span/store.rs:14-23`), same shape; keyed by
+  seq + `trace_index`; pre-allocates (`:29`); **no `clear()`**.
+- **Seq** — one shared `SeqCounter` (`server.rs:204`) feeds both stores (`:205-211`). Boot
+  reserves a block ahead: `reserved_seq_block = initial_seq + SEQ_BLOCK_SIZE(1000)`
+  (`server.rs:214-219`, `persistence.rs:5`), persisted before serving and re-persisted at
+  shutdown (`:441`). Bookmark eviction `should_evict(bookmark_seq, oldest_log_seq,
+  oldest_span_seq)` (`store/bookmarks.rs:127`) compares against **both** stores' oldest —
+  valid only because logs+spans share one line.
+- **Sessions** — `SessionState` (`daemon/session.rs:82-95`): config scope (triggers,
+  filters, notification queue), no data, **no domain field yet**. `SessionId` enum
+  `Anonymous|Named` (`:18-22`). Anonymous dropped on disconnect (`:252`); Named persisted
+  (`:779-848`) / restored (`:703-774`). Triggers per-session (`TriggerManager`, `:84`),
+  seeded with 2 defaults (windows `500/200/5`, `trigger.rs:81-83`).
+- **Query surface** — one dispatch `match`, 25 methods (`daemon/rpc_handler.rs:42-68`).
+  `RpcHandler::new` (`:20-38`) takes `pipeline`/`span_store`/`bookmarks` as fields;
+  handlers read `self.*` directly. Queries hit the **global** store; `session_id` scopes
+  only bookmark-name resolution, per-session config, and `status.get` (`:248-280`).
+  Capabilities `["bookmarks","oneshot_triggers","client_info"]` (`:88-92`).
+
+**Load-bearing fact:** storage is one global bucket; sessions scope config, not data.
+
+---
+
+## PART A — DOMAINS
+
+## 2. Concept
+
+A **domain** is an isolated bundle of *ingest ports + log buffer + span buffer + seq
+space + bookmark namespace + receivers* that **shares nothing** with other domains.
+Two confirmed consumers: **dev tracks** (worktree → `tN`) and **production vs
+development** (durable `production` alongside `dev`/`tN`).
+
+**Isolation invariant:** a record ingested on A's port is visible only to consumers on
+`use_domain(A)`. Cross-domain queries are impossible by construction.
+
+**Non-goal — isolation is not security.** No access control on
+`create/delete/use_domain`; domains organize noise on a local single-user broker, they
+are not a tenancy boundary. `session.*` methods (e.g. `session.list`,
+`rpc_handler.rs:743`) intentionally span domains — config is global, only *data* is
+partitioned; stated so it's a decision, not an accident.
+
+## 3. Model A — a domain is a full instance of today's machinery
+
+Each domain owns its own copy of the per-broker machinery; queries resolve the domain
+**once** at the RPC boundary and then run today's inner code unchanged.
+
+```
+struct Domain {
+    pipeline:   LogPipeline,      // owns InMemoryStore + SeqCounter + PreTriggerBuffer + event channel
+    span_store: SpanStore,        // shares this domain's SeqCounter (as server.rs:204-211 does today)
+    bookmarks:  BookmarkStore,    // per-domain (bookmarks reference this domain's seq)
+    metrics:    ReceiverMetrics,  // per-domain (was one global Arc); B7 liveness fields live here
+    receivers:  DomainReceivers,  // GelfReceiver + OtlpReceiver + spawned processors for this domain
+    config:     DomainConfig,     // name, gelf_port, otlp_grpc_port, otlp_http_port,
+                                  //   log_buffer_size, span_buffer_size, source: Config|Runtime
+    // B7 liveness: last_log_received_at / last_span_received_at (AtomicU64 epoch-ms)
+}
+struct DomainRegistry { domains: RwLock<HashMap<DomainId, Arc<Domain>>> }  // DomainId = validated name
+```
+
+**Ownership split:** the `Domain` owns all **seq-referencing** state (pipeline, span
+store, bookmarks, receivers, metrics); the **session** owns config (triggers, filters,
+notification queue) + the domain-binding.
+
+**The session→domain→store plumbing (resolves buildability Blocker 1 — this is concrete,
+not "one line"):**
+- `SessionState` gains `domain: RwLock<DomainId>`, defaulting to `DomainId("default")` in
+  `new_anonymous`/`new_named`/`restore_named`. Mutable (unlike `name`) because
+  `use_domain` switches it.
+- `SessionRegistry` gains `domain_of(&SessionId) -> DomainId` and `set_domain(&SessionId,
+  DomainId)` (mirroring `set_client_info`, `session.rs:271`).
+- `RpcHandler::new` takes `domains: Arc<DomainRegistry>` **instead of**
+  `pipeline`/`span_store`/`bookmarks`. `handle()` resolves `let d =
+  self.domains.get(&self.sessions.domain_of(session_id))?` once, and **passes `&d: &Domain`
+  as a new first parameter into every private `handle_*` method** (each currently reads
+  `self.pipeline`/`self.span_store`/`self.bookmarks`; they switch to `d.pipeline` etc.).
+  The store-internal code is byte-for-byte unchanged; the ~25 handler *signatures* change.
+
+**What Model A dissolves:** per-domain seq is free (each `Domain` has its own
+`SeqCounter`); `default` = the domain named `"default"`, `N=1` today (uniform path);
+delete-while-bound = `Arc` refcount; trace↔log join stays in-domain automatically;
+per-domain broadcast channel. (Verified by the gate: `should_evict`, cursors,
+`bookmarks.add` default start_seq, and per-domain seq non-collision all hold under
+replication.)
+
+## 4. The contract (MCP + CLI + SDK)
+
+Method names follow the enforced `<group>.<verb>` convention (wire →
+`protocol/src/methods.rs` `<Group><Verb>` → SDK `<group>_<verb>` → CLI `logmon domains
+<verb>`). All ports/tunables **optional with sensible defaults** —
+`domains.create{name:"t3"}` alone works.
+
+```
+domains.create(name, gelf_port?, otlp_grpc_port?, otlp_http_port?,
+               log_buffer_size?, span_buffer_size?)
+  -> { name, gelf_port, otlp_grpc_port, otlp_http_port,
+       log_buffer_size, span_buffer_size, source:"runtime" }
+  # Idempotent ensure; EPHEMERAL runtime domain. gelf_port serves UDP+TCP.
+  # provided ports → bind (error if a DIFFERENT domain holds any); omitted → allocate.
+  # A port explicitly set to 0 DISABLES that receiver for the domain (mirrors the
+  #   daemon-level `otlp_grpc_port>0 || otlp_http_port>0` gate, server.rs:287).
+  # exists w/ same ports → no-op; different ports → error. Refuse if max_domains reached.
+  # Ports acquired SYNCHRONOUSLY (incl. OTLP pre-bind, §9.3) → clean conflict errors.
+
+domains.delete(name) -> { name, deleted:true }
+  # Runtime only; refuse config-declared (incl. default). Arc-graceful teardown.
+
+domains.use(name)          # session-scoped sticky bind; switchable; error if absent; none → default.
+                           # Also a `domain` param on session.start (atomic connect-time bind).
+                           # session.domain is connect-time state, never persisted.
+
+domains.clear()            # NEW method. Dispose the BOUND domain's DATA: logs + spans
+                           #   (InMemoryStore::clear + new SpanStore::clear). Keeps domain
+                           #   + receivers alive; seq stays monotonic. `logs.clear` is left
+                           #   UNCHANGED (logs-only, back-compat). No separate spans.clear.
+
+domains.list()
+  -> { domains: [ { name, gelf_port, otlp_grpc_port, otlp_http_port,
+                    source:"config"|"runtime", log_buffer_size, span_buffer_size,
+                    log_count, span_count, oldest_seq, newest_seq,
+                    last_log_received_at, last_span_received_at, idle_secs, stale } ] }
+  # Pure registry view — no session context. (Liveness fields populated in Wave 3 / B7;
+  #   Wave 2 ships them null.)
+```
+
+**Flag-backs to the Store dev-tracks spec (§13):** 3 ports not 4 (`gelf_port` = UDP+TCP);
+method names `domains.create/use/...`; `session.start` `domain` param; `domains.clear`;
+liveness fields; the OTLP beacon caveat (§9.8). Derivation stays `gelf 12201+N /
+otlp_grpc 4317+N / otlp_http 4318+N`.
+
+**Capabilities:** add `"domains"` (`rpc_handler.rs:88-92`).
+
+## 5. Lifecycle & persistence
+
+Two sources, no domain-*registry* persistence machinery:
+- **Config-declared** — `DaemonConfig` grows an optional `domains` array (JSON — the
+  config is `serde_json`, `persistence.rs:161`, **not** TOML). `default` is the implicit
+  entry. Durable via the config file. `domains.delete` refuses these.
+- **Runtime-created** — `domains.create` domains are ephemeral (gone on restart,
+  re-ensured by the producer; `dev-server.sh` already does this). Bounded by the finite
+  preconfigured track set; `max_domains` (config, default 32) caps **runtime** domains
+  only (default + config-declared always honored, don't count against it). Chosen for
+  dev-tracks because it binds ports only for tracks actually running.
+
+**Bookmark durability follows domain source (decision #1).** Config-declared domains
+(default + `production` + any listed) **persist their `BookmarkStore`** to `state.json`;
+runtime/ephemeral domains do not. Concretely: `snapshot_named_for_persistence`
+(`session.rs:779-848`) / `restore_named` (`:703-774`) iterate the config-declared
+domains' bookmark stores (today they touch one global store; the call site is
+`server.rs:227`). This keeps a durable domain's user annotations durable, consistent with
+its config-declared durability, without persisting the ephemeral domains.
+
+**Delete-while-bound, reader side:** a query against a deleted domain returns
+`domain "t3" no longer exists — use_domain to rebind` — **no** silent fallback to
+`default`. Since `session.domain` isn't persisted, restart lands everyone at `default`
+and clients re-bind — consistent.
+
+**Anonymous bookmark cleanup across domains:** an anonymous session that switched domains
+may hold bookmarks in more than one store; on disconnect, clear it across every domain it
+touched (track touched-domains on the session), rather than only its current binding
+(`server.rs:695`, `bookmarks.clear_session`).
+
+## 6. Tunables, lazy allocation, trigger-window defaults
+
+- **Per-domain sizes:** `log_buffer_size` (default `buffer_size`=10000) + `span_buffer_size`
+  (default 10000), on `domains.create` + config. Prod: `log_buffer_size=100_000`.
+- **Lazy buffer allocation (invariant):** replace `VecDeque::with_capacity(capacity)`
+  (`memory.rs:36`, `store.rs:29`) with `VecDeque::new()` + one-time `reserve_exact(max_capacity)`
+  on the **first** `append`/`insert` (guard `entries.capacity()==0`). Idle domain → ~0
+  buffer memory; steady-state footprint unchanged. Pre-trigger buffer already lazy.
+- **Trigger-window defaults (decision #4 — note the two distinct hardcodes):**
+  `DaemonConfig` gains `default_trigger_pre_window/post_window/notify_context` (optional,
+  default `500/200/5`). These are applied at **both** places that currently hardcode: (a)
+  `TriggerManager::new()`'s seeded built-in triggers (`trigger.rs:81-83`), and (b) the
+  ad-hoc `triggers.add`/`triggers.edit` omission default, which is **`0` today**
+  (`rpc_handler.rs` `handle_triggers_add`, independent of `trigger.rs`). **Behavior
+  change:** omitting a window on `triggers.add` now yields `500/200` instead of `0`, so an
+  ad-hoc trigger captures context by default. Called out intentionally.
+
+## 7. `status.get` — session situational awareness
+
+Extend `handle_status` (`rpc_handler.rs:248-280`) with `current_domain` and an echo of
+`active_filters` (strings; `filters.list` `:286` already returns them). One call answers
+"where am I / what's narrowing me / is data flowing." B7 adds per-domain/per-source counts.
+
+## 8. Migration (T3 data-integrity) + the seq-block fix
+
+**Existing `state.json` → default-only world (gate verdict: SAFE):** `seq_block` seeds the
+`default` domain's `SeqCounter`; named sessions restore as config (unbound → default);
+restored bookmarks land in **default's** `BookmarkStore` (confirmed persisted +
+seq-carrying, `session.rs:779-848` / `restore_named` / `insert_persisted`
+`bookmarks.rs:194`). No field is dropped. The in-memory buffers are never persisted
+(`persist_buffer_on_exit` is defined-but-unwired). **`default` must replicate the
+reserve-block-and-persist on every boot** (`server.rs:214-219`) — not just inherit the seq
+value — or restored cursors mis-resolve.
+
+**Fix the pre-existing seq-block high-water bug (decision #2 — in scope):** today
+`reserved_seq_block = initial_seq + 1000` is a **fixed** step that never tracks
+`seq_counter.current()`, so a run emitting **>1000 records reuses seqs after any restart**,
+mis-slicing persisted cursors. Fix: on shutdown persist
+`seq_block = max(reserved_seq_block, counter.current())` (per domain that persists) so seqs
+never rewind. Orthogonal to domains but a real data-integrity bug in the path we're
+touching. Own test: a >1000-record run, restart, assert a pre-restart cursor still resolves
+correctly.
+
+## 9. Implementation seams
+
+1. **★ Scope ALL THREE global session scans to the domain (the gate's load-bearing fix).**
+   The per-domain processors must consider only sessions bound to their domain. Add a
+   domain arg (backed by §3's `SessionState.domain`) to each:
+   - `evaluate_filters` (`session.rs:521` → `log_processor.rs:139`) → `..._for_domain(domain, entry)`.
+     **This is the data-loss site** — global today, a filter in domain B would suppress
+     storage of domain A's non-matching logs (breaks §2). MANDATORY.
+   - `active_session_ids_sorted_by_pre_window` (`session.rs:329` → `log_processor.rs:36`) →
+     `..._for_domain(domain)`. Prevents foreign trigger firing + `post_window` `AtomicU32`
+     corruption from two processors racing one counter.
+   - `active_session_ids` for spans (`session.rs:696` → `span_processor.rs:34`) →
+     `..._for_domain(domain)`. **Prevents real cross-domain payload delivery** — a B-bound
+     session's span trigger firing on A's spans and queuing A's data into B's notification
+     queue (`send_or_queue_notification` `session.rs:603`, drained with no domain check).
+   - Plus `evaluate_trigger` (`session.rs:344`) scoping, as before.
+2. **Pre-buffer re-sync on bind.** `use_domain` must call `sync_pre_buffer_size`
+   (`log_processor.rs:21`) for **both** the old and new domain (old may shrink, new may
+   grow), and `max_pre_window` must be **domain-scoped** (`session.rs:408`) — else a
+   rebind leaves the new domain's pre-buffer at cap 0 and triggers fire with **zero
+   pre-context** (silent). (This is why §9.1 alone is insufficient.)
+3. **Runtime receiver lifecycle + OTLP sync pre-bind.** `Gelf/OtlpReceiver::start`
+   (`server.rs:279-293`) are re-callable; all four types have stop paths (GELF
+   oneshot-on-drop `udp.rs:68`/`tcp.rs:92`; OTLP `serve_with_shutdown` `grpc.rs:369`/
+   `http.rs:61` + `Drop` abort `otlp/mod.rs:87-107`). GELF binds synchronously (clean
+   `Err`); **OTLP binds inside its spawned task**, so `domains.create` must pre-bind: HTTP
+   → hand `axum::serve` a pre-bound `TcpListener` (it already accepts one); gRPC → tonic
+   `serve_with_incoming_shutdown` fed by `tokio_stream::wrappers::TcpListenerStream` —
+   **adds a `tokio-stream` dependency to `crates/core`** (not currently present).
+4. **Event subscription follows `use_domain`.** `handle_connection`'s `select!` loop owns
+   `event_rx` (`server.rs:642,646`); a `use_domain` handled inside `handler.handle()`
+   (`:650`) can't reach it directly. Mechanism: after each `handle()`, the loop re-reads
+   `sessions.domain_of(&session_id)`, diffs against a cached value, and re-subscribes to
+   the new domain's channel on change.
+5. **`SpanStore::clear()`** — add it (mirrors `InMemoryStore::clear`; `SpanStore` doesn't
+   implement `LogStore`, so it's a self-contained inherent method). Needed by
+   `domains.clear` + `domains.delete`.
+6. **Trace↔log join stays in-domain** — real join (`rpc_handler.rs:499-503`) resolves
+   within the bound domain automatically; the notification placeholder
+   (`span_processor.rs:90`, hardcoded 0) must not cross domains.
+7. **Windows transport parity** — the `#[cfg(windows)]` control socket (`server.rs:452-523`,
+   `auto_start.rs:122`) is unaffected by ingest ports; keep in sync on server bring-up.
+8. **OTLP beacon is a protocol change, not a call-site tweak.** `send_otel_beacon("OTEL:ONLINE")`
+   (`server.rs:55-60,297`) is a fixed multicast with no port/domain — with N domains a
+   producer keying off it can be released by the wrong domain's OTLP. Making it
+   per-domain-meaningful requires adding port/domain to the payload — a wire change; flag
+   to Store (§13). Interim: suppress the beacon for runtime domains, or leave it default-only.
+9. **Port allocation** (omitted mode): allocate from an ephemeral range, bind
+   synchronously, retry on race, return chosen ports.
+10. **Name validation** reuse `is_valid_session_name` (`session.rs:164`, `[A-Za-z0-9_-]`);
+    **lifecycle logging** of create/delete/bind + bind failures (ERROR=fix-code, WARN=zero-at-idle).
+
+---
+
+## PART B — Usage-driven improvements
+
+## B1 · Strict filter parsing
+
+**Why "reject unknown selectors" is too blunt:** `parse_selector` maps any unknown token
+to `Selector::AdditionalField` (`parser.rs:167,285`) — a real feature (`_track=t3`).
+So flag **only the provable** (the "blocking check biases to false-negatives" rule):
+
+**Provable typo → hard error.** Evaluate the rule **on the `selector=value` path only —
+after** the quoted-pattern (`parser.rs:381`) and bare-regex (`:390`) branches, keyed off
+the **first `=` split** (`:395`): if `lhs.ends_with('>') || lhs.ends_with('<')`, strip that
+trailing char and reject when the remainder ∉ `{l,d,b,c}`. Catches `level>=WARN`,
+`duration>=100`, `retries>=3`, `L>=warn`.
+> **Do NOT** implement as a raw "earliest of `>=`,`<=`,`=` over the token" scan — that
+> false-positives on the valid escape hatch `"a>=b"` (bare quoted, `:381`) and `/a>=b/`
+> (bare regex, `:390`), which the quote/regex branches must claim first. (`_url=a>=b`,
+> `m=x>=y` are safe under the split rule: their first `=` is the selector `=`.) The
+> `{l,d,b,c}` exemption is dead code — those are consumed by strip_prefix above — but keep
+> it (belt-and-suspenders vs a future reorder) with a comment saying why it's unreachable.
+> Compare the base **without** stripping internal whitespace so `l >= warn` errors rather
+> than silently becoming `AdditionalField("l >")`.
+
+**Error must be actionable:** name the token, suggest the intended selector, **and point
+to the escape hatch** — `unknown selector "retries>" — did you mean l>= / d>= ? For a
+literal search, quote it ("retries>=3") or use regex (/retries>=3/). valid: m, fm, mfm, h,
+fa, fi, ln, l, sn, sv, st, sk`.
+
+**Ambiguous `unknown=value` → soft hint, not rejection.** Can't prove `message_contains=X`
+is a typo; don't block it. Backstop via B2: when an additional-field selector matches **0
+of scanned>0** records, attach a hint. Gate the hint on **field-KEY absence** across
+scanned records, not just value-mismatch — the matcher's `.get(name)` (`matcher.rs:99-109`)
+already distinguishes key-absent from present-but-non-matching, so a valid-but-absent
+`_track=t3` (field present, value differs) does **not** fire a misleading "did you mean m=?".
+
+Applies at every `parse_filter` site. Hard errors fail fast at `add_filter`/`add_trigger`;
+hints ride query responses.
+
+## B2 · `matched` / `scanned` counts
+
+Every query-shaped response carries `{ matched, scanned, buffer_total, buffer_oldest_seq,
+buffer_newest_seq }` — `matched=0, scanned=5000` (filter's fault) vs `scanned=0` (empty/
+dead). Applies to `logs.recent` + `traces.recent` (primary), and — for consistency —
+`logs.export`, `logs.context`, `traces.get/slow/logs`, `spans.context` where a count is
+meaningful (pin per-method in the test list). Thread `scanned` out of `recent`
+(`memory.rs:82`). Additive — **verify `crates/protocol`/`crates/sdk` response structs
+don't `deny_unknown_fields`**. Powers B1's soft hint.
+
+## B5 · Truncation awareness
+
+When a query's lower bound (`b>=`/`c>=`-resolved seq, or window) is older than the bound
+domain's `buffer_oldest_seq`, set `truncated:true, evicted_before_window:<n|"unknown">`.
+Resolve at the `bookmark_resolver` boundary (`filter/bookmark_resolver.rs`) against
+`d.pipeline.oldest_log_seq()` — either grow `ResolvedFilter` with a `truncated` field or
+compare post-hoc at the RPC site. Rides B2's `oldest_seq`.
+
+## B7 · Richer status + stall detection (two tiers)
+
+- **Tier A (cheap):** per-domain counts + `last_log/span_received_at` (broker-ingest
+  epoch-ms, stamped on append/insert — not the producer's timestamp) + `idle_secs` +
+  `stale` (trips when `idle_secs > stale_after_secs`; config default 12h, optional
+  per-domain override). Per-listener liveness (gelf_udp/tcp, otlp_grpc/http) rides the
+  now-per-domain `ReceiverMetrics` (§3; `receiver/metrics.rs:18-25`) — add `last_received_at`
+  + received-count per `ReceiverSource` to see *which transport* stalled.
+- **Tier B:** per-source (host / service_name) counts + recent rate (records/sec) — new
+  per-source map + windowed rate. Answers "is store_server talking right now?".
+
+Surfaced in `status.get` (current domain, per-source) + `domains.list` (per-domain).
+**Pull-based** (a stalled domain has no consumer to push to).
+
+---
+
+## 10. Build order
+
+**Wave 1 — response-shape + parser (no domain coupling; self-verifiable):** B2 → B1
+(now gate-verified) → B5.
+
+**Wave 2 — Part A core (T3: failing-test-first + blast-radius):**
+4. `SessionState.domain` + registry `domain_of`/`set_domain`; `Domain`/`DomainRegistry`;
+   `RpcHandler` restructure (holds `Arc<DomainRegistry>`, threads `&d`); `default`=`N=1`;
+   **the three-site scoping (§9.1)** + pre-buffer re-sync (§9.2); migration (§8) + the
+   seq-block fix, each with its own test.
+5. Runtime receiver lifecycle (`domains.create/delete`, OTLP sync pre-bind + `tokio-stream`),
+   config-declared domains + persistence of their bookmarks (§5), `max_domains`.
+6. Binding (`domains.use` + `session.start`), `domains.clear` + `SpanStore::clear`, event
+   re-subscribe (§9.4), lazy allocation, trigger-window defaults (§6).
+7. Contract surface: `domains.*` methods, `"domains"` capability, `status.get` additions.
+
+**Wave 3 — B7:** Tier A (domain + receiver liveness + stall; populates the `domains.list`/
+`status.get` liveness fields), then Tier B (per-source + rates).
+
+Wave 1→2 stays low-rework: B2/B5 run against `d.pipeline` after the resolve-at-boundary
+lands; only the field access changes.
+
+## 11. Test list (verification + adversarial)
+
+**Part A**
+- **Isolation (the gate's three sites):** a filter set by a B-bound session does NOT drop
+  A's logs (`evaluate_filters` scoping); a B-bound trigger does NOT fire on A's records
+  (log + span enumeration); a B-bound span trigger does NOT deliver A's span payload into
+  B's queue; two domains' processors don't corrupt a shared session's `post_window`.
+- Pre-buffer: after `use_domain(B)`, a trigger with `pre_window=500` captures 500 pre-records
+  from B (not zero) — the rebind re-sync.
+- Isolation baseline: record on A's port invisible under `use_domain(B)`; seq=5 in A and B
+  don't alias.
+- Default back-compat: no `use_domain` behaves exactly as today.
+- **Migration:** old `state.json` → default domain, seqs preserved, bookmarks resolvable
+  against `default`; `default` re-reserves+persists the seq block on boot.
+- **Seq-block fix:** >1000-record run, restart, a pre-restart cursor still resolves correctly.
+- **Production bookmark durability:** a bookmark in a config-declared `production` domain
+  survives restart; a runtime-domain bookmark does not.
+- Lifecycle: idempotent create (same/different/held ports); delete refused on config/default;
+  Arc-graceful delete-while-bound; query-after-delete → rebind error (no silent fallback).
+- `max_domains` refusal (runtime only); omitted-ports allocation; **OTLP port clash → clean
+  synchronous error** (prove the pre-bind catches it, not a dead task); `port=0` disables that receiver.
+- `domains.clear` empties logs+spans, keeps receivers, seq monotonic.
+- Lazy alloc: created-but-idle domain allocates ~0 buffer; first record allocates once.
+
+**Part B**
+- B1 hard-error: `level>=WARN`, `duration>=100`, `retries>=3`, `L>=warn`, `l >= warn` → error
+  with escape-hatch guidance. **B1 false-positive (load-bearing):** `"a>=b"`, `/a>=b/`,
+  `/x<=y/`, `_url=a>=b`, `m=x>=y`, `_track=t3`, bareword, `/regex/i` → all still valid.
+- B1 soft-hint: fires on a key-absent additional field with scanned>0; **silent** on a
+  present-but-value-mismatch field (`_track=t3` when records have `_track=t1`) and on scanned=0.
+- B2: counts correct on empty/full/matches-none/matches-all; old client ignoring new fields works.
+- B5: bookmark older than `oldest_seq` → `truncated`; in-range → not.
+- B7: `stale` crosses threshold; per-listener liveness distinguishes stalled GELF vs live OTLP.
+
+## 12. Design gate — DONE (rev 2)
+
+Four fresh-context reviewers ran (soundness/blast-radius, migration, B1-false-positive,
+buildability). Model A's core confirmed sound; convergent findings (session-scoping,
+seq-block, production bookmarks) resolved above. A **light re-verification of the §9.1
+three-site rewrite** is warranted before Wave 2 (it's the load-bearing change), but Wave 1
+(B2/B1/B5) is domain-independent and B1 is already gate-verified, so Wave 1 may start now.
+Per-phase self-review + mid-checkpoint after Wave 2 step 4 + deep adversarial gate over the
+full diff before merge still apply.
+
+## 13. Flag-backs to the Store dev-tracks spec
+
+Contract deltas Store must absorb: **3 ports not 4**; method names `domains.create/use/
+delete/list/clear`; `session.start` `domain` param; `domains.list` shape; stall/liveness
+fields; and the **OTLP beacon caveat** (§9.8 — the current `OTEL:ONLINE` beacon can't
+distinguish domains without a payload/wire change; if dev-tracks' tracing-init keys off it,
+that needs addressing). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+N`.
+
+## 14. Cross-references
+
+- Seed proposal: `2026-06-30-domains-and-broker-improvements-proposal.md`.
+- Store dev-tracks design: Store repo
+  `docs/superpowers/specs/2026-06-29-multi-worktree-dev-tracks-design.md` §6.9.
+- Generic logmon guide (Store repo) `docs/guides/logmon.md` — update once landed.
