@@ -570,12 +570,18 @@ tiny window, data retained, connected-only, no client surface yet), CLI
 only fires on omission, clap always sends `Some(0)`), OTLP single-arm-`0` allocates
 a random port instead of disabling (H; mirrors the daemon gate, §4 wording).
 
+**Step 7 / stage 2.4 — surfacing, done 2026-07-15** (commit `6cc5098`): SDK
+`domains_create/delete/list/use/clear`; MCP `create_domain/delete_domain/
+list_domains/use_domain/clear_domain` tools; `logmon domains create/delete/list/
+clear` + a global `--domain NAME` connect-time bind — the one-shot CLI's stand-in
+for sticky `use_domain` (`logmon --domain t3 domains clear` clears a specific
+domain); the `"domains"` capability; and `status.get` `current_domain` +
+`active_filters`. New logic (status fields, capability) is failing-test-first; the
+SDK/CLI wrappers have round-trip tests; the MCP tools are mechanical `broker.call`
+mirrors of the gated wire methods (covered transitively — no MCP harness exists).
+Docs (skill + 3 READMEs) updated. A lighter surfacing gate follows.
+
 **Remaining:**
-- **Step 7 / stage 2.4 — surfacing**: SDK domain methods, `logmon domains` CLI,
-  MCP tools, the `"domains"` capability, and `status.get`
-  `current_domain`/`active_filters`.
-- **Deep gate on the 2.4 surfacing diff** when it lands (the core gate is done —
-  see above; surfacing is lower-risk client wrappers but still gets a check).
 - **DEFERRED — durability** (config-declared + persistent domains + durable bookmark
   persistence — the rest of step 5's §5). Blocked on a persisted-schema decision.
   **Gap found during 2.2:** §5/decision-#1 (durable domains persist bookmarks)
