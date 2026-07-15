@@ -61,7 +61,14 @@ enum TrgVerb {
 
 pub async fn dispatch(broker: &Broker, cmd: TriggersCmd, json: bool) -> i32 {
     match cmd.verb {
-        TrgVerb::Add { filter, pre_window, post_window, notify_context, description, oneshot } => {
+        TrgVerb::Add {
+            filter,
+            pre_window,
+            post_window,
+            notify_context,
+            description,
+            oneshot,
+        } => {
             let params = TriggersAdd {
                 filter,
                 pre_window: Some(pre_window),
@@ -72,46 +79,105 @@ pub async fn dispatch(broker: &Broker, cmd: TriggersCmd, json: bool) -> i32 {
             };
             let result = match broker.triggers_add(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("triggers.add failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("triggers.add failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             println!("trigger added: id={} oneshot={oneshot}", result.id);
             0
         }
         TrgVerb::List => {
             let result = match broker.triggers_list(TriggersList {}).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("triggers.list failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("triggers.list failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
-            if result.triggers.is_empty() { println!("(no triggers)"); return 0; }
-            let rows: Vec<Vec<String>> = result.triggers.iter().map(|t| vec![
-                t.id.to_string(),
-                t.filter.clone(),
-                format!("{}/{}/{}", t.pre_window, t.post_window, t.notify_context),
-                t.match_count.to_string(),
-                t.oneshot.to_string(),
-                t.description.clone().unwrap_or_default(),
-            ]).collect();
-            format::print_table(&["id", "filter", "pre/post/notify", "fired", "oneshot", "description"], rows);
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            if result.triggers.is_empty() {
+                println!("(no triggers)");
+                return 0;
+            }
+            let rows: Vec<Vec<String>> = result
+                .triggers
+                .iter()
+                .map(|t| {
+                    vec![
+                        t.id.to_string(),
+                        t.filter.clone(),
+                        format!("{}/{}/{}", t.pre_window, t.post_window, t.notify_context),
+                        t.match_count.to_string(),
+                        t.oneshot.to_string(),
+                        t.description.clone().unwrap_or_default(),
+                    ]
+                })
+                .collect();
+            format::print_table(
+                &[
+                    "id",
+                    "filter",
+                    "pre/post/notify",
+                    "fired",
+                    "oneshot",
+                    "description",
+                ],
+                rows,
+            );
             0
         }
-        TrgVerb::Edit { id, filter, pre_window, post_window, notify_context, description, oneshot } => {
-            let params = TriggersEdit { id, filter, pre_window, post_window, notify_context, description, oneshot };
+        TrgVerb::Edit {
+            id,
+            filter,
+            pre_window,
+            post_window,
+            notify_context,
+            description,
+            oneshot,
+        } => {
+            let params = TriggersEdit {
+                id,
+                filter,
+                pre_window,
+                post_window,
+                notify_context,
+                description,
+                oneshot,
+            };
             let result = match broker.triggers_edit(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("triggers.edit failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("triggers.edit failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             println!("trigger edited: id={}", result.id);
             0
         }
         TrgVerb::Remove { id } => {
             let result = match broker.triggers_remove(TriggersRemove { id }).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("triggers.remove failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("triggers.remove failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             println!("removed: id={}", result.removed);
             0
         }

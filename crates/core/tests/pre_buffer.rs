@@ -1,16 +1,24 @@
-use logmon_broker_core::engine::pre_buffer::PreTriggerBuffer;
-use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
 use chrono::Utc;
+use logmon_broker_core::engine::pre_buffer::PreTriggerBuffer;
+use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
 use std::collections::HashMap;
 
 fn make_entry(seq: u64) -> LogEntry {
     LogEntry {
-        seq, timestamp: Utc::now(), level: Level::Info,
-        message: format!("msg {seq}"), full_message: None,
-        host: "test".into(), facility: None, file: None, line: None,
+        seq,
+        timestamp: Utc::now(),
+        level: Level::Info,
+        message: format!("msg {seq}"),
+        full_message: None,
+        host: "test".into(),
+        facility: None,
+        file: None,
+        line: None,
         additional_fields: HashMap::new(),
-        trace_id: None, span_id: None,
-        matched_filters: Vec::new(), source: LogSource::Filter,
+        trace_id: None,
+        span_id: None,
+        matched_filters: Vec::new(),
+        source: LogSource::Filter,
     }
 }
 

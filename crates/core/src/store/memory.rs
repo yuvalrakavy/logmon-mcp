@@ -1,11 +1,11 @@
-use crate::gelf::message::LogEntry;
-use crate::filter::parser::ParsedFilter;
 use crate::filter::matcher::matches_entry;
+use crate::filter::parser::ParsedFilter;
+use crate::gelf::message::LogEntry;
 use crate::store::traits::{LogStore, StoreStats};
 use chrono::{DateTime, Utc};
-use std::collections::{VecDeque, HashSet, HashMap};
-use std::sync::RwLock;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::time::Duration;
 
 /// Inner state guarded by a single `RwLock`. Collapsing the three
@@ -167,9 +167,12 @@ impl LogStore for InMemoryStore {
         let inner = self.inner.read().unwrap();
         let window_ns = window.as_nanos() as i64;
 
-        inner.entries.iter()
+        inner
+            .entries
+            .iter()
             .filter(|e| {
-                let diff = (e.timestamp - timestamp).num_nanoseconds()
+                let diff = (e.timestamp - timestamp)
+                    .num_nanoseconds()
                     .map(|ns| ns.abs())
                     .unwrap_or(i64::MAX);
                 diff <= window_ns
@@ -188,7 +191,9 @@ impl LogStore for InMemoryStore {
             return Vec::new();
         };
         let seq_set: HashSet<u64> = seqs.iter().copied().collect();
-        inner.entries.iter()
+        inner
+            .entries
+            .iter()
             .filter(|e| seq_set.contains(&e.seq))
             .cloned()
             .collect()
@@ -196,7 +201,10 @@ impl LogStore for InMemoryStore {
 
     fn count_by_trace_id(&self, trace_id: u128) -> usize {
         let inner = self.inner.read().unwrap();
-        inner.trace_index.get(&trace_id).map_or(0, |seqs| seqs.len())
+        inner
+            .trace_index
+            .get(&trace_id)
+            .map_or(0, |seqs| seqs.len())
     }
 
     fn clear(&self) {
@@ -219,7 +227,12 @@ impl LogStore for InMemoryStore {
     }
 
     fn oldest_timestamp(&self) -> Option<DateTime<Utc>> {
-        self.inner.read().unwrap().entries.front().map(|e| e.timestamp)
+        self.inner
+            .read()
+            .unwrap()
+            .entries
+            .front()
+            .map(|e| e.timestamp)
     }
 
     fn oldest_seq(&self) -> Option<u64> {
@@ -262,7 +275,7 @@ mod lazy_alloc_tests {
 #[cfg(test)]
 mod oldest_ts_tests {
     use super::*;
-    use crate::gelf::message::{LogEntry, Level, LogSource};
+    use crate::gelf::message::{Level, LogEntry, LogSource};
     use chrono::Utc;
     use std::collections::HashMap;
 
@@ -327,7 +340,11 @@ mod oldest_ts_tests {
         store.append(entry(2));
         store.append(entry(3));
         assert_eq!(store.newest_seq(), Some(3), "newest = back of the deque");
-        assert_eq!(store.oldest_seq(), Some(1), "oldest = front (guards a mixup)");
+        assert_eq!(
+            store.oldest_seq(),
+            Some(1),
+            "oldest = front (guards a mixup)"
+        );
     }
 }
 
@@ -344,7 +361,7 @@ mod concurrency_tests {
     //! never wedging.
 
     use super::*;
-    use crate::gelf::message::{LogEntry, Level, LogSource};
+    use crate::gelf::message::{Level, LogEntry, LogSource};
     use chrono::Utc;
     use std::collections::HashMap;
     use std::sync::Arc;

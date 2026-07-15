@@ -1,5 +1,5 @@
-use logmon_broker_core::span::types::*;
 use chrono::Utc;
+use logmon_broker_core::span::types::*;
 use std::collections::HashMap;
 
 #[test]
@@ -46,7 +46,10 @@ fn test_span_event() {
         timestamp: Utc::now(),
         attributes: {
             let mut m = HashMap::new();
-            m.insert("exception.message".to_string(), serde_json::json!("null pointer"));
+            m.insert(
+                "exception.message".to_string(),
+                serde_json::json!("null pointer"),
+            );
             m
         },
     };

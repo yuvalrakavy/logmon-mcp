@@ -97,8 +97,12 @@ pub async fn spawn_ephemeral_domain(
     let mut domain = Domain::new_with_metrics(config, 0, metrics);
 
     // --- Domain-scoped processors (serve only sessions bound to `id`, §9.1) ---
-    let log_processor =
-        spawn_log_processor(log_rx, domain.pipeline.clone(), sessions.clone(), id.clone());
+    let log_processor = spawn_log_processor(
+        log_rx,
+        domain.pipeline.clone(),
+        sessions.clone(),
+        id.clone(),
+    );
     let span_processor = spawn_span_processor(
         span_rx,
         domain.span_store.clone(),
@@ -107,7 +111,12 @@ pub async fn spawn_ephemeral_domain(
         id,
     );
 
-    domain.receivers = Some(DomainReceivers::new(gelf, otlp, log_processor, span_processor));
+    domain.receivers = Some(DomainReceivers::new(
+        gelf,
+        otlp,
+        log_processor,
+        span_processor,
+    ));
     Ok(Arc::new(domain))
 }
 

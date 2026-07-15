@@ -60,9 +60,8 @@ pub fn install(scope: Scope) -> Result<()> {
     let rendered = PLIST_TEMPLATE.replace("{BINARY_PATH}", exe_str);
 
     if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create plist parent dir: {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create plist parent dir: {}", parent.display()))?;
     }
     std::fs::write(&plist_path, rendered)
         .with_context(|| format!("failed to write plist: {}", plist_path.display()))?;
@@ -71,9 +70,9 @@ pub fn install(scope: Scope) -> Result<()> {
     let _ = bootout(scope);
 
     let target = scope.bootstrap_target();
-    let plist_str = plist_path.to_str().with_context(|| {
-        format!("plist path is not valid UTF-8: {}", plist_path.display())
-    })?;
+    let plist_str = plist_path
+        .to_str()
+        .with_context(|| format!("plist path is not valid UTF-8: {}", plist_path.display()))?;
     let status = std::process::Command::new("launchctl")
         .args(["bootstrap", &target, plist_str])
         .status()

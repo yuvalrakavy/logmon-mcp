@@ -35,7 +35,10 @@ async fn typed_trigger_fired_received() {
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            panic!("timed out waiting for TriggerFired for trigger {}", added.id);
+            panic!(
+                "timed out waiting for TriggerFired for trigger {}",
+                added.id
+            );
         }
         match tokio::time::timeout(remaining, sub.recv()).await {
             Ok(Ok(Notification::TriggerFired(payload))) if payload.trigger_id == added.id => {
@@ -46,7 +49,10 @@ async fn typed_trigger_fired_received() {
             Ok(Ok(Notification::TriggerFired(_))) => continue,
             Ok(Ok(other)) => panic!("expected TriggerFired, got: {other:?}"),
             Ok(Err(e)) => panic!("notification channel error: {e:?}"),
-            Err(_) => panic!("timed out waiting for TriggerFired for trigger {}", added.id),
+            Err(_) => panic!(
+                "timed out waiting for TriggerFired for trigger {}",
+                added.id
+            ),
         }
     }
 }

@@ -13,20 +13,31 @@ pub enum ParsedFilter {
 pub enum Qualifier {
     BarePattern(Pattern),
     SelectorPattern(Selector, Pattern),
-    LevelFilter { op: LevelOp, level: Level },
+    LevelFilter {
+        op: LevelOp,
+        level: Level,
+    },
     DurationFilter(DurationOp, f64),
-    BookmarkFilter { op: BookmarkOp, name: String },
+    BookmarkFilter {
+        op: BookmarkOp,
+        name: String,
+    },
     /// Read-and-advance bookmark reference. Resolved to `SeqFilter` by
     /// `bookmark_resolver::resolve_bookmarks` (which also acquires the
     /// CursorCommit handle from the BookmarkStore).
-    CursorFilter { name: String },
+    CursorFilter {
+        name: String,
+    },
     /// Internal-only: produced by `resolve_bookmarks` from `BookmarkFilter`
     /// (and from `CursorFilter` once Task 6/7 lands). Never emitted by the
     /// parser, never serialized in user-facing wire shapes.
     /// Uses `SeqOp` (strict `Gt`/`Lt`) — distinct from `BookmarkOp` because the
     /// cursor design resolves `b>=name` / `b<=name` to STRICT `>` / `<` against
     /// the bookmark's seq (not ≥/≤).
-    SeqFilter { op: SeqOp, value: u64 },
+    SeqFilter {
+        op: SeqOp,
+        value: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,18 +164,18 @@ impl<'de> Deserialize<'de> for Pattern {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Selector {
-    Message,                   // m
-    FullMessage,               // fm
-    MessageOrFull,             // mfm
-    Host,                      // h
-    Facility,                  // fa
-    File,                      // fi
-    Line,                      // ln
-    SpanName,                  // sn
-    ServiceName,               // sv
-    SpanStatus,                // st
-    SpanKind,                  // sk
-    AdditionalField(String),   // anything else
+    Message,                 // m
+    FullMessage,             // fm
+    MessageOrFull,           // mfm
+    Host,                    // h
+    Facility,                // fa
+    File,                    // fi
+    Line,                    // ln
+    SpanName,                // sn
+    ServiceName,             // sv
+    SpanStatus,              // st
+    SpanKind,                // sk
+    AdditionalField(String), // anything else
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -207,7 +218,8 @@ fn is_valid_bookmark_token(name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'/')
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'/')
 }
 
 /// Split the input on commas, but respect double-quoted strings (don't split inside quotes).
@@ -320,13 +332,15 @@ fn parse_token(token: &str) -> Result<Qualifier, FilterParseError> {
 
     // Duration filter: d>=N, d<=N
     if let Some(rest) = token.strip_prefix("d>=") {
-        let value: f64 = rest.parse()
-            .map_err(|_| FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest)))?;
+        let value: f64 = rest.parse().map_err(|_| {
+            FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest))
+        })?;
         return Ok(Qualifier::DurationFilter(DurationOp::Gte, value));
     }
     if let Some(rest) = token.strip_prefix("d<=") {
-        let value: f64 = rest.parse()
-            .map_err(|_| FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest)))?;
+        let value: f64 = rest.parse().map_err(|_| {
+            FilterParseError::InvalidLevelSyntax(format!("invalid duration value: {}", rest))
+        })?;
         return Ok(Qualifier::DurationFilter(DurationOp::Lte, value));
     }
 
@@ -530,7 +544,10 @@ mod bookmark_tests {
     #[test]
     fn parses_bookmark_gte_bare_name() {
         match parse_one("b>=before") {
-            Qualifier::BookmarkFilter { op: BookmarkOp::Gte, name } => {
+            Qualifier::BookmarkFilter {
+                op: BookmarkOp::Gte,
+                name,
+            } => {
                 assert_eq!(name, "before");
             }
             other => panic!("unexpected: {other:?}"),
@@ -540,7 +557,10 @@ mod bookmark_tests {
     #[test]
     fn parses_bookmark_lte_bare_name() {
         match parse_one("b<=after") {
-            Qualifier::BookmarkFilter { op: BookmarkOp::Lte, name } => {
+            Qualifier::BookmarkFilter {
+                op: BookmarkOp::Lte,
+                name,
+            } => {
                 assert_eq!(name, "after");
             }
             other => panic!("unexpected: {other:?}"),
@@ -550,7 +570,10 @@ mod bookmark_tests {
     #[test]
     fn parses_bookmark_qualified_name() {
         match parse_one("b>=session-A/before") {
-            Qualifier::BookmarkFilter { op: BookmarkOp::Gte, name } => {
+            Qualifier::BookmarkFilter {
+                op: BookmarkOp::Gte,
+                name,
+            } => {
                 assert_eq!(name, "session-A/before");
             }
             other => panic!("unexpected: {other:?}"),
@@ -710,7 +733,9 @@ pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
 pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,
-        ParsedFilter::Qualifiers(qs) => qs.iter().any(|q| matches!(q, Qualifier::CursorFilter { .. })),
+        ParsedFilter::Qualifiers(qs) => qs
+            .iter()
+            .any(|q| matches!(q, Qualifier::CursorFilter { .. })),
     }
 }
 
@@ -725,7 +750,10 @@ fn resolved_lower_bound(filter: &ParsedFilter) -> Option<u64> {
         ParsedFilter::Qualifiers(qs) => qs
             .iter()
             .filter_map(|q| match q {
-                Qualifier::SeqFilter { op: SeqOp::Gt, value } => Some(*value),
+                Qualifier::SeqFilter {
+                    op: SeqOp::Gt,
+                    value,
+                } => Some(*value),
                 _ => None,
             })
             .max(),
@@ -767,7 +795,10 @@ mod strict_selector_tests {
     fn bare_quoted_pattern_with_operators_stays_valid() {
         // The documented escape hatch for literal text containing >= / <=.
         assert!(matches!(first(r#""a>=b""#), Qualifier::BarePattern(_)));
-        assert!(matches!(first(r#""retries<=0""#), Qualifier::BarePattern(_)));
+        assert!(matches!(
+            first(r#""retries<=0""#),
+            Qualifier::BarePattern(_)
+        ));
     }
 
     #[test]
@@ -783,8 +814,14 @@ mod strict_selector_tests {
             first("_url=a>=b"),
             Qualifier::SelectorPattern(Selector::AdditionalField(_), _)
         ));
-        assert!(matches!(first("m=x>=y"), Qualifier::SelectorPattern(Selector::Message, _)));
-        assert!(matches!(first("fa=a<=b"), Qualifier::SelectorPattern(Selector::Facility, _)));
+        assert!(matches!(
+            first("m=x>=y"),
+            Qualifier::SelectorPattern(Selector::Message, _)
+        ));
+        assert!(matches!(
+            first("fa=a<=b"),
+            Qualifier::SelectorPattern(Selector::Facility, _)
+        ));
     }
 
     #[test]
@@ -800,7 +837,10 @@ mod strict_selector_tests {
     fn comparison_selectors_still_parse() {
         assert!(matches!(first("l>=ERROR"), Qualifier::LevelFilter { .. }));
         assert!(matches!(first("d>=100"), Qualifier::DurationFilter(..)));
-        assert!(matches!(first("b>=anchor"), Qualifier::BookmarkFilter { .. }));
+        assert!(matches!(
+            first("b>=anchor"),
+            Qualifier::BookmarkFilter { .. }
+        ));
         assert!(matches!(first("c>=cur"), Qualifier::CursorFilter { .. }));
     }
 
@@ -808,22 +848,40 @@ mod strict_selector_tests {
 
     #[test]
     fn typo_long_form_selectors_error() {
-        assert!(matches!(err("level>=WARN"), FilterParseError::UnknownComparisonSelector(_)));
-        assert!(matches!(err("duration>=100"), FilterParseError::UnknownComparisonSelector(_)));
-        assert!(matches!(err("retries>=3"), FilterParseError::UnknownComparisonSelector(_)));
-        assert!(matches!(err("foo<=bar"), FilterParseError::UnknownComparisonSelector(_)));
+        assert!(matches!(
+            err("level>=WARN"),
+            FilterParseError::UnknownComparisonSelector(_)
+        ));
+        assert!(matches!(
+            err("duration>=100"),
+            FilterParseError::UnknownComparisonSelector(_)
+        ));
+        assert!(matches!(
+            err("retries>=3"),
+            FilterParseError::UnknownComparisonSelector(_)
+        ));
+        assert!(matches!(
+            err("foo<=bar"),
+            FilterParseError::UnknownComparisonSelector(_)
+        ));
     }
 
     #[test]
     fn typo_capital_level_selector_errors() {
         // strip_prefix("l>=") is case-sensitive, so `L>=` falls through to the rule.
-        assert!(matches!(err("L>=warn"), FilterParseError::UnknownComparisonSelector(_)));
+        assert!(matches!(
+            err("L>=warn"),
+            FilterParseError::UnknownComparisonSelector(_)
+        ));
     }
 
     #[test]
     fn spaced_operator_errors_not_silent_no_match() {
         // `l >= warn` must NOT silently become AdditionalField("l >") → 0 matches.
-        assert!(matches!(err("l >= warn"), FilterParseError::UnknownComparisonSelector(_)));
+        assert!(matches!(
+            err("l >= warn"),
+            FilterParseError::UnknownComparisonSelector(_)
+        ));
     }
 
     #[test]
@@ -841,7 +899,10 @@ mod strict_selector_tests {
     #[test]
     fn error_names_token_and_points_to_escape_hatch() {
         let msg = err("level>=WARN").to_string();
-        assert!(msg.contains("level>"), "should name the offending token: {msg}");
+        assert!(
+            msg.contains("level>"),
+            "should name the offending token: {msg}"
+        );
         assert!(
             msg.contains("quote") || msg.contains("regex"),
             "should point to the escape hatch: {msg}"
@@ -856,7 +917,10 @@ mod truncation_tests {
     use super::*;
 
     fn gt(seq: u64) -> ParsedFilter {
-        ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter { op: SeqOp::Gt, value: seq }])
+        ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter {
+            op: SeqOp::Gt,
+            value: seq,
+        }])
     }
 
     #[test]
@@ -882,7 +946,10 @@ mod truncation_tests {
             ParsedFilter::Qualifiers(vec![Qualifier::BarePattern(Pattern::Substring("x".into()))]);
         assert_eq!(evicted_before_window(&bare, Some(100)), None);
         // b<= (upper bound → SeqOp::Lt) is NOT a lower bound
-        let lt = ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter { op: SeqOp::Lt, value: 5 }]);
+        let lt = ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter {
+            op: SeqOp::Lt,
+            value: 5,
+        }]);
         assert_eq!(evicted_before_window(&lt, Some(100)), None);
     }
 
@@ -892,20 +959,38 @@ mod truncation_tests {
         // is seq > max(both). Picking the FIRST would false-positive on truncation.
         // Effective bound 300 > oldest 100 → nothing in the real window evicted.
         let old_then_new = ParsedFilter::Qualifiers(vec![
-            Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 },
-            Qualifier::SeqFilter { op: SeqOp::Gt, value: 300 },
+            Qualifier::SeqFilter {
+                op: SeqOp::Gt,
+                value: 10,
+            },
+            Qualifier::SeqFilter {
+                op: SeqOp::Gt,
+                value: 300,
+            },
         ]);
         assert_eq!(evicted_before_window(&old_then_new, Some(100)), None);
         // And order-independent (AND is commutative; the field must be too).
         let new_then_old = ParsedFilter::Qualifiers(vec![
-            Qualifier::SeqFilter { op: SeqOp::Gt, value: 300 },
-            Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 },
+            Qualifier::SeqFilter {
+                op: SeqOp::Gt,
+                value: 300,
+            },
+            Qualifier::SeqFilter {
+                op: SeqOp::Gt,
+                value: 10,
+            },
         ]);
         assert_eq!(evicted_before_window(&new_then_old, Some(100)), None);
         // When the MAX bound is genuinely evicted, report the gap against IT.
         let both_evicted = ParsedFilter::Qualifiers(vec![
-            Qualifier::SeqFilter { op: SeqOp::Gt, value: 10 },
-            Qualifier::SeqFilter { op: SeqOp::Gt, value: 50 },
+            Qualifier::SeqFilter {
+                op: SeqOp::Gt,
+                value: 10,
+            },
+            Qualifier::SeqFilter {
+                op: SeqOp::Gt,
+                value: 50,
+            },
         ]);
         assert_eq!(evicted_before_window(&both_evicted, Some(100)), Some(50));
     }

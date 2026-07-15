@@ -297,7 +297,14 @@ pub async fn run_with_overrides(
                 // keep serving. GELF above still fails loud (it is the core
                 // function), and explicit `domains.create` still fails loud because
                 // it propagates `start`'s error to the caller. Deep-gate finding C.
-                match OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx, receiver_metrics.clone()).await {
+                match OtlpReceiver::start(
+                    otlp_config,
+                    log_tx.clone(),
+                    span_tx,
+                    receiver_metrics.clone(),
+                )
+                .await
+                {
                     Ok(otlp_receiver) => {
                         let otlp_info = otlp_receiver.listening_on();
                         info!(?otlp_info, "OTLP receiver started");
@@ -333,7 +340,12 @@ pub async fn run_with_overrides(
                 pipeline.clone(),
                 DomainId::default_domain(),
             );
-            (log_rx, Some(gelf_receiver), otlp_receiver, all_receivers_info)
+            (
+                log_rx,
+                Some(gelf_receiver),
+                otlp_receiver,
+                all_receivers_info,
+            )
         }
     };
 
@@ -342,8 +354,12 @@ pub async fn run_with_overrides(
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
     // 11. Start log processor
-    let _processor_handle =
-        spawn_log_processor(log_rx, pipeline.clone(), sessions.clone(), DomainId::default_domain());
+    let _processor_handle = spawn_log_processor(
+        log_rx,
+        pipeline.clone(),
+        sessions.clone(),
+        DomainId::default_domain(),
+    );
 
     // 12. Sync pre-buffer size after restoring sessions
     sync_pre_buffer_size(&pipeline, &sessions);
@@ -701,11 +717,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(ci) = &params.client_info {
         let serialized = serde_json::to_string(ci).unwrap_or_default();
         if serialized.len() > 4096 {
-            let resp = RpcResponse::error(
-                first_request.id,
-                -32602,
-                "client_info exceeds 4 KB limit",
-            );
+            let resp =
+                RpcResponse::error(first_request.id, -32602, "client_info exceeds 4 KB limit");
             write_message(&mut writer, &resp).await?;
             return Ok(());
         }
@@ -897,7 +910,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     if matches!(session_id, SessionId::Anonymous(_)) {
         let removed = handler.clear_session_bookmarks(&session_id);
         if removed > 0 {
-            info!(?session_id, removed, "cleared anonymous-session bookmarks on disconnect");
+            info!(
+                ?session_id,
+                removed, "cleared anonymous-session bookmarks on disconnect"
+            );
         }
     }
 

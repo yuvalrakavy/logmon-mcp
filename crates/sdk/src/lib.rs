@@ -28,6 +28,12 @@ pub use logmon_broker_protocol::{
 ///
 /// `#[non_exhaustive]` lets future variants ship without a major-version
 /// bump — match arms must include a wildcard.
+///
+/// The size disparity between `TriggerFired` and `Reconnected` is
+/// deliberate: boxing the payload would force every consumer to deref
+/// through a `Box`, and the channel only ever holds a handful of values
+/// at once.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum Notification {

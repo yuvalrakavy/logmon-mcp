@@ -34,8 +34,7 @@ async fn count_domain(client: &mut TestClient, name: &str) -> usize {
 
 async fn send_gelf(port: u16, msg: &str) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let payload =
-        format!(r#"{{"version":"1.1","host":"test","short_message":"{msg}","level":6}}"#);
+    let payload = format!(r#"{{"version":"1.1","host":"test","short_message":"{msg}","level":6}}"#);
     sock.send_to(payload.as_bytes(), format!("127.0.0.1:{port}"))
         .await
         .unwrap();
@@ -62,7 +61,10 @@ async fn config_domain_boots_and_ingests_isolated() {
         .unwrap();
     let mut got = false;
     for _ in 0..40 {
-        let r: LogsRecentResult = client.call("logs.recent", json!({ "count": 50 })).await.unwrap();
+        let r: LogsRecentResult = client
+            .call("logs.recent", json!({ "count": 50 }))
+            .await
+            .unwrap();
         if r.logs.iter().any(|l| l.message.contains("staging log")) {
             got = true;
             break;
@@ -76,7 +78,10 @@ async fn config_domain_boots_and_ingests_isolated() {
         .call::<DomainInfo>("domains.use", json!({ "name": "default" }))
         .await
         .unwrap();
-    let r: LogsRecentResult = client.call("logs.recent", json!({ "count": 50 })).await.unwrap();
+    let r: LogsRecentResult = client
+        .call("logs.recent", json!({ "count": 50 }))
+        .await
+        .unwrap();
     assert!(
         !r.logs.iter().any(|l| l.message.contains("staging log")),
         "staging log must not leak into default"

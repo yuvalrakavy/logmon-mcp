@@ -13,15 +13,14 @@ use logmon_broker_protocol::{
     BookmarksAdd, BookmarksAddResult, BookmarksClear, BookmarksClearResult, BookmarksList,
     BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, DomainsClear, DomainsClearResult,
     DomainsCreate, DomainsCreateResult, DomainsDelete, DomainsDeleteResult, DomainsList,
-    DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult,
-    FiltersEdit, FiltersEditResult, FiltersList, FiltersListResult, FiltersRemove,
-    FiltersRemoveResult, LogsClear, LogsClearResult, LogsContext, LogsContextResult, LogsExport,
-    LogsExportResult, LogsRecent, LogsRecentResult, SessionDrop, SessionDropResult, SessionList,
-    SessionListResult, SpansContext, SpansContextResult, StatusGet, StatusGetResult, TracesGet,
-    TracesGetResult, TracesLogs, TracesLogsResult, TracesRecent, TracesRecentResult, TracesSlow,
-    TracesSlowResult, TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult,
-    TriggersEdit, TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove,
-    TriggersRemoveResult,
+    DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult, FiltersEdit,
+    FiltersEditResult, FiltersList, FiltersListResult, FiltersRemove, FiltersRemoveResult,
+    LogsClear, LogsClearResult, LogsContext, LogsContextResult, LogsExport, LogsExportResult,
+    LogsRecent, LogsRecentResult, SessionDrop, SessionDropResult, SessionList, SessionListResult,
+    SpansContext, SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult,
+    TracesLogs, TracesLogsResult, TracesRecent, TracesRecentResult, TracesSlow, TracesSlowResult,
+    TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult, TriggersEdit,
+    TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove, TriggersRemoveResult,
 };
 
 impl Broker {

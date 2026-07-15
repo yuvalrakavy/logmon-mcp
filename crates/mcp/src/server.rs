@@ -237,7 +237,9 @@ struct UseDomainParams {
 
 #[rmcp::tool_router]
 impl GelfMcpServer {
-    #[rmcp::tool(description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics")]
+    #[rmcp::tool(
+        description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics"
+    )]
     async fn get_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -251,7 +253,9 @@ impl GelfMcpServer {
 
     // ---- Log Query Tools ----
 
-    #[rmcp::tool(description = "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression. Response carries matched/scanned/buffer_total diagnostics (scanned=0 = empty buffer; matched=0 with scanned>0 = filter matched nothing while data flows) plus truncated/evicted_before_window when a bookmark/cursor window rolled off. Unknown-selector comparison typos like level>=WARN are rejected with a suggestion.")]
+    #[rmcp::tool(
+        description = "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression. Response carries matched/scanned/buffer_total diagnostics (scanned=0 = empty buffer; matched=0 with scanned>0 = filter matched nothing while data flows) plus truncated/evicted_before_window when a bookmark/cursor window rolled off. Unknown-selector comparison typos like level>=WARN are rejected with a suggestion."
+    )]
     async fn get_recent_logs(
         &self,
         Parameters(p): Parameters<GetRecentLogsParams>,
@@ -273,7 +277,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Get log entries surrounding a specific entry identified by seq number. Returns context before and after.")]
+    #[rmcp::tool(
+        description = "Get log entries surrounding a specific entry identified by seq number. Returns context before and after."
+    )]
     async fn get_log_context(
         &self,
         Parameters(p): Parameters<GetLogContextParams>,
@@ -373,7 +379,9 @@ impl GelfMcpServer {
 
     // ---- Filter Management Tools ----
 
-    #[rmcp::tool(description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored.")]
+    #[rmcp::tool(
+        description = "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored."
+    )]
     async fn get_filters(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -385,7 +393,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Add a new buffer filter. Logs matching this filter will be stored. Uses OR semantics with existing filters.")]
+    #[rmcp::tool(
+        description = "Add a new buffer filter. Logs matching this filter will be stored. Uses OR semantics with existing filters."
+    )]
     async fn add_filter(
         &self,
         Parameters(p): Parameters<AddFilterParams>,
@@ -450,7 +460,9 @@ impl GelfMcpServer {
 
     // ---- Trigger Management Tools ----
 
-    #[rmcp::tool(description = "List all triggers. Triggers capture a window of logs around matching entries and emit notifications.")]
+    #[rmcp::tool(
+        description = "List all triggers. Triggers capture a window of logs around matching entries and emit notifications."
+    )]
     async fn get_triggers(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -462,7 +474,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Add a new trigger. When a log matches the filter, the pre/post windows are captured and a notification is emitted.")]
+    #[rmcp::tool(
+        description = "Add a new trigger. When a log matches the filter, the pre/post windows are captured and a notification is emitted."
+    )]
     async fn add_trigger(
         &self,
         Parameters(p): Parameters<AddTriggerParams>,
@@ -486,7 +500,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Edit an existing trigger by ID. Only the provided fields are updated.")]
+    #[rmcp::tool(
+        description = "Edit an existing trigger by ID. Only the provided fields are updated."
+    )]
     async fn edit_trigger(
         &self,
         Parameters(p): Parameters<EditTriggerParams>,
@@ -664,7 +680,9 @@ impl GelfMcpServer {
 
     // ---- Bookmark Tools ----
 
-    #[rmcp::tool(description = "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs.")]
+    #[rmcp::tool(
+        description = "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs."
+    )]
     async fn add_bookmark(
         &self,
         Parameters(p): Parameters<AddBookmarkParams>,
@@ -685,7 +703,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "List all live bookmarks across all sessions, newest first. Optionally filter by session name.")]
+    #[rmcp::tool(
+        description = "List all live bookmarks across all sessions, newest first. Optionally filter by session name."
+    )]
     async fn list_bookmarks(
         &self,
         Parameters(p): Parameters<ListBookmarksParams>,
@@ -703,17 +723,16 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Remove a bookmark by name. Bare name resolves to the current session; use 'session/name' to remove a bookmark from another session.")]
+    #[rmcp::tool(
+        description = "Remove a bookmark by name. Bare name resolves to the current session; use 'session/name' to remove a bookmark from another session."
+    )]
     async fn remove_bookmark(
         &self,
         Parameters(p): Parameters<RemoveBookmarkParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
-            .call(
-                "bookmarks.remove",
-                serde_json::json!({ "name": p.name }),
-            )
+            .call("bookmarks.remove", serde_json::json!({ "name": p.name }))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
@@ -721,7 +740,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Clear all bookmarks for a session at once. Defaults to the calling session. Useful for iterative debugging workflows: wipe all bookmarks, re-add fresh ones, repeat. Pass an explicit session name to clear another session's bookmarks.")]
+    #[rmcp::tool(
+        description = "Clear all bookmarks for a session at once. Defaults to the calling session. Useful for iterative debugging workflows: wipe all bookmarks, re-add fresh ones, repeat. Pass an explicit session name to clear another session's bookmarks."
+    )]
     async fn clear_bookmarks(
         &self,
         Parameters(p): Parameters<ClearBookmarksParams>,
@@ -775,7 +796,9 @@ impl GelfMcpServer {
 
     // ---- Domain Management Tools ----
 
-    #[rmcp::tool(description = "Create (or idempotently ensure) an isolated domain — a full broker instance with its own log/span buffers, receivers, and triggers. Omitted ports are auto-allocated; a port of 0 disables that receiver. Ephemeral (gone on daemon restart).")]
+    #[rmcp::tool(
+        description = "Create (or idempotently ensure) an isolated domain — a full broker instance with its own log/span buffers, receivers, and triggers. Omitted ports are auto-allocated; a port of 0 disables that receiver. Ephemeral (gone on daemon restart)."
+    )]
     async fn create_domain(
         &self,
         Parameters(p): Parameters<CreateDomainParams>,
@@ -800,7 +823,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Delete a domain and tear down its receivers. Refuses config-declared domains including 'default'.")]
+    #[rmcp::tool(
+        description = "Delete a domain and tear down its receivers. Refuses config-declared domains including 'default'."
+    )]
     async fn delete_domain(
         &self,
         Parameters(p): Parameters<DeleteDomainParams>,
@@ -815,7 +840,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "List all live domains with their ports, source (config/persistent/ephemeral), and log/span counts.")]
+    #[rmcp::tool(
+        description = "List all live domains with their ports, source (config/persistent/ephemeral), and log/span counts."
+    )]
     async fn list_domains(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -827,7 +854,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Bind this session to a domain. Subsequent log/trace queries and trigger notifications target that domain until you switch again. Errors if the domain does not exist.")]
+    #[rmcp::tool(
+        description = "Bind this session to a domain. Subsequent log/trace queries and trigger notifications target that domain until you switch again. Errors if the domain does not exist."
+    )]
     async fn use_domain(
         &self,
         Parameters(p): Parameters<UseDomainParams>,
@@ -842,7 +871,9 @@ impl GelfMcpServer {
         )]))
     }
 
-    #[rmcp::tool(description = "Dispose the bound domain's data — logs and spans — keeping the domain and its receivers alive. Sequence numbers stay monotonic. (logs.clear is the logs-only cousin.)")]
+    #[rmcp::tool(
+        description = "Dispose the bound domain's data — logs and spans — keeping the domain and its receivers alive. Sequence numbers stay monotonic. (logs.clear is the logs-only cousin.)"
+    )]
     async fn clear_domain(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let result = self
             .broker
@@ -855,9 +886,45 @@ impl GelfMcpServer {
     }
 }
 
+/// Skill content shipped as MCP `instructions` so any compliant client
+/// (Claude Code, Cursor, etc.) surfaces it as server-level guidance
+/// without the user installing the file by hand. The file lives at
+/// `skill/logmon.md` at the workspace root and is embedded at compile
+/// time.
+const SKILL_INSTRUCTIONS: &str = include_str!("../../../skill/logmon.md");
+
 #[rmcp::tool_handler]
 impl ServerHandler for GelfMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SKILL_INSTRUCTIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SKILL_INSTRUCTIONS;
+
+    #[test]
+    fn skill_instructions_is_embedded_and_non_empty() {
+        // Catches `skill/logmon.md` going missing, getting truncated, or
+        // losing its YAML frontmatter at compile/test time rather than at
+        // runtime in a client's session.
+        assert!(
+            !SKILL_INSTRUCTIONS.is_empty(),
+            "skill/logmon.md is empty — embedding failed"
+        );
+        assert!(
+            SKILL_INSTRUCTIONS.starts_with("---\n"),
+            "skill/logmon.md must start with YAML frontmatter"
+        );
+        assert!(
+            SKILL_INSTRUCTIONS.contains("name: logmon"),
+            "skill/logmon.md frontmatter must declare `name: logmon`"
+        );
+        assert!(
+            SKILL_INSTRUCTIONS.contains("## When to reach for logmon"),
+            "skill/logmon.md must contain the `When to reach for logmon` section"
+        );
     }
 }

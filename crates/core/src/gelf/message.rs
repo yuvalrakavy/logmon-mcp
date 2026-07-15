@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc, TimeZone};
+use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -13,7 +13,9 @@ fn serialize_opt_trace_id<S: Serializer>(id: &Option<u128>, s: S) -> Result<S::O
 fn deserialize_opt_trace_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u128>, D::Error> {
     let opt: Option<String> = Option::deserialize(d)?;
     match opt {
-        Some(s) => u128::from_str_radix(&s, 16).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => u128::from_str_radix(&s, 16)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
@@ -28,7 +30,9 @@ fn serialize_opt_span_id<S: Serializer>(id: &Option<u64>, s: S) -> Result<S::Ok,
 fn deserialize_opt_span_id<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     let opt: Option<String> = Option::deserialize(d)?;
     match opt {
-        Some(s) => u64::from_str_radix(&s, 16).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => u64::from_str_radix(&s, 16)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
@@ -95,11 +99,19 @@ pub struct LogEntry {
     pub file: Option<String>,
     pub line: Option<u32>,
     pub additional_fields: HashMap<String, serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none",
-            serialize_with = "serialize_opt_trace_id", deserialize_with = "deserialize_opt_trace_id")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_opt_trace_id",
+        deserialize_with = "deserialize_opt_trace_id"
+    )]
     pub trace_id: Option<u128>,
-    #[serde(default, skip_serializing_if = "Option::is_none",
-            serialize_with = "serialize_opt_span_id", deserialize_with = "deserialize_opt_span_id")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_opt_span_id",
+        deserialize_with = "deserialize_opt_span_id"
+    )]
     pub span_id: Option<u64>,
     #[serde(default)]
     pub matched_filters: Vec<String>,
@@ -146,53 +158,68 @@ pub enum GelfParseError {
 
 pub fn parse_gelf_message(bytes: &[u8], seq: u64) -> Result<LogEntry, GelfParseError> {
     let v: serde_json::Value = serde_json::from_slice(bytes)?;
-    let obj = v.as_object().ok_or(GelfParseError::MissingField("root object"))?;
+    let obj = v
+        .as_object()
+        .ok_or(GelfParseError::MissingField("root object"))?;
 
-    let host = obj.get("host")
+    let host = obj
+        .get("host")
         .and_then(|v| v.as_str())
         .ok_or(GelfParseError::MissingField("host"))?
         .to_string();
 
-    let message = obj.get("short_message")
+    let message = obj
+        .get("short_message")
         .and_then(|v| v.as_str())
         .ok_or(GelfParseError::MissingField("short_message"))?
         .to_string();
 
-    let syslog_level = obj.get("level")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(6) as u8;
+    let syslog_level = obj.get("level").and_then(|v| v.as_u64()).unwrap_or(6) as u8;
 
     // Check for _level additional field (tracing-gelf sets this for TRACE)
-    let level = obj.get("_level")
+    let level = obj
+        .get("_level")
         .and_then(|v| v.as_str())
         .and_then(Level::from_name)
         .unwrap_or_else(|| Level::from_syslog(syslog_level));
 
-    let timestamp = obj.get("timestamp")
+    let timestamp = obj
+        .get("timestamp")
         .and_then(|v| v.as_f64())
         .map(|ts| {
             let secs = ts as i64;
             let nanos = ((ts - secs as f64) * 1_000_000_000.0) as u32;
-            Utc.timestamp_opt(secs, nanos).single().unwrap_or_else(Utc::now)
+            Utc.timestamp_opt(secs, nanos)
+                .single()
+                .unwrap_or_else(Utc::now)
         })
         .unwrap_or_else(Utc::now);
 
-    let full_message = obj.get("full_message").and_then(|v| v.as_str()).map(String::from);
-    let facility = obj.get("facility").and_then(|v| v.as_str()).map(String::from);
+    let full_message = obj
+        .get("full_message")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let facility = obj
+        .get("facility")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let file = obj.get("file").and_then(|v| v.as_str()).map(String::from);
     let line = obj.get("line").and_then(|v| v.as_u64()).map(|v| v as u32);
 
     // Collect additional fields (keys starting with _), strip the _ prefix
-    let mut additional_fields: HashMap<String, serde_json::Value> = obj.iter()
+    let mut additional_fields: HashMap<String, serde_json::Value> = obj
+        .iter()
         .filter(|(k, _)| k.starts_with('_') && *k != "_level")
         .map(|(k, v)| (k[1..].to_string(), v.clone()))
         .collect();
 
-    let trace_id = additional_fields.remove("trace_id")
+    let trace_id = additional_fields
+        .remove("trace_id")
         .and_then(|v| v.as_str().map(String::from))
         .and_then(|s| u128::from_str_radix(&s, 16).ok());
 
-    let span_id = additional_fields.remove("span_id")
+    let span_id = additional_fields
+        .remove("span_id")
         .and_then(|v| v.as_str().map(String::from))
         .and_then(|s| u64::from_str_radix(&s, 16).ok());
 

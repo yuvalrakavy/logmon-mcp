@@ -42,7 +42,10 @@ async fn triggers_add_honors_explicit_windows_including_zero() {
         .unwrap();
     let list: TriggersListResult = client.call("triggers.list", json!({})).await.unwrap();
     let t = list.triggers.iter().find(|t| t.id == add.id).unwrap();
-    assert_eq!(t.pre_window, 0, "explicit 0 is honored, not replaced by the default");
+    assert_eq!(
+        t.pre_window, 0,
+        "explicit 0 is honored, not replaced by the default"
+    );
     assert_eq!(t.post_window, 10);
     assert_eq!(t.notify_context, 3);
 }

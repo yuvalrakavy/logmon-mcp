@@ -8,7 +8,9 @@
 #![cfg(feature = "test-support")]
 
 use logmon_broker_core::test_support::*;
-use logmon_broker_protocol::{DomainInfo, DomainsClearResult, DomainsDeleteResult, DomainsListResult};
+use logmon_broker_protocol::{
+    DomainInfo, DomainsClearResult, DomainsDeleteResult, DomainsListResult,
+};
 use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,8 +40,7 @@ async fn wait_log_count(client: &mut TestClient, name: &str, want: usize) -> usi
 /// Send one well-formed GELF/UDP datagram to `127.0.0.1:port`.
 async fn send_gelf(port: u16, msg: &str) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let payload =
-        format!(r#"{{"version":"1.1","host":"test","short_message":"{msg}","level":6}}"#);
+    let payload = format!(r#"{{"version":"1.1","host":"test","short_message":"{msg}","level":6}}"#);
     sock.send_to(payload.as_bytes(), format!("127.0.0.1:{port}"))
         .await
         .unwrap();
@@ -253,7 +254,11 @@ async fn create_then_gelf_ingest_is_isolated_to_the_domain() {
 
     // A datagram to t3's port lands in t3's pipeline — and ONLY t3's.
     send_gelf(t3.gelf_port, "hello t3").await;
-    assert_eq!(wait_log_count(&mut client, "t3", 1).await, 1, "landed in t3");
+    assert_eq!(
+        wait_log_count(&mut client, "t3", 1).await,
+        1,
+        "landed in t3"
+    );
 
     let default_count = get_domain(&mut client, "default").await.unwrap().log_count;
     assert_eq!(
@@ -388,7 +393,10 @@ async fn clear_disposes_bound_domain_data_and_keeps_seq_monotonic() {
         .call("domains.clear", json!({}))
         .await
         .expect("domains.clear");
-    assert!(cleared.logs_cleared >= 1, "at least the one log was cleared");
+    assert!(
+        cleared.logs_cleared >= 1,
+        "at least the one log was cleared"
+    );
 
     let after = get_domain(&mut client, "t3").await.unwrap();
     assert_eq!(after.log_count, 0, "logs disposed");
@@ -523,7 +531,10 @@ async fn concurrent_create_same_name_converges_to_one_domain() {
     let mut client = daemon.connect_anon().await;
     let list: DomainsListResult = client.call("domains.list", json!({})).await.unwrap();
     let count = list.domains.iter().filter(|d| d.name == "race").count();
-    assert_eq!(count, 1, "exactly one 'race' domain must exist, got {count}");
+    assert_eq!(
+        count, 1,
+        "exactly one 'race' domain must exist, got {count}"
+    );
 }
 
 /// The same create-serialization must also prevent `max_domains` OVERSHOOT:
@@ -556,12 +567,18 @@ async fn concurrent_create_respects_max_domains() {
             ok += 1;
         }
     }
-    assert_eq!(ok, 2, "exactly max_domains (2) creates may succeed, got {ok}");
+    assert_eq!(
+        ok, 2,
+        "exactly max_domains (2) creates may succeed, got {ok}"
+    );
 
     let mut client = daemon.connect_anon().await;
     let list: DomainsListResult = client.call("domains.list", json!({})).await.unwrap();
     let api = list.domains.iter().filter(|d| d.name != "default").count();
-    assert_eq!(api, 2, "registry must hold exactly max_domains API domains, got {api}");
+    assert_eq!(
+        api, 2,
+        "registry must hold exactly max_domains API domains, got {api}"
+    );
 }
 
 /// Same abort-prevention guard for `span_buffer_size`.

@@ -32,7 +32,8 @@ async fn broker_stays_responsive_under_burst_load() {
     // user-space channel during the burst.
     let producer = tokio::spawn(async move {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let payload = br#"{"version":"1.1","host":"stress","short_message":"x","level":6,"timestamp":1.0}"#;
+        let payload =
+            br#"{"version":"1.1","host":"stress","short_message":"x","level":6,"timestamp":1.0}"#;
         let target = format!("127.0.0.1:{udp_port}");
         for _ in 0..200_000 {
             let _ = socket.send_to(payload, &target).await;

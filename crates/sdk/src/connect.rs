@@ -5,9 +5,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::reconnect::{
-    initial_connect, is_transport_error, map_bridge_error, ConnectionManager,
-};
+use crate::reconnect::{initial_connect, is_transport_error, map_bridge_error, ConnectionManager};
 use crate::{BrokerError, Notification};
 
 /// Builder for [`Broker`] connections. Use [`Broker::connect`] to obtain one
@@ -82,9 +80,11 @@ impl BrokerBuilder {
     }
 
     pub(crate) fn resolved_socket_path(&self) -> Option<PathBuf> {
-        self.socket_path
-            .clone()
-            .or_else(|| std::env::var("LOGMON_BROKER_SOCKET").ok().map(PathBuf::from))
+        self.socket_path.clone().or_else(|| {
+            std::env::var("LOGMON_BROKER_SOCKET")
+                .ok()
+                .map(PathBuf::from)
+        })
     }
 
     pub(crate) fn session_name_clone(&self) -> Option<String> {
@@ -158,8 +158,7 @@ impl Broker {
     /// Untyped JSON-RPC call — convenience pass-through used by the MCP shim
     /// and by [`Broker::call_typed`].
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, BrokerError> {
-        let deadline =
-            tokio::time::Instant::now() + self.inner.config.resolved_call_timeout();
+        let deadline = tokio::time::Instant::now() + self.inner.config.resolved_call_timeout();
         let bridge = self.inner.current_bridge(deadline).await?;
         match bridge.call(method, params).await {
             Ok(v) => Ok(v),

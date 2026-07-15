@@ -1,21 +1,28 @@
+use chrono::Utc;
 use logmon_broker_core::daemon::log_processor::{process_entry, sync_pre_buffer_size};
 use logmon_broker_core::daemon::session::SessionRegistry;
 use logmon_broker_core::engine::pipeline::LogPipeline;
-use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
 use logmon_broker_core::filter::parser::parse_filter;
-use chrono::Utc;
+use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_entry(level: Level, msg: &str, facility: &str) -> LogEntry {
     LogEntry {
-        seq: 0, timestamp: Utc::now(), level,
-        message: msg.to_string(), full_message: None,
-        host: "test".into(), facility: Some(facility.into()),
-        file: None, line: None,
+        seq: 0,
+        timestamp: Utc::now(),
+        level,
+        message: msg.to_string(),
+        full_message: None,
+        host: "test".into(),
+        facility: Some(facility.into()),
+        file: None,
+        line: None,
         additional_fields: HashMap::new(),
-        trace_id: None, span_id: None,
-        matched_filters: Vec::new(), source: LogSource::Filter,
+        trace_id: None,
+        span_id: None,
+        matched_filters: Vec::new(),
+        source: LogSource::Filter,
     }
 }
 
@@ -73,7 +80,9 @@ fn test_named_session_survives_disconnect() {
     let sessions = Arc::new(SessionRegistry::new());
     let sid = sessions.create_named("persistent").unwrap();
 
-    sessions.add_trigger(&sid, "fa=special", 100, 50, 3, Some("custom"), false).unwrap();
+    sessions
+        .add_trigger(&sid, "fa=special", 100, 50, 3, Some("custom"), false)
+        .unwrap();
     let triggers_before = sessions.list_triggers(&sid);
     assert_eq!(triggers_before.len(), 3); // 2 defaults + 1 custom
 

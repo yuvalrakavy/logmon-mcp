@@ -41,7 +41,10 @@ async fn typed_methods_round_trip() {
     // triggers.list — confirms the just-added trigger round-trips back
     let triggers: TriggersListResult = broker.triggers_list(TriggersList {}).await.unwrap();
     assert!(
-        triggers.triggers.iter().any(|t| t.id == added.id && t.oneshot),
+        triggers
+            .triggers
+            .iter()
+            .any(|t| t.id == added.id && t.oneshot),
         "expected triggers.list to contain trigger {} with oneshot=true; got {:?}",
         added.id,
         triggers.triggers

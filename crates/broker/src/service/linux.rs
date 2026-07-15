@@ -4,7 +4,7 @@
 //! drops it under `~/.config/systemd/user` (User scope) or
 //! `/etc/systemd/system` (System scope), then `systemctl daemon-reload`
 //! + `enable --now`. Uninstall does the reverse: `disable --now`,
-//! remove unit, `daemon-reload`.
+//!   remove unit, `daemon-reload`.
 //!
 //! The unit type is `Type=notify`, which matches the broker's sd_notify
 //! READY=1 emit on startup (see Task 20). systemd will mark the unit

@@ -27,12 +27,22 @@ enum SpnVerb {
 pub async fn dispatch(broker: &Broker, cmd: SpansCmd, json: bool) -> i32 {
     match cmd.verb {
         SpnVerb::Context { seq, before, after } => {
-            let params = SpansContext { seq, before: Some(before), after: Some(after) };
+            let params = SpansContext {
+                seq,
+                before: Some(before),
+                after: Some(after),
+            };
             let result = match broker.spans_context(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("spans.context failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("spans.context failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             let blocks: Vec<String> = result.spans.iter().map(format_span).collect();
             format::print_blocks(blocks, "(no spans)");
             0
@@ -44,7 +54,11 @@ fn format_span(s: &SpanEntry) -> String {
     let parent = s.parent_span_id.as_deref().unwrap_or("(root)");
     format!(
         "[seq={}] {} {} ({:.1}ms)\n  trace={} span={} parent={parent}",
-        s.seq, s.start_time.to_rfc3339(), s.name, s.duration_ms,
-        s.trace_id, s.span_id,
+        s.seq,
+        s.start_time.to_rfc3339(),
+        s.name,
+        s.duration_ms,
+        s.trace_id,
+        s.span_id,
     )
 }

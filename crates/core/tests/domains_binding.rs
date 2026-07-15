@@ -13,9 +13,8 @@ use tokio::net::UdpSocket;
 /// Send one GELF/UDP datagram at the given syslog level (6=info, 3=error).
 async fn send_gelf_level(port: u16, msg: &str, level: u8) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let payload = format!(
-        r#"{{"version":"1.1","host":"test","short_message":"{msg}","level":{level}}}"#
-    );
+    let payload =
+        format!(r#"{{"version":"1.1","host":"test","short_message":"{msg}","level":{level}}}"#);
     sock.send_to(payload.as_bytes(), format!("127.0.0.1:{port}"))
         .await
         .unwrap();
@@ -30,7 +29,10 @@ async fn send_gelf(port: u16, msg: &str) {
 async fn wait_for_log(client: &mut TestClient, needle: &str) -> Vec<String> {
     let mut msgs = Vec::new();
     for _ in 0..40 {
-        let r: LogsRecentResult = client.call("logs.recent", json!({ "count": 50 })).await.unwrap();
+        let r: LogsRecentResult = client
+            .call("logs.recent", json!({ "count": 50 }))
+            .await
+            .unwrap();
         msgs = r.logs.iter().map(|l| l.message.clone()).collect();
         if msgs.iter().any(|m| m.contains(needle)) {
             break;

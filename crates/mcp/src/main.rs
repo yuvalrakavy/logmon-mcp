@@ -8,7 +8,11 @@ mod notifications;
 mod server;
 
 #[derive(Parser, Debug)]
-#[command(name = "logmon-mcp", version, about = "logmon broker MCP shim and CLI tool")]
+#[command(
+    name = "logmon-mcp",
+    version,
+    about = "logmon broker MCP shim and CLI tool"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Subcommand>,

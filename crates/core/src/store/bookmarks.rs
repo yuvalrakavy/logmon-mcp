@@ -110,7 +110,8 @@ pub fn is_valid_bookmark_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
     }
-    name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Predicate: should this bookmark be auto-evicted?
@@ -201,7 +202,11 @@ impl BookmarkStore {
         let mut v: Vec<Bookmark> = map.values().cloned().collect();
         // Newest seq first; tie-break on qualified_name so equal-seq ordering
         // is deterministic (HashMap iteration order is not).
-        v.sort_by(|a, b| b.seq.cmp(&a.seq).then_with(|| a.qualified_name.cmp(&b.qualified_name)));
+        v.sort_by(|a, b| {
+            b.seq
+                .cmp(&a.seq)
+                .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+        });
         v
     }
 
@@ -220,11 +225,7 @@ impl BookmarkStore {
     /// - Hold bookmarks write lock until AFTER `recently_evicted` is updated, so
     ///   a concurrent `cursor_read_and_advance` waiting on the bookmarks lock
     ///   observes the eviction signal atomically with the entry's removal.
-    pub fn sweep(
-        &self,
-        oldest_log_seq: Option<u64>,
-        oldest_span_seq: Option<u64>,
-    ) {
+    pub fn sweep(&self, oldest_log_seq: Option<u64>, oldest_span_seq: Option<u64>) {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         let evicted: Vec<String> = map
             .iter()
@@ -371,15 +372,27 @@ mod tests {
     fn add_with_replace_on_fresh_name_reports_not_replaced() {
         let store = BookmarkStore::new();
         let (_, replaced) = store.add("A", "fresh", 1, None, true).unwrap();
-        assert!(!replaced, "replace=true on a non-existent name is not a replace");
+        assert!(
+            !replaced,
+            "replace=true on a non-existent name is not a replace"
+        );
     }
 
     #[test]
     fn invalid_name_rejected() {
         let store = BookmarkStore::new();
-        assert!(matches!(store.add("A", "", 0, None, false), Err(BookmarkError::InvalidName(_))));
-        assert!(matches!(store.add("A", "has/slash", 0, None, false), Err(BookmarkError::InvalidName(_))));
-        assert!(matches!(store.add("A", "has space", 0, None, false), Err(BookmarkError::InvalidName(_))));
+        assert!(matches!(
+            store.add("A", "", 0, None, false),
+            Err(BookmarkError::InvalidName(_))
+        ));
+        assert!(matches!(
+            store.add("A", "has/slash", 0, None, false),
+            Err(BookmarkError::InvalidName(_))
+        ));
+        assert!(matches!(
+            store.add("A", "has space", 0, None, false),
+            Err(BookmarkError::InvalidName(_))
+        ));
     }
 
     #[test]
@@ -393,7 +406,10 @@ mod tests {
     #[test]
     fn remove_missing_errors() {
         let store = BookmarkStore::new();
-        assert!(matches!(store.remove("A/x"), Err(BookmarkError::NotFound(_))));
+        assert!(matches!(
+            store.remove("A/x"),
+            Err(BookmarkError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -481,7 +497,9 @@ mod tests {
     fn add_records_seq_and_created_at_and_description() {
         let store = BookmarkStore::new();
         let before = Utc::now();
-        let (bm, replaced) = store.add("session-a", "checkpoint", 42, Some("note"), false).unwrap();
+        let (bm, replaced) = store
+            .add("session-a", "checkpoint", 42, Some("note"), false)
+            .unwrap();
         let after = Utc::now();
         assert_eq!(bm.seq, 42);
         assert_eq!(bm.description.as_deref(), Some("note"));
@@ -537,7 +555,10 @@ mod tests {
         let (lower, _commit) = store.cursor_read_and_advance("s", "fresh");
         assert_eq!(lower, 0);
         let listed = store.list();
-        let entry = listed.iter().find(|b| b.qualified_name == "s/fresh").unwrap();
+        let entry = listed
+            .iter()
+            .find(|b| b.qualified_name == "s/fresh")
+            .unwrap();
         assert_eq!(entry.seq, 0);
     }
 
@@ -555,7 +576,11 @@ mod tests {
         let (lower, commit) = store.cursor_read_and_advance("s", "c");
         assert_eq!(lower, 0);
         commit.commit(100);
-        let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
+        let entry = store
+            .list()
+            .into_iter()
+            .find(|b| b.qualified_name == "s/c")
+            .unwrap();
         assert_eq!(entry.seq, 100);
     }
 
@@ -565,8 +590,12 @@ mod tests {
         let _ = store.add("s", "c", 50, None, false).unwrap();
         let (lower, commit) = store.cursor_read_and_advance("s", "c");
         assert_eq!(lower, 50);
-        commit.commit(50);   // No new records — max equals lower.
-        let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
+        commit.commit(50); // No new records — max equals lower.
+        let entry = store
+            .list()
+            .into_iter()
+            .find(|b| b.qualified_name == "s/c")
+            .unwrap();
         assert_eq!(entry.seq, 50);
     }
 
@@ -579,7 +608,11 @@ mod tests {
         assert!(store.list().iter().all(|b| b.qualified_name != "s/c"));
         // Commit re-inserts at the high-water mark.
         commit.commit(200);
-        let entry = store.list().into_iter().find(|b| b.qualified_name == "s/c").unwrap();
+        let entry = store
+            .list()
+            .into_iter()
+            .find(|b| b.qualified_name == "s/c")
+            .unwrap();
         assert_eq!(entry.seq, 200);
     }
 

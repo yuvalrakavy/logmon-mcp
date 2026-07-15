@@ -139,7 +139,11 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn channels() -> (mpsc::Sender<LogEntry>, mpsc::Sender<SpanEntry>, Arc<ReceiverMetrics>) {
+    fn channels() -> (
+        mpsc::Sender<LogEntry>,
+        mpsc::Sender<SpanEntry>,
+        Arc<ReceiverMetrics>,
+    ) {
         // Leak the receivers so the senders stay open for the lifetime of the
         // test (the receiver never parks on a full/closed channel here).
         let (log_tx, log_rx) = mpsc::channel(16);

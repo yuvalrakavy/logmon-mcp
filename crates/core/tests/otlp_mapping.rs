@@ -1,5 +1,5 @@
-use logmon_broker_core::receiver::otlp::mapping::*;
 use logmon_broker_core::gelf::message::Level;
+use logmon_broker_core::receiver::otlp::mapping::*;
 
 #[test]
 fn test_severity_to_level() {
@@ -15,8 +15,8 @@ fn test_severity_to_level() {
 #[test]
 fn test_bytes_to_trace_id() {
     let bytes = vec![
-        0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb1, 0x6e, 0x0f,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb1, 0x6e, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x01,
     ];
     assert_eq!(
         bytes_to_trace_id(&bytes),
@@ -33,10 +33,7 @@ fn test_bytes_to_trace_id_empty() {
 #[test]
 fn test_bytes_to_span_id() {
     let bytes = vec![0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
-    assert_eq!(
-        bytes_to_span_id(&bytes),
-        Some(0x00f067aa0ba902b7_u64)
-    );
+    assert_eq!(bytes_to_span_id(&bytes), Some(0x00f067aa0ba902b7_u64));
 }
 
 #[test]

@@ -26,21 +26,44 @@ pub async fn dispatch(broker: &Broker, cmd: SessionsCmd, json: bool) -> i32 {
         SesVerb::List => {
             let result = match broker.session_list(SessionList {}).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("session.list failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("session.list failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
-            if result.sessions.is_empty() { println!("(no sessions)"); return 0; }
-            let rows: Vec<Vec<String>> = result.sessions.iter().map(|s| vec![
-                s.id.clone(),
-                s.name.clone().unwrap_or_else(|| "(anonymous)".into()),
-                s.connected.to_string(),
-                s.trigger_count.to_string(),
-                s.filter_count.to_string(),
-                s.queue_size.to_string(),
-                format!("{}s", s.last_seen_secs_ago),
-            ]).collect();
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            if result.sessions.is_empty() {
+                println!("(no sessions)");
+                return 0;
+            }
+            let rows: Vec<Vec<String>> = result
+                .sessions
+                .iter()
+                .map(|s| {
+                    vec![
+                        s.id.clone(),
+                        s.name.clone().unwrap_or_else(|| "(anonymous)".into()),
+                        s.connected.to_string(),
+                        s.trigger_count.to_string(),
+                        s.filter_count.to_string(),
+                        s.queue_size.to_string(),
+                        format!("{}s", s.last_seen_secs_ago),
+                    ]
+                })
+                .collect();
             format::print_table(
-                &["id", "name", "connected", "triggers", "filters", "queue", "last_seen"],
+                &[
+                    "id",
+                    "name",
+                    "connected",
+                    "triggers",
+                    "filters",
+                    "queue",
+                    "last_seen",
+                ],
                 rows,
             );
             0
@@ -48,9 +71,15 @@ pub async fn dispatch(broker: &Broker, cmd: SessionsCmd, json: bool) -> i32 {
         SesVerb::Drop { name } => {
             let result = match broker.session_drop(SessionDrop { name }).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("session.drop failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("session.drop failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             println!("dropped: {}", result.dropped);
             0
         }

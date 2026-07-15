@@ -48,10 +48,7 @@ async fn client_info_size_limit() {
         Ok(_) => panic!("expected error for oversize client_info, got Ok"),
         Err(e) => e.to_string(),
     };
-    assert!(
-        err.contains("client_info exceeds 4 KB limit"),
-        "got: {err}"
-    );
+    assert!(err.contains("client_info exceeds 4 KB limit"), "got: {err}");
 }
 
 #[tokio::test]

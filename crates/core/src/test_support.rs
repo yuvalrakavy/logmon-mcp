@@ -195,9 +195,7 @@ impl TestDaemonHandle {
                 .await
                 .is_err()
             {
-                tracing::warn!(
-                    "test daemon did not shut down within 5s; aborting task"
-                );
+                tracing::warn!("test daemon did not shut down within 5s; aborting task");
                 abort_handle.abort();
             }
         }
@@ -423,7 +421,11 @@ impl TestClient {
 
     /// Connect + handshake with a connect-time `domain` bind (the `session.start`
     /// `domain` param). Panics on failure.
-    pub async fn connect_with_domain(socket_path: &Path, name: Option<String>, domain: &str) -> Self {
+    pub async fn connect_with_domain(
+        socket_path: &Path,
+        name: Option<String>,
+        domain: &str,
+    ) -> Self {
         Self::try_connect(socket_path, name, None, Some(domain.to_string()))
             .await
             .expect("test client failed to connect with domain")

@@ -1,0 +1,31 @@
+{
+  "name": "logmon-mcp",
+  "version": "0.2.0",
+  "description": "Real-time logs and traces for AI coding assistants. Local broker that ingests GELF (UDP+TCP) and OTLP (gRPC+HTTP) telemetry and exposes it to AI assistants over MCP, with a typed filter DSL, bookmarks, cursors, and triggers.",
+  "author": {
+    "name": "Yuval Rakavy",
+    "url": "https://github.com/yuvalrakavy"
+  },
+  "homepage": "https://github.com/yuvalrakavy/logmon-mcp",
+  "repository": "https://github.com/yuvalrakavy/logmon-mcp",
+  "license": "MIT",
+  "keywords": [
+    "logs",
+    "traces",
+    "telemetry",
+    "debugging",
+    "mcp",
+    "gelf",
+    "otlp",
+    "opentelemetry",
+    "tracing"
+  ],
+  "mcpServers": {
+    "logmon": {
+      "command": "logmon-mcp"
+    }
+  },
+  "commands": [
+    "./skill/logmon.md"
+  ]
+}

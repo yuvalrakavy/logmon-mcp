@@ -13,7 +13,11 @@ async fn status_human_format_includes_uptime() {
     .await
     .unwrap();
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("uptime"), "stdout: {stdout}");
     assert!(stdout.contains("receivers"), "stdout: {stdout}");
@@ -25,7 +29,9 @@ async fn status_json_emits_typed_struct() {
 
     let output = tokio::task::spawn_blocking(move || {
         let mut cmd = cli.cmd();
-        cmd.args(["status", "--json"]).output().expect("subprocess failed")
+        cmd.args(["status", "--json"])
+            .output()
+            .expect("subprocess failed")
     })
     .await
     .unwrap();

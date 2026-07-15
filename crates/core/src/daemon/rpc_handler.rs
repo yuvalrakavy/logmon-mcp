@@ -324,8 +324,12 @@ impl RpcHandler {
 
     /// List all live domains (registry view; sorted by name for determinism).
     fn handle_domains_list(&self) -> Result<Value, String> {
-        let mut domains: Vec<DomainInfo> =
-            self.domains.list().iter().map(|d| domain_to_info(d)).collect();
+        let mut domains: Vec<DomainInfo> = self
+            .domains
+            .list()
+            .iter()
+            .map(|d| domain_to_info(d))
+            .collect();
         domains.sort_by(|a, b| a.name.cmp(&b.name));
         serde_json::to_value(DomainsListResult { domains }).map_err(|e| e.to_string())
     }
@@ -404,7 +408,9 @@ impl RpcHandler {
         ),
         String,
     > {
-        let Some(s) = filter_str else { return Ok((None, None)) };
+        let Some(s) = filter_str else {
+            return Ok((None, None));
+        };
         if s.trim().is_empty() {
             return Ok((None, None));
         }
@@ -427,14 +433,18 @@ impl RpcHandler {
         if let Some(trace_id_hex) = params.get("trace_id").and_then(|v| v.as_str()) {
             if let Some(s) = filter_str {
                 if !s.trim().is_empty() {
-                    let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
+                    let parsed =
+                        crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
                     if crate::filter::parser::contains_cursor_qualifier(&parsed) {
-                        return Err("cursor qualifier not permitted in logs.recent with trace_id".to_string());
+                        return Err(
+                            "cursor qualifier not permitted in logs.recent with trace_id"
+                                .to_string(),
+                        );
                     }
                 }
             }
-            let trace_id = u128::from_str_radix(trace_id_hex, 16)
-                .map_err(|_| "invalid trace_id")?;
+            let trace_id =
+                u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
             let logs = d.pipeline.logs_by_trace_id(trace_id);
             let count = logs.len();
             // trace_id is an index lookup over the whole buffer, not a filter
@@ -636,8 +646,7 @@ impl RpcHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
         // Reject bookmark filters in registered (long-lived) filters.
-        let parsed = crate::filter::parser::parse_filter(filter)
-            .map_err(|e| e.to_string())?;
+        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
             return Err(
                 "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
@@ -672,7 +681,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_filters_remove(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_filters_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let filter_id = params
             .get("id")
@@ -717,8 +730,7 @@ impl RpcHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: filter".to_string())?;
         // Reject bookmark filters in registered (long-lived) triggers.
-        let parsed = crate::filter::parser::parse_filter(filter)
-            .map_err(|e| e.to_string())?;
+        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
             return Err(
                 "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
@@ -756,7 +768,11 @@ impl RpcHandler {
         Ok(json!({ "id": id }))
     }
 
-    fn handle_triggers_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_triggers_edit(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let trigger_id = params
             .get("id")
@@ -764,8 +780,14 @@ impl RpcHandler {
             .ok_or_else(|| "missing required parameter: id".to_string())?
             as u32;
         let filter = params.get("filter").and_then(|v| v.as_str());
-        let pre = params.get("pre_window").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let post = params.get("post_window").and_then(|v| v.as_u64()).map(|v| v as u32);
+        let pre = params
+            .get("pre_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let post = params
+            .get("post_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
         let ctx = params
             .get("notify_context")
             .and_then(|v| v.as_u64())
@@ -774,7 +796,9 @@ impl RpcHandler {
         let oneshot = params.get("oneshot").and_then(|v| v.as_bool());
         let info = self
             .sessions
-            .edit_trigger(session_id, trigger_id, filter, pre, post, ctx, desc, oneshot)
+            .edit_trigger(
+                session_id, trigger_id, filter, pre, post, ctx, desc, oneshot,
+            )
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({
@@ -789,7 +813,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_triggers_remove(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_triggers_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let trigger_id = params
             .get("id")
@@ -807,7 +835,11 @@ impl RpcHandler {
     // traces.* / spans.*
     // -----------------------------------------------------------------------
 
-    fn handle_traces_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_traces_recent(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
         let filter_str = params.get("filter").and_then(|v| v.as_str());
@@ -818,11 +850,11 @@ impl RpcHandler {
         }
 
         let pipeline = &d.pipeline;
-        let summaries = d.span_store.recent_traces(
-            count,
-            resolved.as_ref(),
-            |trace_id| pipeline.count_by_trace_id(trace_id) as u32,
-        );
+        let summaries = d
+            .span_store
+            .recent_traces(count, resolved.as_ref(), |trace_id| {
+                pipeline.count_by_trace_id(trace_id) as u32
+            });
         // recent_traces walks the whole span buffer, so scanned == buffer_total
         // for this query. (Buffer stats are read separately from the scan — a
         // concurrent write can make them momentarily differ; a diagnostic count,
@@ -878,14 +910,17 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_summary(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_traces_summary(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let trace_id_hex = params
             .get("trace_id")
             .and_then(|v| v.as_str())
             .ok_or("missing required parameter: trace_id")?;
-        let trace_id =
-            u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
+        let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let spans = d.span_store.get_trace(trace_id);
         if spans.is_empty() {
@@ -979,18 +1014,19 @@ impl RpcHandler {
                 let mut groups: std::collections::HashMap<String, Vec<f64>> =
                     std::collections::HashMap::new();
                 for s in &slow {
-                    groups.entry(s.name.clone()).or_default().push(s.duration_ms);
+                    groups
+                        .entry(s.name.clone())
+                        .or_default()
+                        .push(s.duration_ms);
                 }
                 let mut result: Vec<Value> = groups
                     .iter()
                     .map(|(name, durations)| {
                         let mut sorted = durations.clone();
-                        sorted.sort_by(|a, b| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        sorted
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                         let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
-                        let p95_idx =
-                            ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
+                        let p95_idx = ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
                         json!({
                             "name": name,
                             "avg_ms": (avg * 10.0).round() / 10.0,
@@ -1018,8 +1054,7 @@ impl RpcHandler {
             .get("trace_id")
             .and_then(|v| v.as_str())
             .ok_or("missing required parameter: trace_id")?;
-        let trace_id =
-            u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
+        let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let filter_str = params.get("filter").and_then(|v| v.as_str());
         let (resolved, cursor_commit) =
@@ -1053,7 +1088,11 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_spans_context(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_spans_context(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let seq = params
             .get("seq")
@@ -1108,7 +1147,11 @@ impl RpcHandler {
     // bookmarks.*
     // -----------------------------------------------------------------------
 
-    fn handle_bookmarks_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_bookmarks_add(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let name = params
             .get("name")
@@ -1147,7 +1190,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_bookmarks_list(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_bookmarks_list(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         self.sweep_bookmarks(&d);
         let session_filter = params.get("session").and_then(|v| v.as_str());
@@ -1172,20 +1219,26 @@ impl RpcHandler {
         Ok(json!({ "bookmarks": items, "count": items.len() }))
     }
 
-    fn handle_bookmarks_remove(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_bookmarks_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: name".to_string())?;
         let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
-        d.bookmarks
-            .remove(&qualified)
-            .map_err(|e| e.to_string())?;
+        d.bookmarks.remove(&qualified).map_err(|e| e.to_string())?;
         Ok(json!({ "removed": qualified }))
     }
 
-    fn handle_bookmarks_clear(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_bookmarks_clear(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         // Default to the calling session if no explicit session is given.
         let session = params

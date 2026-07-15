@@ -13,11 +13,15 @@ impl Default for SeqCounter {
 
 impl SeqCounter {
     pub fn new() -> Self {
-        Self { counter: AtomicU64::new(0) }
+        Self {
+            counter: AtomicU64::new(0),
+        }
     }
 
     pub fn new_with_initial(initial: u64) -> Self {
-        Self { counter: AtomicU64::new(initial) }
+        Self {
+            counter: AtomicU64::new(initial),
+        }
     }
 
     /// Returns the next sequence number. Always ≥ 1 — `seq = 0` is reserved

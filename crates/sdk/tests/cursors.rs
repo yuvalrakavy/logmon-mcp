@@ -1,7 +1,7 @@
-use logmon_broker_sdk::{Broker, Filter};
-use logmon_broker_protocol::LogsRecent;
-use logmon_broker_core::test_support::spawn_test_daemon_for_sdk;
 use logmon_broker_core::gelf::message::Level;
+use logmon_broker_core::test_support::spawn_test_daemon_for_sdk;
+use logmon_broker_protocol::LogsRecent;
+use logmon_broker_sdk::{Broker, Filter};
 
 #[test]
 fn cursor_builder_emits_c_ge() {

@@ -192,11 +192,17 @@ fn test_max_pre_window() {
     let registry = SessionRegistry::new();
     let id = registry.create_anonymous();
     // Default triggers have pre_window=500
-    assert_eq!(registry.max_pre_window_for_domain(&DomainId::default_domain()), 500);
+    assert_eq!(
+        registry.max_pre_window_for_domain(&DomainId::default_domain()),
+        500
+    );
     registry
         .add_trigger(&id, "fa=test", 1000, 200, 5, None, false)
         .unwrap();
-    assert_eq!(registry.max_pre_window_for_domain(&DomainId::default_domain()), 1000);
+    assert_eq!(
+        registry.max_pre_window_for_domain(&DomainId::default_domain()),
+        1000
+    );
 }
 
 #[test]

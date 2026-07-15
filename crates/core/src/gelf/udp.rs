@@ -70,7 +70,10 @@ pub async fn start_udp_listener(
         }
     });
 
-    Ok(UdpListenerHandle { port, _shutdown: tx })
+    Ok(UdpListenerHandle {
+        port,
+        _shutdown: tx,
+    })
 }
 
 #[cfg(test)]
@@ -87,16 +90,24 @@ mod tests {
     async fn full_channel_does_not_park_udp_listener() {
         let (sender, _rx) = mpsc::channel(1);
         // Fill the channel pre-emptively.
-        sender.try_send(crate::gelf::message::LogEntry {
-            seq: 0, timestamp: chrono::Utc::now(),
-            level: crate::gelf::message::Level::Info,
-            message: "filler".into(), full_message: None,
-            host: "h".into(), facility: None, file: None, line: None,
-            additional_fields: std::collections::HashMap::new(),
-            trace_id: None, span_id: None,
-            matched_filters: vec![],
-            source: crate::gelf::message::LogSource::Filter,
-        }).unwrap();
+        sender
+            .try_send(crate::gelf::message::LogEntry {
+                seq: 0,
+                timestamp: chrono::Utc::now(),
+                level: crate::gelf::message::Level::Info,
+                message: "filler".into(),
+                full_message: None,
+                host: "h".into(),
+                facility: None,
+                file: None,
+                line: None,
+                additional_fields: std::collections::HashMap::new(),
+                trace_id: None,
+                span_id: None,
+                matched_filters: vec![],
+                source: crate::gelf::message::LogSource::Filter,
+            })
+            .unwrap();
 
         let metrics = Arc::new(ReceiverMetrics::new());
         let handle = start_udp_listener("127.0.0.1:0", sender.clone(), metrics.clone())
@@ -108,9 +119,13 @@ mod tests {
         // drain the OS buffer immediately for each one (since try_send
         // returns instantly) and bump the counter.
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let payload = br#"{"version":"1.1","host":"h","short_message":"x","level":6,"timestamp":1.0}"#;
+        let payload =
+            br#"{"version":"1.1","host":"h","short_message":"x","level":6,"timestamp":1.0}"#;
         for _ in 0..50 {
-            socket.send_to(payload, format!("127.0.0.1:{port}")).await.unwrap();
+            socket
+                .send_to(payload, format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
         }
         // Tiny sleep to let the listener pick up the datagrams.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -119,6 +134,10 @@ mod tests {
         // may have been kernel-dropped before reaching us. Real assertion:
         // > 0, because the channel was already full.
         let snap = metrics.snapshot();
-        assert!(snap.gelf_udp >= 1, "expected at least one user-space drop, got {:?}", snap);
+        assert!(
+            snap.gelf_udp >= 1,
+            "expected at least one user-space drop, got {:?}",
+            snap
+        );
     }
 }

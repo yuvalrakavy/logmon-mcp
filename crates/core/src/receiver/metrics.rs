@@ -88,9 +88,7 @@ impl ReceiverMetrics {
         };
         counter.fetch_add(1, Ordering::Relaxed);
 
-        let now_nanos = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or(i64::MAX);
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
         // Relaxed: last_warn_nanos guards nothing else; sole side effect is the warn emission below.
         let last = self.last_warn_nanos.load(Ordering::Relaxed);
         if now_nanos.saturating_sub(last) >= WARN_INTERVAL_NANOS
@@ -182,7 +180,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn try_send_log_drops_when_full() {
-        use crate::gelf::message::{LogEntry, Level, LogSource};
+        use crate::gelf::message::{Level, LogEntry, LogSource};
         use chrono::Utc;
         use std::collections::HashMap;
         use tokio::sync::mpsc;
@@ -191,12 +189,20 @@ mod tests {
         let m = Arc::new(ReceiverMetrics::new());
 
         let make = || LogEntry {
-            seq: 0, timestamp: Utc::now(), level: Level::Info,
-            message: "x".into(), full_message: None,
-            host: "h".into(), facility: None, file: None, line: None,
+            seq: 0,
+            timestamp: Utc::now(),
+            level: Level::Info,
+            message: "x".into(),
+            full_message: None,
+            host: "h".into(),
+            facility: None,
+            file: None,
+            line: None,
             additional_fields: HashMap::new(),
-            trace_id: None, span_id: None,
-            matched_filters: vec![], source: LogSource::Filter,
+            trace_id: None,
+            span_id: None,
+            matched_filters: vec![],
+            source: LogSource::Filter,
         };
 
         // First send fills the 1-slot channel.

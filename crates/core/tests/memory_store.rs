@@ -1,17 +1,25 @@
+use chrono::Utc;
+use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
 use logmon_broker_core::store::memory::InMemoryStore;
 use logmon_broker_core::store::traits::LogStore;
-use logmon_broker_core::gelf::message::{LogEntry, Level, LogSource};
-use chrono::Utc;
 use std::collections::HashMap;
 
 fn make_entry(seq: u64, level: Level, msg: &str) -> LogEntry {
     LogEntry {
-        seq, timestamp: Utc::now(), level,
-        message: msg.to_string(), full_message: None,
-        host: "test".into(), facility: None, file: None, line: None,
+        seq,
+        timestamp: Utc::now(),
+        level,
+        message: msg.to_string(),
+        full_message: None,
+        host: "test".into(),
+        facility: None,
+        file: None,
+        line: None,
         additional_fields: HashMap::new(),
-        trace_id: None, span_id: None,
-        matched_filters: Vec::new(), source: LogSource::Filter,
+        trace_id: None,
+        span_id: None,
+        matched_filters: Vec::new(),
+        source: LogSource::Filter,
     }
 }
 
@@ -67,7 +75,7 @@ fn test_context_by_seq_at_edges() {
     // At the beginning
     let ctx = store.context_by_seq(1, 5, 1);
     assert_eq!(ctx[0].seq, 1); // can't go before first
-    // At the end
+                               // At the end
     let ctx = store.context_by_seq(5, 1, 5);
     assert_eq!(ctx.last().unwrap().seq, 5); // can't go past last
 }

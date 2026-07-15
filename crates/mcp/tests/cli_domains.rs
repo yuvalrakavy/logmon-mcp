@@ -126,7 +126,13 @@ async fn domain_flag_does_not_stick_across_invocations() {
 #[tokio::test]
 async fn domain_flag_does_not_block_creating_that_domain() {
     let (_daemon, cli) = spawn_with_cli().await;
-    let out = run(&cli, &["--domain", "t3", "domains", "create", "--name", "t3", "--json"]).await;
+    let out = run(
+        &cli,
+        &[
+            "--domain", "t3", "domains", "create", "--name", "t3", "--json",
+        ],
+    )
+    .await;
     assert!(
         out.status.success(),
         "--domain t3 domains create t3 must succeed (registry op ignores the bind), stderr: {}",

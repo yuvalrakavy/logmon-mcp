@@ -54,5 +54,8 @@ async fn logs_recent_reports_buffer_stats_on_match() {
 
     assert!(r.buffer_total >= 3);
     assert_eq!(r.count, r.buffer_total, "no filter → every record matches");
-    assert_eq!(r.scanned, r.buffer_total, "no filter → every record scanned");
+    assert_eq!(
+        r.scanned, r.buffer_total,
+        "no filter → every record scanned"
+    );
 }

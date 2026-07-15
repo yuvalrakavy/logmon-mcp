@@ -107,8 +107,7 @@ pub fn process_entry_for_domain(
             // Build notification event and send/queue
             let mut any_oneshot_removed = false;
             for m in &matches {
-                let context_before =
-                    pipeline.context_by_seq(entry.seq, m.pre_window as usize, 0);
+                let context_before = pipeline.context_by_seq(entry.seq, m.pre_window as usize, 0);
                 let event = PipelineEvent {
                     session_id: sid.to_string(),
                     trigger_id: m.id,

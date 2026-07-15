@@ -44,36 +44,65 @@ enum BkmVerb {
 
 pub async fn dispatch(broker: &Broker, cmd: BookmarksCmd, json: bool) -> i32 {
     match cmd.verb {
-        BkmVerb::Add { name, start_seq, description, replace } => {
-            let params = BookmarksAdd { name, description, start_seq, replace };
+        BkmVerb::Add {
+            name,
+            start_seq,
+            description,
+            replace,
+        } => {
+            let params = BookmarksAdd {
+                name,
+                description,
+                start_seq,
+                replace,
+            };
             let result = match broker.bookmarks_add(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("bookmarks.add failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("bookmarks.add failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             let action = if result.replaced { "replaced" } else { "added" };
-            println!("bookmark {action}: {} (seq={})", result.qualified_name, result.seq);
+            println!(
+                "bookmark {action}: {} (seq={})",
+                result.qualified_name, result.seq
+            );
             0
         }
         BkmVerb::List { session } => {
             let params = BookmarksList { session };
             let result = match broker.bookmarks_list(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("bookmarks.list failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("bookmarks.list failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             if result.bookmarks.is_empty() {
                 println!("(no bookmarks)");
                 return 0;
             }
-            let rows: Vec<Vec<String>> = result.bookmarks.iter().map(|b| {
-                vec![
-                    b.qualified_name.clone(),
-                    b.seq.to_string(),
-                    b.created_at.to_rfc3339(),
-                    b.description.clone().unwrap_or_default(),
-                ]
-            }).collect();
+            let rows: Vec<Vec<String>> = result
+                .bookmarks
+                .iter()
+                .map(|b| {
+                    vec![
+                        b.qualified_name.clone(),
+                        b.seq.to_string(),
+                        b.created_at.to_rfc3339(),
+                        b.description.clone().unwrap_or_default(),
+                    ]
+                })
+                .collect();
             format::print_table(&["name", "seq", "created_at", "description"], rows);
             0
         }
@@ -81,9 +110,15 @@ pub async fn dispatch(broker: &Broker, cmd: BookmarksCmd, json: bool) -> i32 {
             let params = BookmarksRemove { name };
             let result = match broker.bookmarks_remove(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("bookmarks.remove failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("bookmarks.remove failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
             println!("removed: {}", result.removed);
             0
         }
@@ -91,10 +126,19 @@ pub async fn dispatch(broker: &Broker, cmd: BookmarksCmd, json: bool) -> i32 {
             let params = BookmarksClear { session };
             let result = match broker.bookmarks_clear(params).await {
                 Ok(r) => r,
-                Err(e) => { format::error(&format!("bookmarks.clear failed: {e}"), json); return 1; }
+                Err(e) => {
+                    format::error(&format!("bookmarks.clear failed: {e}"), json);
+                    return 1;
+                }
             };
-            if json { format::print_json(&result); return 0; }
-            println!("cleared {} bookmark(s) for session {}", result.removed_count, result.session);
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            println!(
+                "cleared {} bookmark(s) for session {}",
+                result.removed_count, result.session
+            );
             0
         }
     }

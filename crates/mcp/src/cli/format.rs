@@ -10,9 +10,8 @@ pub const DEFAULT_MAX_BLOCK_BYTES: usize = 16 * 1024;
 
 /// Pretty-print a serializable value as JSON. Trailing newline included.
 pub fn json_string<T: Serialize>(value: &T) -> String {
-    let mut s = serde_json::to_string_pretty(value).unwrap_or_else(|e| {
-        format!("{{\"error\":\"failed to serialize result: {e}\"}}")
-    });
+    let mut s = serde_json::to_string_pretty(value)
+        .unwrap_or_else(|e| format!("{{\"error\":\"failed to serialize result: {e}\"}}"));
     s.push('\n');
     s
 }
@@ -25,11 +24,7 @@ pub fn print_json<T: Serialize>(value: &T) {
 /// Combine pre-formatted record blocks into a single human-readable string,
 /// applying record-count and byte-count limits with a "... N more" marker
 /// when truncation occurs.
-pub fn truncate_blocks(
-    blocks: Vec<String>,
-    max_records: usize,
-    max_bytes: usize,
-) -> String {
+pub fn truncate_blocks(blocks: Vec<String>, max_records: usize, max_bytes: usize) -> String {
     let total = blocks.len();
     let mut out = String::new();
     let mut emitted_records = 0usize;

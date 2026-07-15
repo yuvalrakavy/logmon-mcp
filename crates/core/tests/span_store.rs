@@ -1,14 +1,15 @@
+use chrono::Utc;
+use logmon_broker_core::engine::seq_counter::SeqCounter;
 use logmon_broker_core::span::store::SpanStore;
 use logmon_broker_core::span::types::*;
-use logmon_broker_core::engine::seq_counter::SeqCounter;
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_span(name: &str, trace_id: u128, duration_ms: f64) -> SpanEntry {
     let now = Utc::now();
     SpanEntry {
-        seq: 0, trace_id,
+        seq: 0,
+        trace_id,
         span_id: rand_id(),
         parent_span_id: None,
         start_time: now,
@@ -64,11 +65,18 @@ fn test_slow_spans() {
 fn newest_seq_returns_back_span_seq() {
     let seq = Arc::new(SeqCounter::new());
     let store = SpanStore::new(100, seq);
-    assert!(store.newest_seq().is_none(), "empty store has no newest seq");
+    assert!(
+        store.newest_seq().is_none(),
+        "empty store has no newest seq"
+    );
     store.insert(make_span("a", 0x1, 10.0));
     store.insert(make_span("b", 0x2, 20.0));
     let last = store.insert(make_span("c", 0x3, 30.0)); // insert() returns the assigned seq
-    assert_eq!(store.newest_seq(), Some(last), "newest = back of the buffer");
+    assert_eq!(
+        store.newest_seq(),
+        Some(last),
+        "newest = back of the buffer"
+    );
     assert!(
         store.oldest_seq().unwrap() < last,
         "oldest (front) must be < newest (back) — guards a mixup"

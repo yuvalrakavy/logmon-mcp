@@ -159,7 +159,6 @@ impl ConnectionManager {
             reconnect_loop(mgr).await;
         });
     }
-
 }
 
 async fn reconnect_loop(mgr: Arc<ConnectionManager>) {
@@ -180,8 +179,7 @@ async fn reconnect_loop(mgr: Arc<ConnectionManager>) {
                 if is_new {
                     // Daemon resurrection — the named session we held is gone.
                     let mut state = mgr.state.lock().await;
-                    *state =
-                        ConnectionState::PermanentlyFailed(TerminalReason::SessionLost);
+                    *state = ConnectionState::PermanentlyFailed(TerminalReason::SessionLost);
                     drop(state);
                     mgr.state_changed.notify_waiters();
                     tracing::warn!(
@@ -274,8 +272,7 @@ async fn try_handshake(
         domain: None,
     };
     let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params).unwrap());
-    let req_json = serde_json::to_string(&req)
-        .map_err(|e| BrokerError::Protocol(e.to_string()))?;
+    let req_json = serde_json::to_string(&req).map_err(|e| BrokerError::Protocol(e.to_string()))?;
 
     {
         use tokio::io::AsyncWriteExt;
@@ -284,7 +281,10 @@ async fn try_handshake(
             .write_all(req_json.as_bytes())
             .await
             .map_err(BrokerError::Transport)?;
-        writer.write_all(b"\n").await.map_err(BrokerError::Transport)?;
+        writer
+            .write_all(b"\n")
+            .await
+            .map_err(BrokerError::Transport)?;
         writer.flush().await.map_err(BrokerError::Transport)?;
     }
 
@@ -315,9 +315,9 @@ fn parse_session_start_response(resp: RpcResponse) -> Result<SessionStartResult,
             message: err.message,
         });
     }
-    let value = resp.result.ok_or_else(|| {
-        BrokerError::Protocol("session.start response had no result".into())
-    })?;
+    let value = resp
+        .result
+        .ok_or_else(|| BrokerError::Protocol("session.start response had no result".into()))?;
     serde_json::from_value(value).map_err(|e| BrokerError::Protocol(e.to_string()))
 }
 
@@ -397,8 +397,7 @@ pub(crate) async fn initial_connect(
         domain: None,
     };
     let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params).unwrap());
-    let req_json =
-        serde_json::to_string(&req).map_err(|e| BrokerError::Protocol(e.to_string()))?;
+    let req_json = serde_json::to_string(&req).map_err(|e| BrokerError::Protocol(e.to_string()))?;
 
     {
         use tokio::io::AsyncWriteExt;
@@ -454,10 +453,7 @@ pub(crate) async fn initial_connect(
 /// Watcher: when the bridge fires its disconnect notify, transition the
 /// manager to Reconnecting (or PermanentlyFailed for anonymous). Spawned once
 /// per live bridge.
-pub(crate) fn spawn_disconnect_watcher(
-    mgr: Arc<ConnectionManager>,
-    disconnect: Arc<Notify>,
-) {
+pub(crate) fn spawn_disconnect_watcher(mgr: Arc<ConnectionManager>, disconnect: Arc<Notify>) {
     tokio::spawn(async move {
         disconnect.notified().await;
         mgr.enter_disconnect().await;
