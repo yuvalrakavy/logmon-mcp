@@ -18,9 +18,10 @@ struct Cli {
     #[arg(long, global = true)]
     session: Option<String>,
 
-    /// Bind this invocation to a domain (connect-time). Queries — and
-    /// `domains clear` — then target that domain instead of `default`. CLI mode
-    /// only; omitted → the `default` domain.
+    /// Scope this invocation to an existing domain: queries — and `domains
+    /// clear` — target it. Omitted → `default`. Does not persist across
+    /// invocations (each is reset). `domains create/delete/list` ignore it.
+    /// CLI mode only.
     #[arg(long, global = true)]
     domain: Option<String>,
 

@@ -19,6 +19,20 @@ pub struct DomainsCmd {
     verb: DomVerb,
 }
 
+impl DomainsCmd {
+    /// Registry-management verbs (create/delete/list) operate on the domain
+    /// registry regardless of the session's binding, so the global `--domain`
+    /// bind is skipped for them — otherwise `--domain t3 domains create t3`
+    /// could never succeed (a bind-before-create requires t3 to already exist).
+    /// `clear` DOES honor the bind: it disposes the *bound* domain's data.
+    pub fn is_registry_op(&self) -> bool {
+        matches!(
+            self.verb,
+            DomVerb::Create { .. } | DomVerb::Delete { .. } | DomVerb::List
+        )
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum DomVerb {
     /// Create (or idempotently ensure) an ephemeral domain. Omitted ports are

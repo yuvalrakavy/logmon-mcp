@@ -101,7 +101,7 @@ Domains are isolated broker instances — each has its own log/span buffers, rec
 - **clear_domain** — Dispose the bound domain's logs + spans (keeps the domain alive; seq stays monotonic).
 - **delete_domain** — Delete a domain and tear down its receivers (refuses `default`).
 
-In CLI mode a session is short-lived, so there is no `use` verb — pass the global `--domain NAME` flag to target one invocation (e.g. `logmon-mcp --domain t3 logs recent`, or `logmon-mcp --domain t3 domains clear`).
+In CLI mode there is no `use` verb — pass the global `--domain NAME` flag to scope a single invocation (e.g. `logmon-mcp --domain t3 logs recent`, or `logmon-mcp --domain t3 domains clear`). It targets an existing domain and resets to `default` when omitted, so a prior `--domain` never silently carries over.
 
 ## Multi-Session Behavior
 

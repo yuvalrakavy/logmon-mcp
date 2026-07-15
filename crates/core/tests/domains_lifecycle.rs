@@ -166,6 +166,50 @@ async fn create_is_idempotent_and_rejects_conflicting_ports() {
     );
 }
 
+/// A stateless dev-track re-creates its domain on every startup with the SAME
+/// explicit (derived) ports — `domains.create{name, gelf_port, otlp_*}` repeated
+/// with identical params must be an idempotent no-op returning the existing
+/// domain, NOT a conflict error. (Omitted-ports idempotency is covered above;
+/// dev-tracks pass derived ports, so this locks in the explicit-ports path.)
+#[tokio::test]
+async fn create_with_same_explicit_ports_is_idempotent() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    // First create — capture the allocated ports (stand-ins for a dev-track's
+    // derived ports).
+    let first: DomainInfo = client
+        .call("domains.create", json!({ "name": "track12" }))
+        .await
+        .expect("first create");
+
+    // Re-create with the SAME explicit ports → idempotent success.
+    let again: DomainInfo = client
+        .call(
+            "domains.create",
+            json!({
+                "name": "track12",
+                "gelf_port": first.gelf_port,
+                "otlp_grpc_port": first.otlp_grpc_port,
+                "otlp_http_port": first.otlp_http_port,
+            }),
+        )
+        .await
+        .expect("re-create with identical explicit ports must succeed (idempotent)");
+    assert_eq!(again.gelf_port, first.gelf_port);
+    assert_eq!(again.otlp_grpc_port, first.otlp_grpc_port);
+    assert_eq!(again.otlp_http_port, first.otlp_http_port);
+    assert_eq!(again.source, "ephemeral");
+
+    // And still exactly one domain — the re-ensure must not duplicate it.
+    let list: DomainsListResult = client.call("domains.list", json!({})).await.unwrap();
+    assert_eq!(
+        list.domains.iter().filter(|d| d.name == "track12").count(),
+        1,
+        "re-ensure must not duplicate the domain"
+    );
+}
+
 #[tokio::test]
 async fn create_rejects_otlp_port_clash_across_domains() {
     let daemon = spawn_test_daemon().await;

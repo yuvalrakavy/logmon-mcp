@@ -16,7 +16,7 @@ logmon-mcp [--session NAME] [--json] <COMMAND>
 
 Global flags:
 - `--session NAME`: connect to a named session. Default for CLI mode is `"cli"` so state persists across invocations.
-- `--domain NAME`: bind this invocation to a domain (connect-time). Queries — and `domains clear` — then target that domain. Omitted → the `default` domain.
+- `--domain NAME`: scope this invocation to an existing domain — queries and `domains clear` target it. Omitted → `default`. Does not persist across invocations (each one is reset); `domains create/delete/list` ignore it.
 - `--json`: emit machine-readable JSON. Default is human-readable text.
 
 ### Commands
@@ -46,5 +46,5 @@ Run `logmon-mcp <group> --help` for per-group flag details.
 
 - **Triggers don't fire in CLI mode.** A CLI invocation exits before any matching log can fire the trigger. Use the CLI to *manage* triggers; subscribe to fires via the MCP shim or a custom SDK consumer.
 - **The CLI is one-shot.** No reconnect, 5-second call timeout. Errors fast if the broker isn't running.
-- **Domains in CLI mode.** Because the CLI is one-shot, there is no `domains use` (a sticky bind wouldn't survive the invocation) — pass `--domain NAME` to bind a single invocation instead. `domains create/delete/list/clear` manage domains; MCP mode additionally has the sticky `use_domain` tool for its long-lived session.
+- **Domains in CLI mode.** There is no sticky `domains use` verb. The CLI connects with a persistent named session, so each invocation is *explicitly* scoped by `--domain NAME` (queries + `domains clear`) and reset to `default` when the flag is omitted — a prior `--domain` never silently carries over. `domains create/delete/list` are domain-agnostic and ignore `--domain`. MCP mode, being long-lived, additionally has the sticky `use_domain` tool.
 - **No auto-start.** Install the broker as a service: `logmon-broker install-service --scope user`.

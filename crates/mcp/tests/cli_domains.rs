@@ -95,3 +95,43 @@ async fn domain_flag_binds_the_invocation() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// Surfacing-gate finding 1 (CRITICAL): `--domain` must NOT stick across
+/// invocations. The CLI connects with a persistent NAMED session ("cli"), so a
+/// prior `--domain X` bind lives on server-side; an unflagged invocation must
+/// reset to `default` rather than silently keep serving X. Both invocations here
+/// share ONE daemon + the "cli" session, reproducing the real deployment.
+#[tokio::test]
+async fn domain_flag_does_not_stick_across_invocations() {
+    let (_daemon, cli) = spawn_with_cli().await;
+    run(&cli, &["domains", "create", "--name", "t3", "--json"]).await;
+
+    // Invocation 1: bind to t3.
+    let out = run(&cli, &["--domain", "t3", "status", "--json"]).await;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["current_domain"], "t3");
+
+    // Invocation 2: UNFLAGGED — must be back on default, not stuck on t3.
+    let out = run(&cli, &["status", "--json"]).await;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["current_domain"], "default",
+        "an unflagged invocation must reset to default, not stick on the prior --domain"
+    );
+}
+
+/// Surfacing-gate finding 2: registry-management verbs (create/delete/list) are
+/// domain-agnostic, so `--domain` must NOT gate them — else creating the very
+/// domain named in `--domain` is impossible (bind-before-create can't succeed).
+#[tokio::test]
+async fn domain_flag_does_not_block_creating_that_domain() {
+    let (_daemon, cli) = spawn_with_cli().await;
+    let out = run(&cli, &["--domain", "t3", "domains", "create", "--name", "t3", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "--domain t3 domains create t3 must succeed (registry op ignores the bind), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["name"], "t3");
+}

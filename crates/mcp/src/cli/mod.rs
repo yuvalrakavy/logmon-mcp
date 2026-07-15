@@ -37,12 +37,17 @@ pub async fn dispatch(
         }
     };
 
-    // `--domain` binds this one-shot connection before the command runs, so
-    // queries (and `domains clear`) target the chosen domain. The bind lives
-    // only for this invocation — CLI sessions are short-lived — which is why
-    // there is no sticky `domains use` subcommand.
-    if let Some(domain) = domain {
-        if let Err(e) = broker.domains_use(DomainsUse { name: domain }).await {
+    // Bind this invocation's domain BEFORE the command runs — to `--domain` if
+    // given, else back to `default`. The CLI connects with a persistent NAMED
+    // session ("cli"), so this reset is load-bearing: without it a prior
+    // `--domain X` would stick server-side and silently scope later UNFLAGGED
+    // invocations to X. Registry-management verbs (domains create/delete/list)
+    // are domain-agnostic and skip the bind, so `--domain t3 domains create t3`
+    // still works (and a stale binding can't affect them anyway).
+    let skip_bind = matches!(&cmd, Subcommand::Domains(c) if c.is_registry_op());
+    if !skip_bind {
+        let target = domain.unwrap_or_else(|| "default".to_string());
+        if let Err(e) = broker.domains_use(DomainsUse { name: target }).await {
             format::error(&format!("--domain bind failed: {e}"), json);
             return 1;
         }
