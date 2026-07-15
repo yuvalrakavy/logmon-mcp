@@ -775,3 +775,35 @@ which touch **zero `state.json` schema** and so avoid every HIGH gate finding ab
 - **Tests (failing-first):** config domain boots + isolated ingest on its port; `default`-named
   entry rejected (only the real default remains); port-clash entry skipped, daemon stays up;
   `domains.delete` on a config domain refused; buffer-size defaults applied.
+
+## 18. Consumer feedback — dev-tracks (Store), 2026-07-15
+
+The Store project's multi-worktree parallel-development ("dev-tracks") system is the primary
+consumer. Each track runs a full app stack in its own worktree, creates one ephemeral domain
+by its tag at launch (idempotent re-ensure), and needs queries auto-scoped to its domain with
+zero ceremony and zero chance of reading the wrong track. Feedback assessed and actioned:
+
+- **#1 [DONE — branch `feat/domain-consumer-feedback`] Connect-time domain binding.**
+  `BrokerBuilder::domain()` + a `LOGMON_DOMAIN` env var / `--domain`, bound at `session.start`
+  and **re-sent on every reconnect** (durable — never a silent revert to `default`). Set
+  `LOGMON_DOMAIN` once per worktree and every MCP session + CLI call auto-scopes. Fail-loud on a
+  missing domain (create it before the shim connects). Reconnect-preservation requires a NAMED
+  session (anonymous can't resume — it fails loud, still never silent-wrong-domain).
+- **#2 [DONE] Liveness.** `DomainInfo` gains `last_log_received_at` / `last_span_received_at` /
+  `idle_secs` / `stale` (config `stale_after_secs`, default 60; `idle_secs` always raw);
+  `status.get` gains per-listener `receiver_liveness`. `last_*_received_at == None` is the
+  "nothing is shipping to this domain — misconfigured port?" signal.
+- **#3 [CONFIRMED + documented] OTEL:ONLINE beacon.** Fires ONLY from the DEFAULT domain's boot
+  (`server.rs`); ephemeral/config domains emit none — so a non-default domain's beacon cannot
+  false-release a producer (the premise doesn't arise). A non-default domain's readiness signal
+  is **`create_domain` RETURNING**: OTLP pre-binds synchronously (§9.3), so its port is live by
+  then. Contract: a producer targeting a non-default domain must NOT wait on the beacon.
+- **#4 [documented + guarded] OTLP port adjacency.** The defaults 4317/4318 are ADJACENT, so a
+  naive per-track `base+N` stride collides across domains at N≥1 (caught loudly by the
+  synchronous bind, not silent). Docs: stride OTLP by ≥2, or use non-adjacent bases. Added a
+  `domains.create` guard rejecting `otlp_grpc == otlp_http` within one domain with a clear error.
+- **#5 [contract confirmed] Ephemeral lifecycle on producer shutdown.** Ephemeral domains live
+  until an explicit `delete_domain` or a broker restart (in-memory; nothing persists). Idempotent
+  re-ensure means stable-named tracks (t0/t1/t2) never accumulate. **No idle-TTL reaping** — it
+  would race post-shutdown log inspection (the consumer's stated concern). A long opt-in TTL
+  could be revisited only for an unbounded-ephemeral-names consumer; not on the roadmap.

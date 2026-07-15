@@ -260,6 +260,19 @@ impl RpcHandler {
             otlp_http: req.otlp_http_port,
         };
 
+        // A single domain's OTLP gRPC and HTTP arms cannot share a port; the
+        // synchronous bind would otherwise fail with a cryptic "address in use".
+        // (Related trap for port-derivation schemes: the OTLP defaults 4317/4318
+        // are ADJACENT, so a naive per-track base+N stride collides at N≥1 across
+        // domains — step OTLP by ≥2. See the config docs. Consumer #4.)
+        if let (Some(g), Some(h)) = (req.otlp_grpc_port, req.otlp_http_port) {
+            if g != 0 && g == h {
+                return Err(format!(
+                    "otlp_grpc_port and otlp_http_port must differ (both = {g})"
+                ));
+            }
+        }
+
         // Serialize the whole check-and-commit (see `create_lock`). Held until
         // this function returns, so get()→count→bind→insert is atomic with
         // respect to other concurrent creates on this shared handler.

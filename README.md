@@ -463,6 +463,8 @@ Defaults:
 
 Ports are optional (omitted → auto-allocated; `0` → that receiver disabled) — declare explicit ports for a domain an external producer targets by a fixed port. Config domains hold no persisted data (empty buffers, fresh seq each boot); `domains delete` refuses them (edit `config.json`). A malformed or port-clashing entry is skipped with a warning; the daemon still starts. Query one with `logmon-mcp --domain staging logs recent`.
 
+> **Deriving per-track ports?** The OTLP defaults `4317` (gRPC) and `4318` (HTTP) are **adjacent**, so a naive `base + N` stride collides at N≥1 (track 1's gRPC `4318` = track 0's HTTP `4318`). Stride OTLP by **≥2** per track, or use non-adjacent bases. (`gelf 12201+N / otlp_grpc 4317+2N / otlp_http 4318+2N` is collision-free.)
+
 Environment variable overrides:
 
 - `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (skips PATH lookup).

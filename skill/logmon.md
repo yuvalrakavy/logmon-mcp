@@ -130,7 +130,7 @@ Domains are isolated broker instances — each has its own log/span buffers, rec
 - **`clear_domain()`** — dispose the bound domain's logs + spans (keeps it alive; seq stays monotonic).
 - **`delete_domain(name)`** — delete a domain and tear down its receivers (refuses `default`).
 
-The MCP shim can bind a domain **at connect** via the `LOGMON_DOMAIN` env var (or `--domain`), re-applied on every reconnect — set it once per worktree/project so every session auto-scopes to its track, durably (never silently reverts to `default`; a missing domain is a loud error). In CLI mode there is no `use` verb — pass `--domain NAME` (or `LOGMON_DOMAIN`) to scope one invocation (e.g. `logmon-mcp --domain t3 logs recent`); it resets to `default` when both are absent. Durable domains can be declared in `config.json`.
+The MCP shim can bind a domain **at connect** via the `LOGMON_DOMAIN` env var (or `--domain`), re-applied on every reconnect — set it once per worktree/project so every session auto-scopes to its track, durably (never silently reverts to `default`; a missing domain is a loud error). In CLI mode there is no `use` verb — pass `--domain NAME` (or `LOGMON_DOMAIN`) to scope one invocation (e.g. `logmon-mcp --domain t3 logs recent`); it resets to `default` when both are absent. Durable domains can be declared in `config.json`. **Lifecycle:** an ephemeral domain lives until you `delete_domain` it or the broker restarts — there is no idle auto-reaping (so a stopped stack's logs stay queryable), and re-creating with the same name + ports is an idempotent no-op.
 
 ## Filter DSL
 

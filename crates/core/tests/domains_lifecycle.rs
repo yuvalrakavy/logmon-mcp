@@ -676,3 +676,35 @@ async fn domain_stale_flag_honors_threshold() {
         .unwrap();
     assert!(!t4.stale, "never received → not stale even at threshold 0");
 }
+
+/// Consumer #4: a domain's OTLP gRPC and HTTP arms can't share a port — caught
+/// with a clear error, not the cryptic bind failure. (Both 0 = disabled is OK.)
+#[tokio::test]
+async fn create_rejects_equal_otlp_ports() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let res: anyhow::Result<DomainInfo> = client
+        .call(
+            "domains.create",
+            json!({ "name": "x", "otlp_grpc_port": 5555, "otlp_http_port": 5555 }),
+        )
+        .await;
+    let err = res
+        .expect_err("equal OTLP ports must be rejected")
+        .to_string();
+    assert!(
+        err.contains("must differ"),
+        "expected a clear 'must differ' error, got: {err}"
+    );
+
+    // Both 0 (disabled) is not a collision.
+    let ok: DomainInfo = client
+        .call(
+            "domains.create",
+            json!({ "name": "y", "otlp_grpc_port": 0, "otlp_http_port": 0 }),
+        )
+        .await
+        .expect("both-disabled OTLP is fine");
+    assert_eq!(ok.name, "y");
+}

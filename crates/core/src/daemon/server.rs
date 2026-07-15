@@ -309,6 +309,11 @@ pub async fn run_with_overrides(
                         let otlp_info = otlp_receiver.listening_on();
                         info!(?otlp_info, "OTLP receiver started");
                         all_receivers_info.extend(otlp_info);
+                        // Default-domain ONLY, by design (consumer #4/§18): the beacon
+                        // carries no domain/port, so non-default domains never emit it
+                        // (see `domain_lifecycle`, which sends none). A producer
+                        // targeting a non-default domain uses `create_domain` returning
+                        // (its OTLP port pre-binds synchronously) as the readiness signal.
                         send_otel_beacon("OTEL:ONLINE\n");
                         Some(otlp_receiver)
                     }
