@@ -291,13 +291,33 @@ pub async fn run_with_overrides(
                     grpc_addr: format!("0.0.0.0:{}", config.otlp_grpc_port),
                     http_addr: format!("0.0.0.0:{}", config.otlp_http_port),
                 };
-                let otlp_receiver =
-                    OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx, receiver_metrics.clone()).await?;
-                let otlp_info = otlp_receiver.listening_on();
-                info!(?otlp_info, "OTLP receiver started");
-                all_receivers_info.extend(otlp_info);
-                send_otel_beacon("OTEL:ONLINE\n");
-                Some(otlp_receiver)
+                // OTLP is an OPTIONAL receiver. A port clash at boot must NOT take
+                // the daemon down (and with it GELF/logging) — degrade loudly and
+                // keep serving. GELF above still fails loud (it is the core
+                // function), and explicit `domains.create` still fails loud because
+                // it propagates `start`'s error to the caller. Deep-gate finding C.
+                match OtlpReceiver::start(otlp_config, log_tx.clone(), span_tx, receiver_metrics.clone()).await {
+                    Ok(otlp_receiver) => {
+                        let otlp_info = otlp_receiver.listening_on();
+                        info!(?otlp_info, "OTLP receiver started");
+                        all_receivers_info.extend(otlp_info);
+                        send_otel_beacon("OTEL:ONLINE\n");
+                        Some(otlp_receiver)
+                    }
+                    Err(e) => {
+                        // `span_tx` was moved into `start` and dropped on its error
+                        // path, so the span processor's channel closes as in the
+                        // OTLP-disabled branch below — no separate drop needed.
+                        warn!(
+                            grpc_port = config.otlp_grpc_port,
+                            http_port = config.otlp_http_port,
+                            error = %e,
+                            "OTLP receiver failed to bind; continuing with OTLP DISABLED \
+                             (GELF/logging unaffected). Free the port(s) or set them to 0 to silence this."
+                        );
+                        None
+                    }
+                }
             } else {
                 // Drop span_tx so the span processor's recv() eventually
                 // returns None when the daemon shuts down.

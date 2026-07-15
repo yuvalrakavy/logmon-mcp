@@ -403,3 +403,131 @@ async fn clear_is_scoped_to_the_bound_domain() {
         "t4 (unbound) is untouched by clear"
     );
 }
+
+/// `domains.create` rejects an oversized `log_buffer_size` at the RPC boundary
+/// instead of accepting it and later ABORTING the whole process when the ring is
+/// lazily reserved on first ingest (`VecDeque::reserve_exact` is infallible → an
+/// allocation failure invokes the global alloc-error handler, which aborts —
+/// killing every domain and disconnecting every client, not just the offender).
+#[tokio::test]
+async fn create_rejects_oversized_log_buffer() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    // ~1e11 entries: astronomically beyond any real ring; must be refused, never
+    // realized. (We deliberately do NOT ingest — pre-fix that would abort the
+    // test process itself.)
+    let res: anyhow::Result<DomainInfo> = client
+        .call(
+            "domains.create",
+            json!({ "name": "huge", "log_buffer_size": 100_000_000_000u64 }),
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "oversized log_buffer_size must be rejected, got {res:?}"
+    );
+    assert!(
+        get_domain(&mut client, "huge").await.is_none(),
+        "a rejected create must leave no domain behind"
+    );
+}
+
+/// Concurrent `domains.create` for the SAME name must converge to a single live
+/// domain (idempotent ensure). Pre-fix, the existence-check → port-bind →
+/// registry-insert straddles the bind `.await` on the shared handler, so N racers
+/// each pass the `get()==None` check, each bind their OWN ports, and the last
+/// `insert` silently overwrites (and tears down) the others — every caller but
+/// one is handed a port that is closed moments later. All racers must instead
+/// observe the same live domain (same allocated ports).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_create_same_name_converges_to_one_domain() {
+    let daemon = spawn_test_daemon().await;
+
+    let n = 8;
+    let mut handles = Vec::new();
+    for _ in 0..n {
+        let sock = daemon.socket_path.clone();
+        handles.push(tokio::spawn(async move {
+            let mut c = TestClient::connect(&sock, None, None).await;
+            c.call::<DomainInfo>("domains.create", json!({ "name": "race" }))
+                .await
+        }));
+    }
+
+    let mut ports = Vec::new();
+    for h in handles {
+        let info = h
+            .await
+            .unwrap()
+            .expect("each concurrent create should succeed idempotently");
+        ports.push(info.gelf_port);
+    }
+
+    let first = ports[0];
+    assert!(
+        ports.iter().all(|&p| p == first),
+        "all concurrent same-name creates must converge to one live domain; got gelf_ports {ports:?}"
+    );
+
+    let mut client = daemon.connect_anon().await;
+    let list: DomainsListResult = client.call("domains.list", json!({})).await.unwrap();
+    let count = list.domains.iter().filter(|d| d.name == "race").count();
+    assert_eq!(count, 1, "exactly one 'race' domain must exist, got {count}");
+}
+
+/// The same create-serialization must also prevent `max_domains` OVERSHOOT:
+/// N racers with distinct names near the cap must not all pass the pre-insert
+/// count check. Exactly `max_domains` may succeed; the rest get the cap error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_create_respects_max_domains() {
+    let mut config = default_test_config();
+    config.max_domains = 2; // `default` is Config-sourced and doesn't count.
+    let daemon = TestDaemonHandle::spawn_with_config(config).await;
+
+    let n = 8;
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let sock = daemon.socket_path.clone();
+        handles.push(tokio::spawn(async move {
+            let mut c = TestClient::connect(&sock, None, None).await;
+            c.call::<DomainInfo>("domains.create", json!({ "name": format!("d{i}") }))
+                .await
+        }));
+    }
+
+    let mut ok = 0;
+    for h in handles {
+        if h.await.unwrap().is_ok() {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 2, "exactly max_domains (2) creates may succeed, got {ok}");
+
+    let mut client = daemon.connect_anon().await;
+    let list: DomainsListResult = client.call("domains.list", json!({})).await.unwrap();
+    let api = list.domains.iter().filter(|d| d.name != "default").count();
+    assert_eq!(api, 2, "registry must hold exactly max_domains API domains, got {api}");
+}
+
+/// Same abort-prevention guard for `span_buffer_size`.
+#[tokio::test]
+async fn create_rejects_oversized_span_buffer() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let res: anyhow::Result<DomainInfo> = client
+        .call(
+            "domains.create",
+            json!({ "name": "huge", "span_buffer_size": 100_000_000_000u64 }),
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "oversized span_buffer_size must be rejected, got {res:?}"
+    );
+    assert!(
+        get_domain(&mut client, "huge").await.is_none(),
+        "a rejected create must leave no domain behind"
+    );
+}

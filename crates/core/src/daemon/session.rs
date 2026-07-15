@@ -6,7 +6,7 @@ use crate::filter::parser::{parse_filter, FilterParseError, ParsedFilter};
 use crate::gelf::message::{Level, LogEntry, LogSource};
 use crate::span::types::{SpanEntry, SpanStatus, TraceSummary};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
@@ -97,6 +97,11 @@ struct SessionState {
     /// state). Mutable — unlike `name` — because `use_domain` switches it.
     /// Defaults to `default`; never persisted (connect-time state, §4).
     domain: RwLock<DomainId>,
+    /// Every domain this session has been bound to over its lifetime (seeded
+    /// with `default`, extended on each `set_domain`). An anonymous session that
+    /// switched domains may hold bookmarks in more than one store; on disconnect
+    /// they must be cleared across ALL of them (§5), not just the current one.
+    touched_domains: RwLock<HashSet<DomainId>>,
 }
 
 impl SessionState {
@@ -113,6 +118,7 @@ impl SessionState {
             last_seen: Mutex::new(Instant::now()),
             client_info: RwLock::new(None),
             domain: RwLock::new(DomainId::default_domain()),
+            touched_domains: RwLock::new(HashSet::from([DomainId::default_domain()])),
         }
     }
 
@@ -129,6 +135,7 @@ impl SessionState {
             last_seen: Mutex::new(Instant::now()),
             client_info: RwLock::new(None),
             domain: RwLock::new(DomainId::default_domain()),
+            touched_domains: RwLock::new(HashSet::from([DomainId::default_domain()])),
         }
     }
 
@@ -309,6 +316,24 @@ impl SessionRegistry {
         }
     }
 
+    /// Every domain this session has been bound to (seeded with `default`,
+    /// extended on each [`Self::set_domain`]). Empty for an unknown session.
+    /// Used on disconnect to clear an anonymous session's bookmarks across every
+    /// domain it touched (§5), not just its current binding.
+    pub fn touched_domains(&self, id: &SessionId) -> Vec<DomainId> {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        match sessions.get(id) {
+            Some(state) => state
+                .touched_domains
+                .read()
+                .expect("touched_domains lock poisoned")
+                .iter()
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Bind a session to `domain` (mirrors [`Self::set_client_info`]). No-op if
     /// `id` is unknown. Idempotent: re-binding to the same domain changes
     /// nothing.
@@ -323,6 +348,15 @@ impl SessionRegistry {
     pub fn set_domain(&self, id: &SessionId, domain: DomainId) {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         if let Some(state) = sessions.get(id) {
+            // Record the domain in the touched set (idempotent) so disconnect
+            // cleanup sweeps it even after the session moves on (§5). Separate
+            // lock, acquired and released before the `domain` lock below — no
+            // nesting, no ordering hazard.
+            state
+                .touched_domains
+                .write()
+                .expect("touched_domains lock poisoned")
+                .insert(domain.clone());
             let mut current = state.domain.write().expect("domain lock poisoned");
             if *current != domain {
                 *current = domain;

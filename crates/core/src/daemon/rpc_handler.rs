@@ -66,6 +66,16 @@ pub struct RpcHandler {
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
     domain_policy: DomainPolicy,
+    /// Serializes `domains.create` end-to-end. The existence-check → port-bind →
+    /// registry-insert sequence straddles an `.await` on this shared handler, so
+    /// without this lock two concurrent creates for the same name both pass the
+    /// `get()==None` check, both bind their own ports, and the second `insert`
+    /// silently overwrites (and tears down) the first — handing that caller a
+    /// dead port. Held across the whole create so check-and-commit is atomic. It
+    /// also closes the `max_domains` overshoot (N racers all counting the same
+    /// pre-insert total). Creation is a rare control-plane op, so serializing it
+    /// costs nothing.
+    create_lock: tokio::sync::Mutex<()>,
 }
 
 impl RpcHandler {
@@ -81,6 +91,7 @@ impl RpcHandler {
             start_time: std::time::Instant::now(),
             receivers_info,
             domain_policy,
+            create_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -114,6 +125,14 @@ impl RpcHandler {
             "triggers.remove" => self.handle_triggers_remove(session_id, &request.params),
             "session.list" => self.handle_session_list(),
             "session.drop" => self.handle_session_drop(&request.params),
+            // `domains.create` is async (it binds ports) and is dispatched by
+            // `handle_async`, never here. An explicit arm gives a clear error if a
+            // future caller ever routes a create through the sync path by mistake,
+            // rather than the generic "unknown method".
+            "domains.create" => Err(
+                "domains.create must be dispatched via handle_async (it binds ports asynchronously)"
+                    .to_string(),
+            ),
             "domains.delete" => self.handle_domains_delete(&request.params),
             "domains.list" => self.handle_domains_list(),
             "domains.use" => self.handle_domains_use(session_id, &request.params),
@@ -179,6 +198,15 @@ impl RpcHandler {
     // domains.* (ephemeral lifecycle — Wave 2 stage 2.2b)
     // -----------------------------------------------------------------------
 
+    /// Upper bound on a `domains.create` buffer size (log or span). The size
+    /// flows unclamped into `VecDeque::reserve_exact` on the domain's first
+    /// ingest, and `reserve_exact` is INFALLIBLE — an allocation failure aborts
+    /// the whole process (every domain, every client), so a client-supplied size
+    /// is bounded here. 10M entries is ~100× any realistic per-domain ring and
+    /// still comfortably allocatable. (`default`'s config-supplied sizes never
+    /// come through this path.)
+    const MAX_DOMAIN_BUFFER_SIZE: usize = 10_000_000;
+
     /// Create (or idempotently ensure) an ephemeral domain. Binds its receivers
     /// synchronously so a port clash is a clean error; refuses once
     /// `max_domains` API-created domains exist.
@@ -199,6 +227,11 @@ impl RpcHandler {
             otlp_grpc: req.otlp_grpc_port,
             otlp_http: req.otlp_http_port,
         };
+
+        // Serialize the whole check-and-commit (see `create_lock`). Held until
+        // this function returns, so get()→count→bind→insert is atomic with
+        // respect to other concurrent creates on this shared handler.
+        let _create_guard = self.create_lock.lock().await;
 
         // Idempotent ensure: an existing domain with matching (or unspecified)
         // ports is a no-op; conflicting ports are an error.
@@ -227,6 +260,22 @@ impl RpcHandler {
         let span_buffer_size = req
             .span_buffer_size
             .unwrap_or(self.domain_policy.default_span_buffer_size);
+
+        // Bound the buffer sizes before they reach `reserve_exact` (see
+        // `MAX_DOMAIN_BUFFER_SIZE`): reject an absurd request at the boundary
+        // rather than aborting the process on first ingest.
+        if log_buffer_size > Self::MAX_DOMAIN_BUFFER_SIZE {
+            return Err(format!(
+                "log_buffer_size {log_buffer_size} exceeds the maximum {}",
+                Self::MAX_DOMAIN_BUFFER_SIZE
+            ));
+        }
+        if span_buffer_size > Self::MAX_DOMAIN_BUFFER_SIZE {
+            return Err(format!(
+                "span_buffer_size {span_buffer_size} exceeds the maximum {}",
+                Self::MAX_DOMAIN_BUFFER_SIZE
+            ));
+        }
 
         let domain = spawn_ephemeral_domain(
             id,
@@ -1135,16 +1184,21 @@ impl RpcHandler {
         Ok(json!({ "removed_count": removed_count, "session": session }))
     }
 
-    /// Clear all bookmarks for a given session in the domain it is currently
-    /// bound to. Used when anonymous sessions disconnect to drop their
-    /// ephemeral bookmarks. (Named sessions preserve bookmarks via snapshot.)
-    /// No-op if the bound domain has since been deleted (its bookmarks went
-    /// with it).
+    /// Clear all bookmarks for a given session across EVERY domain it has been
+    /// bound to over its lifetime (§5), not just its current binding — an
+    /// anonymous session that switched domains may hold bookmarks in more than
+    /// one store. Used when anonymous sessions disconnect to drop their ephemeral
+    /// bookmarks. (Named sessions preserve bookmarks via snapshot.) A domain that
+    /// has since been deleted is skipped (its bookmarks went with it).
     pub fn clear_session_bookmarks(&self, session_id: &SessionId) -> usize {
-        match self.domains.get(&self.sessions.domain_of(session_id)) {
-            Some(d) => d.bookmarks.clear_session(&session_id.to_string()),
-            None => 0,
+        let session_key = session_id.to_string();
+        let mut removed = 0;
+        for domain_id in self.sessions.touched_domains(session_id) {
+            if let Some(d) = self.domains.get(&domain_id) {
+                removed += d.bookmarks.clear_session(&session_key);
+            }
         }
+        removed
     }
 
     fn sweep_bookmarks(&self, d: &Domain) {

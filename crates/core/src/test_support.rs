@@ -289,6 +289,15 @@ impl TestDaemonHandle {
         Self::spawn_in_dir_no_inject(tempdir, default_test_config()).await
     }
 
+    /// Like [`Self::spawn_with_real_receivers`] but with a caller-provided config
+    /// — lets a test set real GELF/OTLP ports (e.g. to exercise a boot-time
+    /// OTLP port clash). Panics if the socket never appears (a daemon that aborts
+    /// boot is itself the failure a resilience test asserts against).
+    pub async fn spawn_with_real_receivers_config(config: DaemonConfig) -> Self {
+        let tempdir = Arc::new(TempDir::new().expect("create tempdir for test daemon"));
+        Self::spawn_in_dir_no_inject(tempdir, config).await
+    }
+
     async fn spawn_in_dir_no_inject(tempdir: Arc<TempDir>, config: DaemonConfig) -> Self {
         let socket_path = tempdir.path().join("logmon.sock");
         let dir_for_daemon = tempdir.path().to_path_buf();

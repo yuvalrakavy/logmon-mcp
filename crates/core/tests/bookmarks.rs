@@ -198,3 +198,75 @@ fn bookmarks_end_to_end() {
     let r = call(&handler, &sid_a, "bookmarks.list", json!({})).unwrap();
     assert_eq!(r["count"], 1);
 }
+
+/// §5: an anonymous session that switched domains holds bookmarks in more than
+/// one store; on disconnect its bookmarks must be cleared across EVERY domain it
+/// touched, not just its current binding. Pre-fix, `clear_session_bookmarks`
+/// swept only the current domain and returned 1 (leaking the `default` entry).
+#[test]
+fn anonymous_bookmark_cleanup_spans_all_touched_domains() {
+    // Default domain.
+    let seq = Arc::new(SeqCounter::new());
+    let pipeline = Arc::new(LogPipeline::new_with_seq_counter(1000, seq.clone()));
+    let span_store = Arc::new(SpanStore::new(1000, seq));
+    let sessions = Arc::new(SessionRegistry::new());
+    let domains = Arc::new(DomainRegistry::new());
+    domains.insert(Arc::new(Domain::from_parts(
+        DomainConfig {
+            name: DomainId::default_domain(),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
+            log_buffer_size: 1000,
+            span_buffer_size: 1000,
+            source: DomainSource::Config,
+        },
+        pipeline,
+        span_store,
+        Arc::new(BookmarkStore::new()),
+        Arc::new(ReceiverMetrics::new()),
+    )));
+    // Second domain "t3" with its own isolated stores.
+    let seq2 = Arc::new(SeqCounter::new());
+    let pipeline2 = Arc::new(LogPipeline::new_with_seq_counter(1000, seq2.clone()));
+    let span_store2 = Arc::new(SpanStore::new(1000, seq2));
+    domains.insert(Arc::new(Domain::from_parts(
+        DomainConfig {
+            name: DomainId::new("t3").unwrap(),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
+            log_buffer_size: 1000,
+            span_buffer_size: 1000,
+            source: DomainSource::Ephemeral,
+        },
+        pipeline2,
+        span_store2,
+        Arc::new(BookmarkStore::new()),
+        Arc::new(ReceiverMetrics::new()),
+    )));
+    let handler = Arc::new(RpcHandler::new(
+        domains,
+        sessions.clone(),
+        vec!["test".into()],
+        DomainPolicy {
+            max_domains: 32,
+            default_log_buffer_size: 1000,
+            default_span_buffer_size: 1000,
+        },
+    ));
+
+    // Anonymous session: bookmark in `default`, switch to `t3`, bookmark in `t3`.
+    let sid = sessions.create_anonymous();
+    call(&handler, &sid, "bookmarks.add", json!({ "name": "m_default" })).unwrap();
+    call(&handler, &sid, "domains.use", json!({ "name": "t3" })).unwrap();
+    call(&handler, &sid, "bookmarks.add", json!({ "name": "m_t3" })).unwrap();
+
+    // Disconnect cleanup must sweep BOTH touched domains (default + t3).
+    let removed = handler.clear_session_bookmarks(&sid);
+    assert_eq!(
+        removed, 2,
+        "cleanup must clear the session's bookmarks in every domain it touched \
+         (default + t3), got {removed}"
+    );
+}
