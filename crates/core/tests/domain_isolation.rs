@@ -20,6 +20,9 @@ fn domain(name: &str) -> Domain {
     Domain::new(
         DomainConfig {
             name: DomainId::new(name).unwrap(),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
             log_buffer_size: 1000,
             span_buffer_size: 1000,
             source: DomainSource::Ephemeral,

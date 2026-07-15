@@ -708,3 +708,76 @@ pub struct StatusGetResult {
     #[serde(default)]
     pub receiver_drops: ReceiverDropCounts,
 }
+
+// =============================================================================
+// domains.*
+// =============================================================================
+
+/// A single domain as reported by `domains.list` and `domains.create`.
+///
+/// A port value of `0` means that receiver is disabled for the domain. The
+/// count/seq fields reflect the domain's live buffers. Per-source liveness
+/// fields (`last_*_received_at`, `idle_secs`, `stale`) arrive with B7 (Wave 3);
+/// they are intentionally absent from this Wave-2 shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainInfo {
+    pub name: String,
+    pub gelf_port: u16,
+    pub otlp_grpc_port: u16,
+    pub otlp_http_port: u16,
+    /// `"config"` | `"persistent"` | `"ephemeral"`.
+    pub source: String,
+    pub log_buffer_size: usize,
+    pub span_buffer_size: usize,
+    pub log_count: usize,
+    pub span_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsCreate {
+    pub name: String,
+    /// GELF UDP+TCP port. Omitted → auto-allocate; `0` → disable GELF for this
+    /// domain; otherwise bind exactly this port (error if held by another domain).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gelf_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_grpc_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_http_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_buffer_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_buffer_size: Option<usize>,
+    /// `false` (default) → ephemeral (gone on restart). `true` → durable
+    /// (re-created at boot). Durable domains are a later stage; Wave 2 accepts
+    /// only ephemeral creation.
+    #[serde(default)]
+    pub persist: bool,
+}
+
+/// `domains.create` returns the created (or already-existing) domain, same
+/// shape as a `domains.list` entry.
+pub type DomainsCreateResult = DomainInfo;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsDelete {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsDeleteResult {
+    pub name: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsList {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsListResult {
+    pub domains: Vec<DomainInfo>,
+}

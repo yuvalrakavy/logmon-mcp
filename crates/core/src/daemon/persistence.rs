@@ -104,6 +104,12 @@ pub struct DaemonConfig {
     pub otlp_http_port: u16,
     #[serde(default = "default_span_buffer_size")]
     pub span_buffer_size: usize,
+    /// Cap on the number of API-created domains (ephemeral + persistent).
+    /// `config`-declared domains and the implicit `default` are always honored
+    /// and do NOT count against this. `domains.create` refuses once the cap is
+    /// reached.
+    #[serde(default = "default_max_domains")]
+    pub max_domains: usize,
 }
 
 fn default_gelf_port() -> u16 {
@@ -124,6 +130,9 @@ fn default_otlp_http_port() -> u16 {
 fn default_span_buffer_size() -> usize {
     10000
 }
+fn default_max_domains() -> usize {
+    32
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -137,6 +146,7 @@ impl Default for DaemonConfig {
             otlp_grpc_port: 4317,
             otlp_http_port: 4318,
             span_buffer_size: 10000,
+            max_domains: 32,
         }
     }
 }

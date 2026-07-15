@@ -42,8 +42,10 @@ const SOCKET_WAIT_TICKS: usize = 100;
 const SOCKET_WAIT_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Default config used by the test harness: every receiver port set to 0 so
-/// nothing real is bound, and a small-but-realistic buffer.
-fn default_test_config() -> DaemonConfig {
+/// nothing real is bound, and a small-but-realistic buffer. Public so tests can
+/// tweak individual knobs (e.g. `max_domains`) and pass the result to
+/// [`TestDaemonHandle::spawn_with_config`].
+pub fn default_test_config() -> DaemonConfig {
     DaemonConfig {
         gelf_port: 0,
         gelf_udp_port: None,
@@ -54,6 +56,7 @@ fn default_test_config() -> DaemonConfig {
         otlp_grpc_port: 0,
         otlp_http_port: 0,
         span_buffer_size: 1_000,
+        max_domains: 32,
     }
 }
 
@@ -90,6 +93,14 @@ impl TestDaemonHandle {
     /// like persisted-trigger restoration.
     pub async fn spawn_in_tempdir(tempdir: Arc<TempDir>) -> Self {
         Self::spawn_in_dir(tempdir, default_test_config()).await
+    }
+
+    /// Spawn an in-process daemon with a caller-provided config (injected log
+    /// channel; the `default` domain has no real receivers). Lets a test set
+    /// knobs like `max_domains`. Created domains still bind real ports.
+    pub async fn spawn_with_config(config: DaemonConfig) -> Self {
+        let tempdir = Arc::new(TempDir::new().expect("create tempdir for test daemon"));
+        Self::spawn_in_dir(tempdir, config).await
     }
 
     /// Spawn an in-process daemon reusing an existing tempdir. Used by

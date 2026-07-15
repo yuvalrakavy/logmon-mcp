@@ -7,7 +7,7 @@ use logmon_broker_core::daemon::domain::{
     Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
 };
 use logmon_broker_core::daemon::log_processor::process_entry;
-use logmon_broker_core::daemon::rpc_handler::RpcHandler;
+use logmon_broker_core::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use logmon_broker_core::daemon::session::SessionRegistry;
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
@@ -50,6 +50,9 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
     domains.insert(Arc::new(Domain::from_parts(
         DomainConfig {
             name: DomainId::default_domain(),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
             log_buffer_size: 1000,
             span_buffer_size: 1000,
             source: DomainSource::Config,
@@ -59,7 +62,16 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
         bookmarks,
         metrics,
     )));
-    let handler = Arc::new(RpcHandler::new(domains, sessions.clone(), vec!["test".into()]));
+    let handler = Arc::new(RpcHandler::new(
+        domains,
+        sessions.clone(),
+        vec!["test".into()],
+        DomainPolicy {
+            max_domains: 32,
+            default_log_buffer_size: 1000,
+            default_span_buffer_size: 1000,
+        },
+    ));
     (handler, pipeline, sessions)
 }
 

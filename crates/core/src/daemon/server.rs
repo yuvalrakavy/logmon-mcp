@@ -3,7 +3,7 @@ use crate::daemon::log_processor::{spawn_log_processor, sync_pre_buffer_size};
 use crate::daemon::persistence::{
     config_dir, load_state, save_state, DaemonConfig, DaemonState, SEQ_BLOCK_SIZE,
 };
-use crate::daemon::rpc_handler::RpcHandler;
+use crate::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::daemon::span_processor::spawn_span_processor;
 use crate::daemon::transport::{read_request, write_message};
@@ -338,6 +338,9 @@ pub async fn run_with_overrides(
     domains.insert(Arc::new(Domain::from_parts(
         DomainConfig {
             name: DomainId::default_domain(),
+            gelf_port: config.gelf_port,
+            otlp_grpc_port: config.otlp_grpc_port,
+            otlp_http_port: config.otlp_http_port,
             log_buffer_size: config.buffer_size,
             span_buffer_size: config.span_buffer_size,
             source: DomainSource::Config,
@@ -350,10 +353,17 @@ pub async fn run_with_overrides(
 
     // 13. Create RpcHandler. It resolves each request's bound domain out of the
     //     registry (once, at the boundary) and runs the store code against it.
+    //     The domain policy (max_domains + default buffer sizes) drives
+    //     `domains.create`.
     let handler = Arc::new(RpcHandler::new(
         domains.clone(),
         sessions.clone(),
         all_receivers_info,
+        DomainPolicy {
+            max_domains: config.max_domains,
+            default_log_buffer_size: config.buffer_size,
+            default_span_buffer_size: config.span_buffer_size,
+        },
     ));
 
     // 14. Listen on Unix socket (unix) or TCP (windows)
@@ -692,7 +702,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             request_result = read_request(&mut reader) => {
                 match request_result {
                     Ok(Some(request)) => {
-                        let response = handler.handle(&session_id, &request);
+                        let response = handler.handle_async(&session_id, &request).await;
                         write_message(&mut writer, &response).await?;
                     }
                     Ok(None) => {

@@ -1,9 +1,60 @@
-use crate::daemon::domain::{Domain, DomainRegistry};
+use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
+use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::{SessionId, SessionRegistry};
 use logmon_broker_protocol::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// Domain-creation policy sourced from `DaemonConfig`: the `max_domains` cap and
+/// the default buffer sizes applied when `domains.create` omits them.
+#[derive(Debug, Clone, Copy)]
+pub struct DomainPolicy {
+    pub max_domains: usize,
+    pub default_log_buffer_size: usize,
+    pub default_span_buffer_size: usize,
+}
+
+/// Project a live [`Domain`] into its wire [`DomainInfo`] (used by
+/// `domains.create` and `domains.list`). Per-source liveness fields are Wave 3.
+fn domain_to_info(d: &Domain) -> DomainInfo {
+    DomainInfo {
+        name: d.config.name.to_string(),
+        gelf_port: d.config.gelf_port,
+        otlp_grpc_port: d.config.otlp_grpc_port,
+        otlp_http_port: d.config.otlp_http_port,
+        source: d.config.source.as_str().to_string(),
+        log_buffer_size: d.config.log_buffer_size,
+        span_buffer_size: d.config.span_buffer_size,
+        log_count: d.pipeline.store_len(),
+        span_count: d.span_store.len(),
+        oldest_seq: d.pipeline.oldest_log_seq(),
+        newest_seq: d.pipeline.newest_log_seq(),
+    }
+}
+
+/// A requested port matches an existing domain's bound port when it is
+/// unspecified (`None`) or equal.
+fn port_matches(existing: u16, requested: Option<u16>) -> bool {
+    requested.is_none_or(|p| p == existing)
+}
+
+/// Idempotency for `domains.create`: an existing domain whose ports all match
+/// (or were left unspecified) is a no-op returning its info; conflicting ports
+/// are an error.
+fn ensure_idempotent(existing: &Domain, requested: &DomainPortSpec) -> Result<Value, String> {
+    let matches = port_matches(existing.config.gelf_port, requested.gelf)
+        && port_matches(existing.config.otlp_grpc_port, requested.otlp_grpc)
+        && port_matches(existing.config.otlp_http_port, requested.otlp_http);
+    if matches {
+        serde_json::to_value(domain_to_info(existing)).map_err(|e| e.to_string())
+    } else {
+        Err(format!(
+            "domain \"{}\" already exists with different ports",
+            existing.id()
+        ))
+    }
+}
 
 pub struct RpcHandler {
     /// The set of live domains. Every query resolves its bound domain out of
@@ -14,6 +65,7 @@ pub struct RpcHandler {
     sessions: Arc<SessionRegistry>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
+    domain_policy: DomainPolicy,
 }
 
 impl RpcHandler {
@@ -21,12 +73,14 @@ impl RpcHandler {
         domains: Arc<DomainRegistry>,
         sessions: Arc<SessionRegistry>,
         receivers_info: Vec<String>,
+        domain_policy: DomainPolicy,
     ) -> Self {
         Self {
             domains,
             sessions,
             start_time: std::time::Instant::now(),
             receivers_info,
+            domain_policy,
         }
     }
 
@@ -60,6 +114,8 @@ impl RpcHandler {
             "triggers.remove" => self.handle_triggers_remove(session_id, &request.params),
             "session.list" => self.handle_session_list(),
             "session.drop" => self.handle_session_drop(&request.params),
+            "domains.delete" => self.handle_domains_delete(&request.params),
+            "domains.list" => self.handle_domains_list(),
             "traces.recent" => self.handle_traces_recent(session_id, &request.params),
             "traces.get" => self.handle_traces_get(session_id, &request.params),
             "traces.summary" => self.handle_traces_summary(session_id, &request.params),
@@ -77,6 +133,20 @@ impl RpcHandler {
             Ok(value) => RpcResponse::success(request.id, value),
             Err(msg) => RpcResponse::error(request.id, -32601, &msg),
         }
+    }
+
+    /// Async dispatch entry used by the connection loop. `domains.create` must
+    /// bind real ports before it can respond (async, §9.3), so it is handled
+    /// here; every other method — including the synchronous `domains.delete` /
+    /// `domains.list` — delegates to the synchronous [`Self::handle`].
+    pub async fn handle_async(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
+        if request.method == "domains.create" {
+            return match self.handle_domains_create(&request.params).await {
+                Ok(value) => RpcResponse::success(request.id, value),
+                Err(msg) => RpcResponse::error(request.id, -32601, &msg),
+            };
+        }
+        self.handle(session_id, request)
     }
 
     pub fn build_session_start_result(&self, session_id: &SessionId) -> SessionStartResult {
@@ -101,6 +171,110 @@ impl RpcHandler {
                 "client_info".into(),
             ],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // domains.* (ephemeral lifecycle — Wave 2 stage 2.2b)
+    // -----------------------------------------------------------------------
+
+    /// Create (or idempotently ensure) an ephemeral domain. Binds its receivers
+    /// synchronously so a port clash is a clean error; refuses once
+    /// `max_domains` API-created domains exist.
+    async fn handle_domains_create(&self, params: &Value) -> Result<Value, String> {
+        let req: DomainsCreate = serde_json::from_value(params.clone())
+            .map_err(|e| format!("invalid domains.create params: {e}"))?;
+
+        if req.persist {
+            return Err(
+                "persistent domains are not yet supported — create with persist=false (ephemeral)"
+                    .into(),
+            );
+        }
+
+        let id = DomainId::new(&req.name).map_err(|e| e.to_string())?;
+        let requested = DomainPortSpec {
+            gelf: req.gelf_port,
+            otlp_grpc: req.otlp_grpc_port,
+            otlp_http: req.otlp_http_port,
+        };
+
+        // Idempotent ensure: an existing domain with matching (or unspecified)
+        // ports is a no-op; conflicting ports are an error.
+        if let Some(existing) = self.domains.get(&id) {
+            return ensure_idempotent(&existing, &requested);
+        }
+
+        // `max_domains` caps API-created (non-`config`) domains; `config` +
+        // `default` are always honored and don't count.
+        let api_created = self
+            .domains
+            .list()
+            .iter()
+            .filter(|d| d.config.source != DomainSource::Config)
+            .count();
+        if api_created >= self.domain_policy.max_domains {
+            return Err(format!(
+                "max_domains ({}) reached — delete a domain before creating another",
+                self.domain_policy.max_domains
+            ));
+        }
+
+        let log_buffer_size = req
+            .log_buffer_size
+            .unwrap_or(self.domain_policy.default_log_buffer_size);
+        let span_buffer_size = req
+            .span_buffer_size
+            .unwrap_or(self.domain_policy.default_span_buffer_size);
+
+        let domain = spawn_ephemeral_domain(
+            id,
+            requested,
+            log_buffer_size,
+            span_buffer_size,
+            self.sessions.clone(),
+        )
+        .await
+        .map_err(|e| format!("could not create domain: {e}"))?;
+
+        let info = domain_to_info(&domain);
+        self.domains.insert(domain);
+        serde_json::to_value(info).map_err(|e| e.to_string())
+    }
+
+    /// Delete an ephemeral (or persistent) domain. Refuses `config`-declared
+    /// domains (incl. `default`). Teardown is Arc-graceful: an in-flight query
+    /// that already resolved the domain keeps running against its clone, and the
+    /// receivers stop when the last `Arc` drops.
+    fn handle_domains_delete(&self, params: &Value) -> Result<Value, String> {
+        let req: DomainsDelete = serde_json::from_value(params.clone())
+            .map_err(|e| format!("invalid domains.delete params: {e}"))?;
+        let id = DomainId::new(&req.name).map_err(|e| e.to_string())?;
+
+        let existing = self
+            .domains
+            .get(&id)
+            .ok_or_else(|| format!("domain \"{id}\" does not exist"))?;
+        if existing.config.source == DomainSource::Config {
+            return Err(format!(
+                "cannot delete config-declared domain \"{id}\" — edit config.json"
+            ));
+        }
+        drop(existing);
+        self.domains.remove(&id);
+
+        serde_json::to_value(DomainsDeleteResult {
+            name: req.name,
+            deleted: true,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// List all live domains (registry view; sorted by name for determinism).
+    fn handle_domains_list(&self) -> Result<Value, String> {
+        let mut domains: Vec<DomainInfo> =
+            self.domains.list().iter().map(|d| domain_to_info(d)).collect();
+        domains.sort_by(|a, b| a.name.cmp(&b.name));
+        serde_json::to_value(DomainsListResult { domains }).map_err(|e| e.to_string())
     }
 
     // -----------------------------------------------------------------------

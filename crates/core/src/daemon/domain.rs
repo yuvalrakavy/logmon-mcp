@@ -17,11 +17,14 @@
 
 use crate::engine::pipeline::LogPipeline;
 use crate::engine::seq_counter::SeqCounter;
+use crate::receiver::gelf::GelfReceiver;
+use crate::receiver::otlp::OtlpReceiver;
 use crate::receiver::ReceiverMetrics;
 use crate::span::store::SpanStore;
 use crate::store::bookmarks::BookmarkStore;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tokio::task::JoinHandle;
 
 /// Validated domain identifier — the registry key. Same charset as session
 /// names (`[A-Za-z0-9_-]`, non-empty; see [`super::session::is_valid_name`]).
@@ -92,12 +95,19 @@ impl DomainSource {
     }
 }
 
-/// Static description of a domain: identity, buffer sizes, and provenance.
-/// (Ingest ports arrive with the runtime-receiver work in a later stage; the
-/// keystone domain, `default`, is fed by the daemon-level receivers.)
+/// Static description of a domain: identity, ingest ports, buffer sizes, and
+/// provenance. The port fields hold the ports the domain's receivers actually
+/// bound (resolved at create time); `0` means that receiver is disabled. For
+/// `default` these mirror the daemon-level config values.
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
     pub name: DomainId,
+    /// GELF UDP+TCP port (`0` = GELF disabled for this domain).
+    pub gelf_port: u16,
+    /// OTLP gRPC port (`0` = disabled).
+    pub otlp_grpc_port: u16,
+    /// OTLP HTTP port (`0` = disabled).
+    pub otlp_http_port: u16,
     pub log_buffer_size: usize,
     pub span_buffer_size: usize,
     pub source: DomainSource,
@@ -115,13 +125,21 @@ pub struct Domain {
     pub span_store: Arc<SpanStore>,
     pub bookmarks: Arc<BookmarkStore>,
     pub metrics: Arc<ReceiverMetrics>,
+    /// Live receivers + processor tasks for a `domains.create`d domain. `None`
+    /// for `default` (fed by the daemon-level receivers in `run_with_overrides`)
+    /// and for test-constructed domains. Held here so that when the last
+    /// `Arc<Domain>` drops — the domain was deleted AND no in-flight query still
+    /// holds it — the listeners stop and the processors are aborted. This is the
+    /// delete-while-bound Arc-graceful teardown.
+    pub receivers: Option<DomainReceivers>,
 }
 
 impl Domain {
     /// Assemble a domain from already-constructed parts. Used for `default`,
     /// whose seq counter / pipeline / bookmarks are seeded from `state.json`
     /// (and used to restore named sessions) before the `Domain` wrapper exists.
-    /// See [`crate::daemon::server::run_with_overrides`].
+    /// See [`crate::daemon::server::run_with_overrides`]. `receivers` is `None`
+    /// (default's receivers are daemon-level); the create path sets it after.
     pub fn from_parts(
         config: DomainConfig,
         pipeline: Arc<LogPipeline>,
@@ -135,14 +153,26 @@ impl Domain {
             span_store,
             bookmarks,
             metrics,
+            receivers: None,
         }
     }
 
     /// Build a brand-new domain with freshly-allocated, independent machinery:
     /// its own seq space, log + span buffers, bookmark namespace, and receiver
-    /// metrics. Used by `domains.create` and by tests. `initial_seq` seeds the
-    /// domain's seq counter (`0` for a fresh ephemeral domain).
+    /// metrics. Used by tests. `initial_seq` seeds the domain's seq counter
+    /// (`0` for a fresh ephemeral domain).
     pub fn new(config: DomainConfig, initial_seq: u64) -> Self {
+        Self::new_with_metrics(config, initial_seq, Arc::new(ReceiverMetrics::new()))
+    }
+
+    /// Like [`Self::new`] but reuses a caller-provided `ReceiverMetrics`. The
+    /// create path uses this so a live domain's receivers and its query surface
+    /// (`status.get` drop counts) share ONE metrics instance.
+    pub fn new_with_metrics(
+        config: DomainConfig,
+        initial_seq: u64,
+        metrics: Arc<ReceiverMetrics>,
+    ) -> Self {
         let seq_counter = Arc::new(SeqCounter::new_with_initial(initial_seq));
         let pipeline = Arc::new(LogPipeline::new_with_seq_counter(
             config.log_buffer_size,
@@ -150,13 +180,54 @@ impl Domain {
         ));
         let span_store = Arc::new(SpanStore::new(config.span_buffer_size, seq_counter));
         let bookmarks = Arc::new(BookmarkStore::new());
-        let metrics = Arc::new(ReceiverMetrics::new());
         Self::from_parts(config, pipeline, span_store, bookmarks, metrics)
     }
 
     /// This domain's id (its config name).
     pub fn id(&self) -> &DomainId {
         &self.config.name
+    }
+}
+
+/// Live receivers + processor tasks feeding a `domains.create`d domain (see
+/// [`Domain::receivers`]). Dropping this stops the GELF/OTLP listeners (via
+/// their own `Drop`) and aborts the domain's log + span processor tasks, so a
+/// deleted domain leaves nothing running.
+pub struct DomainReceivers {
+    /// Held for its `Drop` (stops the UDP/TCP listeners). `None` if GELF was
+    /// disabled (`gelf_port = 0`) for this domain.
+    #[allow(dead_code)]
+    gelf: Option<GelfReceiver>,
+    /// Held for its `Drop` (signals gRPC/HTTP shutdown + aborts their tasks).
+    /// `None` if OTLP was disabled for this domain.
+    #[allow(dead_code)]
+    otlp: Option<OtlpReceiver>,
+    log_processor: JoinHandle<()>,
+    span_processor: JoinHandle<()>,
+}
+
+impl DomainReceivers {
+    pub fn new(
+        gelf: Option<GelfReceiver>,
+        otlp: Option<OtlpReceiver>,
+        log_processor: JoinHandle<()>,
+        span_processor: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            gelf,
+            otlp,
+            log_processor,
+            span_processor,
+        }
+    }
+}
+
+impl Drop for DomainReceivers {
+    fn drop(&mut self) {
+        // The GELF/OTLP receivers stop via their own `Drop`; abort the
+        // processor tasks so a deleted domain leaves nothing running.
+        self.log_processor.abort();
+        self.span_processor.abort();
     }
 }
 
@@ -241,6 +312,9 @@ mod tests {
     fn cfg(name: &str) -> DomainConfig {
         DomainConfig {
             name: DomainId::new(name).unwrap(),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
             log_buffer_size: 100,
             span_buffer_size: 100,
             source: DomainSource::Ephemeral,
