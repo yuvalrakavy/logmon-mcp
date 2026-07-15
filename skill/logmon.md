@@ -36,7 +36,7 @@ logmon uses a **broker + clients** architecture:
 - **logmon-mcp** (shim): Thin MCP bridge. One per Claude session, all connected to the same broker.
 - **logmon-broker-sdk**: Typed Rust client SDK for non-MCP consumers (test harnesses, dashboards, archival workers). Cross-language clients can codegen from `crates/protocol/protocol-v1.schema.json`.
 
-Multiple Claude sessions share the same broker and log buffer. Each session has its own triggers and filters; named sessions persist across disconnects.
+Multiple Claude sessions share the same broker. By default they share the `default` log buffer, but a session can bind to an isolated **domain** — its own buffers, receivers, triggers, and filters — via `use_domain` (or the `--domain` flag in CLI mode); see Domains below. Each session has its own triggers and filters; named sessions persist across disconnects.
 
 ## CLI alternative (Bash tool)
 

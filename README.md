@@ -29,6 +29,8 @@ Application(s)        AI Sessions / Test Harnesses / Other Clients
 
 **Other clients:** anything depending on the public `logmon-broker-sdk` Rust crate, or speaking JSON-RPC against the documented protocol (`crates/protocol/protocol-v1.schema.json`).
 
+**Domains:** the broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see Configuration) or create ephemeral ones at runtime via the domain tools. A session/invocation targets one via `use_domain` (MCP) or `--domain` (CLI).
+
 ## Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (for building from source)

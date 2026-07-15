@@ -2515,6 +2515,19 @@
             "otlp_grpc_logs": 0,
             "otlp_grpc_traces": 0
           }
+        },
+        "current_domain": {
+          "description": "The domain the calling session is currently bound to (§7). Additive:\nan older daemon that omits it deserializes as `\"\"`.",
+          "type": "string",
+          "default": ""
+        },
+        "active_filters": {
+          "description": "Echo of the session's active buffer-filter strings (§7) so a single\nstatus call answers \"what is narrowing me\". Additive.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
         }
       },
       "required": [
@@ -2667,6 +2680,13 @@
         },
         "client_info": {
           "description": "Caller-supplied identity/metadata. The daemon currently records and ignores\nthis field; size validation lands in Task 11."
+        },
+        "domain": {
+          "description": "Optional connect-time domain bind: an atomic equivalent of calling\n`domains.use` immediately after connecting. Errors the handshake if the\nnamed domain does not exist. Omitted → the `default` domain.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
