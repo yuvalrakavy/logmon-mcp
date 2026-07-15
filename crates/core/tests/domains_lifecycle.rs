@@ -8,7 +8,7 @@
 #![cfg(feature = "test-support")]
 
 use logmon_broker_core::test_support::*;
-use logmon_broker_protocol::{DomainInfo, DomainsDeleteResult, DomainsListResult};
+use logmon_broker_protocol::{DomainInfo, DomainsClearResult, DomainsDeleteResult, DomainsListResult};
 use serde_json::json;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -314,5 +314,92 @@ async fn delete_releases_ports_for_reuse() {
     assert!(
         reused,
         "deleted domain's ports (gelf={gelf}, grpc={grpc}, http={http}) must be reusable after teardown"
+    );
+}
+
+#[tokio::test]
+async fn clear_disposes_bound_domain_data_and_keeps_seq_monotonic() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let t3: DomainInfo = client
+        .call("domains.create", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+    client
+        .call::<DomainInfo>("domains.use", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+
+    send_gelf(t3.gelf_port, "before clear").await;
+    assert_eq!(wait_log_count(&mut client, "t3", 1).await, 1);
+    let newest_before = get_domain(&mut client, "t3")
+        .await
+        .unwrap()
+        .newest_seq
+        .expect("t3 has a newest seq after ingest");
+
+    // Clear the bound domain's data.
+    let cleared: DomainsClearResult = client
+        .call("domains.clear", json!({}))
+        .await
+        .expect("domains.clear");
+    assert!(cleared.logs_cleared >= 1, "at least the one log was cleared");
+
+    let after = get_domain(&mut client, "t3").await.unwrap();
+    assert_eq!(after.log_count, 0, "logs disposed");
+    assert_eq!(after.span_count, 0, "spans disposed");
+
+    // A record after clear gets a seq ABOVE the pre-clear newest — seq stays
+    // monotonic (clear disposes data, not the counter).
+    send_gelf(t3.gelf_port, "after clear").await;
+    assert_eq!(wait_log_count(&mut client, "t3", 1).await, 1);
+    let newest_after = get_domain(&mut client, "t3")
+        .await
+        .unwrap()
+        .newest_seq
+        .expect("t3 has a newest seq after re-ingest");
+    assert!(
+        newest_after > newest_before,
+        "seq stays monotonic across clear: {newest_after} > {newest_before}"
+    );
+}
+
+/// `domains.clear` clears ONLY the bound domain — a sibling domain is untouched.
+#[tokio::test]
+async fn clear_is_scoped_to_the_bound_domain() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let t3: DomainInfo = client
+        .call("domains.create", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+    let t4: DomainInfo = client
+        .call("domains.create", json!({ "name": "t4" }))
+        .await
+        .unwrap();
+
+    send_gelf(t3.gelf_port, "t3 data").await;
+    send_gelf(t4.gelf_port, "t4 data").await;
+
+    // Bind to t3 and clear.
+    client
+        .call::<DomainInfo>("domains.use", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+    assert_eq!(wait_log_count(&mut client, "t3", 1).await, 1);
+    let _: DomainsClearResult = client.call("domains.clear", json!({})).await.unwrap();
+
+    assert_eq!(
+        get_domain(&mut client, "t3").await.unwrap().log_count,
+        0,
+        "t3 (bound) was cleared"
+    );
+    // t4's data survives.
+    assert_eq!(
+        wait_log_count(&mut client, "t4", 1).await,
+        1,
+        "t4 (unbound) is untouched by clear"
     );
 }

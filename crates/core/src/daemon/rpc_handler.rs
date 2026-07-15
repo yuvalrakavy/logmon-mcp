@@ -117,6 +117,7 @@ impl RpcHandler {
             "domains.delete" => self.handle_domains_delete(&request.params),
             "domains.list" => self.handle_domains_list(),
             "domains.use" => self.handle_domains_use(session_id, &request.params),
+            "domains.clear" => self.handle_domains_clear(session_id),
             "traces.recent" => self.handle_traces_recent(session_id, &request.params),
             "traces.get" => self.handle_traces_get(session_id, &request.params),
             "traces.summary" => self.handle_traces_summary(session_id, &request.params),
@@ -306,6 +307,20 @@ impl RpcHandler {
         sync_pre_buffer_size_for_domain(&new_domain.pipeline, &self.sessions, &new_id);
 
         serde_json::to_value(domain_to_info(&new_domain)).map_err(|e| e.to_string())
+    }
+
+    /// Dispose the BOUND domain's data — logs AND spans — keeping the domain and
+    /// its receivers alive; seq stays monotonic. (`logs.clear` is the logs-only,
+    /// back-compat cousin.)
+    fn handle_domains_clear(&self, session_id: &SessionId) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let logs_cleared = d.pipeline.clear_logs();
+        let spans_cleared = d.span_store.clear();
+        serde_json::to_value(DomainsClearResult {
+            logs_cleared,
+            spans_cleared,
+        })
+        .map_err(|e| e.to_string())
     }
 
     // -----------------------------------------------------------------------

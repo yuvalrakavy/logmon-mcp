@@ -140,6 +140,17 @@ impl SpanStore {
         self.inner.read().unwrap().buffer.len()
     }
 
+    /// Dispose all buffered spans, returning how many were removed. The shared
+    /// seq counter is NOT reset — seq stays monotonic — so bookmarks/cursors
+    /// keep resolving. Mirrors `LogPipeline::clear_logs`; used by `domains.clear`.
+    pub fn clear(&self) -> usize {
+        let mut inner = self.inner.write().unwrap();
+        let n = inner.buffer.len();
+        inner.buffer.clear();
+        inner.trace_index.clear();
+        n
+    }
+
     /// Seq of the newest span currently buffered, or `None` if empty.
     /// Powers B2's `buffer_newest_seq` field on `traces.recent`.
     pub fn newest_seq(&self) -> Option<u64> {
