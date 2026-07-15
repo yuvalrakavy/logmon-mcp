@@ -25,8 +25,10 @@ struct SpanStoreInner {
 impl SpanStore {
     pub fn new(capacity: usize, seq_counter: Arc<SeqCounter>) -> Self {
         Self {
+            // Lazy allocation (§6): start empty and reserve the full ring on the
+            // first insert (see `insert`), so an idle span store holds ~0 buffer.
             inner: RwLock::new(SpanStoreInner {
-                buffer: VecDeque::with_capacity(capacity),
+                buffer: VecDeque::new(),
                 trace_index: HashMap::new(),
                 capacity,
             }),
@@ -38,6 +40,12 @@ impl SpanStore {
         span.seq = self.seq_counter.next();
         let seq = span.seq;
         let mut inner = self.inner.write().unwrap();
+
+        // Lazy allocation (§6): reserve the full ring ONCE, on the first insert.
+        if inner.buffer.capacity() == 0 {
+            let cap = inner.capacity;
+            inner.buffer.reserve_exact(cap);
+        }
 
         if inner.buffer.len() >= inner.capacity {
             if let Some(evicted) = inner.buffer.pop_front() {
@@ -182,5 +190,52 @@ mod oldest_ts_tests {
     fn empty_span_store_returns_none() {
         let store = SpanStore::new(10, Arc::new(SeqCounter::new()));
         assert!(store.oldest_timestamp().is_none());
+    }
+}
+
+#[cfg(test)]
+mod lazy_alloc_tests {
+    use super::*;
+    use crate::engine::seq_counter::SeqCounter;
+    use crate::span::types::{SpanKind, SpanStatus};
+    use std::sync::Arc;
+
+    fn span() -> SpanEntry {
+        SpanEntry {
+            seq: 0,
+            trace_id: 1,
+            span_id: 1,
+            parent_span_id: None,
+            start_time: chrono::Utc::now(),
+            end_time: chrono::Utc::now(),
+            duration_ms: 0.0,
+            name: "s".into(),
+            kind: SpanKind::Internal,
+            service_name: "svc".into(),
+            status: SpanStatus::Unset,
+            attributes: std::collections::HashMap::new(),
+            events: vec![],
+        }
+    }
+
+    #[test]
+    fn buffer_is_unallocated_until_first_insert() {
+        let store = SpanStore::new(10_000, Arc::new(SeqCounter::new()));
+        assert_eq!(
+            store.inner.read().unwrap().buffer.capacity(),
+            0,
+            "a freshly-created span store reserves no buffer"
+        );
+
+        store.insert(span());
+        let cap = store.inner.read().unwrap().buffer.capacity();
+        assert!(cap >= 10_000, "first insert reserves the full ring: {cap}");
+
+        store.insert(span());
+        assert_eq!(
+            store.inner.read().unwrap().buffer.capacity(),
+            cap,
+            "subsequent inserts do not re-allocate"
+        );
     }
 }

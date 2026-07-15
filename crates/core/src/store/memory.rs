@@ -32,8 +32,11 @@ pub struct InMemoryStore {
 impl InMemoryStore {
     pub fn new(capacity: usize) -> Self {
         Self {
+            // Lazy allocation (§6): start empty and reserve the full ring on the
+            // first append (see `append`), so an idle store holds ~0 buffer
+            // memory — matters when many domains are created but stay idle.
             inner: RwLock::new(StoreInner {
-                entries: VecDeque::with_capacity(capacity),
+                entries: VecDeque::new(),
                 seq_set: HashSet::new(),
                 trace_index: HashMap::new(),
             }),
@@ -106,6 +109,14 @@ impl LogStore for InMemoryStore {
         let seq = entry.seq;
         let trace_id = entry.trace_id;
         let mut inner = self.inner.write().unwrap();
+
+        // Lazy allocation (§6): reserve the full ring capacity ONCE, on the first
+        // append. `reserve_exact` on an empty deque allocates exactly the ring;
+        // subsequent appends see a non-zero capacity and skip this. `pop_front`
+        // never shrinks capacity, so the guard stays false thereafter.
+        if inner.entries.capacity() == 0 {
+            inner.entries.reserve_exact(self.max_capacity);
+        }
 
         if inner.entries.len() >= self.max_capacity {
             if let Some(evicted) = inner.entries.pop_front() {
@@ -217,6 +228,34 @@ impl LogStore for InMemoryStore {
 
     fn newest_seq(&self) -> Option<u64> {
         self.inner.read().unwrap().entries.back().map(|e| e.seq)
+    }
+}
+
+#[cfg(test)]
+mod lazy_alloc_tests {
+    use super::*;
+    use crate::gelf::message::{Level, LogEntry};
+
+    #[test]
+    fn buffer_is_unallocated_until_first_append() {
+        let store = InMemoryStore::new(10_000);
+        // Idle: no ring allocated (§6 — matters with many idle domains).
+        assert_eq!(
+            store.inner.read().unwrap().entries.capacity(),
+            0,
+            "a freshly-created store reserves no buffer"
+        );
+
+        store.append(LogEntry::synthetic(Level::Info, "first"));
+        let cap = store.inner.read().unwrap().entries.capacity();
+        assert!(cap >= 10_000, "first append reserves the full ring: {cap}");
+
+        store.append(LogEntry::synthetic(Level::Info, "second"));
+        assert_eq!(
+            store.inner.read().unwrap().entries.capacity(),
+            cap,
+            "subsequent appends do not re-allocate"
+        );
     }
 }
 
