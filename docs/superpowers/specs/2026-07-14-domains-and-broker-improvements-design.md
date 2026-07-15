@@ -579,7 +579,19 @@ domain); the `"domains"` capability; and `status.get` `current_domain` +
 `active_filters`. New logic (status fields, capability) is failing-test-first; the
 SDK/CLI wrappers have round-trip tests; the MCP tools are mechanical `broker.call`
 mirrors of the gated wire methods (covered transitively — no MCP harness exists).
-Docs (skill + 3 READMEs) updated. A lighter surfacing gate follows.
+Docs (skill + 3 READMEs) updated.
+
+**Surfacing gate (done 2026-07-15, commit `b2582be`):** 2 fresh-context finders.
+Wrapper fidelity (all 10 SDK/MCP wire-method strings + param forwarding) verified
+clean. Caught a **CRITICAL** the author's own design narrative had missed: the CLI
+connects with a *persistent named* session (`"cli"`), so the `--domain` flag's
+`domains.use` bind was **sticky** — `logmon --domain t3 status` then an unflagged
+`logmon status` silently kept serving t3. Fixed: every non-registry command now
+binds to `--domain`-or-`default` (reset per invocation); registry verbs
+(create/delete/list) are domain-agnostic and skip the bind (so
+`--domain t3 domains create t3` works). Also locked in idempotent
+same-explicit-ports re-create for stateless dev-tracks (user request — the
+existing `ensure_idempotent` already did it; added the explicit-ports test).
 
 **Remaining:**
 - **DEFERRED — durability** (config-declared + persistent domains + durable bookmark
