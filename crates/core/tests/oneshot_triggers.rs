@@ -99,13 +99,19 @@ async fn non_oneshot_trigger_persists() {
             .unwrap();
     }
 
-    // Add a regular trigger (oneshot defaults to false).
+    // Add a regular trigger (oneshot defaults to false). Explicit post_window=0
+    // so there is no post-window suppression after fire — required for the
+    // fire-twice assertion below now that ad-hoc triggers.add defaults its
+    // windows to 500/200/5 (§6, decision #4) rather than 0.
     let resp: TriggersAddResult = client
         .call(
             "triggers.add",
             json!({
                 "filter": "l>=ERROR",
-                "description": "regular ERROR watch"
+                "description": "regular ERROR watch",
+                "pre_window": 0,
+                "post_window": 0,
+                "notify_context": 0
             }),
         )
         .await

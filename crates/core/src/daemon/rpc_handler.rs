@@ -663,12 +663,24 @@ impl RpcHandler {
                     .to_string(),
             );
         }
-        let pre = params.get("pre_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let post = params.get("post_window").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        // Omitted windows default to 500/200/5 (§6, decision #4) so an ad-hoc
+        // trigger captures context by default. An EXPLICIT value — including 0 —
+        // is honored (the `.map(...).unwrap_or(...)` only defaults when absent).
+        let pre = params
+            .get("pre_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_PRE_WINDOW);
+        let post = params
+            .get("post_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_POST_WINDOW);
         let ctx = params
             .get("notify_context")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+            .map(|v| v as u32)
+            .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_NOTIFY_CONTEXT);
         let desc = params.get("description").and_then(|v| v.as_str());
         let oneshot = params
             .get("oneshot")

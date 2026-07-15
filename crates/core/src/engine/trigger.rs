@@ -59,6 +59,15 @@ impl Trigger {
     }
 }
 
+/// Default trigger windows, used BOTH for the seeded built-in triggers and for
+/// ad-hoc `triggers.add` calls that omit them, so an ad-hoc trigger captures
+/// context by default (§6, decision #4). A per-broker config OVERRIDE of these
+/// is deferred (YAGNI — threading it through the session-creation chain would
+/// ripple `SessionRegistry::new` across many call sites for a knob nobody sets).
+pub const DEFAULT_TRIGGER_PRE_WINDOW: u32 = 500;
+pub const DEFAULT_TRIGGER_POST_WINDOW: u32 = 200;
+pub const DEFAULT_TRIGGER_NOTIFY_CONTEXT: u32 = 5;
+
 pub struct TriggerManager {
     triggers: RwLock<Vec<Trigger>>,
     next_id: AtomicU32,
@@ -78,9 +87,9 @@ impl TriggerManager {
             id: 1,
             condition: parse_filter("l>=ERROR").expect("default filter 1 must be valid"),
             filter_string: "l>=ERROR".to_string(),
-            pre_window: 500,
-            post_window: 200,
-            notify_context: 5,
+            pre_window: DEFAULT_TRIGGER_PRE_WINDOW,
+            post_window: DEFAULT_TRIGGER_POST_WINDOW,
+            notify_context: DEFAULT_TRIGGER_NOTIFY_CONTEXT,
             description: Some("Error-level log detected".to_string()),
             oneshot: false,
             match_count: AtomicU64::new(0),
@@ -91,9 +100,9 @@ impl TriggerManager {
             condition: parse_filter("/panic|unwrap failed|stack backtrace/")
                 .expect("default filter 2 must be valid"),
             filter_string: "/panic|unwrap failed|stack backtrace/".to_string(),
-            pre_window: 500,
-            post_window: 200,
-            notify_context: 5,
+            pre_window: DEFAULT_TRIGGER_PRE_WINDOW,
+            post_window: DEFAULT_TRIGGER_POST_WINDOW,
+            notify_context: DEFAULT_TRIGGER_NOTIFY_CONTEXT,
             description: Some("Panic or unwrap failure detected".to_string()),
             oneshot: false,
             match_count: AtomicU64::new(0),
