@@ -602,3 +602,77 @@ async fn create_rejects_oversized_span_buffer() {
         "a rejected create must leave no domain behind"
     );
 }
+
+/// Consumer #2: liveness — `last_log_received_at` + `idle_secs` populate on
+/// ingest; a never-received domain reports `None` (the "nothing is shipping to
+/// this domain — misconfigured port?" signal) and is not stale.
+#[tokio::test]
+async fn domain_liveness_tracks_last_received_and_idle() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let t3: DomainInfo = client
+        .call("domains.create", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+    let t4: DomainInfo = client
+        .call("domains.create", json!({ "name": "t4" }))
+        .await
+        .unwrap();
+
+    // Fresh domains — nothing received yet.
+    assert!(t3.last_log_received_at.is_none() && t3.idle_secs.is_none() && !t3.stale);
+    assert!(t4.last_log_received_at.is_none());
+
+    // Ingest a GELF log into t3.
+    send_gelf(t3.gelf_port, "hello").await;
+    assert_eq!(wait_log_count(&mut client, "t3", 1).await, 1);
+
+    let t3 = get_domain(&mut client, "t3").await.unwrap();
+    assert!(
+        t3.last_log_received_at.is_some(),
+        "t3 received a log → last_log_received_at set"
+    );
+    assert!(
+        t3.idle_secs.is_some_and(|i| i < 10),
+        "just received → small idle: {:?}",
+        t3.idle_secs
+    );
+    assert!(!t3.stale, "fresh (default 60s threshold) → not stale");
+
+    // t4 still never received → the misconfigured-port signal.
+    let t4 = get_domain(&mut client, "t4").await.unwrap();
+    assert!(
+        t4.last_log_received_at.is_none() && t4.idle_secs.is_none() && !t4.stale,
+        "no ingest → None + not stale"
+    );
+}
+
+/// Consumer #2: the `stale` flag honors the configurable `stale_after_secs`;
+/// a never-received domain is never stale.
+#[tokio::test]
+async fn domain_stale_flag_honors_threshold() {
+    let mut config = default_test_config();
+    config.stale_after_secs = 0; // any received domain is immediately "stale"
+    let daemon = TestDaemonHandle::spawn_with_config(config).await;
+    let mut client = daemon.connect_anon().await;
+    let t3: DomainInfo = client
+        .call("domains.create", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+
+    send_gelf(t3.gelf_port, "x").await;
+    assert_eq!(wait_log_count(&mut client, "t3", 1).await, 1);
+    let t3 = get_domain(&mut client, "t3").await.unwrap();
+    assert!(
+        t3.stale,
+        "threshold 0 + received → stale (idle {:?})",
+        t3.idle_secs
+    );
+
+    // A never-received domain is NOT stale even at threshold 0.
+    let t4: DomainInfo = client
+        .call("domains.create", json!({ "name": "t4" }))
+        .await
+        .unwrap();
+    assert!(!t4.stale, "never received → not stale even at threshold 0");
+}

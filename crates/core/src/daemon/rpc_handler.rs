@@ -13,11 +13,34 @@ pub struct DomainPolicy {
     pub max_domains: usize,
     pub default_log_buffer_size: usize,
     pub default_span_buffer_size: usize,
+    /// Idle-seconds threshold above which a domain is reported `stale` (#2).
+    pub stale_after_secs: u64,
 }
 
 /// Project a live [`Domain`] into its wire [`DomainInfo`] (used by
-/// `domains.create` and `domains.list`). Per-source liveness fields are Wave 3.
-fn domain_to_info(d: &Domain) -> DomainInfo {
+/// `domains.create` and `domains.list`), including liveness (#2): the last
+/// log/span received across the domain's listeners, idle-seconds, and staleness.
+fn domain_to_info(d: &Domain, stale_after_secs: u64) -> DomainInfo {
+    let liv = d.metrics.liveness();
+    let to_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos;
+    // Logs arrive on GELF (udp/tcp) + OTLP logs arms; spans on the OTLP trace arms.
+    let last_log = [
+        liv.gelf_udp,
+        liv.gelf_tcp,
+        liv.otlp_http_logs,
+        liv.otlp_grpc_logs,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let last_span = [liv.otlp_http_traces, liv.otlp_grpc_traces]
+        .into_iter()
+        .flatten()
+        .max();
+    let idle_secs = last_log.max(last_span).map(|n| {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        (now.saturating_sub(n).max(0) / 1_000_000_000) as u64
+    });
     DomainInfo {
         name: d.config.name.to_string(),
         gelf_port: d.config.gelf_port,
@@ -30,6 +53,10 @@ fn domain_to_info(d: &Domain) -> DomainInfo {
         span_count: d.span_store.len(),
         oldest_seq: d.pipeline.oldest_log_seq(),
         newest_seq: d.pipeline.newest_log_seq(),
+        last_log_received_at: last_log.map(to_dt),
+        last_span_received_at: last_span.map(to_dt),
+        idle_secs,
+        stale: idle_secs.is_some_and(|i| i >= stale_after_secs),
     }
 }
 
@@ -42,12 +69,16 @@ fn port_matches(existing: u16, requested: Option<u16>) -> bool {
 /// Idempotency for `domains.create`: an existing domain whose ports all match
 /// (or were left unspecified) is a no-op returning its info; conflicting ports
 /// are an error.
-fn ensure_idempotent(existing: &Domain, requested: &DomainPortSpec) -> Result<Value, String> {
+fn ensure_idempotent(
+    existing: &Domain,
+    requested: &DomainPortSpec,
+    stale_after_secs: u64,
+) -> Result<Value, String> {
     let matches = port_matches(existing.config.gelf_port, requested.gelf)
         && port_matches(existing.config.otlp_grpc_port, requested.otlp_grpc)
         && port_matches(existing.config.otlp_http_port, requested.otlp_http);
     if matches {
-        serde_json::to_value(domain_to_info(existing)).map_err(|e| e.to_string())
+        serde_json::to_value(domain_to_info(existing, stale_after_secs)).map_err(|e| e.to_string())
     } else {
         Err(format!(
             "domain \"{}\" already exists with different ports",
@@ -237,7 +268,7 @@ impl RpcHandler {
         // Idempotent ensure: an existing domain with matching (or unspecified)
         // ports is a no-op; conflicting ports are an error.
         if let Some(existing) = self.domains.get(&id) {
-            return ensure_idempotent(&existing, &requested);
+            return ensure_idempotent(&existing, &requested, self.domain_policy.stale_after_secs);
         }
 
         // `max_domains` caps API-created (non-`config`) domains; `config` +
@@ -289,7 +320,7 @@ impl RpcHandler {
         .await
         .map_err(|e| format!("could not create domain: {e}"))?;
 
-        let info = domain_to_info(&domain);
+        let info = domain_to_info(&domain, self.domain_policy.stale_after_secs);
         self.domains.insert(domain);
         serde_json::to_value(info).map_err(|e| e.to_string())
     }
@@ -328,7 +359,7 @@ impl RpcHandler {
             .domains
             .list()
             .iter()
-            .map(|d| domain_to_info(d))
+            .map(|d| domain_to_info(d, self.domain_policy.stale_after_secs))
             .collect();
         domains.sort_by(|a, b| a.name.cmp(&b.name));
         serde_json::to_value(DomainsListResult { domains }).map_err(|e| e.to_string())
@@ -361,7 +392,11 @@ impl RpcHandler {
         }
         sync_pre_buffer_size_for_domain(&new_domain.pipeline, &self.sessions, &new_id);
 
-        serde_json::to_value(domain_to_info(&new_domain)).map_err(|e| e.to_string())
+        serde_json::to_value(domain_to_info(
+            &new_domain,
+            self.domain_policy.stale_after_secs,
+        ))
+        .map_err(|e| e.to_string())
     }
 
     /// Dispose the BOUND domain's data — logs AND spans — keeping the domain and
@@ -588,6 +623,17 @@ impl RpcHandler {
             .iter()
             .map(|f| f.filter_string.clone())
             .collect();
+        // Per-listener last-received drill-down for the bound domain (#2).
+        let liv = d.metrics.liveness();
+        let to_dt = |n: Option<i64>| n.map(chrono::DateTime::<chrono::Utc>::from_timestamp_nanos);
+        let receiver_liveness = ReceiverLiveness {
+            gelf_udp: to_dt(liv.gelf_udp),
+            gelf_tcp: to_dt(liv.gelf_tcp),
+            otlp_http_logs: to_dt(liv.otlp_http_logs),
+            otlp_http_traces: to_dt(liv.otlp_http_traces),
+            otlp_grpc_logs: to_dt(liv.otlp_grpc_logs),
+            otlp_grpc_traces: to_dt(liv.otlp_grpc_traces),
+        };
         Ok(json!({
             "session": session_info.map(|s| json!({
                 "id": s.id.to_string(),
@@ -617,6 +663,7 @@ impl RpcHandler {
             },
             "current_domain": current_domain,
             "active_filters": active_filters,
+            "receiver_liveness": receiver_liveness,
         }))
     }
 

@@ -136,8 +136,16 @@ pub struct DaemonConfig {
     /// the key loads as `[]`.
     #[serde(default)]
     pub domains: Vec<ConfigDomain>,
+    /// A domain is reported `stale` in `domains.list` once it has been idle (no
+    /// log/span received) longer than this many seconds. Tune to your workload's
+    /// cadence; `idle_secs` is always reported raw regardless of this. (#2.)
+    #[serde(default = "default_stale_after_secs")]
+    pub stale_after_secs: u64,
 }
 
+fn default_stale_after_secs() -> u64 {
+    60
+}
 fn default_gelf_port() -> u16 {
     12201
 }
@@ -174,6 +182,7 @@ impl Default for DaemonConfig {
             span_buffer_size: 10000,
             max_domains: 32,
             domains: Vec::new(),
+            stale_after_secs: 60,
         }
     }
 }

@@ -283,8 +283,8 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `get_triggers` / `add_trigger` / `edit_trigger` / `remove_trigger` | Per-session triggers. |
 | `add_bookmark` / `list_bookmarks` / `remove_bookmark` / `clear_bookmarks` | Bookmarks (also act as cursors via `c>=`). |
 | `get_sessions` / `drop_session` | Multi-session inspection. |
-| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, current domain + active filters. |
-| `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). |
+| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, current domain + active filters, and per-listener `receiver_liveness`. |
+| `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale). |
 | `use_domain` | Bind this session to a domain for subsequent queries + notifications. |
 | `clear_domain` | Dispose the bound domain's logs + spans (keeps the domain alive). |
 

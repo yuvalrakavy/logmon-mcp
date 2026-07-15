@@ -2528,6 +2528,11 @@
             "type": "string"
           },
           "default": []
+        },
+        "receiver_liveness": {
+          "description": "Per-listener last-received wall-clock for the caller's bound domain — the\ndrill-down for \"which port is (not) receiving.\" (Consumer #2.)",
+          "$ref": "#/$defs/ReceiverLiveness",
+          "default": {}
         }
       },
       "required": [
@@ -2656,6 +2661,54 @@
               "format": "uint64",
               "minimum": 0,
               "default": 0
+            }
+          }
+        },
+        "ReceiverLiveness": {
+          "description": "Per-listener last-received wall-clock timestamps for the caller's bound\ndomain — the drill-down for \"which port is (not) receiving.\" `None` = that\nlistener has received nothing. Mirrors [`ReceiverDropCounts`]. (Consumer #2.)",
+          "type": "object",
+          "properties": {
+            "gelf_udp": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "gelf_tcp": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "otlp_http_logs": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "otlp_http_traces": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "otlp_grpc_logs": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "otlp_grpc_traces": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
             }
           }
         }

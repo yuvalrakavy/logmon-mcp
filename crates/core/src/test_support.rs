@@ -58,6 +58,7 @@ pub fn default_test_config() -> DaemonConfig {
         span_buffer_size: 1_000,
         max_domains: 32,
         domains: Vec::new(),
+        stale_after_secs: 60,
     }
 }
 

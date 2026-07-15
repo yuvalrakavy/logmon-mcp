@@ -684,6 +684,25 @@ pub struct ReceiverDropCounts {
     pub otlp_grpc_traces: u64,
 }
 
+/// Per-listener last-received wall-clock timestamps for the caller's bound
+/// domain — the drill-down for "which port is (not) receiving." `None` = that
+/// listener has received nothing. Mirrors [`ReceiverDropCounts`]. (Consumer #2.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ReceiverLiveness {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gelf_udp: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gelf_tcp: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_http_logs: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_http_traces: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_grpc_logs: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_grpc_traces: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct StatusGetResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -701,6 +720,10 @@ pub struct StatusGetResult {
     /// status call answers "what is narrowing me". Additive.
     #[serde(default)]
     pub active_filters: Vec<String>,
+    /// Per-listener last-received wall-clock for the caller's bound domain — the
+    /// drill-down for "which port is (not) receiving." (Consumer #2.)
+    #[serde(default)]
+    pub receiver_liveness: ReceiverLiveness,
 }
 
 // =============================================================================
@@ -710,9 +733,9 @@ pub struct StatusGetResult {
 /// A single domain as reported by `domains.list` and `domains.create`.
 ///
 /// A port value of `0` means that receiver is disabled for the domain. The
-/// count/seq fields reflect the domain's live buffers. Per-source liveness
-/// fields (`last_*_received_at`, `idle_secs`, `stale`) arrive with B7 (Wave 3);
-/// they are intentionally absent from this Wave-2 shape.
+/// count/seq fields reflect the domain's live buffers; the `last_*_received_at` /
+/// `idle_secs` / `stale` liveness fields answer "is this domain actually
+/// receiving?" (`status.get.receiver_liveness` gives the per-listener drill-down).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DomainInfo {
     pub name: String,
@@ -729,6 +752,23 @@ pub struct DomainInfo {
     pub oldest_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest_seq: Option<u64>,
+    /// Wall-clock of the last log ingested into this domain (across any listener),
+    /// or `None` if none ever arrived. A `None` here is the "nothing is shipping
+    /// to this domain — did I misconfigure the port?" signal. (Consumer #2.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_log_received_at: Option<DateTime<Utc>>,
+    /// Wall-clock of the last span ingested into this domain, or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_span_received_at: Option<DateTime<Utc>>,
+    /// Seconds since the most recent log OR span ingest; `None` if neither ever
+    /// arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    /// `true` when the domain HAS received before but has been idle longer than
+    /// the broker's `stale_after_secs` (config, default 60s). A never-received
+    /// domain is `false` — distinguish it via `last_*_received_at == None`.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

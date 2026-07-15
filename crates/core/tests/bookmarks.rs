@@ -70,6 +70,7 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
             max_domains: 32,
             default_log_buffer_size: 1000,
             default_span_buffer_size: 1000,
+            stale_after_secs: 60,
         },
     ));
     (handler, pipeline, sessions)
@@ -269,6 +270,7 @@ fn anonymous_bookmark_cleanup_spans_all_touched_domains() {
             max_domains: 32,
             default_log_buffer_size: 1000,
             default_span_buffer_size: 1000,
+            stale_after_secs: 60,
         },
     ));
 

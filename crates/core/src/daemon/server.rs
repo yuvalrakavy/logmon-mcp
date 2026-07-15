@@ -458,6 +458,7 @@ pub async fn run_with_overrides(
             max_domains: config.max_domains,
             default_log_buffer_size: config.buffer_size,
             default_span_buffer_size: config.span_buffer_size,
+            stale_after_secs: config.stale_after_secs,
         },
     ));
 

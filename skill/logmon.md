@@ -118,13 +118,13 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 
 ### Status
 
-- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, plus **`current_domain`** (your bound domain) and **`active_filters`** (what's narrowing you). Check the drop counts when investigating "missing logs."
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
 ### Domains
 
 Domains are isolated broker instances — each has its own log/span buffers, receivers (GELF/OTLP ports), triggers, and filters. Use them to keep unrelated log streams from interleaving (e.g. one per dev-server or test run). The `default` domain is the always-on anchor; a session stays on `default` until it switches.
 
-- **`list_domains()`** — live domains with ports, source, and log/span counts.
+- **`list_domains()`** — live domains with ports, source, log/span counts, and **liveness**: `last_log_received_at` / `last_span_received_at`, `idle_secs`, `stale`. A `last_*_received_at` of `null` means nothing has shipped to that domain yet — the "is my stack actually reaching this domain, or did I misconfigure the port?" check.
 - **`create_domain(name, gelf_port?, otlp_grpc_port?, otlp_http_port?, ...)`** — create (or idempotently ensure) an ephemeral domain. Omitted ports auto-allocate; `0` disables that receiver.
 - **`use_domain(name)`** — bind this session; subsequent queries and trigger notifications target it until you switch again.
 - **`clear_domain()`** — dispose the bound domain's logs + spans (keeps it alive; seq stays monotonic).

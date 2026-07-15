@@ -60,6 +60,25 @@ pub struct ReceiverMetrics {
     /// Unix-epoch nanos of the last warn emission. Initialised to a value
     /// that ensures the first drop always warns.
     last_warn_nanos: AtomicI64,
+    /// Unix-epoch nanos of the last SUCCESSFUL forward per source (`i64::MIN` =
+    /// never received). Powers per-domain / per-listener liveness (#2).
+    gelf_udp_last: AtomicI64,
+    gelf_tcp_last: AtomicI64,
+    otlp_http_logs_last: AtomicI64,
+    otlp_http_traces_last: AtomicI64,
+    otlp_grpc_logs_last: AtomicI64,
+    otlp_grpc_traces_last: AtomicI64,
+}
+
+/// Snapshot of last-received Unix-epoch nanos per source (`None` = never). (#2.)
+#[derive(Debug, Clone, Default)]
+pub struct ReceiverLivenessNanos {
+    pub gelf_udp: Option<i64>,
+    pub gelf_tcp: Option<i64>,
+    pub otlp_http_logs: Option<i64>,
+    pub otlp_http_traces: Option<i64>,
+    pub otlp_grpc_logs: Option<i64>,
+    pub otlp_grpc_traces: Option<i64>,
 }
 
 impl ReceiverMetrics {
@@ -72,6 +91,43 @@ impl ReceiverMetrics {
             otlp_grpc_logs: AtomicU64::new(0),
             otlp_grpc_traces: AtomicU64::new(0),
             last_warn_nanos: AtomicI64::new(i64::MIN),
+            gelf_udp_last: AtomicI64::new(i64::MIN),
+            gelf_tcp_last: AtomicI64::new(i64::MIN),
+            otlp_http_logs_last: AtomicI64::new(i64::MIN),
+            otlp_http_traces_last: AtomicI64::new(i64::MIN),
+            otlp_grpc_logs_last: AtomicI64::new(i64::MIN),
+            otlp_grpc_traces_last: AtomicI64::new(i64::MIN),
+        }
+    }
+
+    /// Stamp the last-received time for `source` — called on every successful
+    /// forward. Relaxed: liveness is advisory, not a happens-before guard.
+    fn record_received(&self, source: ReceiverSource) {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let slot = match source {
+            ReceiverSource::GelfUdp => &self.gelf_udp_last,
+            ReceiverSource::GelfTcp => &self.gelf_tcp_last,
+            ReceiverSource::OtlpHttpLogs => &self.otlp_http_logs_last,
+            ReceiverSource::OtlpHttpTraces => &self.otlp_http_traces_last,
+            ReceiverSource::OtlpGrpcLogs => &self.otlp_grpc_logs_last,
+            ReceiverSource::OtlpGrpcTraces => &self.otlp_grpc_traces_last,
+        };
+        slot.store(now, Ordering::Relaxed);
+    }
+
+    /// Per-source last-received snapshot (`None` = never). (#2.)
+    pub fn liveness(&self) -> ReceiverLivenessNanos {
+        let g = |a: &AtomicI64| match a.load(Ordering::Relaxed) {
+            i64::MIN => None,
+            v => Some(v),
+        };
+        ReceiverLivenessNanos {
+            gelf_udp: g(&self.gelf_udp_last),
+            gelf_tcp: g(&self.gelf_tcp_last),
+            otlp_http_logs: g(&self.otlp_http_logs_last),
+            otlp_http_traces: g(&self.otlp_http_traces_last),
+            otlp_grpc_logs: g(&self.otlp_grpc_logs_last),
+            otlp_grpc_traces: g(&self.otlp_grpc_traces_last),
         }
     }
 
@@ -114,7 +170,10 @@ impl ReceiverMetrics {
         source: ReceiverSource,
     ) -> bool {
         match sender.try_send(entry) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.record_received(source);
+                true
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.record_drop(source);
                 false
@@ -133,7 +192,10 @@ impl ReceiverMetrics {
         source: ReceiverSource,
     ) -> bool {
         match sender.try_send(entry) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.record_received(source);
+                true
+            }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.record_drop(source);
                 false
