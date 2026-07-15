@@ -543,11 +543,39 @@ Wave 2 was built in a testability-driven refinement of §10's step order.
 methods DURING steps 5–6 (not batched into step 7), so each stage is testable
 end-to-end through the harness. Step 7 is thus reduced to the CLIENT surface.
 
+**Deep gate — core (steps 4–6), done 2026-07-15** (commit `3434795`): 3 breadth
+finders (Sonnet) + 1 depth finder (Opus, blast-radius), fresh contexts, distinct
+lenses. The core T3 invariants were verified **clean** — per-domain isolation (all
+~24 data handlers resolve at the boundary; no global-store reach), seq independence
+(fresh `SeqCounter` per domain), Arc-graceful teardown (no spawned task holds a
+strong `Arc<Domain>` back to its own domain, so delete drops the last Arc), full
+blast-radius on every changed signature, and default-path back-compat. Findings
+were adjudicated against the code (not taken on the finders' word) and remediated:
+- **A (HIGH, 3-finder convergence):** `domains.create` check→bind→insert straddled
+  the port-bind `.await` on the shared handler; concurrent same-name creates
+  orphaned receivers + overshot `max_domains`. Fixed with an async create-lock.
+- **B (HIGH):** unclamped client buffer sizes → `reserve_exact` → process abort on
+  first ingest. Bounded at `MAX_DOMAIN_BUFFER_SIZE` (10M).
+- **C (back-compat):** OTLP port clash at boot aborted the whole daemon (incl.
+  GELF). **Decision (revises §9.3 for the boot path):** the default domain's
+  OPTIONAL OTLP now DEGRADES at boot (warn + disable, keep serving); explicit
+  `domains.create` keeps §9.3 fail-loud. GELF stays fail-loud (core function).
+- **D (§5, 4-finder convergence):** anonymous cross-domain bookmark cleanup swept
+  only the current binding. Added per-session touched-domains tracking.
+- **G (LOW):** explicit `handle()` arm for the async-only `domains.create`.
+
+Deferred to 2.4 (noted, not lost): notification micro-race on `domains.use` (E;
+tiny window, data retained, connected-only, no client surface yet), CLI
+`triggers add` still `0/0/0` (F; pre-existing, out-of-diff — the daemon default
+only fires on omission, clap always sends `Some(0)`), OTLP single-arm-`0` allocates
+a random port instead of disabling (H; mirrors the daemon gate, §4 wording).
+
 **Remaining:**
 - **Step 7 / stage 2.4 — surfacing**: SDK domain methods, `logmon domains` CLI,
   MCP tools, the `"domains"` capability, and `status.get`
   `current_domain`/`active_filters`.
-- **Deep adversarial gate** over the full Wave 2 diff (T3, pre-merge).
+- **Deep gate on the 2.4 surfacing diff** when it lands (the core gate is done —
+  see above; surfacing is lower-risk client wrappers but still gets a check).
 - **DEFERRED — durability** (config-declared + persistent domains + durable bookmark
   persistence — the rest of step 5's §5). Blocked on a persisted-schema decision.
   **Gap found during 2.2:** §5/decision-#1 (durable domains persist bookmarks)
