@@ -60,22 +60,14 @@ async fn named_session_resumes_across_daemon_restart() {
     // resume.
     daemon.restart().await;
 
-    // First notification on the channel must be Reconnected. Loop because
-    // there may be unrelated default-trigger fires queued (we didn't inject
-    // any logs, so this should be clean, but be defensive against future
-    // daemon-side default-trigger changes).
-    let deadline = tokio::time::Instant::now() + TIGHT_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            panic!("timed out waiting for Reconnected notification");
-        }
-        match tokio::time::timeout(remaining, sub.recv()).await {
-            Ok(Ok(Notification::Reconnected)) => break,
-            Ok(Ok(other)) => panic!("expected Reconnected first; got {other:?}"),
-            Ok(Err(e)) => panic!("notification channel error: {e:?}"),
-            Err(_) => panic!("timed out waiting for Reconnected notification"),
-        }
+    // The first notification on the channel must be Reconnected. We inject no
+    // logs, so no unrelated default-trigger fires are expected; any other
+    // notification arriving first is a failure.
+    match tokio::time::timeout(TIGHT_TIMEOUT, sub.recv()).await {
+        Ok(Ok(Notification::Reconnected)) => {}
+        Ok(Ok(other)) => panic!("expected Reconnected first; got {other:?}"),
+        Ok(Err(e)) => panic!("notification channel error: {e:?}"),
+        Err(_) => panic!("timed out waiting for Reconnected notification"),
     }
 
     // Trigger should still be present on the resumed session.
