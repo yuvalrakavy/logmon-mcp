@@ -38,8 +38,11 @@ fn channel_used_pct<T>(sender: &mpsc::Sender<T>) -> u64 {
     (cap - avail) * 100 / cap
 }
 
+/// Serve OTLP/HTTP on a pre-bound listener. Binding happens in
+/// [`super::OtlpReceiver::start`] (before this task is spawned) so a port clash
+/// is a clean synchronous error rather than a silently-dead task.
 pub async fn start_http_server(
-    addr: std::net::SocketAddr,
+    listener: tokio::net::TcpListener,
     log_sender: mpsc::Sender<LogEntry>,
     span_sender: mpsc::Sender<SpanEntry>,
     metrics: Arc<ReceiverMetrics>,
@@ -55,8 +58,9 @@ pub async fn start_http_server(
         .route("/v1/traces", post(handle_traces))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("OTLP HTTP server listening on {}", addr);
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!("OTLP HTTP server listening on {}", addr);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

@@ -342,9 +342,12 @@ impl TraceService for OtlpTraceService {
 // Server startup
 // ---------------------------------------------------------------------------
 
-/// Start the OTLP gRPC server serving both LogsService and TraceService.
+/// Start the OTLP gRPC server serving both LogsService and TraceService on a
+/// pre-bound listener. Binding happens in [`super::OtlpReceiver::start`] (before
+/// this task is spawned) so a port clash is a clean synchronous error rather
+/// than a silently-dead task; here we only serve on the listener we were handed.
 pub async fn start_grpc_server(
-    addr: std::net::SocketAddr,
+    listener: tokio::net::TcpListener,
     log_sender: mpsc::Sender<LogEntry>,
     span_sender: mpsc::Sender<SpanEntry>,
     metrics: Arc<ReceiverMetrics>,
@@ -361,12 +364,14 @@ pub async fn start_grpc_server(
         malformed_count: AtomicU64::new(0),
     };
 
+    let addr = listener.local_addr()?;
     tracing::info!("OTLP gRPC server listening on {}", addr);
 
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     tonic::transport::Server::builder()
         .add_service(LogsServiceServer::new(logs_svc))
         .add_service(TraceServiceServer::new(trace_svc))
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown_rx.recv().await;
         })
         .await?;
