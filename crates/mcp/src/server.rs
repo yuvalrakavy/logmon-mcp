@@ -205,6 +205,34 @@ struct GetTraceLogsParams {
     filter: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct CreateDomainParams {
+    /// Domain name — the isolation key.
+    name: String,
+    /// GELF UDP+TCP port. Omitted → auto-allocate; 0 → disable GELF for this domain.
+    gelf_port: Option<u16>,
+    /// OTLP gRPC port. Omitted → auto-allocate; 0 → disable.
+    otlp_grpc_port: Option<u16>,
+    /// OTLP HTTP port. Omitted → auto-allocate; 0 → disable.
+    otlp_http_port: Option<u16>,
+    /// Log ring capacity (default: the daemon's configured size).
+    log_buffer_size: Option<usize>,
+    /// Span ring capacity (default: the daemon's configured size).
+    span_buffer_size: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DeleteDomainParams {
+    /// Name of the domain to delete. Refuses config-declared domains (incl. 'default').
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct UseDomainParams {
+    /// Domain to bind this session to for subsequent queries and notifications.
+    name: String,
+}
+
 // ---- Tool router ----
 
 #[rmcp::tool_router]
@@ -738,6 +766,87 @@ impl GelfMcpServer {
                     "name": p.name,
                 }),
             )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    // ---- Domain Management Tools ----
+
+    #[rmcp::tool(description = "Create (or idempotently ensure) an isolated domain — a full broker instance with its own log/span buffers, receivers, and triggers. Omitted ports are auto-allocated; a port of 0 disables that receiver. Ephemeral (gone on daemon restart).")]
+    async fn create_domain(
+        &self,
+        Parameters(p): Parameters<CreateDomainParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "domains.create",
+                serde_json::json!({
+                    "name": p.name,
+                    "gelf_port": p.gelf_port,
+                    "otlp_grpc_port": p.otlp_grpc_port,
+                    "otlp_http_port": p.otlp_http_port,
+                    "log_buffer_size": p.log_buffer_size,
+                    "span_buffer_size": p.span_buffer_size,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Delete a domain and tear down its receivers. Refuses config-declared domains including 'default'.")]
+    async fn delete_domain(
+        &self,
+        Parameters(p): Parameters<DeleteDomainParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("domains.delete", serde_json::json!({ "name": p.name }))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "List all live domains with their ports, source (config/persistent/ephemeral), and log/span counts.")]
+    async fn list_domains(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("domains.list", serde_json::json!({}))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Bind this session to a domain. Subsequent log/trace queries and trigger notifications target that domain until you switch again. Errors if the domain does not exist.")]
+    async fn use_domain(
+        &self,
+        Parameters(p): Parameters<UseDomainParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("domains.use", serde_json::json!({ "name": p.name }))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Dispose the bound domain's data — logs and spans — keeping the domain and its receivers alive. Sequence numbers stay monotonic. (logs.clear is the logs-only cousin.)")]
+    async fn clear_domain(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("domains.clear", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(

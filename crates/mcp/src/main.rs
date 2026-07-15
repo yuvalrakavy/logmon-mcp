@@ -18,6 +18,12 @@ struct Cli {
     #[arg(long, global = true)]
     session: Option<String>,
 
+    /// Bind this invocation to a domain (connect-time). Queries — and
+    /// `domains clear` — then target that domain instead of `default`. CLI mode
+    /// only; omitted → the `default` domain.
+    #[arg(long, global = true)]
+    domain: Option<String>,
+
     /// Emit machine-readable JSON instead of human-readable text. CLI mode only.
     #[arg(long, global = true)]
     json: bool,
@@ -39,6 +45,8 @@ enum Subcommand {
     Spans(cli::spans::SpansCmd),
     /// List or drop sessions.
     Sessions(cli::sessions::SessionsCmd),
+    /// Create, delete, list, or clear domains (isolated broker instances).
+    Domains(cli::domains::DomainsCmd),
     /// Print broker status (uptime, receivers, store stats).
     Status,
 }
@@ -53,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
             // No tracing init: CLI is silent on stderr unless format::error()
             // explicitly writes there. Stray RUST_LOG settings shouldn't leak
             // SDK warnings into a CLI consumer's stderr stream.
-            let exit_code = cli::dispatch(cmd, cli.session, cli.json).await;
+            let exit_code = cli::dispatch(cmd, cli.session, cli.domain, cli.json).await;
             std::process::exit(exit_code);
         }
         None => {

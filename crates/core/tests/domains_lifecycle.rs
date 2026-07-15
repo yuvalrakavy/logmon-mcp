@@ -444,12 +444,18 @@ async fn create_rejects_oversized_log_buffer() {
 async fn concurrent_create_same_name_converges_to_one_domain() {
     let daemon = spawn_test_daemon().await;
 
+    // Establish all connections FIRST (sequentially). The race under test is
+    // concurrent CREATE, not concurrent connect — opening 8 clients at once
+    // stresses the accept loop and flakes ("connection refused") under full-suite
+    // load, which is incidental to what this test asserts.
     let n = 8;
-    let mut handles = Vec::new();
+    let mut clients = Vec::new();
     for _ in 0..n {
-        let sock = daemon.socket_path.clone();
+        clients.push(TestClient::connect(&daemon.socket_path, None, None).await);
+    }
+    let mut handles = Vec::new();
+    for mut c in clients {
         handles.push(tokio::spawn(async move {
-            let mut c = TestClient::connect(&sock, None, None).await;
             c.call::<DomainInfo>("domains.create", json!({ "name": "race" }))
                 .await
         }));
@@ -485,12 +491,16 @@ async fn concurrent_create_respects_max_domains() {
     config.max_domains = 2; // `default` is Config-sourced and doesn't count.
     let daemon = TestDaemonHandle::spawn_with_config(config).await;
 
+    // Connect first (see `concurrent_create_same_name`): isolate the concurrent
+    // CREATE race from concurrent-connect flakiness under full-suite load.
     let n = 8;
+    let mut clients = Vec::new();
+    for _ in 0..n {
+        clients.push(TestClient::connect(&daemon.socket_path, None, None).await);
+    }
     let mut handles = Vec::new();
-    for i in 0..n {
-        let sock = daemon.socket_path.clone();
+    for (i, mut c) in clients.into_iter().enumerate() {
         handles.push(tokio::spawn(async move {
-            let mut c = TestClient::connect(&sock, None, None).await;
             c.call::<DomainInfo>("domains.create", json!({ "name": format!("d{i}") }))
                 .await
         }));

@@ -26,4 +26,9 @@ async fn v1_capabilities_advertised() {
         "missing 'client_info' in capabilities: {:?}",
         result.capabilities
     );
+    assert!(
+        result.capabilities.contains(&"domains".to_string()),
+        "missing 'domains' in capabilities: {:?}",
+        result.capabilities
+    );
 }

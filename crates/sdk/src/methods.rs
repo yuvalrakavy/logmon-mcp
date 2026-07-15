@@ -11,7 +11,9 @@
 use crate::{Broker, BrokerError};
 use logmon_broker_protocol::{
     BookmarksAdd, BookmarksAddResult, BookmarksClear, BookmarksClearResult, BookmarksList,
-    BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, FiltersAdd, FiltersAddResult,
+    BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, DomainsClear, DomainsClearResult,
+    DomainsCreate, DomainsCreateResult, DomainsDelete, DomainsDeleteResult, DomainsList,
+    DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult,
     FiltersEdit, FiltersEditResult, FiltersList, FiltersListResult, FiltersRemove,
     FiltersRemoveResult, LogsClear, LogsClearResult, LogsContext, LogsContextResult, LogsExport,
     LogsExportResult, LogsRecent, LogsRecentResult, SessionDrop, SessionDropResult, SessionList,
@@ -126,5 +128,28 @@ impl Broker {
     }
     pub async fn status_get(&self, p: StatusGet) -> Result<StatusGetResult, BrokerError> {
         self.call_typed("status.get", p).await
+    }
+
+    // ---- domains.* ----
+    pub async fn domains_create(
+        &self,
+        p: DomainsCreate,
+    ) -> Result<DomainsCreateResult, BrokerError> {
+        self.call_typed("domains.create", p).await
+    }
+    pub async fn domains_delete(
+        &self,
+        p: DomainsDelete,
+    ) -> Result<DomainsDeleteResult, BrokerError> {
+        self.call_typed("domains.delete", p).await
+    }
+    pub async fn domains_list(&self, p: DomainsList) -> Result<DomainsListResult, BrokerError> {
+        self.call_typed("domains.list", p).await
+    }
+    pub async fn domains_use(&self, p: DomainsUse) -> Result<DomainsUseResult, BrokerError> {
+        self.call_typed("domains.use", p).await
+    }
+    pub async fn domains_clear(&self, p: DomainsClear) -> Result<DomainsClearResult, BrokerError> {
+        self.call_typed("domains.clear", p).await
     }
 }

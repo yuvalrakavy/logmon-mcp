@@ -89,11 +89,24 @@ CLI sessions default to a named session called `"cli"`, so bookmarks and other s
 
 ### Status
 
-- **get_status** — Server status: buffer size, session info, receiver ports, message stats.
+- **get_status** — Server status: buffer size, session info, receiver ports, message stats, plus `current_domain` (the session's bound domain) and `active_filters` (what's narrowing this session).
+
+### Domains
+
+Domains are isolated broker instances — each has its own log/span buffers, receivers (GELF/OTLP ports), triggers, and filters. Use them to keep unrelated log streams from interleaving (e.g. one per dev-server or per test run). The `default` domain is the always-present anchor; a session stays bound to `default` until it switches.
+
+- **list_domains** — List live domains with ports, source, and log/span counts.
+- **create_domain** — Create (or idempotently ensure) an ephemeral domain. Omitted ports auto-allocate; `0` disables that receiver.
+- **use_domain** — Bind this session to a domain; subsequent queries and trigger notifications target it until you switch again.
+- **clear_domain** — Dispose the bound domain's logs + spans (keeps the domain alive; seq stays monotonic).
+- **delete_domain** — Delete a domain and tear down its receivers (refuses `default`).
+
+In CLI mode a session is short-lived, so there is no `use` verb — pass the global `--domain NAME` flag to target one invocation (e.g. `logmon-mcp --domain t3 logs recent`, or `logmon-mcp --domain t3 domains clear`).
 
 ## Multi-Session Behavior
 
-- **Shared buffer**: All sessions read from and write to the same log buffer. `clear_logs` clears for everyone.
+- **Shared buffer**: All sessions bound to the same domain read from and write to that domain's log buffer. `clear_logs` clears it for everyone on that domain.
+- **Domains**: A session can bind to an isolated domain (its own buffer, receivers, triggers, and filters) via `use_domain` (or the `--domain` CLI flag). Data never crosses between domains. See the Domains tools above.
 - **Per-session filters**: Each session's filters determine what gets stored. The union of all sessions' filters is applied (OR semantics across sessions).
 - **Per-session triggers**: Each session has its own triggers. Default triggers (ERROR and panic) are created automatically.
 - **Named sessions**: Use `--session <name>` when starting logmon for persistent sessions that survive disconnects. Triggers and filters are preserved, and notifications are queued while disconnected.

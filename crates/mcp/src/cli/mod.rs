@@ -7,6 +7,7 @@
 
 pub mod bookmarks;
 pub mod connect;
+pub mod domains;
 pub mod filters;
 pub mod format;
 pub mod logs;
@@ -17,9 +18,15 @@ pub mod traces;
 pub mod triggers;
 
 use crate::Subcommand;
+use logmon_broker_protocol::DomainsUse;
 
 /// Top-level CLI dispatch. Returns the process exit code.
-pub async fn dispatch(cmd: Subcommand, session: Option<String>, json: bool) -> i32 {
+pub async fn dispatch(
+    cmd: Subcommand,
+    session: Option<String>,
+    domain: Option<String>,
+    json: bool,
+) -> i32 {
     let session_name = session.unwrap_or_else(|| "cli".to_string());
 
     let broker = match connect::connect_cli(&session_name, &cmd).await {
@@ -30,6 +37,17 @@ pub async fn dispatch(cmd: Subcommand, session: Option<String>, json: bool) -> i
         }
     };
 
+    // `--domain` binds this one-shot connection before the command runs, so
+    // queries (and `domains clear`) target the chosen domain. The bind lives
+    // only for this invocation — CLI sessions are short-lived — which is why
+    // there is no sticky `domains use` subcommand.
+    if let Some(domain) = domain {
+        if let Err(e) = broker.domains_use(DomainsUse { name: domain }).await {
+            format::error(&format!("--domain bind failed: {e}"), json);
+            return 1;
+        }
+    }
+
     match cmd {
         Subcommand::Logs(c) => logs::dispatch(&broker, c, json).await,
         Subcommand::Bookmarks(c) => bookmarks::dispatch(&broker, c, json).await,
@@ -38,6 +56,7 @@ pub async fn dispatch(cmd: Subcommand, session: Option<String>, json: bool) -> i
         Subcommand::Traces(c) => traces::dispatch(&broker, c, json).await,
         Subcommand::Spans(c) => spans::dispatch(&broker, c, json).await,
         Subcommand::Sessions(c) => sessions::dispatch(&broker, c, json).await,
+        Subcommand::Domains(c) => domains::dispatch(&broker, c, json).await,
         Subcommand::Status => status::dispatch(&broker, json).await,
     }
 }

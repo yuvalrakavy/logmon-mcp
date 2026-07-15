@@ -190,6 +190,7 @@ impl RpcHandler {
                 "bookmarks".into(),
                 "oneshot_triggers".into(),
                 "client_info".into(),
+                "domains".into(),
             ],
         }
     }
@@ -567,6 +568,15 @@ impl RpcHandler {
         let session_info = self.sessions.get(session_id);
         let stats = d.pipeline.store_stats();
         let drops = d.metrics.snapshot();
+        // §7 situational awareness: where the session is bound + what is
+        // narrowing it, so one call answers "where am I / what's filtering me".
+        let current_domain = self.sessions.domain_of(session_id).to_string();
+        let active_filters: Vec<String> = self
+            .sessions
+            .list_filters(session_id)
+            .iter()
+            .map(|f| f.filter_string.clone())
+            .collect();
         Ok(json!({
             "session": session_info.map(|s| json!({
                 "id": s.id.to_string(),
@@ -594,6 +604,8 @@ impl RpcHandler {
                 "otlp_grpc_logs": drops.otlp_grpc_logs,
                 "otlp_grpc_traces": drops.otlp_grpc_traces,
             },
+            "current_domain": current_domain,
+            "active_filters": active_filters,
         }))
     }
 

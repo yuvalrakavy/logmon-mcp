@@ -51,5 +51,12 @@ pub async fn dispatch(broker: &Broker, json: bool) -> i32 {
     } else {
         println!("session: (none)");
     }
+    println!("domain: {}", result.current_domain);
+    print!("filters:");
+    if result.active_filters.is_empty() {
+        println!(" (none)");
+    } else {
+        println!(" {}", result.active_filters.join(", "));
+    }
     0
 }

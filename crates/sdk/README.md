@@ -215,6 +215,11 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `session_list` | `SessionList` | `SessionListResult` |
 | `session_drop` | `SessionDrop` | `SessionDropResult` |
 | `status_get` | `StatusGet` | `StatusGetResult` |
+| `domains_create` | `DomainsCreate` | `DomainsCreateResult` |
+| `domains_delete` | `DomainsDelete` | `DomainsDeleteResult` |
+| `domains_list` | `DomainsList` | `DomainsListResult` |
+| `domains_use` | `DomainsUse` | `DomainsUseResult` |
+| `domains_clear` | `DomainsClear` | `DomainsClearResult` |
 
 All methods return `Result<R, BrokerError>`.
 

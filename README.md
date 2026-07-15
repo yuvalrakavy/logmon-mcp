@@ -242,6 +242,11 @@ Once logs are flowing, ask your assistant:
 | `remove_trigger` | Remove a trigger |
 | `get_sessions` | List all connected sessions |
 | `drop_session` | Remove a named session |
+| `list_domains` | List all live domains (ports, source, log/span counts) |
+| `create_domain` | Create/ensure an isolated ephemeral domain |
+| `use_domain` | Bind this session to a domain for subsequent queries/notifications |
+| `clear_domain` | Dispose the bound domain's logs + spans |
+| `delete_domain` | Delete a domain and tear down its receivers |
 
 ## Filter DSL
 

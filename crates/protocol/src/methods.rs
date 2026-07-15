@@ -707,6 +707,14 @@ pub struct StatusGetResult {
     pub store: StoreStats,
     #[serde(default)]
     pub receiver_drops: ReceiverDropCounts,
+    /// The domain the calling session is currently bound to (§7). Additive:
+    /// an older daemon that omits it deserializes as `""`.
+    #[serde(default)]
+    pub current_domain: String,
+    /// Echo of the session's active buffer-filter strings (§7) so a single
+    /// status call answers "what is narrowing me". Additive.
+    #[serde(default)]
+    pub active_filters: Vec<String>,
 }
 
 // =============================================================================
