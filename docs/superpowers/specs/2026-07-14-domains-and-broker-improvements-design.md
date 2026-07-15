@@ -603,3 +603,146 @@ existing `ensure_idempotent` already did it; added the explicit-ports test).
   seq high-water. Fixing it for durable non-default domains needs **per-domain seq
   persistence in `DaemonState`**. The primary consumer (dev-tracks) uses ephemeral
   domains and does not need durability, so this was deferred pending that decision.
+
+## 17. Durability build design — Option A (chosen 2026-07-15)
+
+Durable domains reach **full parity with `default`**: re-created at boot, per-domain
+seq high-water persisted, bookmarks persisted and domain-routed. The `default`
+domain's existing machinery (seq_block reserve-at-boot / persist-at-shutdown;
+`named_sessions[].bookmarks`) is **generalized**, not replaced — every addition is
+`#[serde(default)]`, so an existing `state.json`/`config.json` loads byte-identically
+(**zero migration**; this is the load-bearing property for a data-integrity change).
+
+### 17.1 Schema
+
+**`config.json` (`DaemonConfig`)** — user-authored config domains:
+```rust
+#[serde(default)] pub domains: Vec<ConfigDomain>,
+// ConfigDomain { name: String, gelf_port/otlp_grpc_port/otlp_http_port: Option<u16>,
+//                log_buffer_size/span_buffer_size: Option<usize> }
+```
+
+**`state.json` (`DaemonState`)** — machine-owned:
+```rust
+#[serde(default)] pub domain_seq_blocks: HashMap<String, u64>,   // durable NON-default seq high-water
+#[serde(default)] pub persistent_domains: Vec<PersistentDomainDecl>, // API-created durable decls
+// PersistentDomainDecl { name, gelf_port, otlp_grpc_port, otlp_http_port: u16,
+//                        log_buffer_size, span_buffer_size: usize }  // ports are concrete (allocated)
+```
+`default`'s seq stays in the existing top-level `seq_block` (special-cased — the
+zero-migration wart we accept over restructuring the one field crashes would corrupt).
+
+**`PersistedBookmark`** gains `#[serde(default = "default_domain_str")] pub domain: String`
+(`"default"`). Old bookmarks (no field) → `default`. Snapshot tags each; restore routes
+by it.
+
+### 17.2 Boot (`server.rs`, after the default domain is assembled)
+
+1. Assemble `default` exactly as today (seed from `seq_block`, reserve `+SEQ_BLOCK_SIZE`, save).
+2. **Durable set** = `config.domains` (source `Config`) ∪ `state.persistent_domains` (source
+   `Persistent`). On a name collision **config wins**; the persistent entry is dropped +
+   pruned from `state.json` with a WARN (config.json is authoritative user intent).
+3. For each durable non-default domain, build it like `spawn_ephemeral_domain` **but durable**:
+   seed its `SeqCounter` from `domain_seq_blocks[name]` (absent → 0), reserve `+SEQ_BLOCK_SIZE`,
+   bind receivers at its declared ports, insert with the right `source`. **A bind failure
+   (port clash) SKIPS that domain with a loud WARN — the daemon keeps running** (default +
+   siblings stay up), consistent with the §9.3/finding-C resilience principle (an optional
+   domain must not take the daemon down). Empty buffers (buffers never persist — same as
+   `default`).
+4. Persist the reserved seq blocks for all durable domains immediately (mirrors default's
+   reserve-and-save, so a crash can't reuse seqs).
+
+### 17.3 Shutdown + snapshot/restore (domain-routed bookmarks)
+
+- **Seq:** for each durable domain persist `domain_seq_blocks[name] = reserved.max(counter.current())`
+  (default → `seq_block`, unchanged).
+- **`snapshot_named_for_persistence`** (today takes ONE store): change to take the durable-domain
+  set; snapshot each domain's `BookmarkStore`, tag each bookmark with its `domain`, bucket by
+  session into `named_sessions[].bookmarks`.
+- **`restore_named`** (today takes ONE store): route each persisted bookmark to
+  `domains.get(&pb.domain)`'s store via `insert_persisted`; a bookmark whose domain no longer
+  exists at boot is skipped with a WARN (its domain is gone → its bookmarks go with it,
+  matching the delete-drops-bookmarks model). Ephemeral domains don't exist at boot, so their
+  bookmarks (if any leaked into state) are dropped — ephemeral was never durable.
+
+### 17.4 Lifecycle (`persist=true` stops being rejected)
+
+- `domains.create(persist=true)`: create the domain durable, append its concrete decl to
+  `state.persistent_domains`, `save_state`. **Promote-in-place:** if an *ephemeral* domain of
+  that name exists, flip its `source` to `Persistent` + record its decl (no teardown — receivers
+  and live buffers/seq stay). Idempotent: `persist=true` on an existing persistent domain with
+  matching ports → no-op. `persist=true` on a `config` domain → error (edit config.json).
+- `domains.delete` on a `Persistent` domain: remove from registry (Arc-graceful, as today) AND
+  from `state.persistent_domains` + `save_state`. `Config` domains still refuse delete (unchanged).
+
+### 17.5 Migration proof (zero)
+
+Old `state.json` = `{seq_block, named_sessions:{...bookmarks without domain}}` →
+`domain_seq_blocks={}`, `persistent_domains=[]`, each bookmark `domain="default"`. Old
+`config.json` (no `domains`) → `domains=[]`. Result: **default-only world, byte-identical
+behavior.** Covered by a dedicated old-state load test.
+
+### 17.6 Build phases (each failing-test-first; T3)
+
+1. **Schema types** — the four `serde(default)` additions + `default_domain_str`. Test: an
+   old-shape `state.json`/`config.json` loads to the default-only world (migration proof).
+2. **Config-declared domains at boot** — load `config.domains`, build durable domains with
+   per-domain seq seed/reserve/persist + skip-on-clash. Tests: a config domain boots with its
+   ports + isolated ingest; its seq high-water survives restart (durable-restart seq test);
+   a clashing config domain is skipped, daemon stays up.
+3. **Domain-routed bookmarks** — snapshot/restore refactor. Tests: a bookmark made in a config
+   domain survives restart and resolves (b>= matches post-restart ingest); a bookmark whose
+   domain vanished is dropped; default bookmarks still round-trip unchanged.
+4. **Persistent domains** — `domains.create(persist=true)` + promote-in-place + delete-removes.
+   Tests: create persist=true survives restart; promote an ephemeral in place; delete a
+   persistent removes it from `state.json` (gone after restart); persist=true on config errors.
+
+### 17.7 Open decisions surfaced for the design gate
+
+- **Config-wins on name collision** (vs. error) — chosen; gate to confirm it can't silently
+  mask a user typo.
+- **Skip-on-clash keeps the daemon up** (vs. fail-loud) — chosen for resilience parity with
+  finding C; gate to confirm a skipped domain degrades cleanly (no half-created state, clear
+  WARN, `domains.list` reflects absence).
+- **`default` seq stays top-level** (vs. unify into the map) — chosen for zero-migration; gate
+  to confirm the special-case doesn't desync the two seq paths.
+
+### 17.8 Design-gate outcome (2026-07-15) — Option A needs rework or rescoping
+
+Two fresh-context reviewers (buildability = Sonnet, soundness = Opus) reviewed §17 BEFORE
+any code. **The design is NOT sound/buildable as sketched** — the "simple additive" framing
+understated it. Convergent findings are load-bearing:
+
+- **[HIGH · convergent] Rebuild-from-live persistence is wrong for durable domains.** Shutdown
+  rebuilds `state.json` fresh from LIVE objects (`server.rs:497`, `session.rs:876`). A durable
+  domain SKIPPED at boot (port clash, §17.2 step 3) is absent from the live set, so an ordinary
+  graceful shutdown **erases** its persisted seq high-water + bookmarks (+ its `persistent_domains`
+  decl) — one transient port clash → permanent data loss + seq rewind. Fix: shutdown must **merge**
+  (carry forward declared-but-not-live domains' loaded state), not rebuild.
+- **[HIGH · convergent] Restore ordering.** `restore_named` runs at `server.rs:227`, BEFORE any
+  `Domain`/registry exists (built at `:357+`). Domain-routing bookmarks there drops 100% of them
+  (every lookup misses). Fix: split restore — triggers/filters early (unchanged), bookmarks LATE
+  (after all durable domains are inserted).
+- **[HIGH] Runtime `persist=true` writes stale state.** `RpcHandler` has no state handle / no
+  `save_state` today; §17.4's runtime write persists a stale boot-snapshot seq + bookmarks → data
+  loss on a later crash. Fix: a **separate decl file** (§5's original intent — resolves the
+  §5↔§17.1 contradiction) or re-snapshot live state under a lock.
+- **[MED] Boot binds receivers before persisting the seq reservation** (§17.2 reuses
+  `spawn_ephemeral_domain`'s bind-first shape) → seq-reuse window (masked today only because
+  buffers never persist). Fix: reserve+persist before bind.
+- **[MED] A declared domain named `default` isn't rejected** → could overwrite the real default
+  (seq rewind + bookmark loss via `insert`-replaces-by-key). Fix: reject at config/state load.
+- **[MED] Config-domain ports must be explicit** — omitted → auto-allocate re-randomizes every
+  restart, defeating a durable domain's fixed-port purpose.
+- **[BUILDABLE] Promote-in-place needs `RwLock<DomainSource>`** (source is immutable behind the
+  registry `Arc<Domain>`; ~3 read + 7 construct sites). `spawn_ephemeral_domain` also needs
+  seq + source params. `save_state` needs a lock (runtime vs shutdown race).
+- **[LOW] Config-wins prune** must remove only the decl (config domain inherits seq/bookmarks);
+  **downgrade round-trip** (old binary rewrites old-shape state.json) drops the new fields — note
+  as a known limit.
+
+**Key signal:** nearly every HIGH/MED hazard lives in the **seq + bookmark durability** — the part
+with **no current consumer** (dev-tracks are ephemeral). Config-declared domains *without*
+seq/bookmark durability (declarations-only, explicit ports, reject `default`) sidesteps the
+rebuild-vs-merge data loss, the restore re-ordering, the runtime-write staleness, and the seq-window
+entirely. **Scope re-decision surfaced to the user before rework/build.**
