@@ -14,6 +14,7 @@ use crate::{BrokerError, Notification};
 pub struct BrokerBuilder {
     socket_path: Option<PathBuf>,
     session_name: Option<String>,
+    domain: Option<String>,
     client_info: Option<Value>,
     reconnect_max_attempts: u32,
     reconnect_max_backoff: Duration,
@@ -27,6 +28,7 @@ impl Default for BrokerBuilder {
         Self {
             socket_path: None,
             session_name: None,
+            domain: None,
             client_info: None,
             reconnect_max_attempts: 10,
             reconnect_max_backoff: Duration::from_secs(30),
@@ -40,6 +42,16 @@ impl Default for BrokerBuilder {
 impl BrokerBuilder {
     pub fn session_name(mut self, name: impl Into<String>) -> Self {
         self.session_name = Some(name.into());
+        self
+    }
+    /// Bind the session to `domain` at connect time (the `session.start` `domain`
+    /// param). Unlike a post-connect `use_domain`, this binding is **re-sent on
+    /// every reconnect**, so it survives daemon restarts / socket blips — the
+    /// connection never silently reverts to `default`. Fail-loud: if the domain
+    /// does not exist at (re)connect, the handshake errors rather than falling
+    /// back to `default`.
+    pub fn domain(mut self, name: impl Into<String>) -> Self {
+        self.domain = Some(name.into());
         self
     }
     pub fn client_info(mut self, info: Value) -> Self {
@@ -89,6 +101,10 @@ impl BrokerBuilder {
 
     pub(crate) fn session_name_clone(&self) -> Option<String> {
         self.session_name.clone()
+    }
+
+    pub(crate) fn domain_clone(&self) -> Option<String> {
+        self.domain.clone()
     }
 
     pub(crate) fn client_info_clone(&self) -> Option<Value> {

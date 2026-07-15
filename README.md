@@ -44,7 +44,7 @@ The workspace has four crates that ship as one project:
 | `logmon-broker-sdk` (`crates/sdk`) | Typed Rust client. Talks JSON-RPC against the broker, exposes a typed notification stream, includes a filter-DSL builder and a reconnect state machine. |
 | `logmon-broker-protocol` (`crates/protocol`) | The wire types. Drift-guarded JSON Schema at `crates/protocol/protocol-v1.schema.json` for cross-language clients. |
 
-**Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. A session targets one via `use_domain` (MCP) or the `--domain` flag (CLI).
+**Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. A session targets one via `use_domain` (MCP) or the `--domain` flag (CLI). For a per-worktree / per-project setup, set **`LOGMON_DOMAIN`** in the MCP server's env once: the shim binds that domain at connect and **re-binds it on every reconnect** (durable across daemon restarts — never silently reverts to `default`), so every session auto-scopes with zero per-call ceremony. Create the domain before the shim connects; a missing domain is a loud handshake error, not a silent fallback.
 
 ## Installation
 

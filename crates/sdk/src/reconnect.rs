@@ -269,7 +269,10 @@ async fn try_handshake(
         name: mgr.session_name.clone(),
         protocol_version: PROTOCOL_VERSION,
         client_info: mgr.client_info.clone(),
-        domain: None,
+        // Re-send the connect-time domain on every reconnect so the binding is
+        // durable across daemon restarts / socket blips (never silently reverts
+        // to `default`).
+        domain: mgr.config.domain_clone(),
     };
     let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params).unwrap());
     let req_json = serde_json::to_string(&req).map_err(|e| BrokerError::Protocol(e.to_string()))?;
@@ -394,7 +397,7 @@ pub(crate) async fn initial_connect(
         name: session_name.clone(),
         protocol_version: PROTOCOL_VERSION,
         client_info: client_info.clone(),
-        domain: None,
+        domain: config.domain_clone(),
     };
     let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params).unwrap());
     let req_json = serde_json::to_string(&req).map_err(|e| BrokerError::Protocol(e.to_string()))?;

@@ -141,3 +141,42 @@ async fn domain_flag_does_not_block_creating_that_domain() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["name"], "t3");
 }
+
+/// Consumer #1: `LOGMON_DOMAIN` (set once per worktree) auto-scopes every
+/// invocation with no `--domain`; an explicit `--domain` overrides it.
+#[tokio::test]
+async fn logmon_domain_env_scopes_the_invocation() {
+    let (_daemon, cli) = spawn_with_cli().await;
+    run(&cli, &["domains", "create", "--name", "t3", "--json"]).await;
+    run(&cli, &["domains", "create", "--name", "t4", "--json"]).await;
+
+    // LOGMON_DOMAIN set, no --domain → auto-binds t3.
+    let mut cmd = cli.cmd();
+    cmd.env("LOGMON_DOMAIN", "t3").args(["status", "--json"]);
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["current_domain"], "t3",
+        "LOGMON_DOMAIN must scope an unflagged invocation"
+    );
+
+    // --domain overrides LOGMON_DOMAIN.
+    let mut cmd = cli.cmd();
+    cmd.env("LOGMON_DOMAIN", "t3")
+        .args(["--domain", "t4", "status", "--json"]);
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["current_domain"], "t4",
+        "--domain must override LOGMON_DOMAIN"
+    );
+}
