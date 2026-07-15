@@ -516,3 +516,44 @@ sound. Localized fixes to fold in:
   be bound non-default). Make the contract explicit: `DomainRegistry::get` clones the
   `Arc<Domain>` OUT of the `RwLock` guard so queries never hold the registry lock during
   execution — this is what makes delete-while-bound Arc-graceful.
+
+---
+
+## 16. Implementation status (Wave 2 — updated 2026-07-15)
+
+Wave 2 was built in a testability-driven refinement of §10's step order.
+
+**Done — the domain feature is core-complete:**
+- **Step 4 / stage 2.1** (keystone): `Domain`/`DomainRegistry`, resolve-at-boundary,
+  §9.1 three-site scoping, the seq-block fix (§8), F1–F6. Commits `01a6221`,
+  `654a5f7`, `723baec`.
+- **Step 5 / stage 2.2 — EPHEMERAL lifecycle** (`f512ea2`, `5c7906e`):
+  2.2a OTLP synchronous pre-bind (§9.3) + `tokio-stream` dep (port clash → clean
+  `Err`, aligning OTLP with GELF's fail-loud boot); 2.2b `domains.create/delete/list`
+  (ephemeral) + per-domain `DomainReceivers` (Arc-graceful teardown) + `max_domains`
+  + port allocation, wired as core RPC methods and tested end-to-end via real
+  GELF/OTLP ports (ingest isolation).
+- **Step 6 / stage 2.3 — binding + disposal** (`bb0ab67`, `d868e76`, `5feaccb`,
+  `f0c7b4e`): 2.3a `domains.use` + `session.start` `domain` param + event
+  re-subscribe (§9.4) + pre-buffer re-sync (§9.2/F4) + delete-while-bound keep-alive;
+  2.3b `domains.clear` + `SpanStore::clear`; 2.3c lazy buffer allocation (§6);
+  2.3d ad-hoc trigger windows default `0 → 500/200/5` (§6, decision #4).
+
+**Reorg vs §10:** `domains.create/delete/list/use/clear` were wired as core RPC
+methods DURING steps 5–6 (not batched into step 7), so each stage is testable
+end-to-end through the harness. Step 7 is thus reduced to the CLIENT surface.
+
+**Remaining:**
+- **Step 7 / stage 2.4 — surfacing**: SDK domain methods, `logmon domains` CLI,
+  MCP tools, the `"domains"` capability, and `status.get`
+  `current_domain`/`active_filters`.
+- **Deep adversarial gate** over the full Wave 2 diff (T3, pre-merge).
+- **DEFERRED — durability** (config-declared + persistent domains + durable bookmark
+  persistence — the rest of step 5's §5). Blocked on a persisted-schema decision.
+  **Gap found during 2.2:** §5/decision-#1 (durable domains persist bookmarks)
+  conflicts with §5's "persistent domains start fresh, no seq_block machinery" — a
+  bookmark anchors a **seq**, so a durable domain that resets its seq on reboot
+  dangles its restored bookmarks. `default` avoids this only because it persists its
+  seq high-water. Fixing it for durable non-default domains needs **per-domain seq
+  persistence in `DaemonState`**. The primary consumer (dev-tracks) uses ephemeral
+  domains and does not need durability, so this was deferred pending that decision.
