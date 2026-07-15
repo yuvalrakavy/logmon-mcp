@@ -271,7 +271,13 @@ impl TestDaemonHandle {
         name: &str,
         client_info: Option<Value>,
     ) -> anyhow::Result<TestClient> {
-        TestClient::try_connect(&self.socket_path, Some(name.to_string()), client_info).await
+        TestClient::try_connect(&self.socket_path, Some(name.to_string()), client_info, None).await
+    }
+
+    /// Connect a client bound to `domain` at connect-time (the `session.start`
+    /// `domain` param, an atomic connect-time `domains.use`).
+    pub async fn connect_with_domain(&self, name: Option<&str>, domain: &str) -> TestClient {
+        TestClient::connect_with_domain(&self.socket_path, name.map(String::from), domain).await
     }
 
     /// Spawn the daemon with the REAL GELF receiver (UDP+TCP bound to
@@ -400,9 +406,17 @@ impl TestClient {
         name: Option<String>,
         client_info: Option<Value>,
     ) -> Self {
-        Self::try_connect(socket_path, name, client_info)
+        Self::try_connect(socket_path, name, client_info, None)
             .await
             .expect("test client failed to connect")
+    }
+
+    /// Connect + handshake with a connect-time `domain` bind (the `session.start`
+    /// `domain` param). Panics on failure.
+    pub async fn connect_with_domain(socket_path: &Path, name: Option<String>, domain: &str) -> Self {
+        Self::try_connect(socket_path, name, None, Some(domain.to_string()))
+            .await
+            .expect("test client failed to connect with domain")
     }
 
     /// Connect + handshake, propagating errors.
@@ -416,6 +430,7 @@ impl TestClient {
         socket_path: &Path,
         name: Option<String>,
         client_info: Option<Value>,
+        domain: Option<String>,
     ) -> anyhow::Result<Self> {
         let stream = UnixStream::connect(socket_path).await?;
         let (reader, mut writer) = tokio::io::split(stream);
@@ -426,6 +441,7 @@ impl TestClient {
             name,
             protocol_version: PROTOCOL_VERSION,
             client_info,
+            domain,
         };
         let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params)?);
         let json = serde_json::to_string(&req)?;
@@ -519,7 +535,7 @@ impl TestClient {
         name: Option<String>,
         client_info: Option<Value>,
     ) -> anyhow::Result<SessionStartResult> {
-        let client = Self::try_connect(socket_path, name, client_info).await?;
+        let client = Self::try_connect(socket_path, name, client_info, None).await?;
         Ok(client.session_start_result.clone())
     }
 

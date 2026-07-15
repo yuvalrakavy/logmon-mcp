@@ -70,6 +70,11 @@ pub struct SessionStartParams {
     /// this field; size validation lands in Task 11.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_info: Option<Value>,
+    /// Optional connect-time domain bind: an atomic equivalent of calling
+    /// `domains.use` immediately after connecting. Errors the handshake if the
+    /// named domain does not exist. Omitted → the `default` domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// session.start response

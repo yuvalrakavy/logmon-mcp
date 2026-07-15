@@ -601,6 +601,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             name: None,
             protocol_version: 0,
             client_info: None,
+            domain: None,
         });
 
     if params.protocol_version != PROTOCOL_VERSION {
@@ -630,6 +631,34 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             return Ok(());
         }
     }
+
+    // 2c. Validate the optional connect-time domain bind BEFORE creating the
+    //     session, so an unknown domain errors the handshake rather than
+    //     silently leaving the session on `default`.
+    let connect_domain_id = match &params.domain {
+        Some(name) => match DomainId::new(name) {
+            Ok(id) if domains.contains(&id) => Some(id),
+            Ok(id) => {
+                let resp = RpcResponse::error(
+                    first_request.id,
+                    -32602,
+                    &format!("domain \"{id}\" does not exist — create it first"),
+                );
+                write_message(&mut writer, &resp).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                let resp = RpcResponse::error(
+                    first_request.id,
+                    -32602,
+                    &format!("invalid domain name: {e}"),
+                );
+                write_message(&mut writer, &resp).await?;
+                return Ok(());
+            }
+        },
+        None => None,
+    };
 
     // 3. Create/reconnect session
     let (session_id, is_new) = match &params.name {
@@ -666,6 +695,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         sessions.set_client_info(&session_id, params.client_info.clone());
     }
 
+    // 3c. Apply the validated connect-time domain bind. Done before the event
+    //     subscription resolves the session's domain (F6), so event_rx starts
+    //     on the bound domain's channel.
+    if let Some(id) = connect_domain_id {
+        sessions.set_domain(&session_id, id);
+    }
+
     info!(?session_id, is_new, "session started");
 
     // 4. Send session start response
@@ -695,6 +731,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         .expect("default domain is always present")
         .pipeline
         .subscribe_events();
+    // The domain whose event channel `event_rx` is currently subscribed to.
+    // Tracked so the loop can re-subscribe when the binding changes (§9.4).
+    let mut current_domain = connect_domain;
 
     // 7. Main loop
     loop {
@@ -704,6 +743,17 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(Some(request)) => {
                         let response = handler.handle_async(&session_id, &request).await;
                         write_message(&mut writer, &response).await?;
+                        // §9.4: if the request rebound this session (domains.use),
+                        // re-point the event subscription at the newly-bound
+                        // domain's channel so live trigger notifications follow
+                        // the rebind. F1 already cleared any stale queued events.
+                        let bound = sessions.domain_of(&session_id);
+                        if bound != current_domain {
+                            if let Some(d) = domains.get(&bound) {
+                                event_rx = d.pipeline.subscribe_events();
+                                current_domain = bound;
+                            }
+                        }
                     }
                     Ok(None) => {
                         // EOF
@@ -738,8 +788,26 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         warn!(?session_id, n, "broadcast lagged, dropped events");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!(?session_id, "event channel closed");
-                        break;
+                        // The subscribed domain's pipeline was torn down — the
+                        // domain was deleted while this session was bound to it.
+                        // Keep the connection ALIVE by re-subscribing to the
+                        // session's current binding (or `default` if that is also
+                        // gone) so the client can `domains.use` to rebind rather
+                        // than being disconnected. Queries meanwhile surface the
+                        // vanished-domain error (§5). `default` is never deletable,
+                        // so this cannot busy-loop.
+                        let bound = sessions.domain_of(&session_id);
+                        if let Some(d) = domains.get(&bound) {
+                            event_rx = d.pipeline.subscribe_events();
+                            current_domain = bound;
+                        } else if let Some(d) = domains.get(&DomainId::default_domain()) {
+                            info!(?session_id, "bound domain deleted; event channel re-subscribed to default");
+                            event_rx = d.pipeline.subscribe_events();
+                            current_domain = DomainId::default_domain();
+                        } else {
+                            info!(?session_id, "event channel closed; no domain to re-subscribe");
+                            break;
+                        }
                     }
                 }
             }

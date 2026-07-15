@@ -50,11 +50,13 @@ fn test_session_start_params_roundtrip() {
         name: Some("store-debug".to_string()),
         protocol_version: PROTOCOL_VERSION,
         client_info: None,
+        domain: Some("t3".to_string()),
     };
     let json = serde_json::to_string(&params).unwrap();
     let parsed: SessionStartParams = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.name.as_deref(), Some("store-debug"));
     assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(parsed.domain.as_deref(), Some("t3"));
 }
 
 #[test]

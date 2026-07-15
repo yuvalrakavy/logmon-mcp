@@ -116,6 +116,7 @@ impl RpcHandler {
             "session.drop" => self.handle_session_drop(&request.params),
             "domains.delete" => self.handle_domains_delete(&request.params),
             "domains.list" => self.handle_domains_list(),
+            "domains.use" => self.handle_domains_use(session_id, &request.params),
             "traces.recent" => self.handle_traces_recent(session_id, &request.params),
             "traces.get" => self.handle_traces_get(session_id, &request.params),
             "traces.summary" => self.handle_traces_summary(session_id, &request.params),
@@ -275,6 +276,36 @@ impl RpcHandler {
             self.domains.list().iter().map(|d| domain_to_info(d)).collect();
         domains.sort_by(|a, b| a.name.cmp(&b.name));
         serde_json::to_value(DomainsListResult { domains }).map_err(|e| e.to_string())
+    }
+
+    /// Bind the calling session to an existing domain (`domains.use`). Errors if
+    /// the domain is absent — no silent fallback to `default` (§5). `set_domain`
+    /// clears the session's notification queue (F1) and resets its post-window
+    /// (F3) on a real change. The pre-trigger buffer is re-synced for BOTH the
+    /// old and new domain (§9.2/F4): the old domain's max pre-window may shrink
+    /// now that this session left it, and the new domain's may grow.
+    fn handle_domains_use(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let req: DomainsUse = serde_json::from_value(params.clone())
+            .map_err(|e| format!("invalid domains.use params: {e}"))?;
+        let new_id = DomainId::new(&req.name).map_err(|e| e.to_string())?;
+        let new_domain = self
+            .domains
+            .get(&new_id)
+            .ok_or_else(|| format!("domain \"{new_id}\" does not exist — create it first"))?;
+
+        let old_id = self.sessions.domain_of(session_id);
+        // set_domain runs BEFORE the syncs so max_pre_window reflects the new
+        // binding (F4).
+        self.sessions.set_domain(session_id, new_id.clone());
+
+        if old_id != new_id {
+            if let Some(old_domain) = self.domains.get(&old_id) {
+                sync_pre_buffer_size_for_domain(&old_domain.pipeline, &self.sessions, &old_id);
+            }
+        }
+        sync_pre_buffer_size_for_domain(&new_domain.pipeline, &self.sessions, &new_id);
+
+        serde_json::to_value(domain_to_info(&new_domain)).map_err(|e| e.to_string())
     }
 
     // -----------------------------------------------------------------------

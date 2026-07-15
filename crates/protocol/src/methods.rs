@@ -781,3 +781,23 @@ pub struct DomainsList {}
 pub struct DomainsListResult {
     pub domains: Vec<DomainInfo>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsUse {
+    pub name: String,
+}
+
+/// `domains.use` returns the now-bound domain (same shape as a `domains.list`
+/// entry).
+pub type DomainsUseResult = DomainInfo;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsClear {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsClearResult {
+    /// Number of log records disposed from the bound domain.
+    pub logs_cleared: usize,
+    /// Number of spans disposed from the bound domain.
+    pub spans_cleared: usize,
+}

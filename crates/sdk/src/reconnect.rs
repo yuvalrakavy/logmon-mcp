@@ -271,6 +271,7 @@ async fn try_handshake(
         name: mgr.session_name.clone(),
         protocol_version: PROTOCOL_VERSION,
         client_info: mgr.client_info.clone(),
+        domain: None,
     };
     let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params).unwrap());
     let req_json = serde_json::to_string(&req)
@@ -393,6 +394,7 @@ pub(crate) async fn initial_connect(
         name: session_name.clone(),
         protocol_version: PROTOCOL_VERSION,
         client_info: client_info.clone(),
+        domain: None,
     };
     let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params).unwrap());
     let req_json =
