@@ -35,18 +35,22 @@ pub struct DomainPortSpec {
     pub otlp_http: Option<u16>,
 }
 
-/// Bind a fresh ephemeral domain's receivers, spawn its domain-scoped log + span
-/// processors, and return the assembled `Arc<Domain>`. Does NOT insert into the
-/// registry — the caller does that after its idempotency / `max_domains` checks.
+/// Bind a fresh domain's receivers, spawn its domain-scoped log + span
+/// processors, and return the assembled `Arc<Domain>` tagged with `source`
+/// (`Ephemeral` for `domains.create`, `Config` for a boot-time config domain).
+/// Does NOT insert into the registry — the caller does that after its
+/// idempotency / `max_domains` checks.
 ///
 /// The domain's `ReceiverMetrics` is shared with its receivers so drop counts
-/// are visible to `status.get`. A fresh ephemeral domain starts at seq 0.
+/// are visible to `status.get`. The domain starts at seq 0 (data is never
+/// persisted, so config domains re-created at boot also start fresh).
 pub async fn spawn_ephemeral_domain(
     id: DomainId,
     ports: DomainPortSpec,
     log_buffer_size: usize,
     span_buffer_size: usize,
     sessions: Arc<SessionRegistry>,
+    source: DomainSource,
 ) -> anyhow::Result<Arc<Domain>> {
     let (log_tx, log_rx) = mpsc::channel::<LogEntry>(LOG_CHANNEL_CAP);
     let (span_tx, span_rx) = mpsc::channel::<SpanEntry>(SPAN_CHANNEL_CAP);
@@ -88,7 +92,7 @@ pub async fn spawn_ephemeral_domain(
         otlp_http_port,
         log_buffer_size,
         span_buffer_size,
-        source: DomainSource::Ephemeral,
+        source,
     };
     let mut domain = Domain::new_with_metrics(config, 0, metrics);
 

@@ -84,6 +84,27 @@ pub struct DaemonState {
     pub named_sessions: HashMap<String, PersistedSession>,
 }
 
+/// A durable, user-declared domain from `config.json`. Re-created at boot with
+/// its declared ports; buffers start empty and seq at 0 (like `default` — domain
+/// data is never persisted). Ports mirror `domains.create`: omitted →
+/// auto-allocate; `Some(0)` → disable that receiver; `Some(n)` → bind exactly
+/// `n`. NOTE: omitted ports re-allocate on every restart, so declare explicit
+/// ports for a domain an external producer targets by a fixed port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigDomain {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gelf_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_grpc_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_http_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_buffer_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_buffer_size: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
     #[serde(default = "default_gelf_port")]
@@ -110,6 +131,11 @@ pub struct DaemonConfig {
     /// reached.
     #[serde(default = "default_max_domains")]
     pub max_domains: usize,
+    /// Durable, user-declared domains re-created at boot (declarations-only:
+    /// empty buffers, fresh seq). Empty by default; an old `config.json` without
+    /// the key loads as `[]`.
+    #[serde(default)]
+    pub domains: Vec<ConfigDomain>,
 }
 
 fn default_gelf_port() -> u16 {
@@ -147,6 +173,7 @@ impl Default for DaemonConfig {
             otlp_http_port: 4318,
             span_buffer_size: 10000,
             max_domains: 32,
+            domains: Vec::new(),
         }
     }
 }

@@ -1,4 +1,5 @@
 use crate::daemon::domain::{Domain, DomainConfig, DomainId, DomainRegistry, DomainSource};
+use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::{spawn_log_processor, sync_pre_buffer_size};
 use crate::daemon::persistence::{
     config_dir, load_state, save_state, DaemonConfig, DaemonState, SEQ_BLOCK_SIZE,
@@ -370,6 +371,64 @@ pub async fn run_with_overrides(
         bookmark_store.clone(),
         receiver_metrics.clone(),
     )));
+
+    // 12c. Build config-declared domains (§17.9): user-declared durable domains
+    //      re-created at boot, DECLARATIONS-ONLY (empty buffers, fresh seq — data
+    //      never persists). Each binds its own receivers. A `default`-named entry,
+    //      a duplicate, an invalid name, or a bind failure (port clash) is SKIPPED
+    //      with a WARN so one bad entry can't take the daemon down; bound ports are
+    //      logged. (Per-domain seq/bookmark durability + `persist=true` are §17
+    //      deferred work.)
+    let mut seen_config_domains: std::collections::HashSet<DomainId> =
+        std::collections::HashSet::new();
+    for cd in &config.domains {
+        let id = match DomainId::new(&cd.name) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(name = %cd.name, error = %e, "invalid config domain name; skipping");
+                continue;
+            }
+        };
+        if id == DomainId::default_domain() {
+            warn!("config domain named 'default' is reserved; skipping");
+            continue;
+        }
+        if !seen_config_domains.insert(id.clone()) {
+            warn!(name = %cd.name, "duplicate config domain name; skipping");
+            continue;
+        }
+        let ports = DomainPortSpec {
+            gelf: cd.gelf_port,
+            otlp_grpc: cd.otlp_grpc_port,
+            otlp_http: cd.otlp_http_port,
+        };
+        let log_sz = cd.log_buffer_size.unwrap_or(config.buffer_size);
+        let span_sz = cd.span_buffer_size.unwrap_or(config.span_buffer_size);
+        match spawn_ephemeral_domain(
+            id.clone(),
+            ports,
+            log_sz,
+            span_sz,
+            sessions.clone(),
+            DomainSource::Config,
+        )
+        .await
+        {
+            Ok(domain) => {
+                info!(
+                    name = %id,
+                    gelf = domain.config.gelf_port,
+                    otlp_grpc = domain.config.otlp_grpc_port,
+                    otlp_http = domain.config.otlp_http_port,
+                    "config domain started"
+                );
+                domains.insert(domain);
+            }
+            Err(e) => {
+                warn!(name = %id, error = %e, "config domain failed to start (e.g. port clash); skipping");
+            }
+        }
+    }
 
     // 13. Create RpcHandler. It resolves each request's bound domain out of the
     //     registry (once, at the boundary) and runs the store code against it.

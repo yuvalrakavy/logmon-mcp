@@ -326,6 +326,19 @@ Config files are stored in `~/.config/logmon/`:
 - `config.json` — daemon settings (ports, buffer size, idle timeout)
 - `state.json` — persisted state (seq counter, named sessions)
 
+**Config-declared domains.** `config.json` may declare durable, isolated domains — each a full broker instance with its own receivers, buffers, and triggers — re-created on every boot:
+
+```json
+{
+  "gelf_port": 12201,
+  "domains": [
+    { "name": "staging", "gelf_port": 12300, "otlp_grpc_port": 0, "otlp_http_port": 0 }
+  ]
+}
+```
+
+Ports are optional (omitted → auto-allocated; `0` → that receiver disabled) — declare explicit ports for a domain an external producer targets by a fixed port. Config domains hold no persisted data (empty buffers, fresh seq each boot); `domains delete` refuses them (edit `config.json`). Query one from the CLI with `logmon-mcp --domain staging logs recent`. A malformed or port-clashing entry is skipped with a warning; the daemon still starts.
+
 ### CLI
 
 ```bash

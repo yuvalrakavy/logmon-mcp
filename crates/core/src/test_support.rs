@@ -57,6 +57,7 @@ pub fn default_test_config() -> DaemonConfig {
         otlp_http_port: 0,
         span_buffer_size: 1_000,
         max_domains: 32,
+        domains: Vec::new(),
     }
 }
 

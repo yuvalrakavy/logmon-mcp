@@ -284,6 +284,7 @@ impl RpcHandler {
             log_buffer_size,
             span_buffer_size,
             self.sessions.clone(),
+            DomainSource::Ephemeral,
         )
         .await
         .map_err(|e| format!("could not create domain: {e}"))?;

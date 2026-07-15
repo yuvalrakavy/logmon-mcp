@@ -746,3 +746,32 @@ with **no current consumer** (dev-tracks are ephemeral). Config-declared domains
 seq/bookmark durability (declarations-only, explicit ports, reject `default`) sidesteps the
 rebuild-vs-merge data loss, the restore re-ordering, the runtime-write staleness, and the seq-window
 entirely. **Scope re-decision surfaced to the user before rework/build.**
+
+### 17.9 Chosen build (2026-07-15): config-declared domains, DECLARATIONS-ONLY
+
+Per the re-decision, Option A's seq + bookmark durability and `persist=true` are **deferred**
+(revisit when a durable-domain consumer exists). This build adds only **config-declared domains**,
+which touch **zero `state.json` schema** and so avoid every HIGH gate finding above.
+
+- **Schema (`config.json` only):** `DaemonConfig` gains `#[serde(default)] domains: Vec<ConfigDomain>`,
+  `ConfigDomain { name, gelf_port/otlp_grpc_port/otlp_http_port: Option<u16>, log_buffer_size/span_buffer_size: Option<usize> }`.
+  Ports mirror `domains.create`: omitted → auto-allocate; `Some(0)` → disable that receiver;
+  `Some(n)` → bind n. Buffer sizes default to the daemon-level `buffer_size`/`span_buffer_size`.
+  Old `config.json` (no `domains`) → `[]`; zero migration.
+- **Boot** (`server.rs`, after `default` is assembled + inserted): for each `ConfigDomain`, validate
+  (`DomainId::new`; **reject the literal name `default`**; skip a duplicate name) then build it via
+  the ephemeral builder with `source = Config` (fresh seq 0, empty buffers — like `default`'s
+  buffers, which never persist), binding its receivers. A **bad entry or bind failure SKIPS that
+  domain with a loud WARN — the daemon keeps running** (default + siblings up); the bound ports are
+  logged at `info`.
+- **Builder:** `spawn_ephemeral_domain` gains a `source: DomainSource` param (its one caller passes
+  `Ephemeral`; boot passes `Config`); seq stays 0 for both. No other change.
+- **Lifecycle (all already implemented — verified):** `domains.delete` refuses `source==Config`
+  (edit config.json); config domains do NOT count against `max_domains` (`source != Config`);
+  `domains.create` on a config-domain name idempotently ensures (matching ports → no-op).
+- **Deferred (unchanged from Option A):** per-domain seq persistence, domain-routed bookmark
+  persistence, `persist=true`/persistent domains, promote-in-place. Recorded here so the next
+  builder picks up §17.1–17.8 with the gate findings already mapped.
+- **Tests (failing-first):** config domain boots + isolated ingest on its port; `default`-named
+  entry rejected (only the real default remains); port-clash entry skipped, daemon stays up;
+  `domains.delete` on a config domain refused; buffer-size defaults applied.
