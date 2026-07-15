@@ -183,14 +183,14 @@ domains.list()
                     source:"config"|"persistent"|"ephemeral", log_buffer_size, span_buffer_size,
                     log_count, span_count, oldest_seq, newest_seq,
                     last_log_received_at, last_span_received_at, idle_secs, stale } ] }
-  # Pure registry view — no session context. (Liveness fields populated in Wave 3 / B7;
-  #   Wave 2 ships them null.)
+  # Pure registry view — no session context. (Liveness fields last_log/span_received_at,
+  #   idle_secs, stale are LIVE — pulled forward from B7 by consumer feedback #2; see §18.)
 ```
 
 **Flag-backs to the Store dev-tracks spec (§13):** 3 ports not 4 (`gelf_port` = UDP+TCP);
 method names `domains.create/use/...`; the `persist` flag + `source:config|persistent|ephemeral`
 taxonomy; `session.start` `domain` param; `domains.clear`; liveness fields; the OTLP beacon
-caveat (§9.8). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+N`.
+caveat (§9.8). Derivation `gelf 12201+N / otlp_grpc 4317+2N / otlp_http 4318+2N` — OTLP strides by **2** because 4317/4318 are adjacent (a `+N` stride collides at N≥1; see §18/#4).
 
 **Capabilities:** add `"domains"` (`rpc_handler.rs:88-92`).
 
@@ -474,7 +474,7 @@ delete/list/clear`; the **`persist` flag** on `domains.create` + the
 `session.start` `domain` param; `domains.list` shape; stall/liveness fields; and the
 **OTLP beacon caveat** (§9.8 — the current `OTEL:ONLINE` beacon can't distinguish domains
 without a payload/wire change; if dev-tracks' tracing-init keys off it, that needs
-addressing). Derivation stays `gelf 12201+N / otlp_grpc 4317+N / otlp_http 4318+N`.
+addressing). Derivation `gelf 12201+N / otlp_grpc 4317+2N / otlp_http 4318+2N` — OTLP strides by **2** because 4317/4318 are adjacent (a `+N` stride collides at N≥1; see §18/#4).
 
 ## 14. Cross-references
 

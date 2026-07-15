@@ -260,16 +260,26 @@ impl RpcHandler {
             otlp_http: req.otlp_http_port,
         };
 
-        // A single domain's OTLP gRPC and HTTP arms cannot share a port; the
-        // synchronous bind would otherwise fail with a cryptic "address in use".
-        // (Related trap for port-derivation schemes: the OTLP defaults 4317/4318
-        // are ADJACENT, so a naive per-track base+N stride collides at N≥1 across
-        // domains — step OTLP by ≥2. See the config docs. Consumer #4.)
-        if let (Some(g), Some(h)) = (req.otlp_grpc_port, req.otlp_http_port) {
-            if g != 0 && g == h {
-                return Err(format!(
-                    "otlp_grpc_port and otlp_http_port must differ (both = {g})"
-                ));
+        // No two of a domain's ports (GELF, OTLP gRPC, OTLP HTTP) may coincide —
+        // the synchronous bind would otherwise fail with a cryptic "address in
+        // use". A `0` (disabled) or omitted port is exempt. (Consumer #4; note the
+        // OTLP defaults 4317/4318 are ADJACENT, so a per-track base+N stride must
+        // step OTLP by ≥2 across domains — see the config docs.)
+        let named_ports = [
+            ("gelf_port", req.gelf_port),
+            ("otlp_grpc_port", req.otlp_grpc_port),
+            ("otlp_http_port", req.otlp_http_port),
+        ];
+        for i in 0..named_ports.len() {
+            for j in (i + 1)..named_ports.len() {
+                if let (Some(a), Some(b)) = (named_ports[i].1, named_ports[j].1) {
+                    if a != 0 && a == b {
+                        return Err(format!(
+                            "{} and {} must differ (both = {a})",
+                            named_ports[i].0, named_ports[j].0
+                        ));
+                    }
+                }
             }
         }
 

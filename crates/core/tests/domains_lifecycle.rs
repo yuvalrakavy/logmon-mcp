@@ -698,6 +698,20 @@ async fn create_rejects_equal_otlp_ports() {
         "expected a clear 'must differ' error, got: {err}"
     );
 
+    // GELF sharing an OTLP port is also caught (generalized to all port pairs).
+    let res: anyhow::Result<DomainInfo> = client
+        .call(
+            "domains.create",
+            json!({ "name": "z", "gelf_port": 6666, "otlp_grpc_port": 6666, "otlp_http_port": 0 }),
+        )
+        .await;
+    assert!(
+        res.expect_err("gelf == otlp_grpc must be rejected")
+            .to_string()
+            .contains("must differ"),
+        "any two coinciding non-zero ports must be rejected"
+    );
+
     // Both 0 (disabled) is not a collision.
     let ok: DomainInfo = client
         .call(

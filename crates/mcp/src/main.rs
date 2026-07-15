@@ -23,7 +23,8 @@ struct Cli {
     session: Option<String>,
 
     /// Bind to an existing domain. MCP stdio mode: a connect-time bind, re-applied
-    /// on every reconnect (durable — never silently reverts to `default`). CLI
+    /// on every reconnect when a named `--session` is used (durable; an anonymous
+    /// session fails loud on restart, never a silent `default`). CLI
     /// mode: scopes this invocation (queries + `domains clear`; create/delete/list
     /// ignore it). Falls back to the `LOGMON_DOMAIN` env var (set once per
     /// worktree). Omitted → `default`. The domain must exist (fail-loud).

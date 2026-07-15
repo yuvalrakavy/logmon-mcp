@@ -44,7 +44,7 @@ The workspace has four crates that ship as one project:
 | `logmon-broker-sdk` (`crates/sdk`) | Typed Rust client. Talks JSON-RPC against the broker, exposes a typed notification stream, includes a filter-DSL builder and a reconnect state machine. |
 | `logmon-broker-protocol` (`crates/protocol`) | The wire types. Drift-guarded JSON Schema at `crates/protocol/protocol-v1.schema.json` for cross-language clients. |
 
-**Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. A session targets one via `use_domain` (MCP) or the `--domain` flag (CLI). For a per-worktree / per-project setup, set **`LOGMON_DOMAIN`** in the MCP server's env once: the shim binds that domain at connect and **re-binds it on every reconnect** (durable across daemon restarts — never silently reverts to `default`), so every session auto-scopes with zero per-call ceremony. Create the domain before the shim connects; a missing domain is a loud handshake error, not a silent fallback.
+**Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. A session targets one via `use_domain` (MCP) or the `--domain` flag (CLI). For a per-worktree / per-project setup, set **`LOGMON_DOMAIN`** in the MCP server's env once — **alongside a named `--session`** — so the shim binds that domain at connect and **re-binds it on every reconnect** (durable across daemon restarts). Reconnect-preservation needs a named session: an anonymous session can't resume a restart, so it fails *loud* (never a silent revert to `default`) and the shim is restarted. Every session then auto-scopes with zero per-call ceremony. Create the domain before the shim connects; a missing domain is a loud handshake error, not a silent fallback.
 
 ## Installation
 
@@ -446,9 +446,13 @@ Defaults:
   "otlp_http_port": 4318,
   "buffer_size": 10000,
   "span_buffer_size": 10000,
-  "idle_timeout_secs": 1800
+  "idle_timeout_secs": 1800,
+  "max_domains": 32,
+  "stale_after_secs": 60
 }
 ```
+
+`max_domains` caps API-created domains (config/`default` don't count). `stale_after_secs` is the idle threshold above which `list_domains` reports a domain `stale` (`idle_secs` is always reported raw, so tune or ignore this to fit your workload's cadence).
 
 **Config-declared domains.** Add a `domains` array to declare durable, isolated domains — each a full broker instance with its own receivers, buffers, and triggers — re-created on every boot:
 

@@ -2809,6 +2809,380 @@
         "receivers"
       ]
     },
+    "DomainInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainInfo",
+      "description": "A single domain as reported by `domains.list` and `domains.create`.\n\nA port value of `0` means that receiver is disabled for the domain. The\ncount/seq fields reflect the domain's live buffers; the `last_*_received_at` /\n`idle_secs` / `stale` liveness fields answer \"is this domain actually\nreceiving?\" (`status.get.receiver_liveness` gives the per-listener drill-down).",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "gelf_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_grpc_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_http_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "source": {
+          "description": "`\"config\"` | `\"persistent\"` | `\"ephemeral\"`.",
+          "type": "string"
+        },
+        "log_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "span_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "log_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "span_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "oldest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_log_received_at": {
+          "description": "Wall-clock of the last log ingested into this domain (across any listener),\nor `None` if none ever arrived. A `None` here is the \"nothing is shipping\nto this domain — did I misconfigure the port?\" signal. (Consumer #2.)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_span_received_at": {
+          "description": "Wall-clock of the last span ingested into this domain, or `None`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "idle_secs": {
+          "description": "Seconds since the most recent log OR span ingest; `None` if neither ever\narrived.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stale": {
+          "description": "`true` when the domain HAS received before but has been idle longer than\nthe broker's `stale_after_secs` (config, default 60s). A never-received\ndomain is `false` — distinguish it via `last_*_received_at == None`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name",
+        "gelf_port",
+        "otlp_grpc_port",
+        "otlp_http_port",
+        "source",
+        "log_buffer_size",
+        "span_buffer_size",
+        "log_count",
+        "span_count"
+      ]
+    },
+    "DomainsCreate": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsCreate",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "gelf_port": {
+          "description": "GELF UDP+TCP port. Omitted → auto-allocate; `0` → disable GELF for this\ndomain; otherwise bind exactly this port (error if held by another domain).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_grpc_port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_http_port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "log_buffer_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "span_buffer_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "persist": {
+          "description": "`false` (default) → ephemeral (gone on restart). `true` → durable\n(re-created at boot). Durable domains are a later stage; Wave 2 accepts\nonly ephemeral creation.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "DomainsDelete": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsDelete",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "DomainsDeleteResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsDeleteResult",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "deleted"
+      ]
+    },
+    "DomainsList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsList",
+      "type": "object"
+    },
+    "DomainsListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsListResult",
+      "type": "object",
+      "properties": {
+        "domains": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainInfo"
+          }
+        }
+      },
+      "required": [
+        "domains"
+      ],
+      "$defs": {
+        "DomainInfo": {
+          "description": "A single domain as reported by `domains.list` and `domains.create`.\n\nA port value of `0` means that receiver is disabled for the domain. The\ncount/seq fields reflect the domain's live buffers; the `last_*_received_at` /\n`idle_secs` / `stale` liveness fields answer \"is this domain actually\nreceiving?\" (`status.get.receiver_liveness` gives the per-listener drill-down).",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "gelf_port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "otlp_grpc_port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "otlp_http_port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "source": {
+              "description": "`\"config\"` | `\"persistent\"` | `\"ephemeral\"`.",
+              "type": "string"
+            },
+            "log_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "span_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "log_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "span_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "oldest_seq": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "newest_seq": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "last_log_received_at": {
+              "description": "Wall-clock of the last log ingested into this domain (across any listener),\nor `None` if none ever arrived. A `None` here is the \"nothing is shipping\nto this domain — did I misconfigure the port?\" signal. (Consumer #2.)",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "last_span_received_at": {
+              "description": "Wall-clock of the last span ingested into this domain, or `None`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "idle_secs": {
+              "description": "Seconds since the most recent log OR span ingest; `None` if neither ever\narrived.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "stale": {
+              "description": "`true` when the domain HAS received before but has been idle longer than\nthe broker's `stale_after_secs` (config, default 60s). A never-received\ndomain is `false` — distinguish it via `last_*_received_at == None`.",
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "name",
+            "gelf_port",
+            "otlp_grpc_port",
+            "otlp_http_port",
+            "source",
+            "log_buffer_size",
+            "span_buffer_size",
+            "log_count",
+            "span_count"
+          ]
+        }
+      }
+    },
+    "DomainsUse": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsUse",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "DomainsClear": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsClear",
+      "type": "object"
+    },
+    "DomainsClearResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsClearResult",
+      "type": "object",
+      "properties": {
+        "logs_cleared": {
+          "description": "Number of log records disposed from the bound domain.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "spans_cleared": {
+          "description": "Number of spans disposed from the bound domain.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "logs_cleared",
+        "spans_cleared"
+      ]
+    },
     "TriggerFiredPayload": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TriggerFiredPayload",

@@ -114,6 +114,16 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "StatusGetResult":       schema_for!(StatusGetResult),
             "SessionStartParams":    schema_for!(SessionStartParams),
             "SessionStartResult":    schema_for!(SessionStartResult),
+            // domains.* (DomainsCreateResult / DomainsUseResult are aliases of DomainInfo)
+            "DomainInfo":            schema_for!(DomainInfo),
+            "DomainsCreate":         schema_for!(DomainsCreate),
+            "DomainsDelete":         schema_for!(DomainsDelete),
+            "DomainsDeleteResult":   schema_for!(DomainsDeleteResult),
+            "DomainsList":           schema_for!(DomainsList),
+            "DomainsListResult":     schema_for!(DomainsListResult),
+            "DomainsUse":            schema_for!(DomainsUse),
+            "DomainsClear":          schema_for!(DomainsClear),
+            "DomainsClearResult":    schema_for!(DomainsClearResult),
             // Notification payloads
             "TriggerFiredPayload":   schema_for!(TriggerFiredPayload),
             // Shared types
