@@ -105,7 +105,8 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 
 ### Sessions
 
-- **`get_sessions` / `drop_session(name)`** — list connected sessions; remove a named session and its state.
+- **`get_sessions` / `drop_session(name)`** — list connected sessions; remove a named session and its state. Named sessions persist across reconnects; a *disconnected* one is disposed automatically after the broker's session TTL (default 24 h).
+- **`rename_session(name)`** — rename the current session in place; all state (domain binding, triggers, filters, bookmarks) survives. Use it to claim a meaningful identity (convention: `<Project>-Main-<uuid8>` for a main/home session, `<Project>-tN-<branch>` for a worktree lane). An "already connected" error means another LIVE client holds that name — stop and surface it to the user rather than picking a variant; a *disconnected* holder is displaced automatically (`displaced_stale_holder: true`).
 
 ### Traces (OTLP)
 
@@ -124,7 +125,7 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 
 Domains are isolated broker instances — each has its own log/span buffers, receivers (GELF/OTLP ports), triggers, and filters. Use them to keep unrelated log streams from interleaving (e.g. one per dev-server or test run). The `default` domain is the always-on anchor; a session stays on `default` until it switches.
 
-- **`list_domains()`** — live domains with ports, source, log/span counts, and **liveness**: `last_log_received_at` / `last_span_received_at`, `idle_secs`, `stale`. A `last_*_received_at` of `null` means nothing has shipped to that domain yet — the "is my stack actually reaching this domain, or did I misconfigure the port?" check.
+- **`list_domains()`** — live domains with ports, source, log/span counts, `bound_sessions` (which sessions are bound to each domain; disconnected holders suffixed), and **liveness**: `last_log_received_at` / `last_span_received_at`, `idle_secs`, `stale`. A `last_*_received_at` of `null` means nothing has shipped to that domain yet — the "is my stack actually reaching this domain, or did I misconfigure the port?" check.
 - **`create_domain(name, gelf_port?, otlp_grpc_port?, otlp_http_port?, ...)`** — create (or idempotently ensure) an ephemeral domain. Omitted ports auto-allocate; `0` disables that receiver.
 - **`use_domain(name)`** — bind this session; subsequent queries and trigger notifications target it until you switch again.
 - **`clear_domain()`** — dispose the bound domain's logs + spans (keeps it alive; seq stays monotonic).

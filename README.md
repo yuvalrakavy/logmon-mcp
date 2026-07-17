@@ -283,8 +283,9 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `get_triggers` / `add_trigger` / `edit_trigger` / `remove_trigger` | Per-session triggers. |
 | `add_bookmark` / `list_bookmarks` / `remove_bookmark` / `clear_bookmarks` | Bookmarks (also act as cursors via `c>=`). |
 | `get_sessions` / `drop_session` | Multi-session inspection. |
+| `rename_session` | Rename this session in place — all state (domain binding, triggers, filters, bookmarks) survives. A name held by a *connected* session errors (deliberate: two live clients must not share an identity); a *disconnected* holder is displaced (reported via `displaced_stale_holder`). |
 | `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, current domain + active filters, and per-listener `receiver_liveness`. |
-| `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale). |
+| `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale) and `bound_sessions` — which sessions are bound to each domain (derived from the session registry; disconnected holders are suffixed). |
 | `use_domain` | Bind this session to a domain for subsequent queries + notifications. |
 | `clear_domain` | Dispose the bound domain's logs + spans (keeps the domain alive). |
 
@@ -452,7 +453,7 @@ Defaults:
 }
 ```
 
-`max_domains` caps API-created domains (config/`default` don't count). `stale_after_secs` is the idle threshold above which `list_domains` reports a domain `stale` (`idle_secs` is always reported raw, so tune or ignore this to fit your workload's cadence).
+`max_domains` caps API-created domains (config/`default` don't count). `stale_after_secs` is the idle threshold above which `list_domains` reports a domain `stale` (`idle_secs` is always reported raw, so tune or ignore this to fit your workload's cadence). `session_ttl_secs` (default `86400` = 24 h) is the session TTL: a *disconnected* named session past it is disposed by a periodic sweep (interval TTL/10, clamped 60 s..1 h) — connected sessions never expire, whatever their age. This keeps per-launch generated names (e.g. `MyProject-Main-<uuid8>`) from accumulating forever.
 
 **Config-declared domains.** Add a `domains` array to declare durable, isolated domains — each a full broker instance with its own receivers, buffers, and triggers — re-created on every boot:
 

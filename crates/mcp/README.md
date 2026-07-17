@@ -36,7 +36,7 @@ Global flags:
 | `filters` | `add` / `list` / `edit` / `remove` | Manage per-session buffer filters. |
 | `traces` | `recent` / `get` / `summary` / `slow` / `logs` | Query traces. |
 | `spans` | `context` | Fetch spans surrounding a seq. |
-| `sessions` | `list` / `drop` | List or drop sessions. |
+| `sessions` | `list` / `drop` | List or drop sessions. (Renaming the *current* session is an MCP-mode tool — `rename_session` — not a CLI verb: the CLI's per-invocation session has nothing durable to rename.) |
 | `domains` | `create` / `delete` / `list` / `clear` | Manage isolated domains (each with its own buffers, receivers, triggers). |
 | `status` | (no verb) | Print broker status (incl. `current_domain` + `active_filters`). |
 
