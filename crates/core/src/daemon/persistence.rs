@@ -141,10 +141,20 @@ pub struct DaemonConfig {
     /// cadence; `idle_secs` is always reported raw regardless of this. (#2.)
     #[serde(default = "default_stale_after_secs")]
     pub stale_after_secs: u64,
+    /// A session that stays DISCONNECTED longer than this many seconds is
+    /// disposed by the periodic sweep. Connected sessions never expire — TTL
+    /// measures abandonment, not lifetime. Keeps unique-per-conversation
+    /// session names (meaningful-session-names spec, 2026-07-17) from
+    /// accumulating forever.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
 }
 
 fn default_stale_after_secs() -> u64 {
     60
+}
+fn default_session_ttl_secs() -> u64 {
+    86_400 // 24 h
 }
 fn default_gelf_port() -> u16 {
     12201
@@ -183,6 +193,7 @@ impl Default for DaemonConfig {
             max_domains: 32,
             domains: Vec::new(),
             stale_after_secs: 60,
+            session_ttl_secs: 86_400,
         }
     }
 }

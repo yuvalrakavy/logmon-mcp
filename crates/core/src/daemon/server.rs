@@ -467,6 +467,36 @@ pub async fn run_with_overrides(
         },
     ));
 
+    // 13b. Session TTL sweep (meaningful-session-names spec, 2026-07-17):
+    //      a session DISCONNECTED longer than `session_ttl_secs` is disposed —
+    //      its cross-domain bookmarks cleared first, then the registry entry.
+    //      Connected sessions never expire (TTL measures abandonment, not
+    //      lifetime). Keeps unique-per-conversation names from accumulating.
+    //      Wake: the interval tick. Sleep: `interval.tick().await`.
+    {
+        let sessions = sessions.clone();
+        let handler = handler.clone();
+        let ttl = std::time::Duration::from_secs(config.session_ttl_secs.max(1));
+        tokio::spawn(async move {
+            // Sweep at TTL/10, clamped to [60s, 1h] — timely without churn.
+            let period = (ttl / 10).clamp(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(3600),
+            );
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                for id in sessions.expired_disconnected(ttl) {
+                    let cleared = handler.clear_session_bookmarks(&id);
+                    sessions.dispose(&id);
+                    info!(session = %id, bookmarks_cleared = cleared,
+                        "session TTL sweep: disposed (disconnected past TTL)");
+                }
+            }
+        });
+    }
+
     // 14. Listen on Unix socket (unix) or TCP (windows)
     info!("daemon ready, listening for connections");
 
@@ -759,7 +789,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     // 3. Create/reconnect session
-    let (session_id, is_new) = match &params.name {
+    let (mut session_id, is_new) = match &params.name {
         Some(name) => {
             // Try create_named first; if it fails (already exists), try reconnect
             match sessions.create_named(name) {
@@ -841,6 +871,20 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(Some(request)) => {
                         let response = handler.handle_async(&session_id, &request).await;
                         write_message(&mut writer, &response).await?;
+                        // A successful `session.rename` re-keyed the registry
+                        // entry; this connection must address the session by
+                        // its NEW id from here on (event filtering, domain
+                        // lookups, disconnect handling all key off it).
+                        if request.method == "session.rename" {
+                            if let Some(new_name) = response
+                                .result
+                                .as_ref()
+                                .and_then(|r| r.get("name"))
+                                .and_then(|v| v.as_str())
+                            {
+                                session_id = SessionId::Named(new_name.to_string());
+                            }
+                        }
                         // §9.4: if the request rebound this session (domains.use),
                         // re-point the event subscription at the newly-bound
                         // domain's channel so live trigger notifications follow

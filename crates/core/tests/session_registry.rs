@@ -218,3 +218,32 @@ fn test_session_removed_graceful() {
     assert!(registry.list_triggers(&id).is_empty());
     assert!(registry.list_filters(&id).is_empty());
 }
+
+#[test]
+fn ttl_predicate_spares_connected_and_dispose_removes() {
+    // The TTL sweep's predicate at the registry level: with a ZERO ttl, any
+    // disconnected named session qualifies immediately -- but a CONNECTED one
+    // never does, whatever its age (TTL measures abandonment, not lifetime).
+    let registry = SessionRegistry::new();
+    let live = registry
+        .create_named("Store-Main-live0001")
+        .expect("create live");
+    let dead = registry
+        .create_named("Store-t1-feat-dead")
+        .expect("create dead");
+    registry.disconnect(&dead); // named -> persists, disconnected
+
+    let expired = registry.expired_disconnected(std::time::Duration::ZERO);
+    assert!(
+        expired.contains(&dead),
+        "a disconnected session past its TTL must be swept: {expired:?}"
+    );
+    assert!(
+        !expired.contains(&live),
+        "a connected session must NEVER expire: {expired:?}"
+    );
+
+    registry.dispose(&dead);
+    let expired = registry.expired_disconnected(std::time::Duration::ZERO);
+    assert!(expired.is_empty(), "disposed sessions are gone: {expired:?}");
+}

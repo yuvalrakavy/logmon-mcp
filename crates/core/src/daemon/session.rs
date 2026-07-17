@@ -299,6 +299,117 @@ impl SessionRegistry {
         }
     }
 
+    /// Rename the session `old` to the named identity `new_name`, preserving
+    /// ALL state (triggers, filters, domain binding, notification queue,
+    /// client_info). The meaningful-session-names contract (spec
+    /// 2026-07-17): a Claude conversation renames itself at lane claim to
+    /// `<Project>-tN-<branch>`, so `get_sessions` reads as a dashboard and
+    /// the one-conversation-per-lane invariant is enforceable.
+    ///
+    /// Conflict semantics:
+    /// - target held by a CONNECTED session → `AlreadyConnected` — that IS the
+    ///   invariant firing ("another conversation is working this lane");
+    /// - target held by a DISCONNECTED session → the stale holder is DISPLACED
+    ///   (disposed) and the rename proceeds — a dead conversation must not
+    ///   lock a lane name forever. The stale holder's `touched_domains` are
+    ///   returned so the caller can clear its bookmarks: bookmark stores key
+    ///   by the session NAME, which the renamed session now inherits — without
+    ///   the sweep it would silently adopt a dead conversation's bookmarks.
+    /// - renaming to one's own current name is a no-op.
+    ///
+    /// Anonymous → named is allowed (the session becomes persistent).
+    pub fn rename(
+        &self,
+        old: &SessionId,
+        new_name: &str,
+    ) -> Result<(SessionId, Option<Vec<DomainId>>), SessionError> {
+        if !is_valid_name(new_name) {
+            return Err(SessionError::InvalidName(new_name.to_string()));
+        }
+        let new_id = SessionId::Named(new_name.to_string());
+        if *old == new_id {
+            return Ok((new_id, None));
+        }
+
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        if !sessions.contains_key(old) {
+            return Err(SessionError::NotFound(old.to_string()));
+        }
+        let displaced_domains = match sessions.get(&new_id) {
+            Some(existing) if existing.connected.load(Ordering::Relaxed) => {
+                return Err(SessionError::AlreadyConnected(new_name.to_string()));
+            }
+            Some(stale) => {
+                // Capture BEFORE the remove/overwrite — after it, the registry
+                // no longer knows which domains the dead session touched.
+                let touched = stale
+                    .touched_domains
+                    .read()
+                    .expect("touched_domains lock poisoned")
+                    .iter()
+                    .cloned()
+                    .collect();
+                sessions.remove(&new_id);
+                Some(touched)
+            }
+            None => None,
+        };
+
+        let mut state = sessions.remove(old).expect("checked above");
+        state.name = Some(new_name.to_string());
+        state.touch();
+        sessions.insert(new_id.clone(), state);
+        Ok((new_id, displaced_domains))
+    }
+
+    /// Dispose a session outright (TTL sweep + rename displacement): removed
+    /// from the registry regardless of kind. The caller is responsible for
+    /// clearing its cross-domain bookmarks first (`touched_domains`).
+    pub fn dispose(&self, id: &SessionId) {
+        self.sessions
+            .write()
+            .expect("sessions lock poisoned")
+            .remove(id);
+    }
+
+    /// Sessions that have been DISCONNECTED for longer than `ttl` — the TTL
+    /// sweep's candidates. Connected sessions never expire, whatever their
+    /// age: TTL measures abandonment, not lifetime.
+    pub fn expired_disconnected(&self, ttl: std::time::Duration) -> Vec<SessionId> {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        sessions
+            .iter()
+            .filter(|(_, s)| {
+                !s.connected.load(Ordering::Relaxed)
+                    && s.last_seen.lock().expect("last_seen lock poisoned").elapsed() > ttl
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Display names of every session currently bound to `domain`, connected
+    /// first, each suffixed ` (disconnected)` when not live. Derived from the
+    /// registry — the authoritative record of who is using which domain
+    /// (deliberately NOT caller-supplied; a parameter could lie or go stale).
+    pub fn sessions_bound_to(&self, domain: &DomainId) -> Vec<String> {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        let mut bound: Vec<(bool, String)> = sessions
+            .iter()
+            .filter(|(_, s)| *s.domain.read().expect("domain lock poisoned") == *domain)
+            .map(|(id, s)| {
+                let connected = s.connected.load(Ordering::Relaxed);
+                let label = if connected {
+                    id.to_string()
+                } else {
+                    format!("{id} (disconnected)")
+                };
+                (connected, label)
+            })
+            .collect();
+        bound.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        bound.into_iter().map(|(_, label)| label).collect()
+    }
+
     // --- Domain binding (sticky `use_domain`) ---
 
     /// The domain this session is currently bound to. Returns `default` for an

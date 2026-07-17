@@ -752,6 +752,13 @@ pub struct DomainInfo {
     pub oldest_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub newest_seq: Option<u64>,
+    /// Sessions currently bound to this domain (connected first, disconnected
+    /// suffixed). DERIVED from the session registry — never caller-supplied —
+    /// so with meaningful session names, `domains.list` answers "which
+    /// conversation is using which domain" authoritatively. Populated by
+    /// `domains.list`; empty elsewhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound_sessions: Vec<String>,
     /// Wall-clock of the last log ingested into this domain (across any listener),
     /// or `None` if none ever arrived. A `None` here is the "nothing is shipping
     /// to this domain — did I misconfigure the port?" signal. (Consumer #2.)
@@ -841,6 +848,24 @@ pub struct DomainsUseResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DomainsClear {}
+
+/// `session.rename` — re-key the calling session to a meaningful name
+/// (`<Project>-Main-<short8>` / `<Project>-tN-<branch>`, spec 2026-07-17),
+/// preserving all state. Errors with "already connected" when the target name
+/// is held by a LIVE session — the one-conversation-per-lane invariant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionRename {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SessionRenameResult {
+    /// The session's new name (echoed; the connection re-keys itself on it).
+    pub name: String,
+    /// Set when a stale (disconnected) holder of this name was displaced.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub displaced_stale_holder: bool,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DomainsClearResult {

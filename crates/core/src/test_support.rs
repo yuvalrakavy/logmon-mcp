@@ -59,6 +59,7 @@ pub fn default_test_config() -> DaemonConfig {
         max_domains: 32,
         domains: Vec::new(),
         stale_after_secs: 60,
+        session_ttl_secs: 86_400,
     }
 }
 

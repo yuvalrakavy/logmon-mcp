@@ -228,6 +228,13 @@ struct DeleteDomainParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct RenameSessionParams {
+    /// New session name: <Project>-Main-<short8> or <Project>-tN-<branch>
+    /// ('/' sanitized to '-'; alphanumerics, '-' and '_' only).
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct UseDomainParams {
     /// Domain to bind this session to for subsequent queries and notifications.
     name: String,
@@ -864,6 +871,23 @@ impl GelfMcpServer {
         let result = self
             .broker
             .call("domains.use", serde_json::json!({ "name": p.name }))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Rename this logmon session to a meaningful name (convention: <Project>-Main-<short8> for a home/main conversation, <Project>-tN-<branch> after claiming a dev-track lane; sanitize '/' to '-'). Preserves all session state. ERRORS with 'already connected' when the target name is held by a LIVE session — that means another conversation is already working that dev-track: STOP rather than fight over it. A stale (disconnected) holder is displaced automatically."
+    )]
+    async fn rename_session(
+        &self,
+        Parameters(p): Parameters<RenameSessionParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("session.rename", serde_json::json!({ "name": p.name }))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(

@@ -275,3 +275,181 @@ async fn a_cross_domain_rebind_warns_but_still_binds() {
         "replacing a non-default binding warns even when unwinding to default: {r}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Meaningful session names (spec docs/2026-07-17-meaningful-session-names-spec.md)
+// ---------------------------------------------------------------------------
+
+/// session.rename preserves ALL session state: the domain binding and a live
+/// trigger survive the re-key, and the connection keeps working under the new
+/// identity (the loop re-keys itself off the echoed name).
+#[tokio::test]
+async fn rename_preserves_binding_and_triggers() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let t3: DomainInfo = client
+        .call("domains.create", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+    client
+        .call::<Value>("domains.use", json!({ "name": "t3" }))
+        .await
+        .unwrap();
+    let _: TriggersAddResult = client
+        .call("triggers.add", json!({ "filter": "l>=ERROR" }))
+        .await
+        .unwrap();
+
+    let r: Value = client
+        .call("session.rename", json!({ "name": "Store-t3-feat-thing" }))
+        .await
+        .expect("rename");
+    assert_eq!(r.get("name").and_then(|v| v.as_str()), Some("Store-t3-feat-thing"));
+    assert!(r.get("displaced_stale_holder").is_none(), "nothing displaced: {r}");
+
+    // The binding survived: a t3-port log is visible without re-binding.
+    send_gelf(t3.gelf_port, "after rename").await;
+    let msgs = wait_for_log(&mut client, "after rename").await;
+    assert!(
+        msgs.iter().any(|m| m.contains("after rename")),
+        "the t3 binding must survive the rename: {msgs:?}"
+    );
+
+    // The registry lists the new name, and domains.list attributes the domain
+    // to it (derived bound_sessions).
+    let sessions: Value = client.call("session.list", json!({})).await.unwrap();
+    let names: Vec<String> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(String::from))
+        .collect();
+    assert!(
+        names.contains(&"Store-t3-feat-thing".to_string()),
+        "renamed session must appear by name: {names:?}"
+    );
+    let domains: Value = client.call("domains.list", json!({})).await.unwrap();
+    let t3_entry = domains["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "t3")
+        .expect("t3 listed");
+    let bound: Vec<&str> = t3_entry["bound_sessions"]
+        .as_array()
+        .expect("bound_sessions populated")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        bound.iter().any(|b| b.contains("Store-t3-feat-thing")),
+        "domains.list must attribute t3 to the renamed session: {bound:?}"
+    );
+}
+
+/// The one-conversation-per-lane invariant: renaming to a name held by a
+/// CONNECTED session errors, and the caller's identity/binding are unchanged.
+#[tokio::test]
+async fn rename_to_a_live_holder_errors_and_changes_nothing() {
+    let daemon = spawn_test_daemon().await;
+    let mut holder = daemon.connect_anon().await;
+    let mut challenger = daemon.connect_anon().await;
+
+    let _: Value = holder
+        .call("session.rename", json!({ "name": "Store-t1-feat-x" }))
+        .await
+        .expect("holder takes the name");
+
+    let result = challenger
+        .call::<Value>("session.rename", json!({ "name": "Store-t1-feat-x" }))
+        .await;
+    let err = format!("{:?}", result.expect_err("a live holder must refuse the rename"));
+    assert!(
+        err.contains("already connected"),
+        "the error must say the name is actively held: {err}"
+    );
+
+    // The challenger still works under its old identity (a follow-up call
+    // succeeds and the registry still shows exactly one session by that name).
+    let sessions: Value = challenger.call("session.list", json!({})).await.unwrap();
+    let named: Vec<&str> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .filter(|n| *n == "Store-t1-feat-x")
+        .collect();
+    assert_eq!(named.len(), 1, "exactly one holder of the name: {sessions}");
+}
+
+/// A DISCONNECTED holder is displaced: a dead conversation must not lock a
+/// lane name forever. The displacement is reported, and the stale session is
+/// gone from the registry.
+#[tokio::test]
+async fn rename_displaces_a_disconnected_holder() {
+    let daemon = spawn_test_daemon().await;
+
+    // A named session that then disconnects (named sessions persist). The
+    // close must be EXPLICIT: dropping a TestClient leaves the socket open
+    // (see TestClient::close).
+    {
+        let mut doomed = daemon.connect_anon().await;
+        let _: Value = doomed
+            .call("session.rename", json!({ "name": "Store-t2-feat-old" }))
+            .await
+            .unwrap();
+        doomed.close().await.expect("close");
+    }
+    // Disconnect is EOF-driven and async — wait for the registry to see it.
+    let mut claimer = daemon.connect_anon().await;
+    let mut disconnected = false;
+    for _ in 0..40 {
+        let sessions: Value = claimer.call("session.list", json!({})).await.unwrap();
+        disconnected = sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["name"] == "Store-t2-feat-old" && s["connected"] == false);
+        if disconnected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(disconnected, "the dropped holder must read disconnected");
+
+    let r: Value = claimer
+        .call("session.rename", json!({ "name": "Store-t2-feat-old" }))
+        .await
+        .expect("a stale holder must be displaced, not block");
+    assert_eq!(
+        r.get("displaced_stale_holder").and_then(|v| v.as_bool()),
+        Some(true),
+        "the displacement must be reported: {r}"
+    );
+
+    // Exactly one session by that name, and it is connected (the claimer).
+    let sessions: Value = claimer.call("session.list", json!({})).await.unwrap();
+    let holders: Vec<&Value> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["name"] == "Store-t2-feat-old")
+        .collect();
+    assert_eq!(holders.len(), 1, "{sessions}");
+    assert_eq!(holders[0]["connected"], true);
+}
+
+/// Invalid target names are rejected — including what an unsanitized branch
+/// name would produce ('/').
+#[tokio::test]
+async fn rename_rejects_invalid_names() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    for bad in ["Store-t1-feat/thing", "", "has space"] {
+        let result = client
+            .call::<Value>("session.rename", json!({ "name": bad }))
+            .await;
+        assert!(result.is_err(), "{bad:?} must be rejected");
+    }
+}

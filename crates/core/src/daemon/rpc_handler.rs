@@ -57,6 +57,8 @@ fn domain_to_info(d: &Domain, stale_after_secs: u64) -> DomainInfo {
         last_span_received_at: last_span.map(to_dt),
         idle_secs,
         stale: idle_secs.is_some_and(|i| i >= stale_after_secs),
+        // Filled by `domains.list` from the session registry; empty elsewhere.
+        bound_sessions: Vec::new(),
     }
 }
 
@@ -167,6 +169,7 @@ impl RpcHandler {
             "domains.delete" => self.handle_domains_delete(&request.params),
             "domains.list" => self.handle_domains_list(),
             "domains.use" => self.handle_domains_use(session_id, &request.params),
+            "session.rename" => self.handle_session_rename(session_id, &request.params),
             "domains.clear" => self.handle_domains_clear(session_id),
             "traces.recent" => self.handle_traces_recent(session_id, &request.params),
             "traces.get" => self.handle_traces_get(session_id, &request.params),
@@ -382,10 +385,60 @@ impl RpcHandler {
             .domains
             .list()
             .iter()
-            .map(|d| domain_to_info(d, self.domain_policy.stale_after_secs))
+            .map(|d| {
+                let mut info = domain_to_info(d, self.domain_policy.stale_after_secs);
+                // Who is using this domain — derived from the session
+                // registry, the authoritative record of every binding. With
+                // meaningful session names the listing reads as a dashboard.
+                info.bound_sessions = self.sessions.sessions_bound_to(&d.id());
+                info
+            })
             .collect();
         domains.sort_by(|a, b| a.name.cmp(&b.name));
         serde_json::to_value(DomainsListResult { domains }).map_err(|e| e.to_string())
+    }
+
+    /// Re-key the calling session to a meaningful name (spec 2026-07-17). A
+    /// CONNECTED holder of the target name errors — the one-conversation-per-
+    /// lane invariant ("another conversation is working this lane"); a stale
+    /// disconnected holder is displaced (its cross-domain bookmarks cleared).
+    /// The connection loop re-keys its local session id off the echoed name.
+    fn handle_session_rename(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let req: SessionRename = serde_json::from_value(params.clone())
+            .map_err(|e| format!("invalid session.rename params: {e}"))?;
+        let (new_id, displaced) = self
+            .sessions
+            .rename(session_id, &req.name)
+            .map_err(|e| e.to_string())?;
+        let displaced_stale_holder = match displaced {
+            Some(touched) => {
+                // The stale holder's bookmarks are keyed by the NAME the
+                // renamed session now owns — sweep them so the live session
+                // doesn't inherit a dead conversation's bookmarks. (It has
+                // made none under this name yet, so the sweep is safe.)
+                let key = new_id.to_string();
+                let mut cleared = 0;
+                for domain_id in &touched {
+                    if let Some(d) = self.domains.get(domain_id) {
+                        cleared += d.bookmarks.clear_session(&key);
+                    }
+                }
+                tracing::info!(name = %key, bookmarks_cleared = cleared,
+                    "displaced a disconnected session holding the target name");
+                true
+            }
+            None => false,
+        };
+        tracing::info!(old = %session_id, new = %new_id, "session renamed");
+        serde_json::to_value(SessionRenameResult {
+            name: req.name,
+            displaced_stale_holder,
+        })
+        .map_err(|e| e.to_string())
     }
 
     /// Bind the calling session to an existing domain (`domains.use`). Errors if
