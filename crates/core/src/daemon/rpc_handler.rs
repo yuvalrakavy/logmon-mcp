@@ -415,10 +415,33 @@ impl RpcHandler {
         }
         sync_pre_buffer_size_for_domain(&new_domain.pipeline, &self.sessions, &new_id);
 
-        serde_json::to_value(domain_to_info(
-            &new_domain,
-            self.domain_policy.stale_after_secs,
-        ))
+        // A session's normal lifecycle is default → its domain, then idempotent
+        // re-binds. A NON-default → different NON-default switch is the
+        // signature of two clients sharing one session (e.g. two agent
+        // conversations behind one shared MCP server process, each rebinding
+        // the other's reads out from under it). Warn — in the response, so
+        // both consumers of the shared stream see it — but still bind: the
+        // switch may be deliberate (one client hopping domains on purpose).
+        let rebind_warning = if old_id != new_id && old_id != DomainId::default_domain() {
+            let msg = format!(
+                "session {session_id} was bound to \"{old_id}\" and is now rebound to \
+                 \"{new_id}\". If you did not just switch domains on purpose, another client \
+                 is sharing this session (two agent conversations behind one MCP server \
+                 process?) and your reads may silently target its domain. Fix the setup: \
+                 give each client its own `--session <name>` — do NOT paper over it by \
+                 re-binding before each query, which only hides the collision."
+            );
+            tracing::warn!(session = %session_id, old = %old_id, new = %new_id,
+                "non-default domain rebind — possible shared session");
+            Some(msg)
+        } else {
+            None
+        };
+
+        serde_json::to_value(logmon_broker_protocol::DomainsUseResult {
+            domain: domain_to_info(&new_domain, self.domain_policy.stale_after_secs),
+            rebind_warning,
+        })
         .map_err(|e| e.to_string())
     }
 

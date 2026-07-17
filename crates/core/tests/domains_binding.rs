@@ -201,3 +201,77 @@ async fn delete_while_bound_keeps_session_alive_for_rebind() {
         .await
         .expect("query works after rebind");
 }
+
+/// A non-default → different-domain rebind carries `rebind_warning` — the
+/// signature of two clients sharing one session (two agent conversations
+/// behind one MCP server process, each rebinding the other's reads). The
+/// normal lifecycle stays silent: default → domain, then idempotent re-binds.
+/// The bind itself still succeeds (a deliberate switch is legal); the warning
+/// rides the RESPONSE so both consumers of a shared stream see it.
+#[tokio::test]
+async fn a_cross_domain_rebind_warns_but_still_binds() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    for name in ["t1", "t2"] {
+        let _: DomainInfo = client
+            .call("domains.create", json!({ "name": name }))
+            .await
+            .unwrap();
+    }
+
+    // default → t1: the normal lifecycle, no warning.
+    let r: Value = client
+        .call("domains.use", json!({ "name": "t1" }))
+        .await
+        .expect("bind t1");
+    assert!(
+        r.get("rebind_warning").is_none(),
+        "default → t1 is the normal lifecycle, must not warn: {r}"
+    );
+
+    // t1 → t1: idempotent re-bind (the recommended bind-before-every-burst
+    // workaround), no warning.
+    let r: Value = client
+        .call("domains.use", json!({ "name": "t1" }))
+        .await
+        .expect("re-bind t1");
+    assert!(
+        r.get("rebind_warning").is_none(),
+        "an idempotent re-bind must not warn: {r}"
+    );
+
+    // t1 → t2: the shared-session signature — warned, AND still bound.
+    let r: Value = client
+        .call("domains.use", json!({ "name": "t2" }))
+        .await
+        .expect("bind t2");
+    let warning = r
+        .get("rebind_warning")
+        .and_then(|w| w.as_str())
+        .expect("a non-default → non-default rebind must carry rebind_warning");
+    assert!(
+        warning.contains("t1") && warning.contains("t2"),
+        "the warning must name both domains: {warning}"
+    );
+    assert!(
+        warning.contains("--session"),
+        "the warning must carry the remedy: {warning}"
+    );
+    assert_eq!(
+        r.get("name").and_then(|v| v.as_str()),
+        Some("t2"),
+        "the bind must still succeed — warn, not refuse: {r}"
+    );
+
+    // t2 → default: the session was bound to a non-default domain and the
+    // binding is being replaced — still the collision signature, still warned.
+    let r: Value = client
+        .call("domains.use", json!({ "name": "default" }))
+        .await
+        .expect("bind default");
+    assert!(
+        r.get("rebind_warning").is_some(),
+        "replacing a non-default binding warns even when unwinding to default: {r}"
+    );
+}

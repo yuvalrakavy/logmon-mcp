@@ -50,12 +50,14 @@ async fn domains_typed_lifecycle_round_trip() {
         "got {names:?}"
     );
 
-    // use — binds the session; returns the bound domain.
+    // use — binds the session; returns the bound domain. First bind from
+    // `default` is the normal lifecycle: no rebind warning.
     let bound = broker
         .domains_use(DomainsUse { name: "t3".into() })
         .await
         .unwrap();
-    assert_eq!(bound.name, "t3");
+    assert_eq!(bound.domain.name, "t3");
+    assert!(bound.rebind_warning.is_none());
 
     // clear — disposes the bound domain's data (empty here → 0/0).
     let cleared = broker.domains_clear(DomainsClear {}).await.unwrap();

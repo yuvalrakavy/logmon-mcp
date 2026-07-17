@@ -822,8 +822,22 @@ pub struct DomainsUse {
 }
 
 /// `domains.use` returns the now-bound domain (same shape as a `domains.list`
-/// entry).
-pub type DomainsUseResult = DomainInfo;
+/// entry), plus a warning when the bind REPLACED a different non-default
+/// binding.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsUseResult {
+    #[serde(flatten)]
+    pub domain: DomainInfo,
+    /// Set when this bind switched the session from one NON-default domain to
+    /// a different one. A session's normal lifecycle is `default → its domain`,
+    /// then idempotent re-binds; a non-default→non-default switch is the
+    /// signature of two clients sharing one session (e.g. two agent
+    /// conversations behind one shared MCP server process), each rebinding the
+    /// other's reads out from under it. The bind still succeeds — the warning
+    /// rides the response so BOTH consumers of the shared stream see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebind_warning: Option<String>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DomainsClear {}
