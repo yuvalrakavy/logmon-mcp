@@ -485,6 +485,36 @@ async fn create_rejects_oversized_log_buffer() {
     );
 }
 
+/// The premise behind the harness's readiness probe: a socket path EXISTING
+/// does not mean a client can connect to it.
+///
+/// `spawn_test_daemon` used to gate readiness on `socket_path.exists()`. A Unix
+/// socket path appears at `bind(2)`, but connects only succeed after `listen(2)`
+/// — a separate syscall — so a test racing into that gap got ECONNREFUSED and
+/// died at `TestClient::connect`'s `.expect(...)`. That is the mechanism behind
+/// the rare "test client failed to connect" flakes (one observed 2026-07-25 in
+/// `concurrent_create_same_name_converges_to_one_domain` below); parallel-suite
+/// load merely widens the preemption window between the two syscalls.
+///
+/// The harness now probes with a real connect. This test pins WHY: it shows the
+/// old signal is satisfiable while the new one is not.
+#[tokio::test]
+async fn an_existing_socket_path_is_not_a_connectable_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("logmon.sock");
+    std::fs::write(&path, b"").expect("create a file where the socket would be");
+
+    assert!(
+        path.exists(),
+        "the OLD readiness gate (path exists) is satisfied here"
+    );
+    assert!(
+        tokio::net::UnixStream::connect(&path).await.is_err(),
+        "yet nothing is accepting — which is exactly the window the old gate let \
+         tests race into"
+    );
+}
+
 /// Concurrent `domains.create` for the SAME name must converge to a single live
 /// domain (idempotent ensure). Pre-fix, the existence-check → port-bind →
 /// registry-insert straddles the bind `.await` on the shared handler, so N racers

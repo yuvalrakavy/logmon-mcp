@@ -41,6 +41,33 @@ use crate::gelf::message::{Level, LogEntry};
 const SOCKET_WAIT_TICKS: usize = 100;
 const SOCKET_WAIT_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Wait until the daemon is actually ACCEPTING connections. Returns false if it
+/// never does within the tick budget.
+///
+/// Deliberately probes with a real `connect` rather than checking
+/// `socket_path.exists()`. The path appears at `bind(2)`, but a client can only
+/// connect after `listen(2)` — a separate syscall. A test that raced into that
+/// gap got ECONNREFUSED and failed at `TestClient::connect`'s `.expect(...)`,
+/// which is the mechanism behind the rare "test client failed to connect"
+/// flakes (observed 2026-07-25 in
+/// `concurrent_create_same_name_converges_to_one_domain`). Parallel-suite load
+/// does not cause it — it only widens the window in which the daemon's thread
+/// can be preempted between the two syscalls.
+///
+/// The probe connection is dropped immediately, which is a clean no-op: the
+/// handler returns `Ok(())` on EOF before `session.start` (see
+/// `daemon::server::handle_connection`), so no session is created and nothing
+/// is logged.
+async fn wait_until_connectable(socket_path: &Path) -> bool {
+    for _ in 0..SOCKET_WAIT_TICKS {
+        if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(SOCKET_WAIT_INTERVAL).await;
+    }
+    false
+}
+
 /// Default config used by the test harness: every receiver port set to 0 so
 /// nothing real is bound, and a small-but-realistic buffer. Public so tests can
 /// tweak individual knobs (e.g. `max_domains`) and pass the result to
@@ -134,18 +161,10 @@ impl TestDaemonHandle {
             }
         });
 
-        // Wait for the socket to appear so callers can connect immediately.
-        let mut appeared = false;
-        for _ in 0..SOCKET_WAIT_TICKS {
-            if socket_path.exists() {
-                appeared = true;
-                break;
-            }
-            tokio::time::sleep(SOCKET_WAIT_INTERVAL).await;
-        }
+        let appeared = wait_until_connectable(&socket_path).await;
         assert!(
             appeared,
-            "test daemon socket {} never appeared",
+            "test daemon socket {} never became connectable",
             socket_path.display()
         );
 
@@ -328,17 +347,10 @@ impl TestDaemonHandle {
             }
         });
 
-        let mut appeared = false;
-        for _ in 0..SOCKET_WAIT_TICKS {
-            if socket_path.exists() {
-                appeared = true;
-                break;
-            }
-            tokio::time::sleep(SOCKET_WAIT_INTERVAL).await;
-        }
+        let appeared = wait_until_connectable(&socket_path).await;
         assert!(
             appeared,
-            "real-receiver daemon socket {} never appeared",
+            "real-receiver daemon socket {} never became connectable",
             socket_path.display()
         );
 
