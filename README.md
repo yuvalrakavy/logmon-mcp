@@ -393,6 +393,8 @@ Each session automatically gets two triggers on startup: `l>=ERROR` and `mfm=pan
 
 When a trigger fires, the client receives a notification with the matched entry and surrounding context. The trigger fire count is visible in `get_triggers`.
 
+A trigger is **debounced by its own `post_window`**: while it is inside the window opened by its last match it does not fire again, so one burst produces one capture rather than one per entry. The debounce is strictly per trigger — it never suppresses a *different* trigger. That distinction matters when you arm a rare-event trigger alongside a noisy one (say `kind=deadlock` next to the built-in `l>=ERROR` on a busy stream): the noisy trigger firing constantly has no effect on whether the rare one is evaluated. Set `post_window: 0` to disable the debounce and count every match.
+
 ## Multi-session
 
 - All sessions share the same log and span buffers and the same GELF/OTLP receivers.

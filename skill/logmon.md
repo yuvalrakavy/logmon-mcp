@@ -97,6 +97,8 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 - Defaults on every new session: `l>=ERROR` and `mfm=panic`.
 - `pre_window` captures **unfiltered** context before the match (flight recorder). `post_window` captures after. `notify_context` is how many of the pre-window entries ride along in the notification.
 - `oneshot=true` removes the trigger after the first match — useful for "tell me the next time this happens."
+- A trigger is **debounced by its own `post_window`**: inside the window opened by its last match it won't fire again, so a burst yields one capture. The debounce is per trigger and never silences a different one — arming `kind=deadlock` alongside the noisy built-in `l>=ERROR` is safe, the busy trigger cannot starve the rare one. Use `post_window=0` to count every match.
+- Because of that debounce, `match_count` is "capture count", not "matching entries seen". Don't read it as an event tally on a bursty signal.
 
 ### Bookmarks (named seq positions)
 
@@ -343,7 +345,7 @@ A cursor was idle long enough that its seq fell off the ring buffer. The broker 
 ### "A trigger isn't firing"
 
 1. Triggers evaluate **every** incoming log, regardless of filters. So a filter isn't the cause.
-2. Triggers skip evaluation during another trigger's `post_window` to prevent cascading. If two triggers want overlapping events, expect coalescing.
+2. A trigger is debounced only by its OWN `post_window` — a sibling firing never suppresses it. But within that window it won't re-fire, so a burst gives you one capture, not one per entry; set `post_window=0` to count every match. (Before 2026-07-25 the window was session-wide and a busy trigger really did silence quiet ones — if you are on an older broker, that is your answer.)
 3. CLI mode invocations can't receive trigger fires — the CLI process exits before any log can match. Use the MCP shim or the SDK for that.
 4. Confirm the trigger exists: `get_triggers`.
 5. Verify the filter actually matches incoming logs by trying the same filter in `get_recent_logs`.

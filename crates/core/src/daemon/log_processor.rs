@@ -61,10 +61,20 @@ pub fn process_entry_for_domain(
     let session_ids = sessions.active_session_ids_sorted_by_pre_window_for_domain(domain);
 
     for sid in &session_ids {
-        // 4a. Check post-window
+        // 4a. Advance this session's post-window. It governs STORAGE only —
+        // during the window every entry is stored unconditionally, bypassing
+        // the session's filters, so the context after a trigger is captured.
+        //
+        // It deliberately does NOT skip trigger evaluation. It used to
+        // `continue` here, which blinded every trigger in the session for
+        // `post_window` entries after any one of them fired — so a
+        // frequently-matching trigger (`l>=ERROR` during a test run) starved
+        // every quiet one, and a trigger armed to catch something rare would
+        // never be evaluated at all. Firing suppression is now per-trigger,
+        // inside `TriggerManager::evaluate`, where a trigger debounces only
+        // itself.
         if sessions.decrement_post_window(sid) {
             any_post_window_active = true;
-            continue;
         }
 
         // 4b. Evaluate triggers
@@ -100,8 +110,10 @@ pub fn process_entry_for_domain(
                 }
             }
 
-            // Activate post-window for this session
-            sessions.set_post_window(sid, trigger_max_post);
+            // Activate post-window for this session. EXTEND rather than set:
+            // a match can now land inside an already-open window, and a small
+            // post_window must not truncate a larger one still in flight.
+            sessions.extend_post_window(sid, trigger_max_post);
             any_post_window_active = true;
 
             // Build notification event and send/queue
