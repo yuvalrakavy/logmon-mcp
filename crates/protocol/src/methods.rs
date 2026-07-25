@@ -165,6 +165,11 @@ pub struct TriggerInfo {
     /// serialized (no `skip_serializing_if`) so clients see the explicit value.
     #[serde(default)]
     pub oneshot: bool,
+    /// Entries still to pass before this trigger can fire again — its own
+    /// debounce window; `0` means armed and live. A trigger that looks stuck
+    /// with a non-zero value here is debounced, not broken.
+    #[serde(default)]
+    pub post_remaining: u32,
 }
 
 /// One entry in a `session.list` or `status.get` response.

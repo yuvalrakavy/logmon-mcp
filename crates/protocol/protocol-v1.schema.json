@@ -824,6 +824,13 @@
               "description": "When `true`, the trigger auto-removes after its first match. Always\nserialized (no `skip_serializing_if`) so clients see the explicit value.",
               "type": "boolean",
               "default": false
+            },
+            "post_remaining": {
+              "description": "Entries still to pass before this trigger can fire again — its own\ndebounce window; `0` means armed and live. A trigger that looks stuck\nwith a non-zero value here is debounced, not broken.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "default": 0
             }
           },
           "required": [
@@ -2876,6 +2883,13 @@
           "format": "uint64",
           "minimum": 0
         },
+        "bound_sessions": {
+          "description": "Sessions currently bound to this domain (connected first, disconnected\nsuffixed). DERIVED from the session registry — never caller-supplied —\nso with meaningful session names, `domains.list` answers \"which\nconversation is using which domain\" authoritatively. Populated by\n`domains.list`; empty elsewhere.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "last_log_received_at": {
           "description": "Wall-clock of the last log ingested into this domain (across any listener),\nor `None` if none ever arrived. A `None` here is the \"nothing is shipping\nto this domain — did I misconfigure the port?\" signal. (Consumer #2.)",
           "type": [
@@ -3096,6 +3110,13 @@
               ],
               "format": "uint64",
               "minimum": 0
+            },
+            "bound_sessions": {
+              "description": "Sessions currently bound to this domain (connected first, disconnected\nsuffixed). DERIVED from the session registry — never caller-supplied —\nso with meaningful session names, `domains.list` answers \"which\nconversation is using which domain\" authoritatively. Populated by\n`domains.list`; empty elsewhere.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "last_log_received_at": {
               "description": "Wall-clock of the last log ingested into this domain (across any listener),\nor `None` if none ever arrived. A `None` here is the \"nothing is shipping\nto this domain — did I misconfigure the port?\" signal. (Consumer #2.)",
@@ -3906,6 +3927,13 @@
           "description": "When `true`, the trigger auto-removes after its first match. Always\nserialized (no `skip_serializing_if`) so clients see the explicit value.",
           "type": "boolean",
           "default": false
+        },
+        "post_remaining": {
+          "description": "Entries still to pass before this trigger can fire again — its own\ndebounce window; `0` means armed and live. A trigger that looks stuck\nwith a non-zero value here is debounced, not broken.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 0
         }
       },
       "required": [

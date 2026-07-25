@@ -22,6 +22,13 @@ pub struct TriggerInfo {
     /// remove it — that's the caller's responsibility, since removal needs
     /// pre-buffer resync.
     pub oneshot: bool,
+    /// Entries still to pass before this trigger can fire again — its own
+    /// debounce window, `0` when it is armed and live.
+    ///
+    /// Surfaced because "why isn't my trigger firing?" is now most often
+    /// answered by "it is inside its own post_window", and without this the
+    /// state is invisible: `match_count` looks stuck and nothing explains it.
+    pub post_remaining: u32,
 }
 
 /// A trigger match result
@@ -89,6 +96,7 @@ impl Trigger {
             description: self.description.clone(),
             match_count: self.match_count.load(Ordering::Relaxed),
             oneshot: self.oneshot,
+            post_remaining: self.post_remaining.load(Ordering::Relaxed),
         }
     }
 }
@@ -472,6 +480,29 @@ mod tests {
         mgr.evaluate(&entry);
         mgr.evaluate(&entry);
         assert_eq!(mgr.get(id).unwrap().match_count, 2);
+    }
+
+    /// `post_remaining` must be visible to a caller, so "why isn't my trigger
+    /// firing?" is answerable without guessing: 0 = armed, >0 = debounced.
+    #[test]
+    fn test_post_remaining_is_surfaced() {
+        let mgr = TriggerManager::new();
+        let id = mgr.add("l>=ERROR", 0, 3, 0, Some("t"), false).unwrap();
+        assert_eq!(mgr.get(id).unwrap().post_remaining, 0, "armed and live");
+
+        let entry = make_entry(Level::Error, "fail");
+        mgr.evaluate(&entry);
+        assert_eq!(
+            mgr.get(id).unwrap().post_remaining,
+            3,
+            "debounced for its own post_window after firing"
+        );
+        mgr.evaluate(&entry);
+        assert_eq!(
+            mgr.get(id).unwrap().post_remaining,
+            2,
+            "drains one per entry seen"
+        );
     }
 
     #[test]

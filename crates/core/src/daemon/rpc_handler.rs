@@ -863,6 +863,7 @@ impl RpcHandler {
                     "description": t.description,
                     "match_count": t.match_count,
                     "oneshot": t.oneshot,
+                    "post_remaining": t.post_remaining,
                 })
             })
             .collect();
@@ -956,6 +957,7 @@ impl RpcHandler {
             "description": info.description,
             "match_count": info.match_count,
             "oneshot": info.oneshot,
+            "post_remaining": info.post_remaining,
         }))
     }
 

@@ -391,9 +391,11 @@ Triggers watch every incoming log and fire when a match occurs, capturing contex
 
 Each session automatically gets two triggers on startup: `l>=ERROR` and `mfm=panic`. The pre- and post-trigger captures bypass buffer filters, so context around a fire is never truncated by a narrow filter.
 
-When a trigger fires, the client receives a notification with the matched entry and surrounding context. The trigger fire count is visible in `get_triggers`.
+When a trigger fires, the client receives a notification with the matched entry and surrounding context. `get_triggers` reports both `match_count` (times it has fired) and `post_remaining` (entries still to pass before it can fire again — `0` means armed and live). If a trigger looks stuck, check `post_remaining` before suspecting the filter: a non-zero value means it is debounced, not broken.
 
-A trigger is **debounced by its own `post_window`**: while it is inside the window opened by its last match it does not fire again, so one burst produces one capture rather than one per entry. The debounce is strictly per trigger — it never suppresses a *different* trigger. That distinction matters when you arm a rare-event trigger alongside a noisy one (say `kind=deadlock` next to the built-in `l>=ERROR` on a busy stream): the noisy trigger firing constantly has no effect on whether the rare one is evaluated. Set `post_window: 0` to disable the debounce and count every match.
+**Span triggers behave differently.** A trigger whose filter targets span selectors is evaluated on a separate path: it fires on *every* matching span with no debounce, and its `match_count` and `post_remaining` both stay `0`. So for a span trigger those two numbers say nothing — judge it by the notifications it delivers, not by its counters.
+
+A **log** trigger is **debounced by its own `post_window`**: while it is inside the window opened by its last match it does not fire again, so one burst produces one capture rather than one per entry. The debounce is strictly per trigger — it never suppresses a *different* trigger. That distinction matters when you arm a rare-event trigger alongside a noisy one (say `kind=deadlock` next to the built-in `l>=ERROR` on a busy stream): the noisy trigger firing constantly has no effect on whether the rare one is evaluated. Set `post_window: 0` to disable the debounce and count every match.
 
 ## Multi-session
 

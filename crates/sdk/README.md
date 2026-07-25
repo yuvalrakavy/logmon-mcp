@@ -270,8 +270,11 @@ pub struct LogEntry {
         // Anything carried as `_*` GELF fields lands here with the leading underscore stripped.
     pub trace_id: Option<String>,            // 32-char lowercase hex string on the wire (NOT numeric).
     pub span_id: Option<String>,             // 16-char lowercase hex string on the wire.
-    pub matched_filters: Vec<String>,        // Names of filters this entry matched.
-    pub source: LogSource,
+    pub matched_filters: Vec<String>,        // Filters that caused this entry to be STORED.
+        // Populated only when `source == Filter`. An entry stored because a trigger fired
+        // (`source` = `PreTrigger`/`PostTrigger`) matched no filter, so this is empty — that
+        // is correct, not a missing value. Read it together with `source`, never alone.
+    pub source: LogSource,                   // Why this entry is in the store: Filter | PreTrigger | PostTrigger.
 }
 ```
 
