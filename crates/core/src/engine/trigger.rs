@@ -22,6 +22,13 @@ pub struct TriggerInfo {
     /// remove it — that's the caller's responsibility, since removal needs
     /// pre-buffer resync.
     pub oneshot: bool,
+    /// Entries still to pass before this trigger can fire again — its own
+    /// debounce window, `0` when it is armed and live.
+    ///
+    /// Surfaced because "why isn't my trigger firing?" is now most often
+    /// answered by "it is inside its own post_window", and without this the
+    /// state is invisible: `match_count` looks stuck and nothing explains it.
+    pub post_remaining: u32,
 }
 
 /// A trigger match result
@@ -45,6 +52,37 @@ struct Trigger {
     description: Option<String>,
     oneshot: bool,
     match_count: AtomicU64,
+    /// Entries remaining in THIS trigger's own post-window. While positive the
+    /// trigger does not re-fire (a debounce, so one burst yields one capture),
+    /// but it does not affect any sibling trigger.
+    ///
+    /// This used to be a single counter on the SESSION, and the log processor
+    /// skipped evaluating the whole session while it was positive — so any one
+    /// trigger firing blinded every other trigger in that session for
+    /// `post_window` entries. A busy trigger (`l>=ERROR` during a test run)
+    /// therefore starved every quiet one, which is exactly backwards: the quiet
+    /// triggers are the ones armed to catch something rare. The session-level
+    /// counter still exists and still governs STORAGE (capture context after a
+    /// trigger, bypassing filters); only firing suppression moved here.
+    post_remaining: AtomicU32,
+}
+
+/// Decrement `counter` by one if it is positive, reporting whether it WAS
+/// positive (i.e. whether a post-window is currently active). Mirrors the
+/// session-level counter's CAS loop in `daemon::session`.
+fn decrement_if_active(counter: &AtomicU32) -> bool {
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        if current == 0 {
+            return false;
+        }
+        if counter
+            .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
 }
 
 impl Trigger {
@@ -58,6 +96,7 @@ impl Trigger {
             description: self.description.clone(),
             match_count: self.match_count.load(Ordering::Relaxed),
             oneshot: self.oneshot,
+            post_remaining: self.post_remaining.load(Ordering::Relaxed),
         }
     }
 }
@@ -96,6 +135,7 @@ impl TriggerManager {
             description: Some("Error-level log detected".to_string()),
             oneshot: false,
             match_count: AtomicU64::new(0),
+            post_remaining: AtomicU32::new(0),
         };
 
         let trigger2 = Trigger {
@@ -109,6 +149,7 @@ impl TriggerManager {
             description: Some("Panic or unwrap failure detected".to_string()),
             oneshot: false,
             match_count: AtomicU64::new(0),
+            post_remaining: AtomicU32::new(0),
         };
 
         TriggerManager {
@@ -157,6 +198,7 @@ impl TriggerManager {
             description: description.map(String::from),
             oneshot,
             match_count: AtomicU64::new(0),
+            post_remaining: AtomicU32::new(0),
         };
         self.triggers
             .write()
@@ -191,12 +233,25 @@ impl TriggerManager {
         if let Some((filter_str, condition)) = new_condition {
             trigger.filter_string = filter_str.to_string();
             trigger.condition = condition;
+            // A retargeted trigger must be live under its NEW condition
+            // immediately; a window opened by a match on the OLD one says
+            // nothing about the new one.
+            trigger.post_remaining.store(0, Ordering::Relaxed);
         }
         if let Some(pw) = pre_window {
             trigger.pre_window = pw;
         }
         if let Some(pw) = post_window {
             trigger.post_window = pw;
+            // Clamp any window already in flight to the new size. Without this,
+            // shrinking the window (notably to 0, the documented way to ask for
+            // "count every match") would not take effect until the OLD window
+            // drained — and it drains only on entries that reach `evaluate`, so
+            // on a quiet stream the trigger could stay debounced indefinitely.
+            let remaining = trigger.post_remaining.load(Ordering::Relaxed);
+            if remaining > pw {
+                trigger.post_remaining.store(pw, Ordering::Relaxed);
+            }
         }
         if let Some(nc) = notify_context {
             trigger.notify_context = nc;
@@ -221,6 +276,40 @@ impl TriggerManager {
         Ok(())
     }
 
+    /// Record that trigger `id` fired, for a caller that does its own matching
+    /// instead of going through `evaluate`.
+    ///
+    /// The span processor is the only such caller: it matches spans itself
+    /// (`matches_span` against a re-parsed filter) and never reaches `evaluate`,
+    /// so without this a span trigger's `match_count` stays 0 forever and
+    /// "has this ever fired?" is unanswerable. Deliberately does NOT touch
+    /// `post_remaining` — span triggers are not debounced, and making them so
+    /// is a behaviour change that belongs with unifying the two evaluation
+    /// paths, not with fixing the counter.
+    pub fn record_match(&self, id: u32) {
+        if let Some(t) = self
+            .triggers
+            .read()
+            .expect("triggers lock poisoned")
+            .iter()
+            .find(|t| t.id == id)
+        {
+            t.match_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear every trigger's in-flight debounce window.
+    ///
+    /// Used when a session rebinds to another domain: a window opened by a
+    /// match on the OLD domain's traffic must not leave a trigger deaf on the
+    /// new one (the F3 invariant documented on `SessionRegistry::set_domain`,
+    /// which resets the session's storage counter for the same reason).
+    pub fn reset_post_windows(&self) {
+        for t in self.triggers.read().expect("triggers lock poisoned").iter() {
+            t.post_remaining.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn max_pre_window(&self) -> u32 {
         self.triggers
             .read()
@@ -231,13 +320,25 @@ impl TriggerManager {
             .unwrap_or(0)
     }
 
+    /// Evaluate every trigger against `entry`, returning those that fired.
+    ///
+    /// Each trigger is debounced by its OWN post-window: while a trigger is
+    /// inside the window opened by its last match it neither re-fires nor
+    /// suppresses any other trigger. Every entry decrements every active
+    /// window, so this must be called exactly once per entry per session.
     pub fn evaluate(&self, entry: &LogEntry) -> Vec<TriggerMatch> {
         let triggers = self.triggers.read().expect("triggers lock poisoned");
         triggers
             .iter()
             .filter_map(|t| {
+                // Decrement unconditionally (not only when the entry matches):
+                // the window is measured in entries seen, matching or not.
+                if decrement_if_active(&t.post_remaining) {
+                    return None;
+                }
                 if matches_entry(&t.condition, entry) {
                     t.match_count.fetch_add(1, Ordering::Relaxed);
+                    t.post_remaining.store(t.post_window, Ordering::Relaxed);
                     Some(TriggerMatch {
                         id: t.id,
                         description: t.description.clone(),
@@ -382,10 +483,48 @@ mod tests {
     fn test_evaluate_increments_match_count() {
         let mgr = TriggerManager::new();
         let entry = make_entry(Level::Error, "fail");
+
+        // Trigger 1 carries the default post_window (200), so the second
+        // matching entry lands inside its own debounce window and does NOT
+        // count again. (This assertion used to expect 2: the debounce lived a
+        // layer up, in the log processor's session-wide post-window, so
+        // `evaluate` itself counted every match. End-to-end behaviour is
+        // unchanged — that second entry was suppressed by the session window
+        // regardless — but the suppression is now per-trigger and lives here.)
         mgr.evaluate(&entry);
         mgr.evaluate(&entry);
-        let info = mgr.get(1).unwrap();
-        assert_eq!(info.match_count, 2);
+        assert_eq!(mgr.get(1).unwrap().match_count, 1);
+
+        // A trigger with post_window = 0 has no debounce and counts every match.
+        let id = mgr
+            .add("l>=ERROR", 0, 0, 0, Some("undebounced"), false)
+            .unwrap();
+        mgr.evaluate(&entry);
+        mgr.evaluate(&entry);
+        assert_eq!(mgr.get(id).unwrap().match_count, 2);
+    }
+
+    /// `post_remaining` must be visible to a caller, so "why isn't my trigger
+    /// firing?" is answerable without guessing: 0 = armed, >0 = debounced.
+    #[test]
+    fn test_post_remaining_is_surfaced() {
+        let mgr = TriggerManager::new();
+        let id = mgr.add("l>=ERROR", 0, 3, 0, Some("t"), false).unwrap();
+        assert_eq!(mgr.get(id).unwrap().post_remaining, 0, "armed and live");
+
+        let entry = make_entry(Level::Error, "fail");
+        mgr.evaluate(&entry);
+        assert_eq!(
+            mgr.get(id).unwrap().post_remaining,
+            3,
+            "debounced for its own post_window after firing"
+        );
+        mgr.evaluate(&entry);
+        assert_eq!(
+            mgr.get(id).unwrap().post_remaining,
+            2,
+            "drains one per entry seen"
+        );
     }
 
     #[test]

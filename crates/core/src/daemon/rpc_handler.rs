@@ -390,7 +390,7 @@ impl RpcHandler {
                 // Who is using this domain — derived from the session
                 // registry, the authoritative record of every binding. With
                 // meaningful session names the listing reads as a dashboard.
-                info.bound_sessions = self.sessions.sessions_bound_to(&d.id());
+                info.bound_sessions = self.sessions.sessions_bound_to(d.id());
                 info
             })
             .collect();
@@ -863,6 +863,7 @@ impl RpcHandler {
                     "description": t.description,
                     "match_count": t.match_count,
                     "oneshot": t.oneshot,
+                    "post_remaining": t.post_remaining,
                 })
             })
             .collect();
@@ -956,6 +957,7 @@ impl RpcHandler {
             "description": info.description,
             "match_count": info.match_count,
             "oneshot": info.oneshot,
+            "post_remaining": info.post_remaining,
         }))
     }
 

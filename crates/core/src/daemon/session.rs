@@ -474,6 +474,10 @@ impl SessionRegistry {
                     .expect("queue lock poisoned")
                     .clear();
                 state.post_window_remaining.store(0, Ordering::Relaxed);
+                // F3 covers FIRING suppression too, now that it lives per
+                // trigger: without this a trigger stays debounced on the new
+                // domain because of the old domain's traffic.
+                state.triggers.reset_post_windows();
             }
         }
     }
@@ -529,6 +533,15 @@ impl SessionRegistry {
         match sessions.get(id) {
             Some(state) => state.triggers.evaluate(entry),
             None => Vec::new(),
+        }
+    }
+
+    /// Record a match for a trigger the caller matched itself (span processor).
+    /// See `TriggerManager::record_match`.
+    pub fn record_trigger_match(&self, id: &SessionId, trigger_id: u32) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        if let Some(state) = sessions.get(id) {
+            state.triggers.record_match(trigger_id);
         }
     }
 
@@ -722,6 +735,25 @@ impl SessionRegistry {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         if let Some(state) = sessions.get(id) {
             state.post_window_remaining.store(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Open a storage post-window of at least `count` entries — EXTEND, never
+    /// shrink.
+    ///
+    /// A plain `store` was safe while the log processor could not evaluate
+    /// triggers mid-window (nothing could match, so nothing could overwrite).
+    /// Now that triggers are debounced individually and a match CAN land inside
+    /// an open window, a `store` would let a trigger with a short `post_window`
+    /// truncate a longer window already in flight — silently discarding the
+    /// aftermath a big trigger asked to capture. Taking the max keeps every
+    /// firing's promise: the window ends when the most demanding one is done.
+    pub fn extend_post_window(&self, id: &SessionId, count: u32) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        if let Some(state) = sessions.get(id) {
+            state
+                .post_window_remaining
+                .fetch_max(count, Ordering::Relaxed);
         }
     }
 

@@ -85,10 +85,12 @@ async fn non_oneshot_trigger_persists() {
     let daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_anon().await;
 
-    // Remove the default triggers so the session's post-window is driven
-    // solely by our test trigger (post_window=0 → no post-window suppression
-    // after fire). Otherwise the default ERROR trigger's post_window=200
-    // swallows our second log, masking the actual fire-twice behavior.
+    // Remove the default triggers. This was once REQUIRED: the post-window was
+    // session-wide, so the default ERROR trigger's post_window=200 swallowed our
+    // second log and masked the fire-twice behaviour. Suppression is now
+    // per-trigger (our trigger uses post_window=0, so it never debounces
+    // itself), which makes this removal merely tidy rather than load-bearing —
+    // kept so the test asserts only its own trigger's behaviour.
     let initial: TriggersListResult = client.call("triggers.list", json!({})).await.unwrap();
     for t in &initial.triggers {
         let _: serde_json::Value = client

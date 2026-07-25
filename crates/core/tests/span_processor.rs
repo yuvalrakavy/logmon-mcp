@@ -1,5 +1,5 @@
 use chrono::Utc;
-use logmon_broker_core::daemon::session::SessionRegistry;
+use logmon_broker_core::daemon::session::{SessionId, SessionRegistry};
 use logmon_broker_core::daemon::span_processor::process_span;
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
@@ -27,6 +27,15 @@ fn make_span(name: &str, duration_ms: f64) -> SpanEntry {
     }
 }
 
+fn match_count_of(sessions: &SessionRegistry, sid: &SessionId, trigger_id: u32) -> u64 {
+    sessions
+        .list_triggers(sid)
+        .into_iter()
+        .find(|t| t.id == trigger_id)
+        .expect("trigger present")
+        .match_count
+}
+
 #[test]
 fn test_span_stored() {
     let seq = Arc::new(SeqCounter::new());
@@ -48,7 +57,7 @@ fn test_span_trigger_fires() {
     let sid = sessions.create_anonymous();
 
     // Add a span trigger (d>=500 is a span selector, not log)
-    sessions
+    let t = sessions
         .add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow span"), false)
         .unwrap();
 
@@ -57,6 +66,11 @@ fn test_span_trigger_fires() {
 
     // Span stored
     assert_eq!(store.len(), 1);
+    // ...and the trigger actually FIRED. `store.len()` alone proves nothing
+    // here: process_span stores every span unconditionally at step 1, so this
+    // assertion held even when no trigger matched. match_count is the first
+    // signal on this path that distinguishes fired from didn't.
+    assert_eq!(match_count_of(&sessions, &sid, t), 1);
 }
 
 #[test]
@@ -67,7 +81,7 @@ fn test_span_trigger_no_match() {
     let pipeline = Arc::new(LogPipeline::new(100));
     let sid = sessions.create_anonymous();
 
-    sessions
+    let t = sessions
         .add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow"), false)
         .unwrap();
 
@@ -76,4 +90,9 @@ fn test_span_trigger_no_match() {
 
     // Span stored but no trigger fired
     assert_eq!(store.len(), 1);
+    assert_eq!(
+        match_count_of(&sessions, &sid, t),
+        0,
+        "a non-matching span must not count as a fire"
+    );
 }
