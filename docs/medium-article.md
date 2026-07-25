@@ -130,7 +130,8 @@ logmon is deliberately a developer-loop tool. The job is to help your AI assista
 ```bash
 git clone https://github.com/yuvalrakavy/logmon-mcp
 cd logmon-mcp
-cargo install --path crates/broker --path crates/mcp
+cargo install --path crates/broker
+cargo install --path crates/mcp
 logmon-broker install-service --scope user
 ```
 
