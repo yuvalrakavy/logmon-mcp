@@ -536,6 +536,15 @@ impl SessionRegistry {
         }
     }
 
+    /// Record a match for a trigger the caller matched itself (span processor).
+    /// See `TriggerManager::record_match`.
+    pub fn record_trigger_match(&self, id: &SessionId, trigger_id: u32) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        if let Some(state) = sessions.get(id) {
+            state.triggers.record_match(trigger_id);
+        }
+    }
+
     pub fn list_triggers(&self, id: &SessionId) -> Vec<TriggerInfo> {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         match sessions.get(id) {

@@ -276,6 +276,28 @@ impl TriggerManager {
         Ok(())
     }
 
+    /// Record that trigger `id` fired, for a caller that does its own matching
+    /// instead of going through `evaluate`.
+    ///
+    /// The span processor is the only such caller: it matches spans itself
+    /// (`matches_span` against a re-parsed filter) and never reaches `evaluate`,
+    /// so without this a span trigger's `match_count` stays 0 forever and
+    /// "has this ever fired?" is unanswerable. Deliberately does NOT touch
+    /// `post_remaining` — span triggers are not debounced, and making them so
+    /// is a behaviour change that belongs with unifying the two evaluation
+    /// paths, not with fixing the counter.
+    pub fn record_match(&self, id: u32) {
+        if let Some(t) = self
+            .triggers
+            .read()
+            .expect("triggers lock poisoned")
+            .iter()
+            .find(|t| t.id == id)
+        {
+            t.match_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Clear every trigger's in-flight debounce window.
     ///
     /// Used when a session rebinds to another domain: a window opened by a

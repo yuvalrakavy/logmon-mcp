@@ -99,7 +99,7 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 - `oneshot=true` removes the trigger after the first match — useful for "tell me the next time this happens."
 - A trigger is **debounced by its own `post_window`**: inside the window opened by its last match it won't fire again, so a burst yields one capture. The debounce is per trigger and never silences a different one — arming `kind=deadlock` alongside the noisy built-in `l>=ERROR` is safe, the busy trigger cannot starve the rare one. Use `post_window=0` to count every match.
 - Because of that debounce, `match_count` is "capture count", not "matching entries seen". Don't read it as an event tally on a bursty signal.
-- **The above is for LOG triggers.** A trigger filtering on span selectors runs on a separate path: it fires on every matching span, is never debounced, and its `match_count`/`post_remaining` stay `0` forever. Don't diagnose a span trigger by its counters — they are not wired.
+- **The debounce is for LOG triggers only.** A trigger filtering on span selectors runs on a separate path: it fires on every matching span and is never debounced, so its `post_remaining` stays `0`. Its `match_count` IS counted, so "has this ever fired?" is answerable for span triggers too — but don't expect `post_remaining` to explain a quiet one.
 
 ### Bookmarks (named seq positions)
 

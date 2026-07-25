@@ -393,7 +393,7 @@ Each session automatically gets two triggers on startup: `l>=ERROR` and `mfm=pan
 
 When a trigger fires, the client receives a notification with the matched entry and surrounding context. `get_triggers` reports both `match_count` (times it has fired) and `post_remaining` (entries still to pass before it can fire again — `0` means armed and live). If a trigger looks stuck, check `post_remaining` before suspecting the filter: a non-zero value means it is debounced, not broken.
 
-**Span triggers behave differently.** A trigger whose filter targets span selectors is evaluated on a separate path: it fires on *every* matching span with no debounce, and its `match_count` and `post_remaining` both stay `0`. So for a span trigger those two numbers say nothing — judge it by the notifications it delivers, not by its counters.
+**Span triggers behave differently.** A trigger whose filter targets span selectors is evaluated on a separate path: it fires on *every* matching span, with no debounce, so its `post_remaining` is always `0` and carries no information. Its `match_count` is counted normally, so it still answers "has this fired, and how often?".
 
 A **log** trigger is **debounced by its own `post_window`**: while it is inside the window opened by its last match it does not fire again, so one burst produces one capture rather than one per entry. The debounce is strictly per trigger — it never suppresses a *different* trigger. That distinction matters when you arm a rare-event trigger alongside a noisy one (say `kind=deadlock` next to the built-in `l>=ERROR` on a busy stream): the noisy trigger firing constantly has no effect on whether the rare one is evaluated. Set `post_window: 0` to disable the debounce and count every match.
 

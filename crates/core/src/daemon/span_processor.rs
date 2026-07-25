@@ -47,6 +47,13 @@ pub fn process_span_for_domain(
             if is_span_filter_str(&trigger.filter_string) {
                 if let Ok(filter) = parse_filter(&trigger.filter_string) {
                     if matches_span(&filter, span) {
+                        // Count it here: this path never reaches
+                        // `TriggerManager::evaluate`, which is what increments
+                        // match_count for log triggers. Before the dispatch and
+                        // before any oneshot removal, so the count records the
+                        // fire even if delivery fails or the trigger is about
+                        // to be removed.
+                        sessions.record_trigger_match(sid, trigger.id);
                         let trace_summary = build_trace_summary(span.trace_id, store);
                         let event =
                             SessionRegistry::build_span_event(sid, span, trigger, trace_summary);
