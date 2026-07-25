@@ -79,7 +79,7 @@ impl SpanStore {
             .filter(|s| seqs.contains(&s.seq))
             .cloned()
             .collect();
-        spans.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+        spans.sort_by_key(|s| s.start_time);
         spans
     }
 
@@ -127,7 +127,8 @@ impl SpanStore {
         }
 
         let mut traces: Vec<(u128, u64)> = trace_max_seq.into_iter().collect();
-        traces.sort_by(|a, b| b.1.cmp(&a.1));
+        // Descending by max seq (most recent trace first).
+        traces.sort_by_key(|&(_, max_seq)| std::cmp::Reverse(max_seq));
         traces.truncate(count);
 
         traces
