@@ -429,6 +429,14 @@ pub struct TriggersEditResult {
     pub match_count: u64,
     #[serde(default)]
     pub oneshot: bool,
+    /// Mirrors `TriggerInfo::post_remaining`. This struct is deliberately
+    /// separate from `TriggerInfo`, so a field added there does NOT appear
+    /// here — the daemon emitted `post_remaining` on the edit response while
+    /// this type lacked it, and serde silently dropped it for every typed SDK
+    /// caller. `verify-schema` cannot catch that: it checks schema-vs-Rust,
+    /// not daemon-JSON-vs-Rust.
+    #[serde(default)]
+    pub post_remaining: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

@@ -40,7 +40,8 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ### Added
 
-- **`post_remaining` on `TriggerInfo`** (`triggers.list` / `add` / `edit`):
+- **`post_remaining` on `TriggerInfo`** (`triggers.list` and `triggers.edit`;
+  `triggers.add` returns only the new id, as before):
   entries still to pass before a trigger can fire again; `0` means armed and
   live. If a trigger looks stuck, this distinguishes "debounced" from "broken".
   Additive and defaulted, so older clients are unaffected.
@@ -51,6 +52,18 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
   `match_count` to start moving on triggers that previously read `0` for their
   entire lifetime. Those fires were being silently dropped; the new numbers are
   the corrected ones, not a regression.
+- **Expect your filters to be bypassed more often.** The storage post-window
+  is re-armed by any trigger firing, and triggers now fire that previously
+  could not, so more entries are stored unconditionally as post-trigger
+  context. Bounded — the window still closes within `max(post_window)` entries
+  of the last fire, and the store is a fixed-size ring — but in a session with
+  several frequently-matching triggers it can stay open continuously.
+- **A firing entry is far more expensive than a normal one** (~200 µs vs
+  ~0.6 µs at `pre_window: 500`: a store scan plus context clones). That cost
+  was previously rate-limited to once per `post_window` entries per session;
+  per-trigger debouncing makes it reachable per trigger. An undebounced
+  (`post_window: 0`) trigger on a busy stream can bottleneck that domain's
+  processor — see the README's note before using it.
 
 ### Notes
 

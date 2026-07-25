@@ -464,19 +464,33 @@ impl SessionRegistry {
                 .write()
                 .expect("touched_domains lock poisoned")
                 .insert(domain.clone());
-            let mut current = state.domain.write().expect("domain lock poisoned");
-            if *current != domain {
-                *current = domain;
-                // Binding changed — drop old-domain carryover (F1 + F3).
-                state
-                    .notification_queue
-                    .lock()
-                    .expect("queue lock poisoned")
-                    .clear();
-                state.post_window_remaining.store(0, Ordering::Relaxed);
-                // F3 covers FIRING suppression too, now that it lives per
-                // trigger: without this a trigger stays debounced on the new
-                // domain because of the old domain's traffic.
+            let changed = {
+                let mut current = state.domain.write().expect("domain lock poisoned");
+                if *current != domain {
+                    *current = domain;
+                    // Binding changed — drop old-domain carryover (F1 + F3).
+                    state
+                        .notification_queue
+                        .lock()
+                        .expect("queue lock poisoned")
+                        .clear();
+                    state.post_window_remaining.store(0, Ordering::Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            // F3 covers FIRING suppression too, now that it lives per trigger:
+            // without this a trigger stays debounced on the new domain because
+            // of the old domain's traffic.
+            //
+            // Deliberately AFTER the `domain` write guard drops. Every
+            // `is_in_domain()` — i.e. every domain-scoped scan in both
+            // processors — takes that lock to read, so holding it across an
+            // unrelated `triggers.read()` stalls the ingest path for no reason,
+            // and stalls it longer whenever a `triggers.write()` is queued
+            // (std's RwLock is write-preferring).
+            if changed {
                 state.triggers.reset_post_windows();
             }
         }
@@ -702,7 +716,15 @@ impl SessionRegistry {
 
     // --- Post-trigger window (per-session) ---
 
-    /// Decrement post-window counter. Returns true if post-window was active (entry should skip triggers).
+    /// Decrement the session's STORAGE post-window counter. Returns true if the
+    /// window was active, meaning this entry is stored unconditionally
+    /// (bypassing the session's filters) to capture context after a fire.
+    ///
+    /// It does NOT mean "skip trigger evaluation" — it used to, and the caller
+    /// `continue`d on it, which blinded every trigger in the session for the
+    /// whole window. Firing suppression is per-trigger now, in
+    /// `TriggerManager::evaluate`. See `extend_post_window` for why this window
+    /// must be extended rather than overwritten.
     pub fn decrement_post_window(&self, id: &SessionId) -> bool {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         match sessions.get(id) {
@@ -731,6 +753,10 @@ impl SessionRegistry {
         }
     }
 
+    /// TEST-ONLY. Production must use [`Self::extend_post_window`] — see its
+    /// doc for why an overwrite is wrong now that a match can land inside an
+    /// open window. Kept `pub` for the two integration tests that drive the
+    /// counter directly; no production caller remains.
     pub fn set_post_window(&self, id: &SessionId, count: u32) {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         if let Some(state) = sessions.get(id) {

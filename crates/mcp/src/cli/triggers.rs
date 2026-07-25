@@ -116,6 +116,14 @@ pub async fn dispatch(broker: &Broker, cmd: TriggersCmd, json: bool) -> i32 {
                         t.filter.clone(),
                         format!("{}/{}/{}", t.pre_window, t.post_window, t.notify_context),
                         t.match_count.to_string(),
+                        // "armed" reads better than a bare 0 in a table: this
+                        // is the first thing to check when a trigger looks
+                        // stuck, and the troubleshooting doc sends people here.
+                        if t.post_remaining == 0 {
+                            "armed".to_string()
+                        } else {
+                            format!("{} to go", t.post_remaining)
+                        },
                         t.oneshot.to_string(),
                         t.description.clone().unwrap_or_default(),
                     ]
@@ -127,6 +135,7 @@ pub async fn dispatch(broker: &Broker, cmd: TriggersCmd, json: bool) -> i32 {
                     "filter",
                     "pre/post/notify",
                     "fired",
+                    "debounce",
                     "oneshot",
                     "description",
                 ],

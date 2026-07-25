@@ -1006,6 +1006,13 @@
         "oneshot": {
           "type": "boolean",
           "default": false
+        },
+        "post_remaining": {
+          "description": "Mirrors `TriggerInfo::post_remaining`. This struct is deliberately\nseparate from `TriggerInfo`, so a field added there does NOT appear\nhere — the daemon emitted `post_remaining` on the edit response while\nthis type lacked it, and serde silently dropped it for every typed SDK\ncaller. `verify-schema` cannot catch that: it checks schema-vs-Rust,\nnot daemon-JSON-vs-Rust.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0,
+          "default": 0
         }
       },
       "required": [

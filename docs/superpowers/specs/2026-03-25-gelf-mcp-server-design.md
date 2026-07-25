@@ -75,9 +75,16 @@ Single Rust binary with a storage trait abstraction for future persistence.
 
 **Trigger Engine**: Evaluates every incoming log against all configured triggers, regardless of buffer filters. When a trigger matches: flushes the pre-trigger buffer into the LogStore, sends an MCP notification to Claude, and activates a post-trigger window. During an active post-window, incoming logs skip trigger evaluation entirely and go straight to the store.
 
+> **SUPERSEDED in 0.3.0.** The "skip trigger evaluation during an active
+> post-window" behaviour described in this section and under *Post-trigger
+> Window* below was session-wide, so any one trigger firing blinded every other
+> trigger in that session — a frequently-matching trigger starved the quiet
+> ones. Firing suppression is now **per trigger**: each debounces only itself.
+> The post-window still governs storage exactly as described. See CHANGELOG 0.3.0.
+
 **Pre-trigger Buffer**: A ring buffer that captures all incoming logs regardless of filters. Automatically sized to `max(pre_window)` across all triggers. When a specific trigger fires, its `pre_window` worth of entries are flushed to the LogStore.
 
-**Post-trigger Window**: After a trigger fires, the next N logs (per-trigger `post_window`, default 200) are stored unconditionally, bypassing both trigger evaluation and buffer filters. This captures the aftermath of an event and naturally prevents trigger cascading.
+**Post-trigger Window**: After a trigger fires, the next N logs (per-trigger `post_window`, default 200) are stored unconditionally, bypassing both trigger evaluation and buffer filters. This captures the aftermath of an event and naturally prevents trigger cascading. *(Superseded in 0.3.0 — see the note above: it bypasses buffer filters only; trigger evaluation is no longer skipped, and cascade prevention is per-trigger.)*
 
 **LogStore (trait)**: Abstraction over log storage. v1 implements `InMemoryStore` — a `VecDeque`-based ring buffer behind a `RwLock`. Max entries configurable (default 10,000). The trait allows swapping in SQLite or file-based persistence later.
 
