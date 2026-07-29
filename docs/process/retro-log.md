@@ -60,3 +60,49 @@ Entry template:
 - tier-call: T2 right. The de-escalation earlier in the day (a T2 recovery-policy design killed once the root cause proved mundane) was also right — killing approved-but-unwarranted scope is worth as much as escalating.
 - delegation: 3 fresh-context gates (2 on this work, 1 on the Store timer fix). Yield was outstanding — the post-merge one alone returned 9 findings with measurements it ran itself (timing probes, duty-cycle counterfactuals traced against the old code). Every one verified before fixing. Best single catch: it proved my own regression test would have passed with the bug present.
 - improve: promote the "a commit after the gate invalidates the gate" red-flag into `ways-of-working` (done same session). Candidate, not yet promoted: a `--json`-vs-table parity check for the CLI, since `post_remaining` reached the JSON surface but not the human table while the troubleshooting doc pointed users at exactly that column.
+
+## 2026-07-29 Span time collector — design, two gate rounds, one probe (T2, design only)
+
+- time: ~100% design. Three spec revisions, two full gate rounds (8 fresh-context lenses), one probe. Zero implementation — the branch is spec + probe only.
+- catches: gate=~60 across 8 lenses · probe=1 (decisive) · self-review=3 · user=6 (design redirections, not error corrections) · post-merge=0 (nothing merged).
+  - **Round 1** destroyed five claims the spec *asserted*: `sum_ms` double-counting nesting (**3 lenses convergent**, and the recommended broad-filter idiom guaranteed the nesting); `matches_pattern` allocating (**3 lenses** — the spec claimed matching allocates nothing); `group_keys` failing on non-string attributes (**3 lenses** — it broke the driving example, since a boolean `cache.enabled` is invisible to `.as_str()`); the exact tier not being exact (spans drop at the receiver *before* the collector, and drop rate scales with load — the variable under test in every A/B); order-independence false under truncation.
+  - **Round 2** found **every one of rev 2's three headline fixes individually broken**, all four of its loosenings holed, and three of its new rules wrong — including a delta error bound wrong by an order of magnitude *in the same direction as the one it was fixing*, one paragraph after naming that failure mode.
+  - **The probe** found what 8 lenses had read past: swap-and-fold over-reports self time, because self time and wall union are not additive across a generation boundary. It also replaced two invented numbers with measured ones (lock hold 0.29 ms vs 1.80 ms by chunk size) and demonstrated the A11 invariant across 341 concurrent reads instead of arguing it.
+- friction: **three over-corrections on the same surfaces, ~2 full gate rounds, UNGUARDED** — rev 2's four loosened checks, rev 3's whole concurrency mechanism (replaced when only its lock scope was wrong), and §7.1's edit rules (refuse → permit → a table wrong in *both* directions). See the 2026-07-29 consolidation.
+- tier-call: right at T2, never escalated. Tiering on the **contract surface** (new RPC + MCP + wire types + a document format) rather than on the component was the correct call; the periphery is where every critical finding clustered.
+- delegation: 8 fresh-context lenses, 4 per round, all heavily tool-using (21–52 calls each) — the 0-tool-use failure mode from 2026-07-15 did not recur. Two lenses **disagreed on a verifiable fact** (`ReceiverMetrics` global vs per-domain); resolved by reading the code, not by averaging — per-domain. The **cold-reader lens** (given only a synthetic document, barred from spec and codebase) produced findings no spec-reading lens could, twice, and produced *two-way* evidence for keeping a section I had flagged as cuttable.
+- improve: five candidates, all consolidated 2026-07-29 — change the defect not the mechanism; a loosened check owes a false-negative pass; probe on the second revision; load-bearing claims about existing code belong in a cited table; the cold-reader lens.
+
+---
+
+## Consolidated through 2026-07-29
+
+First consolidation of this log (5 entries, no prior marker). All five proposals accepted and
+landed in `~/.claude/skills/ways-of-working/SKILL.md` the same session:
+
+1. **Change the defect, not the mechanism** → deep-gate section, beside the re-arms-the-gate
+   rule. Invariant: a fix inherits its finding's framing, and replacing a *mechanism* rather
+   than the defective *property* creates unreviewed surface at the moment attention is on the
+   old surface. Evidence: 2026-07-29 ×3, ~2 gate rounds.
+2. **A loosened check owes a false-negative lens, same round** → lens-set list. Invariant: a
+   check is a two-sided classifier and a finding samples one side only. Evidence: 2026-07-29,
+   four loosenings, all leaked; one surface took three revisions.
+3. **Probe on the second revision** → sharpens "probe, don't speculate" with a firing
+   condition. Invariant: on the Nth revision every reviewer reads the same prose, so marginal
+   review value falls as defect prior rises. Evidence: 2026-07-29 (8 lenses read past what one
+   40-line probe caught), 2026-07-25 (best findings were self-measured).
+4. **Load-bearing claims about existing code go in a cited table** → design rules, extending
+   "ground every load-bearing claim". Invariant: prose has no slot for a citation, so a
+   confident claim is indistinguishable from a checked one. Evidence: 2026-07-15 ×2,
+   2026-07-29 — three instances of the author's own narrative asserting the opposite of what a
+   fresh context found.
+5. **The cold-reader lens** → lens-set list. Invariant: an artifact claiming to be
+   interpretable without context can only be falsified by a reader without context. Evidence:
+   2026-07-29 ×2, including two-way evidence for keeping a section the author would have cut.
+
+Two-way check: **no removal candidates.** The gate is earning heavily (~60 findings 2026-07-29;
+6 and ~10 in the July-15 entries). Watch-item, not acted on: the **mid-checkpoint appears in
+none of the five entries** — invisible or unused, and absence of evidence is not evidence to
+drop it. Still unpromoted after two costings: the **0-tool-use finder guard** (2026-07-15,
+logged as "second time"); no recurrence 2026-07-29, where all eight lenses used 21–52 tool
+calls each.
