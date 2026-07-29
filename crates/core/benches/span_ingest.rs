@@ -73,6 +73,72 @@ fn bench_ingest(c: &mut Criterion) {
     ingest_with_sessions(c, 4);
 }
 
+/// A14, the observer effect: what arming a collector costs the ingest path.
+///
+/// Measured at the level that retains the most, over the flagship filter, with
+/// one bound session so the trigger path is present too — i.e. the cost as a
+/// user would actually pay it, not in isolation.
+fn ingest_with_collectors(c: &mut Criterion, n_collectors: usize) {
+    use logmon_broker_core::collector::registry::CollectorRegistry;
+    use logmon_broker_core::collector::sample::Level;
+    use logmon_broker_core::collector::state::{CollectorDef, DEFAULT_MAX_SAMPLE_BYTES};
+    use logmon_broker_core::daemon::domain::DomainId;
+    use logmon_broker_core::daemon::session::SessionId;
+    use logmon_broker_core::daemon::span_processor::process_span_for_domain;
+    use logmon_broker_core::receiver::ReceiverMetrics;
+
+    let seq = Arc::new(SeqCounter::new());
+    let store = Arc::new(SpanStore::new(10_000, seq));
+    let sessions = Arc::new(SessionRegistry::new());
+    let pipeline = Arc::new(LogPipeline::new(10_000));
+    sessions.create_anonymous();
+
+    let domain = DomainId::default_domain();
+    let collectors = CollectorRegistry::new();
+    let metrics = Arc::new(ReceiverMetrics::new());
+    for i in 0..n_collectors {
+        // A quarter of the daemon reservation each, so four fit — the ceiling
+        // §3.4 actually permits.
+        collectors
+            .add(
+                &SessionId::Named(format!("s{i}")),
+                &domain,
+                metrics.clone(),
+                CollectorDef {
+                    name: format!("c{i}"),
+                    filter_string: "sv=store_server".into(),
+                    filter: parse_filter("sv=store_server").expect("valid"),
+                    level: Level::Tree,
+                    group_keys: vec![],
+                    max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
+                    description: None,
+                },
+                Utc::now(),
+            )
+            .expect("within budget");
+    }
+    let span = make_span();
+
+    c.bench_function(&format!("span_ingest/{n_collectors}_collectors"), |b| {
+        b.iter(|| {
+            process_span_for_domain(
+                black_box(&span),
+                black_box(&store),
+                black_box(&sessions),
+                black_box(&pipeline),
+                black_box(&collectors),
+                black_box(&domain),
+            )
+        })
+    });
+}
+
+fn bench_collectors(c: &mut Criterion) {
+    ingest_with_collectors(c, 0);
+    ingest_with_collectors(c, 1);
+    ingest_with_collectors(c, 4);
+}
+
 /// The §4.2 claim under test on its own: a substring match is two `to_lowercase`
 /// allocations per pattern per span. `sv=store_server` is the design's own
 /// flagship filter.
@@ -118,5 +184,11 @@ fn bench_parse(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_ingest, bench_matcher, bench_parse);
+criterion_group!(
+    benches,
+    bench_ingest,
+    bench_collectors,
+    bench_matcher,
+    bench_parse
+);
 criterion_main!(benches);
