@@ -3864,6 +3864,1009 @@
         "count"
       ]
     },
+    "ProfileResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileResult",
+      "description": "The result of profiling a collector or an ad-hoc span query.",
+      "type": "object",
+      "properties": {
+        "collector": {
+          "description": "Collector name, or absent for an ad-hoc `traces.profile` query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filter": {
+          "type": "string"
+        },
+        "level": {
+          "description": "`scalar`, `timing`, or `tree`.",
+          "type": "string"
+        },
+        "matched": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nesting": {
+          "description": "`detected`, `undetected`, or `unknown` — the last when the retention\nlevel cannot answer the question at all.",
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/$defs/ProfileWindow"
+        },
+        "ingest": {
+          "description": "Absent when the pinned domain is gone, or was recreated under the\ncollector, which makes a counter delta meaningless.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileIngest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileExact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "estimated": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileEstimated"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sampled": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileSampled"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "grouped_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProfileGroup"
+          }
+        },
+        "cardinality_capped": {
+          "description": "True when a cardinality cap folded values into `__overflow__`, so at\nleast one row aggregates an arbitrary, arrival-ordered member set.",
+          "type": "boolean"
+        },
+        "suppressed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppressed"
+          }
+        }
+      },
+      "required": [
+        "filter",
+        "level",
+        "matched",
+        "nesting",
+        "window"
+      ],
+      "$defs": {
+        "ProfileWindow": {
+          "description": "The window a profile covers. `wall_ms` runs from the later of arming and the\nlast zeroing, so a collector that was reset mid-run does not report the wall\ntime of data it no longer holds.",
+          "type": "object",
+          "properties": {
+            "armed_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "zeroed_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "read_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "wall_ms": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "required": [
+            "wall_ms"
+          ]
+        },
+        "ProfileIngest": {
+          "description": "Span loss during the window, and the collector's own view of unusable input.\n\n`attribution` is `\"domain\"`, always: the transport counters are per-domain\nand unfiltered, so most of what they count may be spans this collector's\nfilter would never have matched. That makes this sound as a trigger for\nmarking a result untrustworthy, and wrong as a statement about how many\nmatches went missing.",
+          "type": "object",
+          "properties": {
+            "drops_in_window": {
+              "description": "Per-span channel-full drops on the two OTLP trace transports.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shed_batches": {
+              "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_dropped": {
+              "description": "Spans discarded at parse time for unusable identity.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_timestamps": {
+              "description": "Matched spans whose timestamps this collector could not use.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "negative_duration_spans": {
+              "description": "Matched spans that ended before they started.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "attribution": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "drops_in_window",
+            "shed_batches",
+            "malformed_dropped",
+            "malformed_timestamps",
+            "negative_duration_spans",
+            "attribution"
+          ]
+        },
+        "ProfileExact": {
+          "description": "The always-exact tier. Never capped by the sample budget.",
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "avg_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "min_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "max_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "error_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "out_of_range_spans": {
+              "description": "Well-formed spans longer than the sketch's declared range: counted in\nfull toward `total_ms`, clamped in the distribution.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "count",
+            "total_ms",
+            "error_count",
+            "out_of_range_spans"
+          ]
+        },
+        "ProfileEstimated": {
+          "description": "Percentiles from the sketch — bounded relative error, unbounded population.",
+          "type": "object",
+          "properties": {
+            "axis": {
+              "description": "Which population this sketch covers: `collector`, `name`, or `group`.",
+              "type": "string"
+            },
+            "alpha_pct": {
+              "description": "The sketch's relative-accuracy guarantee, as a percentage.",
+              "type": "number",
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "axis",
+            "alpha_pct"
+          ]
+        },
+        "ProfileSampled": {
+          "description": "Everything derived from retained per-span records. Exact over the records it\nholds — which is the whole population only while `complete` is true.",
+          "type": "object",
+          "properties": {
+            "complete": {
+              "description": "`false` once the sample budget stopped retention. The retained set is\nthen a contiguous prefix, not a sample of the whole run.",
+              "type": "boolean"
+            },
+            "sample_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "self_ms": {
+              "description": "Duration minus the union of matched children clipped to this span —\ntime spent in this span and nothing matched below it.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "nested_matches": {
+              "description": "Matched spans whose parent is also matched. Zero means self time equals\ntotal time by construction, and `self_ms` is suppressed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "overlapping_child_ms": {
+              "description": "Child time that lay outside its parent's interval and was clipped away.\nNon-zero means clock skew or instrumentation error, not concurrency.",
+              "type": "number",
+              "format": "double"
+            },
+            "overlapping_child_spans": {
+              "description": "How many children needed clipping. Paired with the millisecond figure\nbecause one child off by a second and a thousand off by a millisecond\nwant opposite remedies.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "wall_union_ms": {
+              "description": "Elapsed time during which at least one matched span was in flight.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "achieved_concurrency": {
+              "description": "Total matched work divided by the wall time it occupied. 1.0 is fully\nserial; 4.0 means four matched spans in flight on average.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "complete",
+            "sample_count",
+            "nested_matches",
+            "overlapping_child_ms",
+            "overlapping_child_spans"
+          ]
+        },
+        "ProfileGroup": {
+          "description": "One row of a breakdown. `key` is the span name, the group tuple, the trace\nid, or the call path, depending on `grouped_by`.",
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "exact": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileExact"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "estimated": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileEstimated"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sampled": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileSampled"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "path_incomplete": {
+              "description": "Set on a call path whose walk stopped at a parent that is not retained,\nso the path is a suffix rather than a root-to-here chain.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "key"
+          ]
+        },
+        "Suppressed": {
+          "description": "Why a field that normally carries a number is `null`.\n\nA profile has several ways to be legitimately unable to answer — the\nretention level is too low, a warm-up cut makes an unwindowed tier\nmeaningless, nothing nested so self time carries no information. Returning\n`null` alone would leave the reader to guess which, and the guesses differ\nin what they imply about the run. Every suppression names its field and its\nreason so a consumer can distinguish \"not measured\" from \"measured as zero\".",
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Dotted path of the suppressed field, e.g. `sampled.self_ms`.",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "remedy": {
+              "description": "What the caller could change to get a number instead. Absent when\nnothing would help.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "field",
+            "reason"
+          ]
+        }
+      }
+    },
+    "ProfileWindow": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileWindow",
+      "description": "The window a profile covers. `wall_ms` runs from the later of arming and the\nlast zeroing, so a collector that was reset mid-run does not report the wall\ntime of data it no longer holds.",
+      "type": "object",
+      "properties": {
+        "armed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "zeroed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "read_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "wall_ms": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "wall_ms"
+      ]
+    },
+    "ProfileIngest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileIngest",
+      "description": "Span loss during the window, and the collector's own view of unusable input.\n\n`attribution` is `\"domain\"`, always: the transport counters are per-domain\nand unfiltered, so most of what they count may be spans this collector's\nfilter would never have matched. That makes this sound as a trigger for\nmarking a result untrustworthy, and wrong as a statement about how many\nmatches went missing.",
+      "type": "object",
+      "properties": {
+        "drops_in_window": {
+          "description": "Per-span channel-full drops on the two OTLP trace transports.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "shed_batches": {
+          "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "malformed_dropped": {
+          "description": "Spans discarded at parse time for unusable identity.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "malformed_timestamps": {
+          "description": "Matched spans whose timestamps this collector could not use.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "negative_duration_spans": {
+          "description": "Matched spans that ended before they started.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "attribution": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "drops_in_window",
+        "shed_batches",
+        "malformed_dropped",
+        "malformed_timestamps",
+        "negative_duration_spans",
+        "attribution"
+      ]
+    },
+    "ProfileExact": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileExact",
+      "description": "The always-exact tier. Never capped by the sample budget.",
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "avg_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "min_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "max_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "error_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "out_of_range_spans": {
+          "description": "Well-formed spans longer than the sketch's declared range: counted in\nfull toward `total_ms`, clamped in the distribution.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "count",
+        "total_ms",
+        "error_count",
+        "out_of_range_spans"
+      ]
+    },
+    "ProfileEstimated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileEstimated",
+      "description": "Percentiles from the sketch — bounded relative error, unbounded population.",
+      "type": "object",
+      "properties": {
+        "axis": {
+          "description": "Which population this sketch covers: `collector`, `name`, or `group`.",
+          "type": "string"
+        },
+        "alpha_pct": {
+          "description": "The sketch's relative-accuracy guarantee, as a percentage.",
+          "type": "number",
+          "format": "double"
+        },
+        "p50_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p80_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p99_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "axis",
+        "alpha_pct"
+      ]
+    },
+    "ProfileSampled": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileSampled",
+      "description": "Everything derived from retained per-span records. Exact over the records it\nholds — which is the whole population only while `complete` is true.",
+      "type": "object",
+      "properties": {
+        "complete": {
+          "description": "`false` once the sample budget stopped retention. The retained set is\nthen a contiguous prefix, not a sample of the whole run.",
+          "type": "boolean"
+        },
+        "sample_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "self_ms": {
+          "description": "Duration minus the union of matched children clipped to this span —\ntime spent in this span and nothing matched below it.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "nested_matches": {
+          "description": "Matched spans whose parent is also matched. Zero means self time equals\ntotal time by construction, and `self_ms` is suppressed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "overlapping_child_ms": {
+          "description": "Child time that lay outside its parent's interval and was clipped away.\nNon-zero means clock skew or instrumentation error, not concurrency.",
+          "type": "number",
+          "format": "double"
+        },
+        "overlapping_child_spans": {
+          "description": "How many children needed clipping. Paired with the millisecond figure\nbecause one child off by a second and a thousand off by a millisecond\nwant opposite remedies.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wall_union_ms": {
+          "description": "Elapsed time during which at least one matched span was in flight.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "achieved_concurrency": {
+          "description": "Total matched work divided by the wall time it occupied. 1.0 is fully\nserial; 4.0 means four matched spans in flight on average.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p50_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p80_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p99_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "complete",
+        "sample_count",
+        "nested_matches",
+        "overlapping_child_ms",
+        "overlapping_child_spans"
+      ]
+    },
+    "ProfileGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ProfileGroup",
+      "description": "One row of a breakdown. `key` is the span name, the group tuple, the trace\nid, or the call path, depending on `grouped_by`.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "exact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileExact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "estimated": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileEstimated"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sampled": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileSampled"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path_incomplete": {
+          "description": "Set on a call path whose walk stopped at a parent that is not retained,\nso the path is a suffix rather than a root-to-here chain.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "$defs": {
+        "ProfileExact": {
+          "description": "The always-exact tier. Never capped by the sample budget.",
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "avg_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "min_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "max_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "error_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "out_of_range_spans": {
+              "description": "Well-formed spans longer than the sketch's declared range: counted in\nfull toward `total_ms`, clamped in the distribution.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "count",
+            "total_ms",
+            "error_count",
+            "out_of_range_spans"
+          ]
+        },
+        "ProfileEstimated": {
+          "description": "Percentiles from the sketch — bounded relative error, unbounded population.",
+          "type": "object",
+          "properties": {
+            "axis": {
+              "description": "Which population this sketch covers: `collector`, `name`, or `group`.",
+              "type": "string"
+            },
+            "alpha_pct": {
+              "description": "The sketch's relative-accuracy guarantee, as a percentage.",
+              "type": "number",
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "axis",
+            "alpha_pct"
+          ]
+        },
+        "ProfileSampled": {
+          "description": "Everything derived from retained per-span records. Exact over the records it\nholds — which is the whole population only while `complete` is true.",
+          "type": "object",
+          "properties": {
+            "complete": {
+              "description": "`false` once the sample budget stopped retention. The retained set is\nthen a contiguous prefix, not a sample of the whole run.",
+              "type": "boolean"
+            },
+            "sample_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "self_ms": {
+              "description": "Duration minus the union of matched children clipped to this span —\ntime spent in this span and nothing matched below it.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "nested_matches": {
+              "description": "Matched spans whose parent is also matched. Zero means self time equals\ntotal time by construction, and `self_ms` is suppressed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "overlapping_child_ms": {
+              "description": "Child time that lay outside its parent's interval and was clipped away.\nNon-zero means clock skew or instrumentation error, not concurrency.",
+              "type": "number",
+              "format": "double"
+            },
+            "overlapping_child_spans": {
+              "description": "How many children needed clipping. Paired with the millisecond figure\nbecause one child off by a second and a thousand off by a millisecond\nwant opposite remedies.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "wall_union_ms": {
+              "description": "Elapsed time during which at least one matched span was in flight.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "achieved_concurrency": {
+              "description": "Total matched work divided by the wall time it occupied. 1.0 is fully\nserial; 4.0 means four matched spans in flight on average.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "complete",
+            "sample_count",
+            "nested_matches",
+            "overlapping_child_ms",
+            "overlapping_child_spans"
+          ]
+        }
+      }
+    },
+    "Suppressed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Suppressed",
+      "description": "Why a field that normally carries a number is `null`.\n\nA profile has several ways to be legitimately unable to answer — the\nretention level is too low, a warm-up cut makes an unwindowed tier\nmeaningless, nothing nested so self time carries no information. Returning\n`null` alone would leave the reader to guess which, and the guesses differ\nin what they imply about the run. Every suppression names its field and its\nreason so a consumer can distinguish \"not measured\" from \"measured as zero\".",
+      "type": "object",
+      "properties": {
+        "field": {
+          "description": "Dotted path of the suppressed field, e.g. `sampled.self_ms`.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "remedy": {
+          "description": "What the caller could change to get a number instead. Absent when\nnothing would help.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "field",
+        "reason"
+      ]
+    },
     "FilterInfo": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "FilterInfo",

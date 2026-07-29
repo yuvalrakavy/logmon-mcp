@@ -592,6 +592,192 @@ pub struct SpansContextResult {
 }
 
 // =============================================================================
+// collectors.* / traces.profile
+// =============================================================================
+
+/// Why a field that normally carries a number is `null`.
+///
+/// A profile has several ways to be legitimately unable to answer — the
+/// retention level is too low, a warm-up cut makes an unwindowed tier
+/// meaningless, nothing nested so self time carries no information. Returning
+/// `null` alone would leave the reader to guess which, and the guesses differ
+/// in what they imply about the run. Every suppression names its field and its
+/// reason so a consumer can distinguish "not measured" from "measured as zero".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct Suppressed {
+    /// Dotted path of the suppressed field, e.g. `sampled.self_ms`.
+    pub field: String,
+    pub reason: String,
+    /// What the caller could change to get a number instead. Absent when
+    /// nothing would help.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+}
+
+/// The window a profile covers. `wall_ms` runs from the later of arming and the
+/// last zeroing, so a collector that was reset mid-run does not report the wall
+/// time of data it no longer holds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileWindow {
+    pub armed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zeroed_at: Option<DateTime<Utc>>,
+    pub read_at: Option<DateTime<Utc>>,
+    pub wall_ms: f64,
+}
+
+/// Span loss during the window, and the collector's own view of unusable input.
+///
+/// `attribution` is `"domain"`, always: the transport counters are per-domain
+/// and unfiltered, so most of what they count may be spans this collector's
+/// filter would never have matched. That makes this sound as a trigger for
+/// marking a result untrustworthy, and wrong as a statement about how many
+/// matches went missing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileIngest {
+    /// Per-span channel-full drops on the two OTLP trace transports.
+    pub drops_in_window: u64,
+    /// Whole request bodies refused with 429 / UNAVAILABLE. The span count
+    /// behind these is unknowable — the bodies were never parsed.
+    pub shed_batches: u64,
+    /// Spans discarded at parse time for unusable identity.
+    pub malformed_dropped: u64,
+    /// Matched spans whose timestamps this collector could not use.
+    pub malformed_timestamps: u64,
+    /// Matched spans that ended before they started.
+    pub negative_duration_spans: u64,
+    pub attribution: String,
+}
+
+/// The always-exact tier. Never capped by the sample budget.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileExact {
+    pub count: u64,
+    pub total_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ms: Option<f64>,
+    pub error_count: u64,
+    /// Well-formed spans longer than the sketch's declared range: counted in
+    /// full toward `total_ms`, clamped in the distribution.
+    pub out_of_range_spans: u64,
+}
+
+/// Percentiles from the sketch — bounded relative error, unbounded population.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileEstimated {
+    /// Which population this sketch covers: `collector`, `name`, or `group`.
+    pub axis: String,
+    /// The sketch's relative-accuracy guarantee, as a percentage.
+    pub alpha_pct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p80_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<f64>,
+}
+
+/// Everything derived from retained per-span records. Exact over the records it
+/// holds — which is the whole population only while `complete` is true.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileSampled {
+    /// `false` once the sample budget stopped retention. The retained set is
+    /// then a contiguous prefix, not a sample of the whole run.
+    pub complete: bool,
+    pub sample_count: u64,
+    /// Duration minus the union of matched children clipped to this span —
+    /// time spent in this span and nothing matched below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_ms: Option<f64>,
+    /// Matched spans whose parent is also matched. Zero means self time equals
+    /// total time by construction, and `self_ms` is suppressed.
+    pub nested_matches: u64,
+    /// Child time that lay outside its parent's interval and was clipped away.
+    /// Non-zero means clock skew or instrumentation error, not concurrency.
+    pub overlapping_child_ms: f64,
+    /// How many children needed clipping. Paired with the millisecond figure
+    /// because one child off by a second and a thousand off by a millisecond
+    /// want opposite remedies.
+    pub overlapping_child_spans: u64,
+    /// Elapsed time during which at least one matched span was in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_union_ms: Option<f64>,
+    /// Total matched work divided by the wall time it occupied. 1.0 is fully
+    /// serial; 4.0 means four matched spans in flight on average.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub achieved_concurrency: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p80_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<f64>,
+}
+
+/// One row of a breakdown. `key` is the span name, the group tuple, the trace
+/// id, or the call path, depending on `grouped_by`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileGroup {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<ProfileExact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<ProfileEstimated>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<ProfileSampled>,
+    /// Set on a call path whose walk stopped at a parent that is not retained,
+    /// so the path is a suffix rather than a root-to-here chain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub path_incomplete: bool,
+}
+
+/// The result of profiling a collector or an ad-hoc span query.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileResult {
+    /// Collector name, or absent for an ad-hoc `traces.profile` query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub filter: String,
+    /// `scalar`, `timing`, or `tree`.
+    pub level: String,
+    pub matched: u64,
+    /// `detected`, `undetected`, or `unknown` — the last when the retention
+    /// level cannot answer the question at all.
+    pub nesting: String,
+    pub window: ProfileWindow,
+    /// Absent when the pinned domain is gone, or was recreated under the
+    /// collector, which makes a counter delta meaningless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<ProfileIngest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<ProfileExact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<ProfileEstimated>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<ProfileSampled>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouped_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<ProfileGroup>,
+    /// True when a cardinality cap folded values into `__overflow__`, so at
+    /// least one row aggregates an arbitrary, arrival-ordered member set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cardinality_capped: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<Suppressed>,
+}
+
+// =============================================================================
 // bookmarks.*
 // =============================================================================
 

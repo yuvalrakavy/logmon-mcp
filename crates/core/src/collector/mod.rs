@@ -8,6 +8,7 @@
 
 pub mod exact;
 pub mod intern;
+pub mod project;
 pub mod registry;
 pub mod sample;
 pub mod sketch;
