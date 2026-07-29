@@ -1056,6 +1056,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "serde_json",
+ "sketches-ddsketch",
  "socket2 0.5.10",
  "tempfile",
  "thiserror 2.0.18",
@@ -1822,6 +1823,12 @@ dependencies = [
  "errno",
  "libc",
 ]
+
+[[package]]
+name = "sketches-ddsketch"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05e40b6cf54d988dc1a2223531b969c9a9e30906ad90ef64890c27b4bfbb46ea"
 
 [[package]]
 name = "slab"

@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod collector;
 pub mod filter;
 pub mod gelf;
 pub mod receiver;
