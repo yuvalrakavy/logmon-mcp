@@ -1042,9 +1042,10 @@ round 2 validated.
 
 ## 17. Implementation status — updated 2026-07-29
 
-Branch `feat/span-time-collector`. Everything below is committed, with the full
-workspace suite green (60 result lines), clippy silent, and `cargo xtask verify-schema`
-clean. No protocol types have changed yet.
+Branch `feat/span-time-collector`. **Phase 1 is complete.** Everything below is
+committed, with the full workspace suite green (62 result lines), clippy silent, and
+`cargo xtask verify-schema` clean. The protocol crate now carries the `Profile*`
+types and the schema has been regenerated.
 
 ### Landed
 
@@ -1059,26 +1060,57 @@ clean. No protocol types have changed yet.
 | Collector state | `collector/state.rs` | §3.6 — one lock, clone-read, swap. |
 | Registry + ingest wiring | `collector/registry.rs`, `daemon/span_processor.rs` | §4.4 — domain-keyed; `Arc` built in `run_with_overrides`, held by `RpcHandler`. |
 | Filter admission | `filter/admission.rs` | §7 — blocks and marks, both directions mutation-tested. |
+| Span-loss counters | `receiver/metrics.rs` + both OTLP paths | §5.1.1 — `record_trace_batch_shed`, `record_trace_malformed`, `trace_ingest_loss()`. |
+| Projections | `collector/project.rs` | §5 — all four categories, percentiles, clipped-union self time, wall union, paths, warm-up. |
+| Wire types | `protocol/methods.rs` | §5.1 — the **complete** field set; core builds them directly, so there is no mirror to drift. |
+| Contract surface | `daemon/rpc_handler.rs` | §7 — `collectors.add\|list\|get\|reset\|remove`, `traces.profile`. |
+| MCP surface | `mcp/server.rs` | 6 tools, 1:1 with the RPC methods. 33 → 39. |
+| `traces.slow` repair | `daemon/rpc_handler.rs`, `span/store.rs` | §1.1 — full population, display floor, §5.7 rank, folded inside the read guard. |
+| A14 | `benches/span_ingest.rs`, `tests/collector_concurrency.rs` | Observer effect measured *and* asserted. |
+
+### Corrections this section makes to §5
+
+Each found by making the spec run. The spec text above is left as written; these
+are the deviations, and they are deliberate.
+
+1. **Self time cannot come out negative** (§5.3). Every clipped child is a subset of
+   its parent's interval, so their union measures at most the parent's duration — the
+   clamp is unreachable and `overlapping_child_ms` would be provably always zero,
+   which reads as "no anomalies" when it means "cannot fire". The pair now reports the
+   **clipped-away mass** and the number of children it came from: the anomaly clipping
+   *hides* (a child that started before its parent or outlived it — clock skew or an
+   instrumentation bug). Still answers V4b. The clamp survives as a documented
+   unreachable guard.
+2. **`achieved_concurrency` is sampled-over-sampled** (§5.1). The spec's
+   `total_ms / wall_union_ms` divides the exact tier's total by the sample tier's
+   union; under truncation those are different populations and the ratio is inflated
+   by exactly the truncation ratio. They agree when `complete`, which is the only case
+   §5.1 had in mind.
+3. **`nesting` has a third state**, `unknown`. Below tree level the question cannot be
+   asked, and `undetected` would let a reader infer a flat call structure from a
+   retention setting.
+4. **Children are keyed on `(trace_id, span_id)`.** Span ids are only unique *within* a
+   trace; sequential-per-trace instrumentation collides constantly across traces.
 
 ### Not yet built
 
-1. **Projections** — `ProfileResult` with its four categories (§5.1), percentiles,
-   self time by clipped interval union (§5.3), wall union, call paths (§5.4),
-   warm-up exclusion (§5.5). The data model they read is complete.
-2. **`ReceiverMetrics` counters** — `shed_batches` and `malformed_dropped` (§5.1.1).
-   **Not optional**: without them `ingest.drops_in_window` is blind to the two
-   dominant loss paths, and the exact tier's central claim stays unproven.
-3. **RPC + MCP surface** — `collectors.add|list|get|reset|remove`, `traces.profile`
-   (§7). `RpcHandler` already holds the registry.
-4. **`traces.slow` fix** — aggregate the full population; `min_duration_ms` becomes a
-   display floor; rank per §5.7 (§1.1).
-5. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
-   cost**; deliberately low priority now that measurement has ranked it.
+1. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
+   cost**; deliberately deprioritised now that measurement has ranked it.
+2. Phases 2–5 per §13: remaining projections work is done, so phase 3 (**history**:
+   snapshot/history/edit, per-collector files, crash harness, merging), phase 4
+   (**comparison**: `collectors.diff`, `collectors.document`), phase 5 (**guards**:
+   threshold triggers).
+3. **`status.get` does not surface the new counters.** Deliberate: `receiver_drops`
+   documents itself as counting entries the broker *silently* lost, and both transports
+   carry a comment explaining why a shed is not one of those. Adding a sibling field is
+   a protocol change worth making on its own terms.
 
 ### Facts that cost time to establish — do not re-derive
 
 - Ingest baseline, measured: 3.94 µs at 0 sessions, 34.6 µs at 1, 118.6 µs at 4 —
   **now 3.91 / 4.35 / 4.66 µs** after the trigger fix.
+- **Observer effect, measured** (1 bound session): **4.10 / 4.39 / 4.93 µs** at 0 / 1 / 4
+  collectors — about **0.21 µs per collector**, 20 % at the four-collector ceiling.
 - Chunk size 8 192 is measured, not chosen: 0.29 ms read lock-hold vs 1.80 ms at 65 536.
 - DDSketch's rank is `(q * (n-1)) as u64` — matches §5.7, no adjustment needed.
 - `Config::min_possible()` **is** public (a gate report said otherwise).
@@ -1086,10 +1118,18 @@ clean. No protocol types have changed yet.
   **record** is the load-bearing guard, since `Config` does not survive persistence.
 - Four test files carry **pre-existing** rustfmt drift (`domains_binding`,
   `log_processor`, `session_registry`, `trigger_window_defaults`). Not mine; leave them.
+- Taking the **read** lock in `CollectorRegistry::reset` does not compile — the baseline
+  update needs a mutable borrow. The borrow checker enforces there what a test samples.
 
 ### Working discipline that has been paying
 
-Every guard is mutation-tested before commit. That has already found a dead guard, two
-vacuous tests, and three distinct ways a mutation harness can lie (patch miss,
-semantically inert patch, misclassified cargo output). Scripts live in the session
-scratchpad; the pattern is worth recreating rather than the files.
+Every guard is mutation-tested before commit. That has found a dead guard, three vacuous
+or non-discriminating tests, one missing test (the reset re-baseline), and **five**
+distinct ways a mutation harness can lie: patch miss, semantically inert patch,
+misclassified cargo output, non-terminating mutation reported as a compile failure, and
+a filter that matched no tests reported as `ok`. Scripts live in the session scratchpad;
+the pattern is worth recreating rather than the files.
+
+Two harness lessons worth keeping: mutate **one half** of a compound guard at a time (it
+proves each half separately *and* still terminates), and `cargo test -p <crate> <filter>`
+filters by test **name** — `--test <file>` selects a target.
