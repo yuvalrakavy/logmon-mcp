@@ -115,6 +115,15 @@ pub enum IngestBasis {
     },
     /// The pinned domain is gone, or was replaced under the collector.
     Unavailable,
+    /// There is no window to attribute loss to — an ad-hoc query over spans
+    /// that arrived before it was asked.
+    ///
+    /// Distinct from `Unavailable` because the reasons read as claims about
+    /// the user's system. Telling someone their domain "is gone or was
+    /// recreated" when they simply ran a one-off profile is a false statement,
+    /// and the whole point of the suppression channel is that a reader can
+    /// trust what it says.
+    NoWindow,
 }
 
 /// Build the profile.
@@ -245,6 +254,21 @@ fn ingest_view(
                          counters no longer share an origin with this collector's baseline"
                     .into(),
                 remedy: None,
+            });
+            None
+        }
+        IngestBasis::NoWindow => {
+            suppressed.push(Suppressed {
+                field: "ingest".into(),
+                reason: "span loss is measured as a delta across a collector's window, and \
+                         an ad-hoc profile has no window — these spans arrived before it \
+                         was asked for"
+                    .into(),
+                remedy: Some(
+                    "arm a collector before the run if you need to know whether spans went \
+                     missing while it was measured"
+                        .into(),
+                ),
             });
             None
         }

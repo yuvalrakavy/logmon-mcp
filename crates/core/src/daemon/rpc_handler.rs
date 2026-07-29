@@ -1709,9 +1709,7 @@ impl RpcHandler {
         let opts = self.profile_options(params)?;
         let mut result = crate::collector::project::profile(
             &scratch.snapshot(),
-            // No baseline exists for a query over spans that arrived before it
-            // was asked, so there is no window to attribute loss to.
-            crate::collector::project::IngestBasis::Unavailable,
+            crate::collector::project::IngestBasis::NoWindow,
             &opts,
             Utc::now(),
         );

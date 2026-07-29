@@ -636,6 +636,33 @@ fn traces_profile_reads_what_is_already_in_the_buffer() {
 }
 
 #[test]
+fn an_ad_hoc_profile_does_not_claim_the_domain_is_gone() {
+    // Caught by the post-deploy smoke test: `traces.profile` reused the
+    // collector's "pinned domain is gone or was recreated" reason, which is a
+    // false statement about the reader's system. A suppression reason is only
+    // worth having if it can be trusted.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.feed("default", &span("svc", "op", 5.0));
+
+    let got = h.call(&sid, "traces.profile", json!({})).expect("profiled");
+    assert!(got["ingest"].is_null());
+    let sup = got["suppressed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["field"] == "ingest")
+        .expect("a reason");
+    let reason = sup["reason"].as_str().unwrap();
+    assert!(
+        !reason.contains("gone") && !reason.contains("recreated"),
+        "nothing is wrong with the domain: {reason}"
+    );
+    assert!(reason.contains("no window"), "got: {reason}");
+    assert!(sup["remedy"].is_string(), "and what to do instead");
+}
+
+#[test]
 fn traces_profile_refuses_a_cursor_because_a_profile_must_repeat() {
     // A cursor is read-and-advance, so a second identical call would return
     // less than the first.
