@@ -2,8 +2,6 @@ use crate::daemon::domain::DomainId;
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::SessionRegistry;
 use crate::engine::pipeline::LogPipeline;
-use crate::filter::matcher::matches_span;
-use crate::filter::parser::{is_span_filter, parse_filter};
 use crate::span::store::SpanStore;
 use crate::span::types::{SpanEntry, SpanStatus, TraceSummary};
 use std::sync::Arc;
@@ -38,33 +36,26 @@ pub fn process_span_for_domain(
     // 1. Store unconditionally (SpanStore assigns seq)
     store.insert(span.clone());
 
-    // 2. Evaluate span triggers for each session bound to this domain
+    // 2. Evaluate span triggers for each session bound to this domain.
+    //
+    // `evaluate_span` matches against each trigger's STORED `ParsedFilter`.
+    // This loop used to clone a `TriggerInfo` per trigger per span and then
+    // re-parse the filter string it had just cloned — recompiling the seeded
+    // regex trigger once per span, per bound session, at 28.07 µs of a 34.6 µs
+    // per-session cost (`benches/span_ingest.rs`). `match_count` is now
+    // incremented inside `evaluate_span`, at match time, exactly as the log
+    // path does it.
     let session_ids = sessions.active_session_ids_for_domain(domain);
     let mut any_oneshot_removed = false;
     for sid in &session_ids {
-        let triggers = sessions.list_triggers(sid);
-        for trigger in &triggers {
-            if is_span_filter_str(&trigger.filter_string) {
-                if let Ok(filter) = parse_filter(&trigger.filter_string) {
-                    if matches_span(&filter, span) {
-                        // Count it here: this path never reaches
-                        // `TriggerManager::evaluate`, which is what increments
-                        // match_count for log triggers. Before the dispatch and
-                        // before any oneshot removal, so the count records the
-                        // fire even if delivery fails or the trigger is about
-                        // to be removed.
-                        sessions.record_trigger_match(sid, trigger.id);
-                        let trace_summary = build_trace_summary(span.trace_id, store);
-                        let event =
-                            SessionRegistry::build_span_event(sid, span, trigger, trace_summary);
-                        sessions.send_or_queue_notification(sid, event.clone());
-                        pipeline.send_event(event);
-                        if trigger.oneshot {
-                            let _ = sessions.remove_trigger(sid, trigger.id);
-                            any_oneshot_removed = true;
-                        }
-                    }
-                }
+        for trigger in sessions.evaluate_span_triggers(sid, span) {
+            let trace_summary = build_trace_summary(span.trace_id, store);
+            let event = SessionRegistry::build_span_event(sid, span, &trigger, trace_summary);
+            sessions.send_or_queue_notification(sid, event.clone());
+            pipeline.send_event(event);
+            if trigger.oneshot {
+                let _ = sessions.remove_trigger(sid, trigger.id);
+                any_oneshot_removed = true;
             }
         }
     }
@@ -86,12 +77,6 @@ pub fn process_span(
     pipeline: &LogPipeline,
 ) {
     process_span_for_domain(span, store, sessions, pipeline, &DomainId::default_domain());
-}
-
-fn is_span_filter_str(filter_str: &str) -> bool {
-    parse_filter(filter_str)
-        .map(|f| is_span_filter(&f))
-        .unwrap_or(false)
 }
 
 fn build_trace_summary(trace_id: u128, store: &SpanStore) -> Option<TraceSummary> {

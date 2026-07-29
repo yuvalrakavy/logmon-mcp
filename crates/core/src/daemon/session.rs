@@ -550,12 +550,18 @@ impl SessionRegistry {
         }
     }
 
-    /// Record a match for a trigger the caller matched itself (span processor).
-    /// See `TriggerManager::record_match`.
-    pub fn record_trigger_match(&self, id: &SessionId, trigger_id: u32) {
+    /// Span-side counterpart of [`Self::evaluate_triggers`].
+    ///
+    /// Takes the sessions lock **once** and evaluates against the triggers'
+    /// stored conditions. The previous span path took this lock twice — once
+    /// via `active_session_ids_for_domain`, once via `list_triggers` — then a
+    /// third for the triggers themselves, and materialised a `TriggerInfo` per
+    /// trigger per span purely to read a filter string it then re-parsed.
+    pub fn evaluate_span_triggers(&self, id: &SessionId, span: &SpanEntry) -> Vec<TriggerMatch> {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
-        if let Some(state) = sessions.get(id) {
-            state.triggers.record_match(trigger_id);
+        match sessions.get(id) {
+            Some(state) => state.triggers.evaluate_span(span),
+            None => Vec::new(),
         }
     }
 
@@ -827,7 +833,7 @@ impl SessionRegistry {
     pub fn build_span_event(
         id: &SessionId,
         span: &SpanEntry,
-        trigger: &TriggerInfo,
+        trigger: &TriggerMatch,
         trace_summary: Option<TraceSummary>,
     ) -> PipelineEvent {
         PipelineEvent {

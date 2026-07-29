@@ -90,7 +90,8 @@ compact record per matched span and every metric is a read-time projection.
   the current code deep-clones every match into a `Vec<SpanEntry>` under the lock, and removing
   the truncation grows that clone set to the whole buffer while `insert` needs a write lock.
 - **Trigger path re-parses and allocates per span**, including a regex compile per span per
-  bound session. **Not fixed here**; filed separately.
+  bound session. Filed separately, then **pulled into phase 1 and fixed** once the bench showed
+  it makes the exact tier unachievable in practice (§4.2).
 - **OTLP/gRPC reports success while dropping spans mid-batch.** Filed separately; §5.1 must
   cope with it either way.
 
@@ -328,12 +329,30 @@ substring match is the two `to_lowercase` calls) — but it is **0.2 % of the pe
 cost**. Convergent lens agreement identified a true defect and said nothing about its
 magnitude; only the bench could.
 
-**Consequence for this design, and it is not cosmetic.** A 16-lane suite emitting faster than
-~29 k spans/s fills the 65 536-slot channel in seconds, and spans are then dropped *at the
-receiver*, before any collector sees them (§5.1.1). Every collector result would carry
-`trustworthy: false` for a reason that has nothing to do with collectors. **The exact tier's
-central claim is unachievable in practice until the trigger path is fixed** — so the
-separately-filed trigger-path fix is a prerequisite of this feature, not an adjacent cleanup.
+**Consequence, and it is not cosmetic.** A 16-lane suite emitting faster than ~29 k spans/s
+fills the 65 536-slot channel in seconds, and spans are then dropped *at the receiver*, before
+any collector sees them (§5.1.1) — so every collector result would carry `trustworthy: false`
+for a reason having nothing to do with collectors. The exact tier's central claim was
+unachievable in practice while that stood, which made the trigger-path fix a **prerequisite**
+of this feature rather than the adjacent cleanup it had been filed as.
+
+**Fixed in phase 1. After, measured on the same bench:**
+
+| Case | Before | After | |
+|---|---|---|---|
+| 0 sessions | 3.94 µs | 3.91 µs | unchanged — no trigger work on this path |
+| 1 session | 34.6 µs | **4.35 µs** | −87.7 %, ~29 k → ~230 k spans/s |
+| 4 sessions | 118.6 µs | **4.66 µs** | −96.1 %, ~8.4 k → ~215 k spans/s |
+
+The shape matters as much as the magnitude: per-span cost is now nearly **flat in session
+count** (3.91 / 4.35 / 4.66 µs) instead of growing ~30 µs per bound session.
+
+`TriggerManager::evaluate_span` matches against each trigger's already-stored `ParsedFilter`
+under one lock, mirroring the log path's `evaluate`. No parse, no regex recompile, and no
+`TriggerInfo` materialisation — `collect` into an empty `Vec` does not allocate, so the
+no-match case (the overwhelmingly common one) allocates nothing at all. Behaviour is
+deliberately unchanged: span triggers are still **not** debounced, which is now pinned by a
+test rather than by a comment.
 
 ### 4.3 Ordering, clocks, malformed input
 

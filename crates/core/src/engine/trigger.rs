@@ -1,6 +1,7 @@
-use crate::filter::matcher::matches_entry;
-use crate::filter::parser::{parse_filter, FilterParseError, ParsedFilter};
+use crate::filter::matcher::{matches_entry, matches_span};
+use crate::filter::parser::{is_span_filter, parse_filter, FilterParseError, ParsedFilter};
 use crate::gelf::message::LogEntry;
+use crate::span::types::SpanEntry;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, Ordering},
     RwLock,
@@ -276,26 +277,44 @@ impl TriggerManager {
         Ok(())
     }
 
-    /// Record that trigger `id` fired, for a caller that does its own matching
-    /// instead of going through `evaluate`.
+    /// Span-side counterpart of [`Self::evaluate`], matching against each
+    /// trigger's **stored** `condition` under a single lock.
     ///
-    /// The span processor is the only such caller: it matches spans itself
-    /// (`matches_span` against a re-parsed filter) and never reaches `evaluate`,
-    /// so without this a span trigger's `match_count` stays 0 forever and
-    /// "has this ever fired?" is unanswerable. Deliberately does NOT touch
-    /// `post_remaining` — span triggers are not debounced, and making them so
-    /// is a behaviour change that belongs with unifying the two evaluation
-    /// paths, not with fixing the counter.
-    pub fn record_match(&self, id: u32) {
-        if let Some(t) = self
-            .triggers
-            .read()
-            .expect("triggers lock poisoned")
+    /// Replaces a path where the span processor reached triggers through
+    /// `list_triggers()` — cloning a `TriggerInfo` (two `String`s) per trigger
+    /// per span — and then re-`parse_filter`ed the string it had just cloned,
+    /// recompiling the seeded `/panic|unwrap failed|stack backtrace/` regex
+    /// once per span per bound session. Measured at **28.07 µs of a 34.6 µs**
+    /// per-span, per-session cost (`benches/span_ingest.rs`).
+    ///
+    /// Behaviour is deliberately unchanged. Span triggers are still **not
+    /// debounced**, so `post_remaining` is neither read nor written here, and
+    /// `match_count` is still incremented at match time — before dispatch and
+    /// before any oneshot removal, so the count records the fire even if
+    /// delivery fails. Unifying the two paths' debounce semantics is now
+    /// structurally possible, but it is a behaviour change and is not part of
+    /// this performance fix.
+    ///
+    /// Allocates nothing when nothing matches, which is the common case:
+    /// `collect` into an empty `Vec` does not allocate.
+    pub fn evaluate_span(&self, span: &SpanEntry) -> Vec<TriggerMatch> {
+        let triggers = self.triggers.read().expect("triggers lock poisoned");
+        triggers
             .iter()
-            .find(|t| t.id == id)
-        {
-            t.match_count.fetch_add(1, Ordering::Relaxed);
-        }
+            .filter(|t| is_span_filter(&t.condition) && matches_span(&t.condition, span))
+            .map(|t| {
+                t.match_count.fetch_add(1, Ordering::Relaxed);
+                TriggerMatch {
+                    id: t.id,
+                    description: t.description.clone(),
+                    filter_string: t.filter_string.clone(),
+                    pre_window: t.pre_window,
+                    post_window: t.post_window,
+                    notify_context: t.notify_context,
+                    oneshot: t.oneshot,
+                }
+            })
+            .collect()
     }
 
     /// Clear every trigger's in-flight debounce window.
