@@ -351,7 +351,6 @@ Two consequences to state rather than discover:
 {
   "collector": "cache-ab", "description": "…",
   "filter": "sv=store_server", "level": "tree",
-  "level_raised_at": null,           // sticky; consulted by diff (§5.6)
   "matched": 1180442,
   "nesting": "detected",             // "detected" | "undetected"
   "window": { "armed_at": "…", "zeroed_at": "…", "read_at": "…", "wall_ms": 2540000 },
@@ -511,7 +510,6 @@ their deltas are exact.
 | Condition | Behaviour |
 |---|---|
 | Different `level` | Compare at `min(level)`. **But nesting evidence is not discarded**: if *either* side reports `nested_matches > 0`, that fact attaches to the `total_ms` delta row and sets `trustworthy: false`. Rev 2 dropped `nested_matches` along with the level, reintroducing the round-1 headline defect through a different door. |
-| Either side `level_raised_at != null` | Marked; the raised side's `self_ms` and paths are excluded, since its early records predate the parent columns (§7.1). |
 | Different `filter` | Compare canonicalized `ParsedFilter`s (lowercased substrings; `f64` thresholds by `total_cmp`). A genuine difference emits `filter_mismatch` + `allow_mismatch`. Regex spellings that compile identically will mark — acceptable, and not worth "fixing" by normalising regex sources. |
 | Incomplete side | Scope to sample-derived rows; `exact` and `estimated` pass. `scalar` collectors (no sample tier) are explicitly permitted. Both sides truncated is still **refused** by default — a faster arm reaches the cap later in wall-clock terms, so the cold prefixes cover different slices. |
 | **Asymmetric ingest loss** | **Refused**, behind `allow_lossy`. §9.6 says of ingest loss "no number here is safe"; a design that concludes that must not then emit a delta. This is the one place marking is insufficient. |
@@ -553,7 +551,9 @@ after eviction. `max_snapshots` 50, FIFO, `snapshots_evicted` reported.
 
 Policy `{per_name, per_group, projections, raw_sample_bytes}`, plus — always, regardless of
 policy — the exact tier, the sketches **with layout identity**, the `ingest` block, and the
-collector's **`filter`, `level`, `level_raised_at`, and policy as of that moment**. Without
+collector's **`filter`, `level`, `group_keys`, `max_sample_bytes`, `description`, `meta`, and
+policy as of that moment** — everything a later reader or diff would otherwise take from the
+live collector. Without
 those, `collectors.diff` would read the *live* collector's current definition and call it
 proof.
 
@@ -601,16 +601,34 @@ already share. §10 puts collector names in filenames, in the directory holding 
 patterns, attribute-only filters, and bookmark windows — all legal span filters. The predicate
 is "contains no log-only qualifier", plus:
 
-- **Blocked** (provably never matches, same bar as the layout refusal): `ParsedFilter::None`,
-  and non-finite `d>=`/`d<=` thresholds (`"nan".parse::<f64>()` succeeds; `x >= NaN` is always
-  false, and `d<=inf` matches everything including malformed spans).
-- **Marked**: if no `sn`/`sv`/`st`/`sk`/`d` qualifier appears anywhere, the response carries
-  `no_span_specific_qualifier: true` naming the uninterpreted selectors. `parse_selector`'s
-  catch-all turns every typo into `AdditionalField`, so `SV=store_server` — the flagship
-  filter with the shift key stuck — parses cleanly and matches nothing for forty minutes.
-  The parser's existing typo rule only fires on an lhs ending in `>`/`<`.
+- **Blocked** — and the bar is *provably never matches*, nothing looser:
+  - `ParsedFilter::None`.
+  - `d>=NaN`, `d<=NaN`, `d>=+inf`, `d<=-inf`. (`"nan".parse::<f64>()` succeeds, and every
+    comparison against NaN is false; `duration_ms` is always finite.)
+  - **An empty duration interval** — `max(Gte thresholds) > min(Lte thresholds)`, strict, so
+    `d>=100, d<=100` still matches exactly 100.0. Qualifiers are AND-ed, so `d>=100, d<=50`
+    can never match, and it is a plausible transposition of "between 50 and 100 ms".
+  - **Not `d<=+inf` or `d>=-inf`.** Rev 3 blocked these under the same heading; they match
+    **everything**, which is the opposite of the stated bar. They are no-ops and are *marked*,
+    not blocked. Stating a bar and then violating it in the same sentence is how the last
+    over-correction began.
+- **Marked, per qualifier — not per filter.** Every `AdditionalField` selector is named in the
+  response, always. Rev 3 marked only when *no* span-specific qualifier appeared anywhere, so
+  `sn=cache.lookup, SV=store_server` went unmarked and the AND still zeroed the collector for
+  forty minutes. `parse_selector`'s catch-all turns every typo into `AdditionalField`, and the
+  parser's existing typo rule only fires on an lhs ending in `>`/`<`.
+  The mark also states that **non-string attribute values never match on the span path** —
+  `matcher.rs` reads attributes through `.and_then(|v| v.as_str())`, so `cache.enabled=true`
+  against an OTLP `BoolValue` matches nothing *for any pattern*. §3.3 fixes this for
+  `group_keys`; the filter path is not fixed here, and the mark is what stops it being silent.
+  (§4.2 already budgets a `matches_pattern` change in phase 1; aligning the span attribute arm
+  with the log arm's `other.to_string()` fallback is the real fix and belongs there.)
 - **Echoed**: `BarePattern` scans **`span.name` only** on the span path, versus every field on
-  the log path. Legal, but narrower than any reader expects.
+  the log path. And **`st=` substring-matches error messages** — the status arm returns
+  `pat_lower == "error" || matches_pattern(pattern, msg)`, so `st=ok` also admits an errored
+  span whose message contains "ok" (`"broken pipe"` does). A collector armed `st=ok` to measure
+  only successful spans will quietly include failures and report `error_count > 0` in a
+  population the user believes is clean.
 
 **Bookmarks are rejected in collector filters** (a pre-parsed filter would freeze a stale seq
 bound). `traces.profile` accepts `b>=`/`b<=` and **rejects `c>=`** — a cursor is
@@ -618,23 +636,75 @@ read-and-advance, so a "profile" that mutates a cursor would make a second ident
 return less, contradicting V22. Rev 2 justified the filter loosening partly with
 bookmark-windowed arms, a case §7 makes impossible; that justification is withdrawn.
 
-### 7.1 `collectors.edit` — exhaustive
+### 7.1 `collectors.edit` — one rule
 
-| Field | Rule |
-|---|---|
-| `description`, `meta` | Free. |
-| `snapshot` policy, `threshold` | Free; each snapshot echoes its own policy. |
-| `filter` | Only when `snapshots.is_empty() && matched == 0`, **checked and swapped inside the collector lock** — otherwise a span matching the old filter lands in a tier the new filter describes. Sets `zeroed_at`. |
-| `level` — raise | Permitted, but **zeroes the sample tier and sets `zeroed_at` and `level_raised_at`**. Rev 2 permitted it outright: from `scalar` the sample tier would start filling at the raise point with no budget hit, so `complete` would read `true` over a *suffix* — falsifying the design's load-bearing honesty flag. From `timing`, zero-filling parent columns is worse, because `parent_span_id == 0` means **root**: every pre-raise span becomes a degenerate root with `span_id == 0`. |
-| `level` — lower | Refused. |
-| `group_keys` | Refused with history or `matched > 0` — they widen the exact tier's key at every level, so pre- and post-edit rows would be keyed differently and the "never approximate" tier becomes a mixture. |
-| `max_sample_bytes` | Raise free; lowering below current usage refused. |
+Rev 1 refused every structural edit. Rev 2 permitted them. Rev 3 wrote an eight-row table that
+a false-negative lens then found wrong in **both** directions simultaneously — partial zeroing
+that left `wall_ms` describing the sample tier while `exact.*` covered the whole run, three
+paths around the daemon reservation, and a `level`-lower refusal with no principled basis
+given that the raise is made safe by zeroing. Three over-corrections on one surface is the
+signal that per-field enumeration is the wrong shape.
 
-**Every edit re-runs the full §7 admission gate.** Shipped precedent to avoid: `filters.add`
-rejects bookmark qualifiers and `edit_filter` does not.
+**The rule:**
 
-An edit does not reset `armed_at`, so `wall_ms` is measured from `max(armed_at, zeroed_at)`
-(§5.1) and a corrected typo does not leave dead minutes in the window.
+> **`description` and `meta` are free. Every other edit is a `reset` plus a config change:
+> it swaps the entire collector state — exact tier, sketches, sample tier, interner,
+> cardinality counters, ingest baseline, `zeroed_at` — and re-runs every gate that
+> `collectors.add` runs.** History is untouched; snapshots are immutable and carry their own
+> definition (§6.3).
+
+Everything the table was trying to express falls out, in the permissive direction:
+
+- **`filter`, `group_keys`, `level` up or down** — all permitted at any time. There is no
+  mixture to fear because the window is zeroed, and no history to invalidate because §6.3
+  records each snapshot's own `filter`, `level`, `group_keys`, and policy, and §5.6 *marks*
+  definition differences rather than refusing them. This restores the `level`-lower case the
+  lens argued for: a `tree` collector heading for the cap mid-suite can drop to `timing` for
+  2.5× the records, which is the only remedy available once the daemon-wide reservation is
+  exhausted at four collectors.
+- **Reservation is re-checked** on every structural edit, closing the three paths that walked
+  past it: a free `max_sample_bytes` raise, a `scalar`→`tree` raise that created a sample tier
+  with no reservation at all, and a `snapshot` policy edit changing `raw_sample_bytes`, which
+  §3.4 counts against the budget.
+- **Every add-time gate re-runs**, not just §7's. Rev 3 said "the full §7 admission gate", but
+  §7 is name and filter admission only — the level/metric compatibility checks live in §11 and
+  the reservation in §3.4, so a `snapshot` policy naming `self_ms` on a `timing` collector was
+  unvalidated.
+- **`level_raised_at` is deleted**, along with §5.6's row consuming it. That row excluded the
+  raised side's `self_ms` "since its early records predate the parent columns" — a rev-2
+  leftover assuming zero-fill. Under zeroing there *are* no early records, and because the flag
+  was sticky and survived `reset`, two snapshots taken entirely after a raise had `self_ms`
+  excluded from every diff forever. The rule that made the raise safe made its output
+  undiffable.
+- **`zeroed_at` moves with the swap**, so `wall_ms` (§5.1) and the ingest baseline describe the
+  same window as the data beside them. Rev 3's partial zeroing inflated `achieved_concurrency`
+  by dividing a whole-run numerator by a post-edit denominator, and produced
+  `sample_count < count` with `complete: true` — a second unmarked exception to the one
+  reconciliation rule the design has.
+
+**Immutable, and the errors say so:** the sketch layout parameters (`alpha`, range,
+`max_name_sketches`, `max_group_sketches`) — §5.6 refuses diffs across mismatched layouts, so
+editing them would poison every existing snapshot's comparability at a stroke — and `name`,
+which §10 uses as the persistence filename.
+
+**`domain` is re-pinnable, but only while zeroed.** §10 states that a collector pinned to an
+API-created domain is *always* orphaned after a restart, since those domains are never
+re-created. Without a re-pin the sanctioned response to the design's own default failure mode
+would be deleting the collector and its history. A restored collector is zeroed by definition,
+so the edit rule already permits it.
+
+**Ordering, because three rules collide here.** §7.1 wants the swap inside the collector lock;
+§3.6 forbids I/O under the lock; §10 makes `edit` write-through; and §6.1 establishes that a
+destructive operation must not commit until the write succeeds. Satisfy all four with a
+per-collector edit mutex held across the whole operation: validate under the lock, persist
+outside it, then swap under the lock only after a successful `rename`. Otherwise an edit whose
+persist fails has zeroed the live collector while the on-disk definition still holds the old
+filter — rev 2's "write-through did not compose" failure in a new place.
+
+*(One rev-3 hazard was retired by the §3.6 probe rather than by this rule: `matched == 0` was
+aliased by swap-and-fold, since any `collectors.get` emptied the live generation and a
+collector that had matched millions read as virgin. Non-destructive reads now clone, so the
+live counters are never zeroed by a read.)*
 
 ---
 
@@ -811,7 +881,7 @@ Duplicate collector name within a session → error. `collectors.add` on an **an
 Loud and specific. Beyond §7 and §7.1: metric above level; unknown group key; arming exceeds
 the daemon reservation (stating requested, remaining, and the four-collector ceiling); snapshot
 policy above level; unknown snapshot label; `diff` refusals (layout, asymmetric ingest loss,
-both-truncated) and markings (level, filter, `level_raised_at`); cardinality and sketch caps;
+both-truncated) and markings (level, filter, group_keys); cardinality and sketch caps;
 sample budget hit; ingest loss present; `nested_matches == 0` suppressing `self_ms`; malformed
 timestamps; negative durations; out-of-range sketch input; snapshot **persist failure** (does
 not zero); `document` folded below `tree`; zero matches returning a well-formed empty result.
@@ -833,8 +903,11 @@ rank per §5.7 · V13 sketch vs sample-exact at a matched convention and stated 
 V14–V17 snapshot/history/merge/descriptions · V18 document completeness incl. per-arm
 provenance, `aggregation`, `correctness_evidence` · V19 both floors, one printed threshold ·
 V20 sizing · V21 bytes-vs-path · V22 lossless regeneration · V23 body order and per-table tier
-· V24 admission: bare patterns and attribute-only filters admitted; `SV=`, `message=`,
-`ParsedFilter::None`, `d>=nan`, `d<=inf` all caught · **V25 zero-duration spans counted and
+· **V24 admission, split in two.** *Blocked:* `ParsedFilter::None`, `d>=NaN`, `d<=NaN`,
+`d>=+inf`, `d<=-inf`, `d>=100, d<=50`. *Marked, never rejected:* `SV=`, `message=`,
+`cache.enabled=true` on a boolean attribute, `d<=+inf`. Bare patterns, attribute-only filters
+and `ALL` admitted. Implementing the mark list as rejection re-creates rev 1's over-block
+through the test suite · **V25 zero-duration spans counted and
 reported as 0.0; negative durations excluded from sketch and `total_ns` and counted.**
 
 **Adversarial.** A1 cap boundary · A2 parent cycle · A3 arrival order, complete **and under
@@ -845,8 +918,10 @@ group and name caps · **A6c a span longer than the declared sketch range — no
 collapse** · A7 diff level/filter/layout/overflow handling · A8 incomplete side · A9 idle CPU ·
 A10 truncation not laundered into a snapshot · **A11 per-field sum invariant across *every*
 structure — `count`, `total_ns`, `sample_count`, sketch count, per-name, per-group,
-`error_count`** · A12 history eviction · **A13 level raise on a collector with prior matches,
-asserting the sample tier zeroed and `level_raised_at` set** · **A14 observer effect: criterion
+`error_count`** · A12 history eviction · **A13 a structural edit — filter, `group_keys`, level up *and* down — on a
+collector with prior matches: every structure zeroed together, `zeroed_at` and the ingest
+baseline moving with it, history untouched, and A11 still holding afterwards. Rev 3's partial
+zeroing made A13 and A11 contradict each other** · **A14 observer effect: criterion
 bench over `process_span_for_domain` at 0/1/4 collectors; a saturation test asserting zero
 receiver drops; a read-during-ingest test at the cap; stated reps and threshold.**
 
