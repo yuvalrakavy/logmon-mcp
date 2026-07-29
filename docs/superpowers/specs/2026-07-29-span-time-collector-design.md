@@ -304,9 +304,36 @@ lock; chunk append; sketch `add`; interner hash lookup.
 and self-limiting (log-scaled, a few hundred times per run at most), but biased toward the
 start of a run and toward *fast* spans, i.e. the cache-on arm.
 
-**Existing path baseline for A14:** a deep `SpanEntry` clone under a `SpanStore` **write**
-lock, `parse_filter` per trigger (twice for span triggers) including a **regex compile per
-span per bound session**, and lock growth of `2 + N_registry + 2×S_bound`.
+**Existing path baseline for A14 — MEASURED**, not derived (criterion, `crates/core/benches/
+span_ingest.rs`, this machine, release):
+
+| Case | Per span | Implied ceiling |
+|---|---|---|
+| `process_span`, 0 sessions bound | **3.94 µs** | ~254 k spans/s |
+| 1 session bound | **34.6 µs** | **~29 k spans/s** |
+| 4 sessions bound | **118.6 µs** | ~8.4 k spans/s |
+
+**92 % of the per-session cost is one regex, compiled per span.** Attributed rather than
+inferred: `parse_filter("/panic|unwrap failed|stack backtrace/")` — the trigger
+`SessionRegistry` seeds into *every* session — measures **28.07 µs**, against 140 ns for the
+other seeded filter and 263 ns for a collector-shaped `sv=store_server, d>=10`.
+`is_span_filter_str` calls `parse_filter` on every trigger for every span, so that compile is
+paid per span per bound session. The rest is the deep `SpanEntry` clone under a `SpanStore`
+**write** lock and lock growth of `2 + N_registry + 2×S_bound`.
+
+**This reprioritises §4.2's own contents.** The matcher de-allocation — flagged by three
+convergent round-1 lenses — is real and confirmed (`matches_span` with a substring qualifier
+is **66 ns** against a **4.0 ns** allocation-free duration-only control, so ~94 % of a
+substring match is the two `to_lowercase` calls) — but it is **0.2 % of the per-session ingest
+cost**. Convergent lens agreement identified a true defect and said nothing about its
+magnitude; only the bench could.
+
+**Consequence for this design, and it is not cosmetic.** A 16-lane suite emitting faster than
+~29 k spans/s fills the 65 536-slot channel in seconds, and spans are then dropped *at the
+receiver*, before any collector sees them (§5.1.1). Every collector result would carry
+`trustworthy: false` for a reason that has nothing to do with collectors. **The exact tier's
+central claim is unachievable in practice until the trigger path is fixed** — so the
+separately-filed trigger-path fix is a prerequisite of this feature, not an adjacent cleanup.
 
 ### 4.3 Ordering, clocks, malformed input
 

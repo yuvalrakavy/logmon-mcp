@@ -37,3 +37,8 @@ sd-notify = { workspace = true }
 tokio-test.workspace = true
 tempfile.workspace = true
 tracing-test = "0.2"
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "span_ingest"
+harness = false
