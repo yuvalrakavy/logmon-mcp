@@ -29,7 +29,9 @@ Mechanisms changed in rev 3 need a round-3 pass on a reduced lens set (§16).
 >   reader.)
 > - **The chunked sample tier had a whole-chunk race.** Sealed list and active chunk were two
 >   lock domains; a reader could miss or double-count 65 536 records. Replaced with a
->   generation swap (§3.6).
+>   single lock over both domains, with only destructive reads swapping (§3.6). A probe
+>   then showed rev 3's first attempt — swap-and-fold on *every* read — was itself wrong.
+>   Corrected in place; see §3.6.
 > - **Write-through persistence did not compose.** Definitions were still shutdown-only, so a
 >   `kill -9` left orphan history with nothing to attach it to and V11 failed by
 >   construction. And because `domains.create(persist=true)` is refused today, orphaning was
@@ -97,7 +99,7 @@ compact record per matched span and every metric is a read-time projection.
 ## 2. Scope
 
 In: collector lifecycle; two-tier retention (exact tier with integer-nanosecond scalars and a
-duration sketch, plus a generation-swapped columnar sample tier); levels; `group_keys`;
+duration sketch, plus a chunked columnar sample tier under one lock); levels; `group_keys`;
 read-time projections including total and self time, percentiles, wall union, nesting
 detection, and call paths; **ingest-loss accounting**; snapshot history with merging;
 descriptions and `meta`; `traces.profile`; `collectors.diff`; `collectors.document`; threshold
@@ -157,7 +159,7 @@ in it is arrival order — so it is **suppressed in `collectors.diff`**, never c
 `__absent__` has identical semantics on both sides and compares fine.
 
 **Caps reset with the window.** The interner and both cardinality counters are part of the
-swapped generation (§3.6), so they are per-window, not lifetime. Otherwise the recommended
+state swapped on a destructive read (§3.6), so they are per-window, not lifetime. Otherwise the recommended
 interleaved A/B/A/B workflow would exhaust a cumulative cap and pin `cardinality_capped` on
 for the rest of the run.
 
@@ -222,31 +224,54 @@ on-disk format hostage to a 0.x crate's private internals.
 those axes — `group_by: "path"` or `"trace"`, a duration band, read-time narrowing on anything
 else — has no sketch and falls back to `sampled`, with `estimated: null` and a reason.
 
-### 3.6 Generations — one critical section, no O(N) under lock
+### 3.6 One lock, and only destructive reads swap
 
 Rev 2's chunked tier split the sealed list and the active chunk into two lock domains, which
 loses or duplicates a whole 65 536-record chunk depending on read ordering. Replaced.
 
-**All collector state lives in one `Generation`**, swapped atomically:
+**All collector state lives under ONE lock** — the defect in rev 2 was the lock *scope*, not
+the chunked structure:
 
-1. sample chunks (record-aligned, all columns)
-2. collector exact tier
-3. per-name exact map · 4. per-group exact map
+1. sealed chunks `Vec<Arc<Chunk>>`, immutable once sealed · the one active mutable chunk
+2. collector exact tier · 3. per-name exact map · 4. per-group exact map
 5. collector sketch · per-name sketches · per-group sketches
 6. the interner and both cardinality counters
-7. ingest baseline (`ReceiverDropSnapshot` at generation start) and `malformed_timestamps`
+7. ingest baseline (`ReceiverDropSnapshot`) and `malformed_timestamps`
 8. `armed_at` / `zeroed_at`, `complete`, sample-byte accounting
 9. `__overflow__` / `name_sketches_capped` flags
 
-**Ingest** takes the generation lock once per matched span and updates every structure inside
-it. Uncontended, because ingest is single-writer per domain (§1).
+**Ingest** takes that lock once per matched span and updates every structure inside it.
+Uncontended, because ingest is single-writer per domain (§1).
 
-**Every read is a swap.** `collectors.get`, `snapshot(reset=false)`, `snapshot(reset=true)`,
-and `reset` all swap the live generation out under the lock — O(1) pointer work — project
-outside the lock, and (except for `reset`) fold the projected generation into a **retired
-accumulator**. The live answer is `retired ⊕ active`, exact because exact scalars, sketches,
-and chunk lists are all additive (§6.5). This gives `reset=false` a real definition, which
-rev 2 never had, and guarantees the lock is never held across anything O(N).
+**Non-destructive reads clone; only destructive ones swap.**
+
+- `collectors.get` and `snapshot(reset=false)`: under the lock, clone the sealed `Arc` list
+  (pointer copies) and **copy the active chunk**, clone the exact tier and sketches; release;
+  project outside. Cost is O(active chunk), not O(N).
+- `snapshot(reset=true)` and `reset`: swap the whole structure out under the lock — O(1) —
+  and project outside it.
+
+> **Probe evidence (measured 2026-07-29, this machine, synthetic 2 M-span workload —
+> `scratchpad/gen-probe`).** Rev 3 originally specified *every* read as a swap-and-fold into
+> a retired accumulator. **That is wrong for non-destructive reads, and the probe proves it.**
+> Exact scalars and sketches are additive, but **self time and wall union are not**: a parent
+> separated from its children by a generation boundary keeps their time, so the fold
+> over-reports. Measured **7.98 s of phantom self time** across 67 split parent/child groups
+> over 100 reads at 200 ms parents. The disqualifying property is not the magnitude but the
+> shape — **the error scales with how often the collector is read**, so reading it would
+> change its reported self time. Chunk-cloning is exact in the same test.
+>
+> **Chunk size 8 192, not 65 536**, also measured: worst read lock-hold **0.29 ms** at 8 192
+> versus **1.80 ms** at 65 536, with ingest throughput under concurrent readers 19.0 M vs
+> 4.3 M spans/s. Both figures are from this probe on this machine and must be re-measured on
+> the real record layout (§12, V1).
+>
+> The probe ran 341 concurrent reads against one writer with **zero invariant violations** —
+> no missing or duplicated records, and the exact tier agreeing with the retained records on
+> every read. That is the A11 invariant, demonstrated rather than argued.
+
+There is deliberately **no retired accumulator**. After `snapshot(reset=true)` the
+sample-derived projections restart, which is correct: the snapshot took that data.
 
 Window stamps, the drop baseline, and the `snapshot-<n>` counter increment happen **inside**
 the swap, or they describe a window that does not match the data printed beside them.
@@ -271,7 +296,7 @@ A third step in `process_span_for_domain`: evaluate this domain's collectors.
 DSL path already lowercases) and make the matcher use a non-allocating case-insensitive
 comparison. This is shared with the log path — a deliberate shared-code change.
 
-Collector hot-path work: pre-parsed filter; one domain-keyed registry read; one generation
+Collector hot-path work: pre-parsed filter; one domain-keyed registry read; one collector
 lock; chunk append; sketch `add`; interner hash lookup.
 
 **The sketch's allocation shape, accurately:** a key arriving *below* `min_key` triggers
@@ -599,7 +624,7 @@ bookmark-windowed arms, a case §7 makes impossible; that justification is withd
 |---|---|
 | `description`, `meta` | Free. |
 | `snapshot` policy, `threshold` | Free; each snapshot echoes its own policy. |
-| `filter` | Only when `snapshots.is_empty() && matched == 0`, **checked and swapped inside the generation lock** — otherwise a span matching the old filter lands in a tier the new filter describes. Sets `zeroed_at`. |
+| `filter` | Only when `snapshots.is_empty() && matched == 0`, **checked and swapped inside the collector lock** — otherwise a span matching the old filter lands in a tier the new filter describes. Sets `zeroed_at`. |
 | `level` — raise | Permitted, but **zeroes the sample tier and sets `zeroed_at` and `level_raised_at`**. Rev 2 permitted it outright: from `scalar` the sample tier would start filling at the raise point with no budget hit, so `complete` would read `true` over a *suffix* — falsifying the design's load-bearing honesty flag. From `timing`, zero-filling parent columns is worse, because `parent_span_id == 0` means **root**: every pre-raise span becomes a degenerate root with `span_id == 0`. |
 | `level` — lower | Refused. |
 | `group_keys` | Refused with history or `matched > 0` — they widen the exact tier's key at every level, so pre- and post-edit rows would be keyed differently and the "never approximate" tier becomes a mixture. |
@@ -747,7 +772,7 @@ the daemon's cwd.
 definitions to graceful shutdown, so a `kill -9` produced orphan history with nothing to
 attach it to and V11 failed by construction.
 
-**Atomicity:** serialize outside the generation lock and off the runtime; write a temp file
+**Atomicity:** serialize outside the collector lock and off the runtime; write a temp file
 **in the same directory**, `fsync` it, `rename`, then `fsync` the directory. A startup sweep
 removes crash-orphaned temps — the existing sweep removes only `daemon.pid` and the socket.
 
@@ -835,7 +860,7 @@ the default harness leaves the span channel idle.
 
 ## 13. Build order
 
-1. **Core.** Generations (§3.6), exact tier with `i128`, DDSketch with enforced range and
+1. **Core.** The §3.6 lock discipline (chunked, 8 192-record chunks), exact tier with `i128`, DDSketch with enforced range and
    zero/negative rules, **the new `ReceiverMetrics` counters**, domain-keyed registry,
    `add`/`list`/`get`/`reset`/`remove`, `traces.profile`, admission (§7), the §4.2 matcher
    de-allocation, criterion, and the §1.1 `traces.slow` fix.
@@ -871,11 +896,23 @@ Two lens choices earned their place and should be reused on any similar design:
 
 ## 16. Round 3 — reduced scope
 
-New in rev 3 and unreviewed: §3.6 generations and the retired-accumulator fold; §5.3 clipped
+New in rev 3: §3.6's lock discipline — **probed, not merely reviewed** (§3.6); §5.3 clipped
 interval union; §5.1.1's new receiver counters; §7.1's exhaustive edit rules; §10's
 single-file write-through and lazy orphan check.
 
-Round 3 runs **concurrency** (on §3.6's swap-and-fold, which replaced a mechanism that was
-itself the fix for a round-1 finding — third iteration on the same surface, so the highest
-prior for a defect) and **false-negative** (on §7.1, loosened again). A cold-reader pass is
-**not** needed: rev 3's document changes are additive to a shape round 2 validated.
+**§3.6 was probed instead of reviewed — and the probe changed the design.** That surface was
+on its third iteration (coarse lock → chunked-with-split-locks → swap-and-fold), which made it
+the highest-prior place for a defect, and each earlier version had *read* correctly to a
+reviewer. A running experiment settled it in one pass: swap-and-fold over-reports self time,
+chunk-cloning is exact, and both the lock-hold cost and the chunk size now rest on measurements
+rather than on a plausible sentence. **Where a design question is executable, execute it** —
+a fourth reader on the same surface would have been the weaker instrument.
+
+That correction is also the third instance of one pattern: rev 2 over-corrected four checks in
+response to false-positive findings, and rev 3 over-corrected the *whole concurrency mechanism*
+when only its lock scope was wrong. **When a reviewer finds a defect, replace the defect, not
+the mechanism.** Rev 2's chunked tier was right in shape; it needed one lock, not a rewrite.
+
+**Still open:** a false-negative pass on §7.1, which has now been tightened and loosened once
+each. A cold-reader pass is **not** needed — rev 3's document changes are additive to a shape
+round 2 validated.
