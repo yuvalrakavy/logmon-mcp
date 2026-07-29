@@ -50,6 +50,8 @@ enum Subcommand {
     Traces(cli::traces::TracesCmd),
     /// Query span context.
     Spans(cli::spans::SpansCmd),
+    /// Arm and read span time collectors, or profile spans already buffered.
+    Collectors(cli::collectors::CollectorsCmd),
     /// List or drop sessions.
     Sessions(cli::sessions::SessionsCmd),
     /// Create, delete, list, or clear domains (isolated broker instances).

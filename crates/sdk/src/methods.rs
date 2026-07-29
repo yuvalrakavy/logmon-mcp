@@ -11,16 +11,19 @@
 use crate::{Broker, BrokerError};
 use logmon_broker_protocol::{
     BookmarksAdd, BookmarksAddResult, BookmarksClear, BookmarksClearResult, BookmarksList,
-    BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, DomainsClear, DomainsClearResult,
-    DomainsCreate, DomainsCreateResult, DomainsDelete, DomainsDeleteResult, DomainsList,
-    DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult, FiltersEdit,
-    FiltersEditResult, FiltersList, FiltersListResult, FiltersRemove, FiltersRemoveResult,
-    LogsClear, LogsClearResult, LogsContext, LogsContextResult, LogsExport, LogsExportResult,
-    LogsRecent, LogsRecentResult, SessionDrop, SessionDropResult, SessionList, SessionListResult,
-    SpansContext, SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult,
-    TracesLogs, TracesLogsResult, TracesRecent, TracesRecentResult, TracesSlow, TracesSlowResult,
-    TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult, TriggersEdit,
-    TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove, TriggersRemoveResult,
+    BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, CollectorsAdd,
+    CollectorsAddResult, CollectorsGet, CollectorsList, CollectorsListResult, CollectorsName,
+    CollectorsRemoveResult, CollectorsResetResult, DomainsClear, DomainsClearResult, DomainsCreate,
+    DomainsCreateResult, DomainsDelete, DomainsDeleteResult, DomainsList, DomainsListResult,
+    DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult, FiltersEdit, FiltersEditResult,
+    FiltersList, FiltersListResult, FiltersRemove, FiltersRemoveResult, LogsClear, LogsClearResult,
+    LogsContext, LogsContextResult, LogsExport, LogsExportResult, LogsRecent, LogsRecentResult,
+    ProfileResult, SessionDrop, SessionDropResult, SessionList, SessionListResult, SpansContext,
+    SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult, TracesLogs,
+    TracesLogsResult, TracesProfile, TracesRecent, TracesRecentResult, TracesSlow,
+    TracesSlowResult, TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult,
+    TriggersEdit, TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove,
+    TriggersRemoveResult,
 };
 
 impl Broker {
@@ -93,6 +96,38 @@ impl Broker {
     }
     pub async fn spans_context(&self, p: SpansContext) -> Result<SpansContextResult, BrokerError> {
         self.call_typed("spans.context", p).await
+    }
+
+    // ---- collectors.* / traces.profile ----
+    pub async fn collectors_add(
+        &self,
+        p: CollectorsAdd,
+    ) -> Result<CollectorsAddResult, BrokerError> {
+        self.call_typed("collectors.add", p).await
+    }
+    pub async fn collectors_list(
+        &self,
+        p: CollectorsList,
+    ) -> Result<CollectorsListResult, BrokerError> {
+        self.call_typed("collectors.list", p).await
+    }
+    pub async fn collectors_get(&self, p: CollectorsGet) -> Result<ProfileResult, BrokerError> {
+        self.call_typed("collectors.get", p).await
+    }
+    pub async fn collectors_reset(
+        &self,
+        p: CollectorsName,
+    ) -> Result<CollectorsResetResult, BrokerError> {
+        self.call_typed("collectors.reset", p).await
+    }
+    pub async fn collectors_remove(
+        &self,
+        p: CollectorsName,
+    ) -> Result<CollectorsRemoveResult, BrokerError> {
+        self.call_typed("collectors.remove", p).await
+    }
+    pub async fn traces_profile(&self, p: TracesProfile) -> Result<ProfileResult, BrokerError> {
+        self.call_typed("traces.profile", p).await
     }
 
     // ---- bookmarks.* ----

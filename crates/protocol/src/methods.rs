@@ -759,6 +759,125 @@ pub struct ProfileGroup {
     pub path_incomplete: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsAdd {
+    pub name: String,
+    pub filter: String,
+    /// `scalar`, `timing`, or `tree` (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// Span attributes to split the numbers by. Values are read directly, so
+    /// booleans and numbers work — unlike the filter path, which only sees
+    /// strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sample_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsAddResult {
+    pub name: String,
+    pub filter: String,
+    pub level: String,
+    #[serde(default)]
+    pub group_keys: Vec<String>,
+    /// The domain the collector is pinned to. Rebinding the session later does
+    /// not move it.
+    pub domain: String,
+    pub max_sample_bytes: u64,
+    /// Filters that are legal but probably not what was meant — a mistyped
+    /// selector, a status match that also admits errors, a no-op threshold.
+    /// Never a refusal: each of these collects *something*.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsList {}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorInfo {
+    pub name: String,
+    pub filter: String,
+    pub level: String,
+    #[serde(default)]
+    pub group_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub domain: String,
+    pub matched: u64,
+    pub armed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zeroed_at: Option<DateTime<Utc>>,
+    /// `false` once the sample budget stopped retention.
+    pub sample_complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsListResult {
+    pub collectors: Vec<CollectorInfo>,
+    pub count: usize,
+    /// Sample bytes reserved across every armed collector, daemon-wide.
+    pub reserved_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsGet {
+    pub name: String,
+    /// `name`, `group`, `trace`, or `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_warmup_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u64>,
+}
+
+/// `collectors.reset` / `collectors.remove`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsName {
+    pub name: String,
+}
+
+/// What a reset threw away. Returned so a reset issued one call too early is
+/// not silently unrecoverable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsDiscarded {
+    pub matched: u64,
+    pub total_ms: f64,
+    pub error_count: u64,
+    pub window_start: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsResetResult {
+    pub name: String,
+    pub discarded: CollectorsDiscarded,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsRemoveResult {
+    pub removed: String,
+    pub reserved_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TracesProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_warmup_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u64>,
+}
+
 /// The result of profiling a collector or an ad-hoc span query.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ProfileResult {
@@ -795,6 +914,10 @@ pub struct ProfileResult {
     pub cardinality_capped: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppressed: Vec<Suppressed>,
+    /// `traces.profile` only — the same admission warnings `collectors.add`
+    /// returns, since an ad-hoc filter has no arm-time moment to report them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 // =============================================================================

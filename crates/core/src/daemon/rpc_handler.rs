@@ -1701,9 +1701,8 @@ impl RpcHandler {
             "ad-hoc profile over {matched} spans currently in the `{}` span store",
             d.config.name
         ));
-        let mut value = serde_json::to_value(result).map_err(|e| e.to_string())?;
-        value["warnings"] = json!(warnings);
-        Ok(value)
+        result.warnings = warnings;
+        serde_json::to_value(result).map_err(|e| e.to_string())
     }
 
     fn profile_options(&self, params: &Value) -> Result<ProfileOptions, String> {

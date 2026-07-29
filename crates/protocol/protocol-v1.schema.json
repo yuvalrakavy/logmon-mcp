@@ -3903,6 +3903,456 @@
         "count"
       ]
     },
+    "CollectorsAdd": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsAdd",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "filter": {
+          "type": "string"
+        },
+        "level": {
+          "description": "`scalar`, `timing`, or `tree` (default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_keys": {
+          "description": "Span attributes to split the numbers by. Values are read directly, so\nbooleans and numbers work — unlike the filter path, which only sees\nstrings.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_sample_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "filter"
+      ]
+    },
+    "CollectorsAddResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsAddResult",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "filter": {
+          "type": "string"
+        },
+        "level": {
+          "type": "string"
+        },
+        "group_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "domain": {
+          "description": "The domain the collector is pinned to. Rebinding the session later does\nnot move it.",
+          "type": "string"
+        },
+        "max_sample_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "warnings": {
+          "description": "Filters that are legal but probably not what was meant — a mistyped\nselector, a status match that also admits errors, a no-op threshold.\nNever a refusal: each of these collects *something*.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "filter",
+        "level",
+        "domain",
+        "max_sample_bytes"
+      ]
+    },
+    "CollectorsList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsList",
+      "type": "object"
+    },
+    "CollectorsListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsListResult",
+      "type": "object",
+      "properties": {
+        "collectors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CollectorInfo"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "reserved_bytes": {
+          "description": "Sample bytes reserved across every armed collector, daemon-wide.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "collectors",
+        "count",
+        "reserved_bytes"
+      ],
+      "$defs": {
+        "CollectorInfo": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "filter": {
+              "type": "string"
+            },
+            "level": {
+              "type": "string"
+            },
+            "group_keys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "domain": {
+              "type": "string"
+            },
+            "matched": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "armed_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "zeroed_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "sample_complete": {
+              "description": "`false` once the sample budget stopped retention.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "filter",
+            "level",
+            "domain",
+            "matched",
+            "sample_complete"
+          ]
+        }
+      }
+    },
+    "CollectorInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorInfo",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "filter": {
+          "type": "string"
+        },
+        "level": {
+          "type": "string"
+        },
+        "group_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domain": {
+          "type": "string"
+        },
+        "matched": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "armed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "zeroed_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "sample_complete": {
+          "description": "`false` once the sample budget stopped retention.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "filter",
+        "level",
+        "domain",
+        "matched",
+        "sample_complete"
+      ]
+    },
+    "CollectorsGet": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsGet",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "group_by": {
+          "description": "`name`, `group`, `trace`, or `path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skip_warmup_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "top_n": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "CollectorsName": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsName",
+      "description": "`collectors.reset` / `collectors.remove`.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "CollectorsResetResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsResetResult",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "discarded": {
+          "$ref": "#/$defs/CollectorsDiscarded"
+        }
+      },
+      "required": [
+        "name",
+        "discarded"
+      ],
+      "$defs": {
+        "CollectorsDiscarded": {
+          "description": "What a reset threw away. Returned so a reset issued one call too early is\nnot silently unrecoverable.",
+          "type": "object",
+          "properties": {
+            "matched": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "error_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "window_start": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "matched",
+            "total_ms",
+            "error_count"
+          ]
+        }
+      }
+    },
+    "CollectorsDiscarded": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsDiscarded",
+      "description": "What a reset threw away. Returned so a reset issued one call too early is\nnot silently unrecoverable.",
+      "type": "object",
+      "properties": {
+        "matched": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "error_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "window_start": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "matched",
+        "total_ms",
+        "error_count"
+      ]
+    },
+    "CollectorsRemoveResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsRemoveResult",
+      "type": "object",
+      "properties": {
+        "removed": {
+          "type": "string"
+        },
+        "reserved_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "removed",
+        "reserved_bytes"
+      ]
+    },
+    "TracesProfile": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TracesProfile",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_keys": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "skip_warmup_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "top_n": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
     "ProfileResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ProfileResult",
@@ -4002,6 +4452,13 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Suppressed"
+          }
+        },
+        "warnings": {
+          "description": "`traces.profile` only — the same admission warnings `collectors.add`\nreturns, since an ad-hoc filter has no arm-time moment to report them.",
+          "type": "array",
+          "items": {
+            "type": "string"
           }
         }
       },

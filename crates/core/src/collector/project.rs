@@ -211,6 +211,11 @@ pub fn profile(
         groups,
         cardinality_capped: snap.cardinality_capped(),
         suppressed,
+        // Filled by the RPC layer for `traces.profile`, whose filter has no
+        // arm-time moment at which to report admission warnings. A collector
+        // reports them from `collectors.add` instead, which is when the caller
+        // can still cheaply change their mind.
+        warnings: Vec::new(),
     }
 }
 

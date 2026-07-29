@@ -45,6 +45,7 @@ fn subcommand_argv(cmd: &Subcommand) -> Vec<&'static str> {
         Subcommand::Filters(_) => vec!["filters"],
         Subcommand::Traces(_) => vec!["traces"],
         Subcommand::Spans(_) => vec!["spans"],
+        Subcommand::Collectors(_) => vec!["collectors"],
         Subcommand::Sessions(_) => vec!["sessions"],
         Subcommand::Domains(_) => vec!["domains"],
         Subcommand::Status => vec!["status"],

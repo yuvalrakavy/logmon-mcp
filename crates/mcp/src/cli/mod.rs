@@ -6,6 +6,7 @@
 //!   and returns the desired process exit code.
 
 pub mod bookmarks;
+pub mod collectors;
 pub mod connect;
 pub mod domains;
 pub mod filters;
@@ -60,6 +61,7 @@ pub async fn dispatch(
         Subcommand::Filters(c) => filters::dispatch(&broker, c, json).await,
         Subcommand::Traces(c) => traces::dispatch(&broker, c, json).await,
         Subcommand::Spans(c) => spans::dispatch(&broker, c, json).await,
+        Subcommand::Collectors(c) => collectors::dispatch(&broker, c, json).await,
         Subcommand::Sessions(c) => sessions::dispatch(&broker, c, json).await,
         Subcommand::Domains(c) => domains::dispatch(&broker, c, json).await,
         Subcommand::Status => status::dispatch(&broker, json).await,
