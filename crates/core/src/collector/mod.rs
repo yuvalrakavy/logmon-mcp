@@ -6,6 +6,7 @@
 //! per matched span, and every metric is a read-time projection over it — so
 //! the shape of the question does not have to be known when collection starts.
 
+pub mod diff;
 pub mod exact;
 pub mod history;
 pub mod intern;
