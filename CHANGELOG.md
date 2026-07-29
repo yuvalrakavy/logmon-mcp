@@ -3,7 +3,13 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
-## Unreleased
+## 0.4.0 — 2026-07-29
+
+`PROTOCOL_VERSION` stays at **1**. Everything here is additive on the wire —
+new methods, new fields on existing results — and the handshake compares the
+protocol version for exact equality, so bumping it would refuse every client
+that had not been upgraded in lockstep. An 0.3.0 `logmon-mcp` shim talks to an
+0.4.0 broker without noticing; it just won't offer the new tools.
 
 ### Added
 
