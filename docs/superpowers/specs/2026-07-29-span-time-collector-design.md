@@ -1075,6 +1075,37 @@ seam rather than a broken unit.
 | `traces.slow` repair | `daemon/rpc_handler.rs`, `span/store.rs` | §1.1 — full population, display floor, §5.7 rank, folded inside the read guard. |
 | A14 | `benches/span_ingest.rs`, `tests/collector_concurrency.rs` | Observer effect measured *and* asserted. |
 
+### Deployed — v0.4.0, tag `v0.4.0`, commit `074e366`
+
+Phase 1 is **live** in `~/.cargo/bin/{logmon-broker,logmon-mcp}`, with the launchd
+service (`logmon.broker`, `KeepAlive`) restarted onto it. `cargo install --path … --force`
+was used rather than copying, so cargo's `.crates.toml` bookkeeping stays truthful.
+
+**`PROTOCOL_VERSION` stays 1.** `server.rs` compares it for **exact equality** in the
+handshake, so bumping it would refuse every client not upgraded in the same instant.
+Everything in phase 1 is additive on the wire. Verified in the field: a 0.3.0 shim
+running since two days before the deploy reconnected to the 0.4.0 broker and resumed
+its session with its triggers intact.
+
+**A running MCP shim does not gain the new tools.** The tool list is compiled into
+`logmon-mcp` and served once at MCP `initialize`; replacing the file on disk does not
+touch a process already running. A parallel session must restart its shim. The CLI is
+unaffected — it spawns a fresh process per invocation, so `logmon-mcp collectors …`
+works immediately.
+
+**Building later phases cannot disturb this.** The deployed binaries are copies, so
+`cargo build` in the tree never reaches them. Verified rather than assumed: `state.json`
+in the live config dir is byte-identical, with an unchanged mtime, across a full
+workspace test run.
+
+**The one hazard ahead is phase 3.** It writes per-collector files into the directory
+holding `state.json`, `daemon.pid` and `config.json` — the live daemon's directory.
+Every test touching persistence must go through `DaemonOverrides.config_dir` (there is
+no env var or flag for it); a helper that calls `config_dir()` directly would write
+into the running daemon's state. The daemon-level path is already guarded — a second
+broker in that directory refuses to start on the pid lock — so the exposure is a unit
+test that writes files without starting a daemon at all.
+
 ### Corrections this section makes to §5
 
 Each found by making the spec run. The spec text above is left as written; these
