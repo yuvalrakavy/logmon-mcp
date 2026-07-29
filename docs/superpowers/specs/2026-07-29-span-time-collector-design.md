@@ -50,8 +50,8 @@ Verified against the tree at `a08c119`.
 | Span matching | `matches_span` / `matches_span_qualifier` (`crates/core/src/filter/matcher.rs`) | Reused verbatim. Supports `sn`, `sv`, `st`, `sk`, `d>=`/`d<=`, bare patterns, and arbitrary span **attributes** via `AdditionalField`. |
 | Bookmark windows on spans | `matches_span_qualifier` `SeqFilter` arm | Bookmarks resolve to `SeqFilter` at the RPC layer, and spans/logs share one seq counter — so `b>=start, b<=end` **already works on span filters today**. `traces.profile` gets window-scoping for free. |
 | Per-session state registry | `SessionRegistry` (`crates/core/src/daemon/session.rs`) | Collectors follow the triggers/filters/bookmarks pattern for lifecycle and persistence. |
-| Per-trigger debounce | `post_window_remaining` (`crates/core/src/daemon/session.rs`) | Landed in 0.3.0. Threshold triggers (§7) reuse it rather than inventing cooldown. |
-| File export | `logs.export` | Establishes the pattern `collectors.export` (§8) follows. |
+| Per-trigger debounce | `post_window_remaining` (`crates/core/src/daemon/session.rs`) | Landed in 0.3.0. Threshold triggers (§8) reuse it rather than inventing cooldown. |
+| File export | `logs.export` | Establishes the pattern `collectors.export` (§9) follows. |
 | Span ring buffer | `SpanStore`, default `span_buffer_size` **10 000** (`crates/core/src/daemon/persistence.rs`) | The reason a query-only design is insufficient: a suite-length run overflows this and eviction is silent. |
 
 ### 1.1 Two existing defects this work touches
@@ -75,27 +75,34 @@ Verified against the tree at `a08c119`.
 
 **In scope**
 
-1. Collector object: create/arm, list, read, reset, remove — per session.
-2. Two-tier retention: an always-exact scalar tier and a capped columnar sample tier.
+1. Collector object: create/arm, list, read, snapshot, reset, remove — per session.
+2. Two-tier retention: an always-exact tier (scalars + duration histogram) and a
+   capped columnar sample tier.
 3. Retention levels (`scalar` / `timing` / `tree`) chosen at definition time.
 4. Optional `group_keys` — span attributes retained as grouping dimensions.
-5. Read-time projections: sum/count/avg/min/max, exact percentiles, self-time,
+5. Read-time projections: sum/count/avg/min/max, percentiles (histogram-estimated
+   over the whole run, and sample-exact where the sample is complete), self-time,
    wall-clock union, nested-match detection, grouping by name / trace / attribute /
    **call path**, and warm-up exclusion.
-6. `traces.profile` — the same projection over the ring buffer, no collector needed.
-7. `collectors.diff` — deltas at every percentile, with mismatch refusals.
-8. `collectors.export` — folded-stack output for speedscope / flamegraph.pl.
-9. Threshold triggers on collectors (phase 4).
-10. Fixing the `traces.slow` grouping bias (§1.1).
+6. **Snapshot history** — snapshot-and-zero between runs, with a declared snapshot
+   policy, retained history, and merging (§6).
+7. **Descriptions** on collectors and on each snapshot, echoed in every result.
+8. `traces.profile` — the same projection over the ring buffer, no collector needed.
+9. `collectors.diff` — deltas at every percentile, with mismatch refusals; accepts
+   snapshots on either side.
+10. `collectors.export` — folded-stack output for speedscope / flamegraph.pl.
+11. Threshold triggers on collectors (phase 5).
+12. Fixing the `traces.slow` grouping bias (§1.1).
 
 **Non-goals**
 
 - Log-derived durations (aggregating a numeric GELF field for non-OTLP apps).
   Broadens reach, but it is a parallel ingest path and nothing in the driving case
-  needs it. Deferred (§12).
-- Persisted baselines ("is this slower than last week"). The exact tier is small
-  enough to persist, but it needs its own storage surface and no current use wants
-  it. Deferred (§12).
+  needs it. Deferred (§13).
+- **Cross-collector** baselines — a shared store you can compare against across
+  projects or machines. Snapshot history (§6) absorbs the in-collector case, which
+  is what the driving workflow needs; a global baseline store is a separate surface
+  with its own naming and retention questions. Deferred (§13).
 - Multi-key `group_by`. Single dimension in v1.
 - Reservoir sampling. Explicitly rejected — see §3.4.
 - Any change to how spans are received or stored.
@@ -106,11 +113,12 @@ Verified against the tree at `a08c119`.
 
 ### 3.1 Two retention tiers
 
-**Exact tier** — `{count, sum_ms, min_ms, max_ms}` for the collector as a whole, plus
-the same four per span name. Memory is O(distinct span names), which is small and
-bounded by real span vocabularies. **Never capped, never approximate.** This tier
-carries the headline A/B number, so the figure quoted in "cache on vs cache off"
-stays exact regardless of run length.
+**Exact tier** — `{count, sum_ms, min_ms, max_ms}` **plus a duration histogram**, for
+the collector as a whole and the same again per span name. Memory is O(distinct span
+names), which is small and bounded by real span vocabularies. **Never capped.** The
+four scalars are never approximate; the histogram carries a bounded relative error by
+construction (§3.5). This tier carries the headline A/B number, so the figure quoted
+in "cache on vs cache off" stays exact regardless of run length.
 
 **Sample tier** — one record per matched span, stored **columnar** (struct-of-arrays,
 one `Vec` per column). Columnar rather than array-of-structs for two reasons: no
@@ -123,8 +131,8 @@ Ordered, each a superset of the previous. Chosen per collector at definition tim
 
 | Level | Columns added | Unlocks | Bytes/match |
 |---|---|---|---|
-| `scalar` | *(none — exact tier only)* | count, sum, avg, min, max — total and per span name | 0 |
-| `timing` | `start_ns i64`, `end_ns i64`, `name_id u32`, `flags u8` | exact percentiles, wall-clock union, per-name percentiles, duration histograms, warm-up exclusion | 21 |
+| `scalar` | *(none — exact tier only)* | count, sum, avg, min, max, **estimated percentiles** (§3.5) — total and per span name | 0 |
+| `timing` | `start_ns i64`, `end_ns i64`, `name_id u32`, `flags u8` | sample-exact percentiles, wall-clock union, warm-up exclusion | 21 |
 | `tree` **(default)** | + `span_id u64`, `parent_span_id u64`, `trace_id u128` | self-time, nested-match detection, per-trace rollups, call-path aggregation, folded export | 53 |
 
 Plus **4 bytes per match per `group_keys` entry** at `timing` and above (one interned
@@ -133,8 +141,11 @@ group keys instead widen the **exact tier's key**, which becomes
 `(span name × group-key values)`. Bounded by the §3.3 cardinality cap, so still
 O(vocabulary) rather than O(matches).
 
+Histograms are per-collector / per-name / per-group, **not** per-match, so they do
+not appear in this table — see §3.5 for their cost.
+
 > Byte figures are **derived from field sizes, not measured.** They must be
-> re-derived against `size_of` in the phase-1 tests (§10, V1), not trusted from
+> re-derived against `size_of` in the phase-1 tests (§12, V1), not trusted from
 > this table.
 
 `flags` packs span status (2 bits) and kind (3 bits).
@@ -184,6 +195,37 @@ Prefix truncation has its own bias — the retained prefix is the **cold** part 
 run, exactly the wrong sample for a cache benchmark. That is why `complete=false` is
 structural rather than a footnote, and why `collectors.diff` refuses to compare an
 incomplete side by default (§5.6).
+
+The histogram (§3.5) is what keeps that bias from reaching the numbers most likely to
+be quoted: it is fed at ingest, so percentiles cover **every** match no matter how
+early the sample tier stopped retaining. Truncation degrades self-time, wall-clock
+union, and paths — not the distribution.
+
+### 3.5 Duration histogram
+
+A log-linear histogram in the exact tier, updated once per match at ingest: O(1), no
+allocation in the steady state, **~4 KB** each (derived from bucket count, not
+measured). One per collector, one per span name, and one per group up to
+`max_group_histograms` (default 64) — past that a group keeps its exact scalars only
+and the result says so, bounding worst-case histogram memory.
+
+**Why at ingest rather than at read or snapshot time.** A histogram built later from
+the sample tier would inherit that tier's prefix truncation, and a long run that blew
+the budget would be laundered into a clean-looking snapshot. Fed at ingest, the
+histogram is complete by construction and independent of the sample cap. This is the
+single reason percentiles survive both truncation *and* snapshotting.
+
+Percentiles read from it are reported as **`estimated`**, carrying their relative
+error bound, and are kept structurally distinct from the sample tier's `sampled`
+percentiles, which are exact for whatever the sample retained (§5.1).
+
+Histograms are **additive** — merging two is exact, not an approximation of a merge.
+That is what makes snapshot merging (§6.5) possible at all.
+
+Prior art, not invention: HDR Histogram and DDSketch both solve this. Port a proven
+bucket layout rather than deriving the boundary math fresh — the standing rule to
+reconcile a new mechanism against its reference applies squarely here, and bucket
+math is exactly the kind of thing that reads correct and is off by one bucket.
 
 ---
 
@@ -237,7 +279,7 @@ Collectors repeat none of it: a domain-keyed registry read under a single lock,
 pre-parsed filters, and borrowed access to collector state with no `*Info`
 materialisation on the ingest path.
 
-This also fixes the baseline for A10 (§11). logmon's span ingest is already heavier
+This also fixes the baseline for A14 (§12). logmon's span ingest is already heavier
 than it looks, so collector overhead must be measured against the **current** path,
 not against zero. The pre-existing cost is **not** fixed in this work — it is filed
 as a separate follow-up.
@@ -269,6 +311,8 @@ The exact/sampled distinction is **structural**, not a footnote:
 
 ```jsonc
 {
+  "collector": "cache-ab",
+  "description": "Store suite — schema-cache A/B",   // §6.6, echoed everywhere
   "filter": "sv=store_server",
   "level": "tree",
   "matched": 48213,                  // exact tier — every match, always
@@ -279,7 +323,12 @@ The exact/sampled distinction is **structural**, not a footnote:
     "avg_ms": 25.6, "min_ms": 0.1, "max_ms": 4310.2
   },
 
-  "sampled": {
+  "estimated": {                     // histogram — covers EVERY match, always present
+    "error_pct": 1.0,
+    "p50_ms": 12.0, "p80_ms": 41.0, "p95_ms": 181.0, "p99_ms": 900.0
+  },
+
+  "sampled": {                       // sample tier — exact for what it retained
     "complete": true,                // false ⇒ prefix-truncated at the budget
     "sample_count": 48213,
     "p50_ms": 12.0, "p80_ms": 41.2, "p95_ms": 180.4, "p99_ms": 902.1,
@@ -289,13 +338,22 @@ The exact/sampled distinction is **structural**, not a footnote:
     "error_count": 12
   },
 
-  "groups": [ { "key": "...", "exact": {...}, "sampled": {...} } ]
+  "groups": [ { "key": "...", "exact": {…}, "estimated": {…}, "sampled": {…} } ]
 }
 ```
 
-A cap-degraded percentile cannot be quoted as if it were the exact sum, because the
-two live in different objects and `sampled.complete` sits immediately beside the
-numbers it qualifies.
+Three categories, and the distinction is structural rather than a footnote, so a
+degraded number cannot be quoted as an exact one:
+
+- **`exact`** — the four scalars. Never approximate, never truncated.
+- **`estimated`** — histogram percentiles over the *whole run*, ±`error_pct`.
+- **`sampled`** — exact for the records the sample tier retained, and everything that
+  needs completeness (self-time, wall-union, paths). Absent at `scalar`.
+
+**Which to quote.** When `sampled.complete` is `true` the two percentile sets agree
+within `error_pct`, and `sampled` is the sharper number. When it is `false`,
+`estimated` is the one that describes the run and `sampled` describes only its cold
+prefix — the case where reading the wrong field is most tempting and most wrong.
 
 Percentile list is a parameter; default `[50, 80, 95, 99]`.
 
@@ -304,7 +362,8 @@ Percentile list is a parameter; default `[50, 80, 95, 99]`.
 | Metric | Min level | Notes |
 |---|---|---|
 | `count`, `sum_ms`, `avg_ms`, `min_ms`, `max_ms` | `scalar` | Exact tier. Never degraded. |
-| `p*_ms` | `timing` | Nearest-rank over the retained sample — exact for that sample, which is the whole population unless `sampled.complete` is `false`. |
+| `estimated.p*_ms` | `scalar` | Histogram (§3.5). Whole run always, ±`error_pct`. |
+| `sampled.p*_ms` | `timing` | Nearest-rank over the retained sample — exact for that sample, which is the whole population unless `sampled.complete` is `false`. |
 | `wall_union_ms` | `timing` | Merged `[start, end)` coverage. |
 | `error_count` | `timing` | From `flags`. |
 | `self_time_ms` | `tree` | Duration minus **retained** children. |
@@ -379,26 +438,143 @@ check must flag only what cannot be correct):
 
 Both errors state the mismatch concretely.
 
+Either side may be a live collector or a snapshot (`collector@label`, §6.2), so
+snapshot↔snapshot, snapshot↔live, and collector↔collector are one call. When the two
+sides carry different representations, the diff compares at the **weaker** of the two
+and says which — comparing an `estimated` percentile against a `sampled` one without
+saying so would be the same apples-to-oranges defect the refusals above exist to
+prevent.
+
 ---
 
-## 6. Contract surface
+## 6. Snapshots and history
+
+### 6.1 Why
+
+The driving workflow is inherently multi-run: define a collector, run the suite,
+snapshot, change one variable, run again, snapshot. Without in-collector history, the
+numbers have to be copied out by hand between runs — which is precisely the
+error-prone, context-losing step this feature exists to remove.
+
+Snapshots are also what make a run **durable**. The live sample tier cannot survive a
+daemon restart (§10), but a snapshot is small enough to persist, so a completed run
+stops being at risk the moment it is snapshotted.
+
+### 6.2 Operations
+
+| Call | Behaviour |
+|---|---|
+| `collectors.snapshot(name, label?, description?, reset=true)` | Record a snapshot, return it, and by default zero the live tiers. |
+| `collectors.reset(name)` | **Discard** without recording. The botched-run path — a mis-configured run must not pollute history. |
+| `collectors.history(name, limit?, merge?)` | Snapshot descriptors; `merge` combines them (§6.5). |
+| `collectors.get(name, snapshot=label)` | Read one snapshot. |
+| `collectors.diff(a, b)` | Either side may be `collector` or `collector@label`. |
+
+Unlabelled snapshots auto-label `snapshot-<n>`. Every snapshot records `taken_at` and
+its window. `max_snapshots` (default 50) evicts FIFO and reports `snapshots_evicted`,
+so a long-running collector loses history visibly rather than silently.
+
+Keeping `reset` distinct from `snapshot` is deliberate: one of them is how you throw
+away a run you know is invalid, and collapsing them would mean either polluting
+history or having no way to discard.
+
+### 6.3 What a snapshot contains — declared at definition time
+
+The sample tier cannot be copied N times, so a snapshot keeps a *projection* of it,
+and the collector declares which projections when it is defined:
+
+```jsonc
+"snapshot": {
+  "per_name": true,          // exact tier — cheap
+  "per_group": true,         // exact tier
+  "projections": ["self_time", "wall_union", "top_paths:100"],
+  "raw_sample_bytes": 0      // 0 = off; >0 keeps a prefix for full later recomputation
+}
+```
+
+**Always present regardless of policy**, because they come from the exact tier: the
+total and per-name scalars, and the histograms. So **percentiles are available on
+every snapshot, for the whole run**, at the stated error bound — the policy governs
+only the sample-derived extras.
+
+The default is right for the driving case with no configuration written:
+`{per_name: true, per_group: true, projections: ["self_time", "wall_union",
+"top_paths:100"], raw_sample_bytes: 0}`.
+
+`raw_sample_bytes > 0` keeps a **prefix** of the sample records, with the same
+semantics and the same `complete` flag as the live cap (§3.4). It is not downsampled:
+uniform downsampling would keep percentiles honest but silently break self-time and
+path aggregation, which need complete parent–child sets. Same reasoning as the
+reservoir rejection, same answer.
+
+### 6.4 Four disciplines
+
+1. **Validated at definition time.** `top_paths` on a `timing` collector errors at
+   `collectors.add` — not after a 40-minute run has already been measured.
+2. **Size is quoted up front.** `collectors.add` returns the derived per-snapshot
+   size and the total at `max_snapshots`, so the memory consequence is visible before
+   it is committed to rather than discovered later.
+3. **Each snapshot echoes its own policy.** Policies are editable via
+   `collectors.edit`, and editing must not retroactively rewrite history — so an old
+   snapshot has to be able to explain its own gaps. Asking a snapshot for something
+   its policy excluded returns a loud error naming the policy, mirroring the level
+   errors of §5.2.
+4. **Completeness travels with the data.** A snapshot records the `complete` flag of
+   the sample tier its sample-derived projections were computed from. Histogram
+   percentiles remain whole-run regardless; self-time, wall-union, and paths inherit
+   the truncation and say so.
+
+### 6.5 Merging
+
+Exact scalars and histograms are both additive, so `collectors.history(name,
+merge: [labels])` combines runs into a single distribution — the direct way to beat
+down run-to-run noise across repetitions instead of arguing about which single run
+was representative.
+
+Sample-derived projections do **not** merge: self-time and paths need the underlying
+records, and averaging two path tables is not a path table. A merged result omits
+them and states that it did, rather than presenting a plausible-looking blend.
+
+### 6.6 Descriptions
+
+`description` on the collector (set at `add`, editable); `label` + `description` on
+each snapshot. Both are echoed in every read, diff, history entry, and export.
+
+This is the "a load-bearing number carries the context it was measured in" rule
+enforced by the data structure rather than by memory: there is no path on which a
+number leaves the broker without the description of the collector — and, for a
+snapshot, the run — that produced it.
+
+---
+
+## 7. Contract surface
 
 Following the existing `noun.verb` convention (`triggers.add`, `traces.slow`).
 
 | JSON-RPC | MCP tool | Purpose |
 |---|---|---|
-| `collectors.add` | `add_collector` | Define and **arm immediately**. Params: `name`, `filter`, `level`, `group_keys`, `max_sample_bytes`, `threshold` (§7). |
+| `collectors.add` | `add_collector` | Define and **arm immediately**. Params: `name`, `filter`, `level`, `group_keys`, `max_sample_bytes`, `description`, `snapshot` (§6), `threshold` (§8). |
 | `collectors.list` | `get_collectors` | Definitions + live counters + memory used. |
-| `collectors.get` | `get_collector` | Read a `ProfileResult`. Projection params: `group_by`, `percentiles`, `skip_warmup_ms`. Non-destructive. |
-| `collectors.reset` | `reset_collector` | **Returns the aggregate it just cleared**, then zeroes. |
+| `collectors.get` | `get_collector` | Read a `ProfileResult`. Projection params: `group_by`, `percentiles`, `skip_warmup_ms`, `snapshot`. Non-destructive. |
+| `collectors.snapshot` | `snapshot_collector` | Record a labelled snapshot, return it, zero the live tiers (§6.2). |
+| `collectors.history` | `get_collector_history` | List snapshots; `merge` combines them (§6.5). |
+| `collectors.edit` | `edit_collector` | Change `description`, `snapshot` policy, `threshold`. Not the filter or level — see below. |
+| `collectors.reset` | `reset_collector` | **Discard** without recording. Returns what it cleared. |
 | `collectors.remove` | `remove_collector` | |
-| `collectors.diff` | `diff_collectors` | §5.6 |
-| `collectors.export` | `export_profile` | §8 |
+| `collectors.diff` | `diff_collectors` | §5.6. Either side may be `collector@label`. |
+| `collectors.export` | `export_profile` | §9 |
 | `traces.profile` | `profile_spans` | Same projection over the ring buffer. Accepts bookmark windows (`b>=`/`b<=`) — already supported on span filters. |
 
-`collectors.reset` returning the cleared aggregate makes run→read→zero→run atomic:
-there is no window in which a read has happened, the zero has not, and a straggling
-span lands in the wrong arm.
+`collectors.snapshot` recording and zeroing in one call makes run→record→zero→run
+atomic: there is no window in which the record has happened, the zero has not, and a
+straggling span lands in the wrong arm. `collectors.reset` gives the same atomicity
+for the discard case.
+
+**`collectors.edit` cannot change `filter` or `level`.** Both would silently
+invalidate every snapshot already in the collector's history against a definition
+that no longer describes them — and §5.6 refuses cross-filter diffs precisely because
+that comparison is meaningless. Changing either means a new collector, which the error
+says.
 
 Wire discipline: new types are additive; `cargo xtask verify-schema` regenerates
 `protocol-v1.schema.json` and the result is committed in the same change.
@@ -408,7 +584,7 @@ CLI mirrors the MCP surface 1:1, per the project's standing rule
 
 ---
 
-## 7. Threshold triggers (phase 4)
+## 8. Threshold triggers (phase 5)
 
 A collector may carry `threshold: { metric, group?, op, value, window_ms }` —
 e.g. p95 of `sn=db.query` over a rolling 60 s window exceeding 200 ms. On crossing,
@@ -428,7 +604,7 @@ matter. Rolling-window evaluation is the requirement, not an optimisation.
 
 ---
 
-## 8. Folded-stack export
+## 9. Folded-stack export
 
 `collectors.export(name, format, path)`. `format: "folded"` emits
 `nameA;nameB;nameC <self_time_us>` — the §5.4 path projection serialised
@@ -441,23 +617,27 @@ the shape, and shapes are where the unqueried problem shows up. Follows the exis
 
 ---
 
-## 9. Lifecycle, persistence, restart
+## 10. Lifecycle, persistence, restart
 
 - **Definitions persist** for named sessions, exactly as triggers/filters/bookmarks
   do. Anonymous-session collectors die with the session.
-- **Accumulated data does not survive a daemon restart** — the sample tier is up to
-  the memory budget and is not written to disk.
+- **Snapshots persist** too, for named sessions. They are small (§6.3) and they are
+  the record of a completed run, which is the thing least acceptable to lose. This is
+  what makes snapshotting after each run the durable workflow: an A/B spanning a
+  restart keeps every run that was snapshotted.
+- **Live accumulated data does not survive a daemon restart** — the sample tier is up
+  to the memory budget and is not written to disk.
 - On restore, a collector comes back **armed but zeroed**, carrying
-  `zeroed_by: "daemon_restart"` and `zeroed_at` until the next explicit reset.
-  A restart mid-A/B is therefore *visible in the result*, not a silently partial run
-  that reads like a complete one.
+  `zeroed_by: "daemon_restart"` and `zeroed_at` until the next explicit reset or
+  snapshot. A restart mid-run is therefore *visible in the result*, not a silently
+  partial run that reads like a complete one. Its persisted history is unaffected.
 - A collector is pinned to its creation domain (§4.2).
 - Duplicate collector name within a session → error, mirroring `rename_session`'s
   refusal to let two live identities collide.
 
 ---
 
-## 10. Error handling
+## 11. Error handling
 
 Every one of these is a loud, specific error — never a zero, an empty result, or a
 silent fallback:
@@ -473,12 +653,19 @@ silent fallback:
 | `diff` on mismatched filter or level | Refused, naming the mismatch (§5.6) |
 | `diff` with an incomplete side | Refused unless `allow_incomplete` (§5.6) |
 | Group-key cardinality cap hit | `__overflow__` bucket + `cardinality_capped: true` |
-| Sample budget hit | `sampled.complete = false`; exact tier unaffected |
+| Sample budget hit | `sampled.complete = false`; exact tier and histogram unaffected |
 | Zero matches | Well-formed empty result — no sentinel, no division by zero |
+| Snapshot policy names a projection above the level | Error at `collectors.add`, not at snapshot time (§6.4) |
+| Reading a snapshot for something its policy excluded | Error naming the excluding policy (§6.4) |
+| Unknown snapshot label | Error listing available labels |
+| `collectors.edit` changing `filter` or `level` | Refused — it would invalidate existing history (§7) |
+| `max_snapshots` reached | Oldest evicted FIFO; `snapshots_evicted` reported |
+| Merging snapshots with sample-derived projections requested | Those fields omitted, with a stated reason (§6.5) |
+| Group histogram cap reached | Group keeps exact scalars only; result says so (§3.5) |
 
 ---
 
-## 11. Test list (verification + adversarial)
+## 12. Test list (verification + adversarial)
 
 **Verification**
 
@@ -496,9 +683,19 @@ silent fallback:
   the stated reason.
 - **V9** `diff` deltas at each percentile, overall and per group.
 - **V10** `reset` returns the cleared aggregate and zeroes atomically.
-- **V11** Restart → armed, zeroed, `zeroed_by` set.
+- **V11** Restart → armed, zeroed, `zeroed_by` set, **persisted history intact**.
 - **V12** `traces.slow` grouped arm now aggregates the population, not the tail
   (regression test for §1.1).
+- **V13** Histogram percentiles match the exact sample percentiles within
+  `error_pct` on several distributions (uniform, bimodal, heavy-tailed).
+- **V14** `snapshot` records, returns, and zeroes; `reset` discards without
+  recording; history reflects exactly the snapshots taken.
+- **V15** Snapshot policy round-trip: each snapshot echoes the policy it was taken
+  under, and editing the collector's policy does not alter existing snapshots.
+- **V16** Merged history equals the sum of its parts for scalars and histograms, and
+  omits sample-derived projections with a stated reason.
+- **V17** Descriptions (collector and snapshot) appear in read, diff, history, and
+  export output.
 
 **Adversarial**
 
@@ -518,7 +715,20 @@ silent fallback:
 - **A8 Incomplete diff.** Refused by default; permitted with `allow_incomplete`.
 - **A9 Idle CPU.** Collector armed with no traffic → zero CPU (the standing
   wake/sleep contract).
-- **A10 Observer effect — the capability A/B on the feature itself.** Run the full
+- **A10 Truncation must not launder into a snapshot.** Overflow the sample budget,
+  then snapshot. Histogram percentiles must still describe the whole run;
+  sample-derived projections must carry `complete: false` through into the snapshot.
+  This is the defect that moving the histogram to ingest exists to prevent, so it
+  gets a test rather than an argument.
+- **A11 Snapshot during ingest.** Spans arriving concurrently with `snapshot` land
+  in exactly one side — `snapshot.count + live.count` equals total ingested, with no
+  span counted twice or dropped.
+- **A12 History eviction.** Exceed `max_snapshots`; the oldest go, `snapshots_evicted`
+  is reported, and no surviving snapshot is corrupted by the eviction.
+- **A13 Diff across representations.** Snapshot (estimated) against live (sampled) —
+  the diff compares at the weaker representation and says so, rather than silently
+  mixing the two.
+- **A14 Observer effect — the capability A/B on the feature itself.** Run the full
   suite with collectors armed and with them absent, and measure ingest overhead.
   A profiler that measurably perturbs what it measures is broken regardless of how
   correct its arithmetic is. This is the one test that cannot be replaced by
@@ -526,19 +736,27 @@ silent fallback:
 
 ---
 
-## 12. Build order
+## 13. Build order
 
 Each phase ends with targeted tests green and a fresh-eyes self-review of the phase
 diff. Mid-checkpoint after phase 1.
 
-1. **Core.** Levels, columnar sample buffer, exact tier, ingest hook, domain-keyed
-   registry, `add`/`list`/`get`/`reset`/`remove`, the `ProfileResult` shape,
+1. **Core.** Levels, columnar sample buffer, exact tier **including the histogram**,
+   ingest hook, domain-keyed registry, `add`/`list`/`get`/`reset`/`remove`,
+   descriptions, the `ProfileResult` shape with its three categories,
    `traces.profile`. Includes the §1.1 `traces.slow` fix, since the grouped arm
    becomes a wrapper over the projection core.
 2. **Projections.** Path aggregation, wall-clock union, warm-up exclusion,
    `group_keys`.
-3. **Comparison.** `collectors.diff` with its refusals; folded export.
-4. **Guards.** Threshold triggers with rolling-window evaluation.
+3. **History.** `snapshot` / `history` / `edit`, snapshot policy with
+   definition-time validation, persistence of snapshots, merging.
+4. **Comparison.** `collectors.diff` with its refusals and cross-representation
+   handling; folded export.
+5. **Guards.** Threshold triggers with rolling-window evaluation.
+
+Phases 1–3 are the complete driving workflow. If phases 4–5 are cut or deferred, the
+feature still does the job it was designed for — the ordering is chosen so that cut
+is clean.
 
 Docs are part of done, in the same session: README tool table + a Filter-DSL/profiling
 section, the logmon skill's tool-selection table, and deletion of the stale
@@ -549,7 +767,7 @@ multi-key `group_by`, reservoir sampling as an opt-in percentile-only mode.
 
 ---
 
-## 13. Design gate — lens set
+## 14. Design gate — lens set
 
 T2 takes one fresh-context pass, but the two canonical lenses are the floor, and this
 design's failure surface argues for more. Named now so the gate brief is not
@@ -563,8 +781,13 @@ improvised:
   are solved problems in mature profilers. Reconcile against how they do it rather
   than re-deriving; the standing rule is to port a proven structure verbatim and
   layer the new concern on top.
-- **False-positive** — §5.6 introduces two *blocking* refusals. A blocking check
-  must reject only the provable, or it gets routed around and stops protecting
-  anything. Verify both refusals fire only on recorded facts.
+- **False-positive** — §5.6 introduces two *blocking* refusals, and §7 adds a third
+  (`edit` refusing filter/level changes). A blocking check must reject only the
+  provable, or it gets routed around and stops protecting anything. Verify all three
+  fire only on recorded facts.
+- **Durability** — snapshots persist (§10), which puts user-visible measurement
+  history on disk for the first time in this feature. Not a migration, so not T3, but
+  the restore path deserves the same scrutiny: a snapshot that restores subtly wrong
+  is worse than one that fails to restore, because it still reads like a measurement.
 
 Convergent findings across lenses are to be treated as load-bearing, not coincidence.
