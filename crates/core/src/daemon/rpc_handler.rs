@@ -1,5 +1,6 @@
+use crate::collector::history::{RunToRunFloor, SnapshotPolicy, StoredSnapshot};
 use crate::collector::project::{GroupBy, ProfileOptions};
-use crate::collector::registry::{ArmedCollector, CollectorRegistry};
+use crate::collector::registry::{ArmedCollector, CollectorRegistry, SnapshotRequest};
 use crate::collector::sample::Level;
 use crate::collector::state::{Collector, CollectorDef, DEFAULT_MAX_SAMPLE_BYTES};
 use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
@@ -193,6 +194,8 @@ impl RpcHandler {
             "collectors.add" => self.handle_collectors_add(session_id, &request.params),
             "collectors.list" => self.handle_collectors_list(session_id),
             "collectors.get" => self.handle_collectors_get(session_id, &request.params),
+            "collectors.snapshot" => self.handle_collectors_snapshot(session_id, &request.params),
+            "collectors.history" => self.handle_collectors_history(session_id, &request.params),
             "collectors.reset" => self.handle_collectors_reset(session_id, &request.params),
             "collectors.remove" => self.handle_collectors_remove(session_id, &request.params),
             "traces.profile" => self.handle_traces_profile(session_id, &request.params),
@@ -1593,6 +1596,17 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let name = require_str(params, "name")?;
+        // A label reads a recorded run. Served from what the snapshot stored
+        // rather than re-projected, because the samples it was projected from
+        // are gone — and re-deriving from the live collector would answer a
+        // different question with the right-looking shape.
+        if let Some(label) = params.get("snapshot").and_then(|v| v.as_str()) {
+            let snap = self
+                .collectors
+                .get_snapshot(session_id, name, label)
+                .map_err(|e| e.to_string())?;
+            return Ok(snapshot_as_profile(&snap));
+        }
         let armed = self
             .collectors
             .get(session_id, name)
@@ -1605,6 +1619,128 @@ impl RpcHandler {
             Utc::now(),
         );
         serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
+    fn handle_collectors_snapshot(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        let policy = SnapshotPolicy {
+            per_name: params
+                .get("per_name")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            per_group: params
+                .get("per_group")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            projections: params
+                .get("projections")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        };
+        let snap = self
+            .collectors
+            .snapshot(
+                session_id,
+                SnapshotRequest {
+                    name: name.to_string(),
+                    label: params
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    description: params
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    meta: params.get("meta").cloned().unwrap_or(Value::Null),
+                    policy,
+                    // Reset by default: the point of a snapshot is usually to
+                    // end one run and begin the next in a single call, which is
+                    // what makes the between-runs step one action rather than
+                    // two that traffic can be interleaved between.
+                    reset: params
+                        .get("reset")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    now: Utc::now(),
+                },
+                crate::collector::project::project_samples,
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(snapshot_summary(&snap))
+    }
+
+    fn handle_collectors_history(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        let (mut snapshots, evicted) = self
+            .collectors
+            .history(session_id, name)
+            .map_err(|e| e.to_string())?;
+        // `limit` takes the most RECENT n, then they are presented oldest
+        // first — the order a sequence of runs is read in.
+        if let Some(limit) = params.get("limit").and_then(|v| v.as_u64()) {
+            let limit = limit as usize;
+            if snapshots.len() > limit {
+                snapshots.drain(..snapshots.len() - limit);
+            }
+        }
+
+        let mut result = json!({
+            "collector": name,
+            "snapshots": snapshots.iter().map(snapshot_summary).collect::<Vec<_>>(),
+            "count": snapshots.len(),
+            "evicted": evicted,
+        });
+
+        if params
+            .get("merge")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let mut suppressed: Vec<Value> = Vec::new();
+            match crate::collector::history::merge(&snapshots) {
+                Ok(m) => {
+                    result["merged"] = exact_json(&m);
+                    result["merged_estimated"] = estimated_json(&m, "collector");
+                    // Stated every time, not only when it bites: someone
+                    // merging runs is looking for a total, and self time or a
+                    // wall union summed across runs would be a number with no
+                    // meaning rather than an approximate one.
+                    suppressed.push(json!({
+                        "field": "merged.sampled",
+                        "reason": "sample-derived figures do not merge — self time and a \
+                                   wall-clock union across separate runs are not a self \
+                                   time and not a union",
+                        "remedy": "read the per-snapshot `sampled` blocks, or compare two \
+                                   runs directly rather than merging them",
+                    }));
+                }
+                Err(e) => suppressed.push(json!({
+                    "field": "merged",
+                    "reason": e.to_string(),
+                })),
+            }
+            if let Some(f) = RunToRunFloor::over_total_ms(&snapshots) {
+                result["floor"] = json!({
+                    "metric": f.metric,
+                    "runs": f.runs,
+                    "min": f.min,
+                    "max": f.max,
+                    "mean": f.mean,
+                    "cv_pct": f.cv_pct,
+                    "caveat": RunToRunFloor::CAVEAT,
+                });
+            }
+            result["suppressed"] = json!(suppressed);
+        }
+        Ok(result)
     }
 
     fn handle_collectors_reset(
@@ -1757,6 +1893,118 @@ impl RpcHandler {
             _ => IngestBasis::Unavailable,
         }
     }
+}
+
+fn exact_json(e: &crate::collector::exact::ExactStats) -> Value {
+    json!({
+        "count": e.count,
+        "total_ms": crate::collector::exact::ns_to_ms(e.total_ns),
+        "avg_ms": e.avg_ns().map(|ns| ns / 1_000_000.0),
+        "min_ms": e.min_ns.map(|ns| ns as f64 / 1_000_000.0),
+        "max_ms": e.max_ns.map(|ns| ns as f64 / 1_000_000.0),
+        "error_count": e.error_count,
+        "out_of_range_spans": e.out_of_range_spans,
+    })
+}
+
+fn estimated_json(e: &crate::collector::exact::ExactStats, axis: &str) -> Value {
+    let q = |p: f64| e.quantile_ns(p).map(|ns| ns / 1_000_000.0);
+    json!({
+        "axis": axis,
+        "alpha_pct": crate::collector::sketch::ALPHA * 100.0,
+        "p50_ms": q(0.50),
+        "p80_ms": q(0.80),
+        "p95_ms": q(0.95),
+        "p99_ms": q(0.99),
+    })
+}
+
+/// A recorded run on the wire.
+///
+/// Reports the definition **from the snapshot**, never from the live
+/// collector — that is the whole reason §6.3 makes a snapshot carry its own.
+fn snapshot_summary(s: &StoredSnapshot) -> Value {
+    json!({
+        "label": s.label,
+        "description": s.description,
+        "meta": s.meta,
+        "taken_at": s.taken_at,
+        "window_start": s.window_start,
+        "wall_ms": s.wall_ms,
+        "filter": s.def.filter_string,
+        "level": s.def.level.as_str(),
+        "group_keys": s.def.group_keys,
+        "exact": exact_json(&s.total),
+        "estimated": estimated_json(&s.total, "collector"),
+        "sampled": s.projections,
+        "ingest": s.ingest.map(|i| json!({
+            "drops_in_window": i.dropped,
+            "shed_batches": i.shed_batches,
+            "malformed_dropped": i.malformed,
+            "malformed_timestamps": s.total.malformed_timestamps,
+            "negative_duration_spans": s.total.negative_duration_spans,
+            "attribution": "domain",
+        })),
+        "sample_complete": s.sample_complete,
+        "cardinality_capped": s.cardinality_capped,
+    })
+}
+
+/// A recorded run in the same shape as a live read.
+///
+/// `collectors.get` returns one type whether it is reading the live window or
+/// a snapshot — a recorded run *is* a profile, of a window that has closed.
+/// Two shapes would mean every client branches on a parameter it passed, and
+/// the typed SDK could not name a return type at all.
+fn snapshot_as_profile(s: &StoredSnapshot) -> Value {
+    let nesting = match (&s.projections, s.def.level.has_tree()) {
+        (Some(p), true) if p.nested_matches > 0 => "detected",
+        (Some(_), true) => "undetected",
+        // No stored projection, or a level that never had parent identity:
+        // the question was not asked, and saying "undetected" would let a
+        // reader infer a flat call structure from a recording policy.
+        _ => "unknown",
+    };
+    let mut suppressed: Vec<Value> = Vec::new();
+    if s.projections.is_none() && s.def.level.has_samples() {
+        suppressed.push(json!({
+            "field": "sampled",
+            "reason": "this snapshot was recorded with projections disabled, and the \
+                       samples it would have been projected from are not retained",
+            "remedy": "take the next snapshot with projections: true",
+        }));
+    }
+    json!({
+        "collector": s.def.name,
+        "description": s.description,
+        "filter": s.def.filter_string,
+        "level": s.def.level.as_str(),
+        "matched": s.total.count,
+        "nesting": nesting,
+        // A closed window: it opened when the previous one was zeroed and
+        // ended when the snapshot was taken.
+        "window": {
+            "armed_at": s.window_start,
+            "read_at": s.taken_at,
+            "wall_ms": s.wall_ms,
+        },
+        "ingest": s.ingest.map(|i| json!({
+            "drops_in_window": i.dropped,
+            "shed_batches": i.shed_batches,
+            "malformed_dropped": i.malformed,
+            "malformed_timestamps": s.total.malformed_timestamps,
+            "negative_duration_spans": s.total.negative_duration_spans,
+            "attribution": "domain",
+        })),
+        "exact": exact_json(&s.total),
+        "estimated": estimated_json(&s.total, "collector"),
+        "sampled": s.projections,
+        "cardinality_capped": s.cardinality_capped,
+        "suppressed": suppressed,
+        // Not a live field, but the label is how this run is referred to
+        // everywhere else, so a result that omitted it would be unquotable.
+        "snapshot": s.label,
+    })
 }
 
 fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {

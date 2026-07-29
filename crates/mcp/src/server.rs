@@ -269,12 +269,41 @@ struct CollectorNameParams {
 #[derive(Deserialize, JsonSchema)]
 struct GetCollectorParams {
     name: String,
+    /// Read a recorded run by its label instead of the live window.
+    snapshot: Option<String>,
     /// Break the numbers down by "name", "group", "trace" or "path".
     group_by: Option<String>,
     /// Exclude spans starting within this many ms of the first matched span.
     skip_warmup_ms: Option<f64>,
     /// Rows returned in the breakdown (default 20).
     top_n: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SnapshotCollectorParams {
+    name: String,
+    /// Unique per collector. Omitted → "snapshot-<n>", and n never repeats.
+    label: Option<String>,
+    /// What this run was. Recorded with the data, so a number found weeks
+    /// later still says what it measured. Give one.
+    description: Option<String>,
+    /// Provenance logmon cannot infer — commit, build profile, config.
+    meta: Option<serde_json::Value>,
+    /// Zero the collector and start the next window. Default true.
+    reset: Option<bool>,
+    /// Store the sample-derived figures (self time, percentiles). Computed now
+    /// or never — the samples themselves are not retained. Default true.
+    projections: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CollectorHistoryParams {
+    name: String,
+    /// Most recent N runs. Omitted → all retained.
+    limit: Option<u32>,
+    /// Also combine them: exact totals and percentiles add across runs, and a
+    /// run-to-run spread is reported. Sample-derived figures do not merge.
+    merge: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -750,6 +779,7 @@ impl GelfMcpServer {
                 "collectors.get",
                 serde_json::json!({
                     "name": p.name,
+                    "snapshot": p.snapshot,
                     "group_by": p.group_by,
                     "skip_warmup_ms": p.skip_warmup_ms,
                     "top_n": p.top_n,
@@ -763,8 +793,66 @@ impl GelfMcpServer {
     }
 
     #[rmcp::tool(
-        description = "Zero a collector and start a fresh window, keeping it armed. Returns a \
-                       summary of what was discarded. Use between runs of an A/B."
+        description = "Record the current window as a named run and start the next one. This \
+                       is the between-runs move for a before/after comparison: arm, run A, \
+                       snapshot, change one thing, run B, snapshot, then compare. Unlike \
+                       reset_collector it KEEPS the run. Always pass a description."
+    )]
+    async fn snapshot_collector(
+        &self,
+        Parameters(p): Parameters<SnapshotCollectorParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.snapshot",
+                serde_json::json!({
+                    "name": p.name,
+                    "label": p.label,
+                    "description": p.description,
+                    "meta": p.meta,
+                    "reset": p.reset,
+                    "projections": p.projections,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "List a collector's recorded runs, oldest first, each with the \
+                       definition it was taken under. With merge=true also combines them and \
+                       reports the run-to-run spread — which is what tells you whether a \
+                       difference between two runs is real or just noise."
+    )]
+    async fn get_collector_history(
+        &self,
+        Parameters(p): Parameters<CollectorHistoryParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.history",
+                serde_json::json!({
+                    "name": p.name,
+                    "limit": p.limit,
+                    "merge": p.merge,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Zero a collector and start a fresh window, keeping it armed. DISCARDS \
+                       the run — use snapshot_collector if you want to keep it. Returns a \
+                       summary of what was thrown away."
     )]
     async fn reset_collector(
         &self,

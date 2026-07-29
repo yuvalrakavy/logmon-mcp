@@ -6,7 +6,8 @@
 
 use clap::{Args, Subcommand};
 use logmon_broker_protocol::{
-    CollectorsAdd, CollectorsGet, CollectorsList, CollectorsName, ProfileResult, TracesProfile,
+    CollectorsAdd, CollectorsGet, CollectorsHistory, CollectorsList, CollectorsName,
+    CollectorsSnapshot, ProfileResult, TracesProfile,
 };
 use logmon_broker_sdk::Broker;
 
@@ -43,6 +44,9 @@ enum ColVerb {
     Get {
         #[arg(long)]
         name: String,
+        /// Read a recorded run by label instead of the live window.
+        #[arg(long)]
+        snapshot: Option<String>,
         /// name | group | trace | path
         #[arg(long)]
         group_by: Option<String>,
@@ -50,6 +54,32 @@ enum ColVerb {
         skip_warmup_ms: Option<f64>,
         #[arg(long)]
         top_n: Option<u64>,
+    },
+    /// Record the current window as a named run and start the next one.
+    Snapshot {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// What this run was. Recorded with the data — give one.
+        #[arg(long)]
+        description: Option<String>,
+        /// Provenance as JSON, e.g. '{"commit":"abc123"}'.
+        #[arg(long)]
+        meta: Option<String>,
+        /// Record without zeroing (default is to zero and start the next run).
+        #[arg(long)]
+        no_reset: bool,
+    },
+    /// List a collector's recorded runs, oldest first.
+    History {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Also combine them and report the run-to-run spread.
+        #[arg(long)]
+        merge: bool,
     },
     /// Zero a collector and start a fresh window, keeping it armed.
     Reset {
@@ -164,8 +194,156 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
             0
         }
 
+        ColVerb::Snapshot {
+            name,
+            label,
+            description,
+            meta,
+            no_reset,
+        } => {
+            let meta = match meta
+                .as_deref()
+                .map(serde_json::from_str::<serde_json::Value>)
+            {
+                Some(Ok(v)) => Some(v),
+                Some(Err(e)) => {
+                    format::error(&format!("--meta is not valid JSON: {e}"), json);
+                    return 1;
+                }
+                None => None,
+            };
+            let result = match broker
+                .collectors_snapshot(CollectorsSnapshot {
+                    name,
+                    label,
+                    description,
+                    meta,
+                    reset: Some(!no_reset),
+                    per_name: None,
+                    per_group: None,
+                    projections: None,
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    format::error(&format!("collectors.snapshot failed: {e}"), json);
+                    return 1;
+                }
+            };
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            println!(
+                "recorded `{}`: {} spans, {:.1}ms total over {:.1}s{}",
+                result.label,
+                result.exact.count,
+                result.exact.total_ms,
+                result.wall_ms / 1000.0,
+                if result.sample_complete {
+                    ""
+                } else {
+                    "  (SAMPLE TRUNCATED)"
+                },
+            );
+            if let Some(d) = &result.description {
+                println!("  {d}");
+            }
+            0
+        }
+
+        ColVerb::History { name, limit, merge } => {
+            let result = match broker
+                .collectors_history(CollectorsHistory {
+                    name,
+                    limit,
+                    merge: Some(merge),
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    format::error(&format!("collectors.history failed: {e}"), json);
+                    return 1;
+                }
+            };
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            if result.snapshots.is_empty() {
+                println!("(no recorded runs)");
+                return 0;
+            }
+            let rows: Vec<Vec<String>> = result
+                .snapshots
+                .iter()
+                .map(|s| {
+                    vec![
+                        s.label.clone(),
+                        format!("{}", s.exact.count),
+                        format!("{:.1}", s.exact.total_ms),
+                        s.exact.avg_ms.map_or("-".into(), |v| format!("{v:.3}")),
+                        s.sampled
+                            .as_ref()
+                            .and_then(|p| p.self_ms)
+                            .map_or("-".into(), |v| format!("{v:.1}")),
+                        if s.sample_complete { "" } else { "truncated" }.to_string(),
+                        s.description.clone().unwrap_or_default(),
+                    ]
+                })
+                .collect();
+            format::print_table(
+                &[
+                    "label",
+                    "count",
+                    "total_ms",
+                    "avg_ms",
+                    "self_ms",
+                    "sample",
+                    "description",
+                ],
+                rows,
+            );
+            if result.evicted > 0 {
+                println!(
+                    "{} older run(s) dropped to the retention cap",
+                    result.evicted
+                );
+            }
+            if let Some(m) = &result.merged {
+                println!(
+                    "\nmerged: {} spans, {:.1}ms total, avg {:.3}ms",
+                    m.count,
+                    m.total_ms,
+                    m.avg_ms.unwrap_or(0.0)
+                );
+            }
+            if let Some(f) = &result.floor {
+                match f.cv_pct {
+                    Some(cv) => println!(
+                        "spread over {} runs: {:.1}–{:.1}ms (mean {:.1}), CV {cv:.1}%",
+                        f.runs, f.min, f.max, f.mean
+                    ),
+                    // Never printed as zero: that would license calling any
+                    // difference significant.
+                    None => println!(
+                        "spread: UNKNOWN — a single run cannot establish one. Repeat the \
+                         run to find out whether a difference is real."
+                    ),
+                }
+                println!("  {}", f.caveat);
+            }
+            for s in &result.suppressed {
+                println!("  not reported: {} — {}", s.field, s.reason);
+            }
+            0
+        }
+
         ColVerb::Get {
             name,
+            snapshot,
             group_by,
             skip_warmup_ms,
             top_n,
@@ -173,6 +351,7 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
             let result = match broker
                 .collectors_get(CollectorsGet {
                     name,
+                    snapshot,
                     group_by,
                     skip_warmup_ms,
                     top_n,

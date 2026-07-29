@@ -206,6 +206,8 @@ pub fn profile(
 
     ProfileResult {
         collector: Some(snap.def.name.clone()),
+        // The live window, not a recorded one.
+        snapshot: None,
         description: snap.def.description.clone(),
         filter: snap.def.filter_string.clone(),
         level: level.as_str().to_string(),
@@ -226,6 +228,29 @@ pub fn profile(
         // can still cheaply change their mind.
         warnings: Vec::new(),
     }
+}
+
+/// Just the sample-derived figures, for a snapshot to record at the moment it
+/// is taken.
+///
+/// A snapshot does not retain the raw samples — at 64 MiB a collector, fifty
+/// of them would be a different product — so a projection not computed here
+/// can never be computed later. Suppression reasons are discarded rather than
+/// surfaced: the snapshot's own `level` and `nested_matches` already say why a
+/// field is absent, and a stored reason would go stale against a collector
+/// whose definition later changed.
+pub fn project_samples(snap: &CollectorSnapshot) -> Option<ProfileSampled> {
+    let level = snap.def.level;
+    if !level.has_samples() {
+        return None;
+    }
+    let mut discard = Vec::new();
+    Some(sampled_view(
+        &snap.samples,
+        None,
+        level.has_tree(),
+        &mut discard,
+    ))
 }
 
 fn window_view(snap: &CollectorSnapshot, read_at: DateTime<Utc>) -> ProfileWindow {

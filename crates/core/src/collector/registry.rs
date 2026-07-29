@@ -9,6 +9,7 @@
 //! was created in for ingest. Those are different questions and the registry
 //! keeps them apart.
 
+use crate::collector::history::{History, HistoryError, SnapshotPolicy, StoredSnapshot};
 use crate::collector::state::{Collector, CollectorDef, CollectorSnapshot};
 use crate::daemon::domain::DomainId;
 use crate::daemon::session::SessionId;
@@ -16,6 +17,7 @@ use crate::filter::matcher::matches_span;
 use crate::receiver::{ReceiverMetrics, TraceIngestLoss};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
+use logmon_broker_protocol::ProfileSampled;
 use std::sync::{Arc, RwLock};
 
 /// Daemon-wide sample reservation (§3.4). Enforced at arm time, so four
@@ -34,6 +36,9 @@ pub enum RegistryError {
         remaining: usize,
         total: usize,
     },
+    Label(HistoryError),
+    /// A snapshot policy asking for more than the level can produce.
+    PolicyRejected(String),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -53,6 +58,8 @@ impl std::fmt::Display for RegistryError {
                  daemon-wide {total} remain; reduce max_sample_bytes, lower the level, \
                  or remove another collector"
             ),
+            RegistryError::Label(e) => write!(f, "{e}"),
+            RegistryError::PolicyRejected(m) => write!(f, "{m}"),
         }
     }
 }
@@ -71,6 +78,22 @@ struct Entry {
     /// which is the lock that excludes ingest — so a reset moves the data and
     /// the baseline together, with nothing able to slip between them (A13).
     ingest_baseline: TraceIngestLoss,
+    /// Recorded runs. Survives every reset and every structural edit — §7.1
+    /// zeroes the collector, never its history, and each snapshot carries the
+    /// definition it was taken under.
+    history: History,
+}
+
+/// Everything `snapshot` varies. A struct rather than nine positional
+/// arguments, three of which are `Option<String>` and would silently swap.
+pub struct SnapshotRequest {
+    pub name: String,
+    pub label: Option<String>,
+    pub description: Option<String>,
+    pub meta: serde_json::Value,
+    pub policy: SnapshotPolicy,
+    pub reset: bool,
+    pub now: DateTime<Utc>,
 }
 
 /// A collector plus everything the read path needs to interpret it.
@@ -146,6 +169,7 @@ impl CollectorRegistry {
             collector: collector.clone(),
             ingest_baseline: metrics.trace_ingest_loss(),
             metrics,
+            history: History::new(),
         });
         Ok(collector)
     }
@@ -186,6 +210,112 @@ impl CollectorRegistry {
         let taken = e.collector.swap(now);
         e.ingest_baseline = e.metrics.trace_ingest_loss();
         Ok(taken)
+    }
+
+    /// Record the current window as a snapshot, and by default start a fresh
+    /// one (§6.1).
+    ///
+    /// Split into two locked steps with the projection computed **between**
+    /// them: projecting means sorting every retained duration and walking the
+    /// parent map, which at a million samples is long enough that doing it
+    /// under the registry's write lock would stall ingest for the duration.
+    /// `take` is atomic, which is the part that matters — the recorded window
+    /// and the fresh one cannot overlap or lose a span.
+    pub fn snapshot<F>(
+        &self,
+        owner: &SessionId,
+        req: SnapshotRequest,
+        project: F,
+    ) -> Result<StoredSnapshot, RegistryError>
+    where
+        F: FnOnce(&CollectorSnapshot) -> Option<ProfileSampled>,
+    {
+        let SnapshotRequest {
+            name,
+            label,
+            description,
+            meta,
+            policy,
+            reset,
+            now,
+        } = req;
+        let name = name.as_str();
+        // Step 1, under the write lock: reserve the label and take the data.
+        let (view, ingest, label) = {
+            let mut g = self.entries.write().expect("registry lock poisoned");
+            let e = g
+                .iter_mut()
+                .find(|e| &e.owner == owner && e.collector.def().name == name)
+                .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+            policy
+                .validate(e.collector.def().level)
+                .map_err(RegistryError::PolicyRejected)?;
+            let label = e
+                .history
+                .reserve_label(label.as_deref())
+                .map_err(RegistryError::Label)?;
+
+            let current = e.metrics.trace_ingest_loss();
+            let ingest = Some(current.since(e.ingest_baseline));
+            let view = if reset {
+                let taken = e.collector.swap(now);
+                e.ingest_baseline = current;
+                taken
+            } else {
+                e.collector.snapshot()
+            };
+            (view, ingest, label)
+        };
+
+        // Step 2, outside every lock: the expensive part.
+        let projections = policy.projections.then(|| project(&view)).flatten();
+
+        // Step 3: file it.
+        let snap = StoredSnapshot::from_view(
+            label,
+            description,
+            meta,
+            now,
+            policy,
+            view,
+            ingest,
+            projections,
+        );
+        let mut g = self.entries.write().expect("registry lock poisoned");
+        let e = g
+            .iter_mut()
+            .find(|e| &e.owner == owner && e.collector.def().name == name)
+            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        e.history.push(snap.clone());
+        Ok(snap)
+    }
+
+    /// Recorded runs, oldest first, plus how many the cap has dropped.
+    pub fn history(
+        &self,
+        owner: &SessionId,
+        name: &str,
+    ) -> Result<(Vec<StoredSnapshot>, u64), RegistryError> {
+        let g = self.entries.read().expect("registry lock poisoned");
+        let e = g
+            .iter()
+            .find(|e| &e.owner == owner && e.collector.def().name == name)
+            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        Ok((e.history.all().to_vec(), e.history.evicted()))
+    }
+
+    pub fn get_snapshot(
+        &self,
+        owner: &SessionId,
+        name: &str,
+        label: &str,
+    ) -> Result<StoredSnapshot, RegistryError> {
+        let g = self.entries.read().expect("registry lock poisoned");
+        let e = g
+            .iter()
+            .find(|e| &e.owner == owner && e.collector.def().name == name)
+            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        e.history.get(label).cloned().map_err(RegistryError::Label)
     }
 
     pub fn remove(&self, owner: &SessionId, name: &str) -> Result<(), RegistryError> {

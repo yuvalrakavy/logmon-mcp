@@ -827,6 +827,9 @@ pub struct CollectorsListResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CollectorsGet {
     pub name: String,
+    /// Read a recorded snapshot by label instead of the live window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     /// `name`, `group`, `trace`, or `path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_by: Option<String>,
@@ -865,6 +868,113 @@ pub struct CollectorsRemoveResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsSnapshot {
+    pub name: String,
+    /// Unique per collector, `[A-Za-z0-9._-]`. Omitted → `snapshot-<n>`, and
+    /// `n` never repeats over a collector's life even after eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// What this run was. Recorded with the data, so a number found weeks
+    /// later still says what it measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Provenance logmon cannot infer — commit, build profile, config. Free
+    /// form, and per-snapshot because two arms of a comparison differ in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+    /// Zero the collector and start a fresh window. Default `true` — the
+    /// point of a snapshot is usually to end one run and begin the next.
+    #[serde(default)]
+    pub reset: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_name: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_group: Option<bool>,
+    /// Store the sample-derived figures. Computed now or never — the samples
+    /// themselves are not retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projections: Option<bool>,
+}
+
+/// One recorded run, as `collectors.history` lists it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SnapshotSummary {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+    pub taken_at: Option<DateTime<Utc>>,
+    pub window_start: Option<DateTime<Utc>>,
+    pub wall_ms: f64,
+    /// The definition **as of this snapshot**, never the live collector's.
+    pub filter: String,
+    pub level: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_keys: Vec<String>,
+    pub exact: ProfileExact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<ProfileEstimated>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled: Option<ProfileSampled>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<ProfileIngest>,
+    /// `false` if the sample budget truncated during this window. Travels with
+    /// the record so a snapshot cannot launder a truncated run.
+    pub sample_complete: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cardinality_capped: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsHistory {
+    pub name: String,
+    /// Most recent N. Omitted → all retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    /// Also return the snapshots combined into one exact tier. Sample-derived
+    /// figures do not merge and are omitted with a reason.
+    #[serde(default)]
+    pub merge: Option<bool>,
+}
+
+/// Spread across repeats of one configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct RunToRunFloor {
+    pub metric: String,
+    pub runs: usize,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    /// Coefficient of variation, as a percentage. **Absent for a single run —
+    /// unknown, not zero.** A floor of zero would license calling any
+    /// difference significant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cv_pct: Option<f64>,
+    /// What this figure does *not* cover. Carried with it because a bare
+    /// spread invites being read as a total error bar.
+    pub caveat: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsHistoryResult {
+    pub collector: String,
+    pub snapshots: Vec<SnapshotSummary>,
+    pub count: usize,
+    /// Snapshots dropped to the retention cap. Reported rather than inferred:
+    /// a caller comparing "the first run" needs to know it is gone.
+    pub evicted: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged: Option<ProfileExact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_estimated: Option<ProfileEstimated>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<RunToRunFloor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<Suppressed>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TracesProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -884,6 +994,11 @@ pub struct ProfileResult {
     /// Collector name, or absent for an ad-hoc `traces.profile` query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collector: Option<String>,
+    /// Set when this is a recorded run rather than the live window. The label
+    /// is how the run is referred to everywhere else, so a result without it
+    /// would be unquotable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub filter: String,

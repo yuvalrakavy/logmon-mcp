@@ -346,6 +346,378 @@ fn clearing_a_sessions_collectors_leaves_every_other_session_alone() {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot history (§6) — the driving workflow
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_ab_workflow_records_two_runs_and_keeps_both() {
+    // arm, run A, snapshot, run B, snapshot, then compare — the sequence the
+    // whole feature exists for.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "cache", "filter": "sv=svc", "level": "tree" }),
+    )
+    .expect("armed");
+
+    for i in 0..4 {
+        h.feed("default", &span_at("svc", "op", 50.0, i * 100_000_000));
+    }
+    let a = h
+        .call(
+            &sid,
+            "collectors.snapshot",
+            json!({
+                "name": "cache", "label": "no-cache",
+                "description": "baseline, cache disabled",
+                "meta": { "commit": "abc123" },
+            }),
+        )
+        .expect("snapshot A");
+    assert_eq!(a["label"], "no-cache");
+    assert_eq!(a["exact"]["total_ms"], 200.0);
+    assert_eq!(a["meta"]["commit"], "abc123");
+
+    // The snapshot reset the window, so run B starts clean.
+    for i in 0..4 {
+        h.feed("default", &span_at("svc", "op", 10.0, i * 100_000_000));
+    }
+    let b = h
+        .call(
+            &sid,
+            "collectors.snapshot",
+            json!({ "name": "cache", "label": "with-cache" }),
+        )
+        .expect("snapshot B");
+    assert_eq!(b["exact"]["total_ms"], 40.0, "run B is not run A plus B");
+
+    // Both runs are still there, oldest first, each with its own context.
+    let hist = h
+        .call(&sid, "collectors.history", json!({ "name": "cache" }))
+        .expect("history");
+    assert_eq!(hist["count"], 2);
+    assert_eq!(hist["evicted"], 0);
+    assert_eq!(hist["snapshots"][0]["label"], "no-cache");
+    assert_eq!(
+        hist["snapshots"][0]["description"], "baseline, cache disabled",
+        "the reason survives with the number"
+    );
+    assert_eq!(hist["snapshots"][1]["label"], "with-cache");
+
+    // And an individual run is readable by label.
+    let one = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "cache", "snapshot": "no-cache" }),
+        )
+        .expect("by label");
+    assert_eq!(one["exact"]["total_ms"], 200.0);
+
+    // The live collector is empty — everything went into the two records.
+    let live = h
+        .call(&sid, "collectors.get", json!({ "name": "cache" }))
+        .expect("live");
+    assert_eq!(live["matched"], 0);
+}
+
+#[test]
+fn a_snapshot_can_record_without_resetting() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "mark", "reset": false }),
+    )
+    .expect("recorded");
+    let live = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(live["matched"], 1, "the window kept running");
+}
+
+#[test]
+fn a_snapshot_records_the_definition_it_was_taken_under() {
+    // §6.3, and the case it exists for: the collector changes between runs. A
+    // reader of the old snapshot must see the old filter, not today's.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sv=svc", "level": "timing" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "before" }),
+    )
+    .unwrap();
+
+    let recorded = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "c", "snapshot": "before" }),
+        )
+        .unwrap();
+    assert_eq!(recorded["filter"], "sv=svc");
+    assert_eq!(recorded["level"], "timing");
+}
+
+#[test]
+fn merging_repeats_adds_them_and_refuses_to_merge_what_cannot_merge() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL", "level": "tree" }),
+    )
+    .unwrap();
+
+    // Three repeats of the same configuration: 100, 110, 120 ms.
+    for (i, total) in [100.0, 110.0, 120.0].iter().enumerate() {
+        for k in 0..10 {
+            h.feed(
+                "default",
+                &span_at("svc", "op", total / 10.0, (i * 10 + k) as i64 * 10_000_000),
+            );
+        }
+        h.call(
+            &sid,
+            "collectors.snapshot",
+            json!({ "name": "c", "label": format!("r{i}") }),
+        )
+        .unwrap();
+    }
+
+    let hist = h
+        .call(
+            &sid,
+            "collectors.history",
+            json!({ "name": "c", "merge": true }),
+        )
+        .expect("merged");
+    assert_eq!(hist["merged"]["count"], 30);
+    assert_eq!(hist["merged"]["total_ms"], 330.0);
+    assert!(hist["merged_estimated"]["p50_ms"].is_number());
+
+    // The floor, with its caveat attached.
+    assert_eq!(hist["floor"]["runs"], 3);
+    assert_eq!(hist["floor"]["min"], 100.0);
+    assert_eq!(hist["floor"]["max"], 120.0);
+    let cv = hist["floor"]["cv_pct"].as_f64().expect("three runs");
+    assert!((cv - 9.0909).abs() < 0.01, "got {cv}");
+    assert!(hist["floor"]["caveat"]
+        .as_str()
+        .unwrap()
+        .contains("ingest loss"));
+
+    // Self time across separate runs is not a self time, and the result says
+    // so rather than quietly omitting it.
+    let sup = hist["suppressed"].as_array().unwrap();
+    assert!(
+        sup.iter().any(|s| s["field"] == "merged.sampled"),
+        "got {sup:?}"
+    );
+}
+
+#[test]
+fn a_single_run_reports_the_floor_as_unknown() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+        .unwrap();
+
+    let hist = h
+        .call(
+            &sid,
+            "collectors.history",
+            json!({ "name": "c", "merge": true }),
+        )
+        .unwrap();
+    assert_eq!(hist["floor"]["runs"], 1);
+    assert!(
+        hist["floor"]["cv_pct"].is_null(),
+        "unknown, not zero — zero would license calling any difference real"
+    );
+}
+
+#[test]
+fn an_auto_labelled_snapshot_gets_a_sequential_name() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    for expect in ["snapshot-1", "snapshot-2", "snapshot-3"] {
+        let s = h
+            .call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+            .unwrap();
+        assert_eq!(s["label"], expect);
+    }
+}
+
+#[test]
+fn a_duplicate_snapshot_label_is_refused() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "base" }),
+    )
+    .unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.snapshot",
+            json!({ "name": "c", "label": "base" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+#[test]
+fn history_survives_a_reset_and_the_reset_does_not_record() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "kept" }),
+    )
+    .unwrap();
+
+    h.feed("default", &span("svc", "op", 99.0));
+    h.call(&sid, "collectors.reset", json!({ "name": "c" }))
+        .expect("discarded");
+
+    let hist = h
+        .call(&sid, "collectors.history", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(hist["count"], 1, "the reset recorded nothing...");
+    assert_eq!(hist["snapshots"][0]["label"], "kept", "...and took nothing");
+}
+
+#[test]
+fn limit_returns_the_most_recent_runs_oldest_first() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    for _ in 0..5 {
+        h.call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+            .unwrap();
+    }
+    let hist = h
+        .call(
+            &sid,
+            "collectors.history",
+            json!({ "name": "c", "limit": 2 }),
+        )
+        .unwrap();
+    assert_eq!(hist["count"], 2);
+    assert_eq!(hist["snapshots"][0]["label"], "snapshot-4");
+    assert_eq!(hist["snapshots"][1]["label"], "snapshot-5");
+}
+
+#[test]
+fn a_snapshot_policy_above_the_level_is_refused_not_downgraded() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL", "level": "scalar" }),
+    )
+    .unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.snapshot",
+            json!({ "name": "c", "projections": true }),
+        )
+        .unwrap_err();
+    assert!(
+        err.contains("scalar") && err.contains("projections"),
+        "got: {err}"
+    );
+    // Not asking for them works at any level.
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "projections": false }),
+    )
+    .expect("recorded without projections");
+}
+
+#[test]
+fn a_snapshot_stores_its_projections_because_the_samples_are_not_kept() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL", "level": "tree" }),
+    )
+    .unwrap();
+    for i in 0..4 {
+        h.feed("default", &span_at("svc", "op", 25.0, i * 100_000_000));
+    }
+    let s = h
+        .call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(s["sampled"]["sample_count"], 4);
+    assert_eq!(s["sampled"]["p50_ms"], 25.0);
+    assert_eq!(
+        s["sampled"]["complete"], true,
+        "and whether it was truncated travels with it"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Ingest accounting (§5.1.1)
 // ---------------------------------------------------------------------------
 

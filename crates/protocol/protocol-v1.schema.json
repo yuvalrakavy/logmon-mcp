@@ -4165,6 +4165,13 @@
         "name": {
           "type": "string"
         },
+        "snapshot": {
+          "description": "Read a recorded snapshot by label instead of the live window.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "group_by": {
           "description": "`name`, `group`, `trace`, or `path`.",
           "type": [
@@ -4353,6 +4360,952 @@
         }
       }
     },
+    "CollectorsSnapshot": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsSnapshot",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "label": {
+          "description": "Unique per collector, `[A-Za-z0-9._-]`. Omitted → `snapshot-<n>`, and\n`n` never repeats over a collector's life even after eviction.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "What this run was. Recorded with the data, so a number found weeks\nlater still says what it measured.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "meta": {
+          "description": "Provenance logmon cannot infer — commit, build profile, config. Free\nform, and per-snapshot because two arms of a comparison differ in it."
+        },
+        "reset": {
+          "description": "Zero the collector and start a fresh window. Default `true` — the\npoint of a snapshot is usually to end one run and begin the next.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "per_name": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "per_group": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "projections": {
+          "description": "Store the sample-derived figures. Computed now or never — the samples\nthemselves are not retained.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "CollectorsHistory": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsHistory",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "limit": {
+          "description": "Most recent N. Omitted → all retained.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "merge": {
+          "description": "Also return the snapshots combined into one exact tier. Sample-derived\nfigures do not merge and are omitted with a reason.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "CollectorsHistoryResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsHistoryResult",
+      "type": "object",
+      "properties": {
+        "collector": {
+          "type": "string"
+        },
+        "snapshots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SnapshotSummary"
+          }
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "evicted": {
+          "description": "Snapshots dropped to the retention cap. Reported rather than inferred:\na caller comparing \"the first run\" needs to know it is gone.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "merged": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileExact"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "merged_estimated": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileEstimated"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "floor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunToRunFloor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "suppressed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppressed"
+          }
+        }
+      },
+      "required": [
+        "collector",
+        "snapshots",
+        "count",
+        "evicted"
+      ],
+      "$defs": {
+        "SnapshotSummary": {
+          "description": "One recorded run, as `collectors.history` lists it.",
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "meta": true,
+            "taken_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "window_start": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "wall_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "filter": {
+              "description": "The definition **as of this snapshot**, never the live collector's.",
+              "type": "string"
+            },
+            "level": {
+              "type": "string"
+            },
+            "group_keys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exact": {
+              "$ref": "#/$defs/ProfileExact"
+            },
+            "estimated": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileEstimated"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sampled": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileSampled"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ingest": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileIngest"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sample_complete": {
+              "description": "`false` if the sample budget truncated during this window. Travels with\nthe record so a snapshot cannot launder a truncated run.",
+              "type": "boolean"
+            },
+            "cardinality_capped": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "label",
+            "wall_ms",
+            "filter",
+            "level",
+            "exact",
+            "sample_complete"
+          ]
+        },
+        "ProfileExact": {
+          "description": "The always-exact tier. Never capped by the sample budget.",
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "avg_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "min_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "max_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "error_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "out_of_range_spans": {
+              "description": "Well-formed spans longer than the sketch's declared range: counted in\nfull toward `total_ms`, clamped in the distribution.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "count",
+            "total_ms",
+            "error_count",
+            "out_of_range_spans"
+          ]
+        },
+        "ProfileEstimated": {
+          "description": "Percentiles from the sketch — bounded relative error, unbounded population.",
+          "type": "object",
+          "properties": {
+            "axis": {
+              "description": "Which population this sketch covers: `collector`, `name`, or `group`.",
+              "type": "string"
+            },
+            "alpha_pct": {
+              "description": "The sketch's relative-accuracy guarantee, as a percentage.",
+              "type": "number",
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "axis",
+            "alpha_pct"
+          ]
+        },
+        "ProfileSampled": {
+          "description": "Everything derived from retained per-span records. Exact over the records it\nholds — which is the whole population only while `complete` is true.",
+          "type": "object",
+          "properties": {
+            "complete": {
+              "description": "`false` once the sample budget stopped retention. The retained set is\nthen a contiguous prefix, not a sample of the whole run.",
+              "type": "boolean"
+            },
+            "sample_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "self_ms": {
+              "description": "Duration minus the union of matched children clipped to this span —\ntime spent in this span and nothing matched below it.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "nested_matches": {
+              "description": "Matched spans whose parent is also matched. Zero means self time equals\ntotal time by construction, and `self_ms` is suppressed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "overlapping_child_ms": {
+              "description": "Child time that lay outside its parent's interval and was clipped away.\nNon-zero means clock skew or instrumentation error, not concurrency.",
+              "type": "number",
+              "format": "double"
+            },
+            "overlapping_child_spans": {
+              "description": "How many children needed clipping. Paired with the millisecond figure\nbecause one child off by a second and a thousand off by a millisecond\nwant opposite remedies.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "wall_union_ms": {
+              "description": "Elapsed time during which at least one matched span was in flight.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "achieved_concurrency": {
+              "description": "Total matched work divided by the wall time it occupied. 1.0 is fully\nserial; 4.0 means four matched spans in flight on average.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "complete",
+            "sample_count",
+            "nested_matches",
+            "overlapping_child_ms",
+            "overlapping_child_spans"
+          ]
+        },
+        "ProfileIngest": {
+          "description": "Span loss during the window, and the collector's own view of unusable input.\n\n`attribution` is `\"domain\"`, always: the transport counters are per-domain\nand unfiltered, so most of what they count may be spans this collector's\nfilter would never have matched. That makes this sound as a trigger for\nmarking a result untrustworthy, and wrong as a statement about how many\nmatches went missing.",
+          "type": "object",
+          "properties": {
+            "drops_in_window": {
+              "description": "Per-span channel-full drops on the two OTLP trace transports.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shed_batches": {
+              "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_dropped": {
+              "description": "Spans discarded at parse time for unusable identity.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_timestamps": {
+              "description": "Matched spans whose timestamps this collector could not use.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "negative_duration_spans": {
+              "description": "Matched spans that ended before they started.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "attribution": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "drops_in_window",
+            "shed_batches",
+            "malformed_dropped",
+            "malformed_timestamps",
+            "negative_duration_spans",
+            "attribution"
+          ]
+        },
+        "RunToRunFloor": {
+          "description": "Spread across repeats of one configuration.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "runs": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "mean": {
+              "type": "number",
+              "format": "double"
+            },
+            "cv_pct": {
+              "description": "Coefficient of variation, as a percentage. **Absent for a single run —\nunknown, not zero.** A floor of zero would license calling any\ndifference significant.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "caveat": {
+              "description": "What this figure does *not* cover. Carried with it because a bare\nspread invites being read as a total error bar.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric",
+            "runs",
+            "min",
+            "max",
+            "mean",
+            "caveat"
+          ]
+        },
+        "Suppressed": {
+          "description": "Why a field that normally carries a number is `null`.\n\nA profile has several ways to be legitimately unable to answer — the\nretention level is too low, a warm-up cut makes an unwindowed tier\nmeaningless, nothing nested so self time carries no information. Returning\n`null` alone would leave the reader to guess which, and the guesses differ\nin what they imply about the run. Every suppression names its field and its\nreason so a consumer can distinguish \"not measured\" from \"measured as zero\".",
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Dotted path of the suppressed field, e.g. `sampled.self_ms`.",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "remedy": {
+              "description": "What the caller could change to get a number instead. Absent when\nnothing would help.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "field",
+            "reason"
+          ]
+        }
+      }
+    },
+    "SnapshotSummary": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SnapshotSummary",
+      "description": "One recorded run, as `collectors.history` lists it.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "meta": true,
+        "taken_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "window_start": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "wall_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "filter": {
+          "description": "The definition **as of this snapshot**, never the live collector's.",
+          "type": "string"
+        },
+        "level": {
+          "type": "string"
+        },
+        "group_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exact": {
+          "$ref": "#/$defs/ProfileExact"
+        },
+        "estimated": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileEstimated"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sampled": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileSampled"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ingest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileIngest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sample_complete": {
+          "description": "`false` if the sample budget truncated during this window. Travels with\nthe record so a snapshot cannot launder a truncated run.",
+          "type": "boolean"
+        },
+        "cardinality_capped": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "label",
+        "wall_ms",
+        "filter",
+        "level",
+        "exact",
+        "sample_complete"
+      ],
+      "$defs": {
+        "ProfileExact": {
+          "description": "The always-exact tier. Never capped by the sample budget.",
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "total_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "avg_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "min_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "max_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "error_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "out_of_range_spans": {
+              "description": "Well-formed spans longer than the sketch's declared range: counted in\nfull toward `total_ms`, clamped in the distribution.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "count",
+            "total_ms",
+            "error_count",
+            "out_of_range_spans"
+          ]
+        },
+        "ProfileEstimated": {
+          "description": "Percentiles from the sketch — bounded relative error, unbounded population.",
+          "type": "object",
+          "properties": {
+            "axis": {
+              "description": "Which population this sketch covers: `collector`, `name`, or `group`.",
+              "type": "string"
+            },
+            "alpha_pct": {
+              "description": "The sketch's relative-accuracy guarantee, as a percentage.",
+              "type": "number",
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "axis",
+            "alpha_pct"
+          ]
+        },
+        "ProfileSampled": {
+          "description": "Everything derived from retained per-span records. Exact over the records it\nholds — which is the whole population only while `complete` is true.",
+          "type": "object",
+          "properties": {
+            "complete": {
+              "description": "`false` once the sample budget stopped retention. The retained set is\nthen a contiguous prefix, not a sample of the whole run.",
+              "type": "boolean"
+            },
+            "sample_count": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "self_ms": {
+              "description": "Duration minus the union of matched children clipped to this span —\ntime spent in this span and nothing matched below it.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "nested_matches": {
+              "description": "Matched spans whose parent is also matched. Zero means self time equals\ntotal time by construction, and `self_ms` is suppressed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "overlapping_child_ms": {
+              "description": "Child time that lay outside its parent's interval and was clipped away.\nNon-zero means clock skew or instrumentation error, not concurrency.",
+              "type": "number",
+              "format": "double"
+            },
+            "overlapping_child_spans": {
+              "description": "How many children needed clipping. Paired with the millisecond figure\nbecause one child off by a second and a thousand off by a millisecond\nwant opposite remedies.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "wall_union_ms": {
+              "description": "Elapsed time during which at least one matched span was in flight.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "achieved_concurrency": {
+              "description": "Total matched work divided by the wall time it occupied. 1.0 is fully\nserial; 4.0 means four matched spans in flight on average.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p50_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p80_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p95_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "p99_ms": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            }
+          },
+          "required": [
+            "complete",
+            "sample_count",
+            "nested_matches",
+            "overlapping_child_ms",
+            "overlapping_child_spans"
+          ]
+        },
+        "ProfileIngest": {
+          "description": "Span loss during the window, and the collector's own view of unusable input.\n\n`attribution` is `\"domain\"`, always: the transport counters are per-domain\nand unfiltered, so most of what they count may be spans this collector's\nfilter would never have matched. That makes this sound as a trigger for\nmarking a result untrustworthy, and wrong as a statement about how many\nmatches went missing.",
+          "type": "object",
+          "properties": {
+            "drops_in_window": {
+              "description": "Per-span channel-full drops on the two OTLP trace transports.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shed_batches": {
+              "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_dropped": {
+              "description": "Spans discarded at parse time for unusable identity.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_timestamps": {
+              "description": "Matched spans whose timestamps this collector could not use.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "negative_duration_spans": {
+              "description": "Matched spans that ended before they started.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "attribution": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "drops_in_window",
+            "shed_batches",
+            "malformed_dropped",
+            "malformed_timestamps",
+            "negative_duration_spans",
+            "attribution"
+          ]
+        }
+      }
+    },
+    "RunToRunFloor": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "RunToRunFloor",
+      "description": "Spread across repeats of one configuration.",
+      "type": "object",
+      "properties": {
+        "metric": {
+          "type": "string"
+        },
+        "runs": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "min": {
+          "type": "number",
+          "format": "double"
+        },
+        "max": {
+          "type": "number",
+          "format": "double"
+        },
+        "mean": {
+          "type": "number",
+          "format": "double"
+        },
+        "cv_pct": {
+          "description": "Coefficient of variation, as a percentage. **Absent for a single run —\nunknown, not zero.** A floor of zero would license calling any\ndifference significant.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "caveat": {
+          "description": "What this figure does *not* cover. Carried with it because a bare\nspread invites being read as a total error bar.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "runs",
+        "min",
+        "max",
+        "mean",
+        "caveat"
+      ]
+    },
     "ProfileResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ProfileResult",
@@ -4361,6 +5314,13 @@
       "properties": {
         "collector": {
           "description": "Collector name, or absent for an ad-hoc `traces.profile` query.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshot": {
+          "description": "Set when this is a recorded run rather than the live window. The label\nis how the run is referred to everywhere else, so a result without it\nwould be unquotable.",
           "type": [
             "string",
             "null"
