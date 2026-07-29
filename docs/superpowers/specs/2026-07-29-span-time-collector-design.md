@@ -1,310 +1,259 @@
 # Span Time Collector — Design Spec
 
-**Date:** 2026-07-29 (rev 2 — post design-gate)
-**Status:** DESIGN — gate run with four fresh-context lenses; blockers resolved in this
-revision. Changed mechanisms need a re-gate before build (see §15).
-**Tier:** **T2** — novel feature minting externally-binding contract surface (JSON-RPC
-methods, MCP tools, wire types in `protocol-v1.schema.json`).
+**Date:** 2026-07-29 (rev 3 — post design-gate round 2)
+**Status:** DESIGN — two gate rounds, eight fresh-context lenses. Rev 3 resolves round 2.
+Mechanisms changed in rev 3 need a round-3 pass on a reduced lens set (§16).
+**Tier:** **T2** — novel feature minting externally-binding contract surface.
 
-> ## Design-gate resolution log (rev 1 → rev 2)
+> ## Gate log
 >
-> Four blind lenses: buildability, soundness + false-positives, performance + prior-art,
-> and a **cold reader** given only a synthetic document and no other context.
+> **Round 1** (buildability, soundness+false-positive, performance+prior-art, cold reader)
+> confirmed the design's *structure* and destroyed several claims made about it: `sum_ms`
+> double-counting nesting, `matches_pattern` allocating, `group_keys` failing on non-string
+> attributes, the exact tier not being exact, and order-independence being false under
+> truncation.
 >
-> The design's *structure* was confirmed by every lens — read-time projections, prefix
-> truncation over reservoir sampling, ingest-fed histograms, reset-vs-snapshot
-> separation, the §9.7 sidecar reversal, and self-time-per-folded-line all survived.
-> What failed were claims made **about** that structure. Convergent findings, weighted
-> hardest per the gate's own rule:
+> **Round 2** (concurrency+durability, false-negative, prior-art+numbers, cold reader) found
+> **every one of rev 2's three headline fixes individually broken**, all four of its
+> loosenings holed, and three of its new rules wrong. The lesson is general and is recorded
+> here because it outlives this feature: **fixes written under gate pressure are less
+> grounded than the design they repair.** Rev 1's failures were claims about existing code;
+> rev 2's were claims about mechanisms invented in response to findings. That is exactly why
+> a substantive change made in response to a finding re-arms the gate.
 >
-> - **★ Nesting (3 lenses, 3 facets).** `sum_ms` double-counts a matched span nested in
->   another matched span; the broad-filter idiom §5.4 recommends *guarantees* nesting;
->   and it overstates a cache win precisely because caches remove nested work. The cold
->   reader independently derived the invariant `nested_matches == 0 ⟹ sum == self_time`
->   and caught rev 1's own §5.1 example violating it. Resolved: **cumulative and self
->   are named peers** (§5.1, §5.2), nesting undetected below `tree` is stated not
->   implied, and negative self-time now has a rule (§5.3).
-> - **★ `matches_pattern` allocates (3 lenses).** rev 1 §4.2 claimed matching allocates
->   nothing; it is `text.to_lowercase().contains(&s.to_lowercase())` — two heap
->   allocations per pattern per span. Corrected in §4.2, with the fix scoped.
-> - **★ `group_keys` on non-string attributes (3 lenses).** The matcher's attribute arm
->   is `.and_then(|v| v.as_str())`, so a boolean `cache.enabled` — the flagship
->   example's most likely encoding — matches nothing. Resolved in §3.3.
-> - **★ The exact tier was never exact (soundness).** Spans are dropped at the receiver
->   before `process_span_for_domain` runs, and drop rate scales with load — the variable
->   under test in every A/B this feature exists to run. Resolved: `ingest` accounting in
->   the result shape (§5.1), a §9.6 row, and `trustworthy: false` on any drop.
-> - **★ Order-independence was false (soundness).** rev 1 §4.3 claimed arrival order
->   never affects a result. Under truncation, *which spans land in the prefix is
->   arrival order*. Restated in §4.3; A3 split so it stops testing only the trivially
->   true case.
-> - **★ All four blocking checks had legitimate false positives (soundness).** The worst
->   blocked the driving use case. The design's idiom everywhere else is
->   *mark-don't-block*; the refusals were an unargued exception. Re-scoped in §5.6/§7.
-> - **Locking (performance + soundness).** A4/A11's atomicity demands forced a coarse
->   lock that O(N) read projections would hold, stalling ingest into the drop path.
->   Resolved with a chunked sample tier (§3.6).
-> - **The histogram was named, not chosen (prior-art).** Algorithm, unit, range, and
->   layout were all unspecified, and the ~4 KB figure was 2–3.5× low. Pinned in §3.5.
-> - **A14 could not detect what it existed to detect (performance).** Ingest is behind a
->   65 536-deep `try_send` channel with no backpressure onto the system under test.
->   Redesigned in §12.
-> - **`logs.export` writes no file daemon-side (buildability)**, and §8's "reuse the
->   existing debounce" was wrong three ways. Both corrected.
+> Round-2 headlines, all resolved below:
+> - **Ingest accounting was blind to the losses it existed to detect.** The HTTP path sheds
+>   whole batches at 429 *before* any counter moves, and malformed spans land in a counter
+>   that is never read (gRPC) or does not exist (HTTP). §5.1's fix required new plumbing,
+>   not a new field. (Verified: `http.rs:450`, `grpc.rs:288-300`, `malformed_count` has no
+>   reader.)
+> - **The chunked sample tier had a whole-chunk race.** Sealed list and active chunk were two
+>   lock domains; a reader could miss or double-count 65 536 records. Replaced with a
+>   generation swap (§3.6).
+> - **Write-through persistence did not compose.** Definitions were still shutdown-only, so a
+>   `kill -9` left orphan history with nothing to attach it to and V11 failed by
+>   construction. And because `domains.create(persist=true)` is refused today, orphaning was
+>   the *primary* path, not the exception (§10).
+> - **Clamp-and-account solved the wrong problem.** The Σ was the defect, not the negativity:
+>   a 100 ms parent with two concurrent 60 ms children has self time 40 ms, and the clamp
+>   returned 0 + an uninterpretable residue. Elastic APM's clipped interval union is the
+>   prior art, and §5.2's merged-interval routine was already in the design at the wrong
+>   scope (§5.3).
+> - **The percentile rank convention was incompatible with the chosen library**, voiding the
+>   accuracy bound it quoted, and V13 was unsatisfiable as written (§5.7).
+> - **The delta error bound was wrong by an order of magnitude, in the same direction as
+>   rev 1** — one paragraph after naming that failure mode (§5.6).
+> - Four loosened checks each opened a hole; a level raise could falsify `complete` itself.
 >
-> Two defects found in **shipped** code were filed separately rather than fixed here:
-> the per-span allocation/re-parse in the trigger path, and OTLP/gRPC reporting success
-> while dropping spans mid-batch.
+> Round 2 also **corrected round 2**: one lens claimed `ReceiverMetrics` is global, another
+> proved it per-domain. Verified per-domain (`domain_lifecycle.rs:57`, `domain.rs:127`).
+> Agent findings are hypotheses.
 
 ---
 
 ## 0. Motivation
 
-logmon answers *"what happened?"*. It does not answer *"where did the time go, and did
-my change help?"*.
+logmon answers *"what happened?"*, not *"where did the time go, and did my change help?"*.
 
-The driving case: measuring a cache behind a kill-switch by running a suite twice and
-comparing time spent in a class of spans — the **capability A/B** that ways-of-working
-requires of any optimisation behind a kill-switch, and which logmon cannot support at
-all today.
+Driving case: measure a cache behind a kill-switch by running a suite twice and comparing
+time in a class of spans — the **capability A/B** required of any kill-switched optimisation,
+which logmon cannot support today.
 
-The generalisation: a **span time collector** that accumulates spans matching a filter
-and lets the consumer ask any timing question of the result.
-
-### 0.1 The principle that shaped everything
-
-**Collect broadly; decide at read time.** The collector computes no metrics. It retains
-a compact record per matched span, and every metric is a read-time projection. Retaining
-`span_id` + `parent_span_id` makes self-time a projection rather than ingest-time
-bookkeeping, which removes the arrival-order hazard that made self-time unattractive.
-
-The gate's headline finding is where rev 1 failed to *follow* this principle: it left
-the double-counting quantity as the number the document leads with.
+**Collect broadly; decide at read time.** The collector computes no metrics; it retains a
+compact record per matched span and every metric is a read-time projection.
 
 ---
 
-## 1. Current architecture — the seams we build on
+## 1. Seams — verified at `a08c119`
 
-Verified against the tree at `a08c119`. Every row re-checked during the gate; two rev-1
-rows were wrong and are corrected here.
+| Seam | Status |
+|---|---|
+| `process_span_for_domain` ingest hook | **Confirmed.** Span triggers exist; the README roadmap line saying otherwise is stale and is deleted here. |
+| `matches_span` | **Confirmed with caveats.** Attributes are **string-only** (`.as_str()`), and matching **allocates** (§4.2). |
+| Bookmark→`SeqFilter` on spans | **Confirmed.** Used by `traces.profile` only (§7). |
+| `SessionRegistry` | Collectors follow the triggers/filters pattern for lifecycle, **but the ingest index is domain-keyed** (§4.4). |
+| `ReceiverMetrics` | **Per-domain** (`domain_lifecycle.rs:57`). Four of six counters are *log* drops; only `otlp_http_traces` / `otlp_grpc_traces` can represent a lost span. |
+| Single-writer ingest | **Confirmed and load-bearing.** One span-processor task per domain (`span_processor.rs:21`, `domain_lifecycle.rs:106`). No writer–writer races exist; every lock below is uncontended on the hot path. |
+| `SpanStore` ring, 10 000 default | Confirmed; eviction is silent. |
+| ~~Per-trigger debounce~~ | **Retracted (rev 2).** The cited symbol is the session storage window; the real counter measures *entries*; span triggers are not debounced at all. §8 reuses nothing. |
+| ~~`logs.export` file pattern~~ | **Retracted (rev 2).** The RPC writes nothing; writes are client-side (§9.9). |
 
-| Seam | Where | Status |
-|---|---|---|
-| Span ingest hook | [`process_span_for_domain`](../../../crates/core/src/daemon/span_processor.rs) | **Confirmed.** Stores the span, then evaluates span-filter triggers per bound session. Span triggers **do** exist — the README roadmap line saying otherwise is stale and is deleted in this change. |
-| Span matching | `matches_span` (`crates/core/src/filter/matcher.rs`) | **Confirmed with two caveats.** Supports `sn`, `sv`, `st`, `sk`, `d>=`/`d<=`, bare patterns, and attributes — but attributes are **string-only** (§3.3), and matching **allocates** (§4.2). |
-| Bookmark windows on spans | `SeqFilter` arm in `matches_span_qualifier` | **Confirmed.** Bookmarks resolve to `SeqFilter` at the RPC layer; spans and logs share one seq counter. `traces.profile` gets window-scoping free. Note a collector pre-parses at arm time, so a bookmark in a *collector* filter resolves **once, at arm** — different semantics from `traces.profile`, and a reason §7 rejects them there. |
-| Per-session state registry | `SessionRegistry` | **Confirmed.** Collectors follow the triggers/filters/bookmarks pattern for lifecycle. |
-| ~~Per-trigger debounce~~ | — | **rev-1 error, retracted.** The cited `post_window_remaining` is the session-level *storage* window. Per-trigger firing suppression is `Trigger::post_remaining`, it counts **entries** not milliseconds, and `record_match` states outright that span triggers are *not* debounced. §8 reuses nothing. |
-| ~~`logs.export` file pattern~~ | — | **rev-1 error, retracted.** The RPC takes no path and writes nothing; the writes are client-side. It does establish the right *division of labour* — see §9.9. |
-| Span ring buffer | `SpanStore`, `span_buffer_size` default **10 000** | **Confirmed**, and eviction is silent. |
-| Receiver drop accounting | `ReceiverMetrics` / `ReceiverDropSnapshot` | **Newly load-bearing.** `try_send_span` drops on a full 65 536-slot channel and counts it. §5.1 now surfaces this. |
+### 1.1 Existing defects touched
 
-### 1.1 Two existing defects this work touches
-
-- **`traces.slow` `group_by="name"` aggregates a biased sample.** `slow_spans` filters
-  to `duration_ms >= min_duration_ms`, sorts descending, **truncates to `count`**, and
-  only then does the handler group. Both truncations bias it — the gate noted rev 1
-  blamed only the `count` one. The fix aggregates the **full matching population**;
-  `min_duration_ms` becomes a *display* floor applied after aggregation, never before.
-  Its nearest-rank convention must also match §5.2 (today `floor(n·0.95)` returns the
-  maximum at n=20). **Fixed in-scope.**
-- **The trigger path re-parses and allocates per span.** Confirmed in detail (§4.2).
-  **Not fixed here** — it has its own blast radius through trigger semantics. Filed
-  separately.
+- **`traces.slow` grouped arm aggregates a biased sample** — `slow_spans` filters by
+  `min_duration_ms`, sorts, `truncate(count)`, *then* the handler groups. **Both** truncations
+  bias it. Fixed: aggregate the full matching population; `min_duration_ms` becomes a display
+  floor applied after aggregation. Its rank convention must match §5.7 (today
+  `floor(n·0.95)` returns the maximum at n=20). **Fold the aggregate inside the read guard** —
+  the current code deep-clones every match into a `Vec<SpanEntry>` under the lock, and removing
+  the truncation grows that clone set to the whole buffer while `insert` needs a write lock.
+- **Trigger path re-parses and allocates per span**, including a regex compile per span per
+  bound session. **Not fixed here**; filed separately.
+- **OTLP/gRPC reports success while dropping spans mid-batch.** Filed separately; §5.1 must
+  cope with it either way.
 
 ---
 
 ## 2. Scope
 
-**In scope**
+In: collector lifecycle; two-tier retention (exact tier with integer-nanosecond scalars and a
+duration sketch, plus a generation-swapped columnar sample tier); levels; `group_keys`;
+read-time projections including total and self time, percentiles, wall union, nesting
+detection, and call paths; **ingest-loss accounting**; snapshot history with merging;
+descriptions and `meta`; `traces.profile`; `collectors.diff`; `collectors.document`; threshold
+triggers (phase 5); the §1.1 `traces.slow` fix.
 
-1. Collector object: arm, list, read, snapshot, reset, remove — per session.
-2. Two-tier retention: an always-exact tier (integer-nanosecond scalars + duration
-   sketch) and a capped **chunked** columnar sample tier.
-3. Retention levels (`scalar` / `timing` / `tree`) chosen at definition time.
-4. `group_keys` — span attributes retained as grouping dimensions.
-5. Read-time projections: cumulative and self time as named peers, percentiles
-   (sketch-estimated whole-run, and sample-exact where complete), wall-clock union,
-   nesting detection, grouping by name / trace / attribute / **call path**, warm-up
-   exclusion.
-6. **Ingest-loss accounting** — drops that happen upstream of the collector are
-   surfaced, never laundered.
-7. Snapshot history with a declared policy, and merging (§6).
-8. Descriptions and `meta` on collectors and snapshots.
-9. `traces.profile` — the same projection over the ring buffer.
-10. `collectors.diff` — deltas at every percentile, with mismatch **marking**.
-11. `collectors.document` — the reader-derived artefact (§9).
-12. Threshold triggers (phase 5), built from scratch (§8).
-13. Fixing the `traces.slow` bias (§1.1).
-
-**Non-goals**
-
-- **Re-importing a document.** No `collectors.import`, no frozen-collector state. The
-  consumer is a reader doing the comparison themselves (§9.1).
-- **Cross-collector baselines** — a shared store comparable across projects or
-  machines. Snapshot history covers the in-collector case. Deferred (§13).
-- Log-derived durations for non-OTLP apps. Deferred (§13).
-- Multi-key `group_by`; reservoir sampling (rejected, §3.4); any change to how spans are
-  received or stored.
+Out: re-importing a document (§9.1); cross-collector baselines; log-derived durations;
+multi-key `group_by`; reservoir sampling (§3.4); `span_id` dedup for retried batches (§9.6
+row instead); changes to how spans are received.
 
 ---
 
 ## 3. Data model
 
-### 3.1 Two retention tiers
+### 3.1 Exact tier
 
-**Exact tier** — per collector, per span name, and per group:
+Per collector, per span name, per group: `count`, `total_ns` (`i128`), `min_ns`, `max_ns`,
+`error_count`, and a duration sketch (§3.5).
 
-| Field | Notes |
-|---|---|
-| `count` | |
-| `cumulative_ns` | `u64` **integer nanoseconds**. f64 addition is not associative, so an f64 accumulator makes results depend on arrival order at the bit level. Integer nanoseconds makes "never approximate" literally true. Reported as `cumulative_ms` (derived f64). |
-| `min_ns`, `max_ns` | |
-| `error_count` | Moved here from the sample tier: it is an O(1) counter, and under-reporting errors is the least acceptable degradation available. |
-| duration sketch | §3.5 |
+**`i128`, not `u64`.** Durations can be negative — `duration_ms` is
+`(end_nano − start_nano) as f64 / 1e6` on both transports, and §5.3 expects child-outlives-parent
+and clock skew. A `u64` accumulator underflows: panic in debug, wrap in release. Accumulate
+from `end_time − start_time` in nanoseconds directly, **not** from `duration_ms`, or the
+integer argument buys nothing.
 
-Memory is O(distinct span names × group cardinality). **Never capped by the sample
-budget**; its own limits are §3.5.
+`total_ns` sums every matched span and **counts a matched span nested inside another matched
+span at both levels**. That is the quantity's definition, not a defect, and §5.1 names it.
 
-`cumulative_ns` is the sum over all matched spans and **double-counts a matched span
-nested inside another matched span**. That is a property of the quantity, not a defect,
-and §5.1 names it accordingly.
-
-**Sample tier** — one record per matched span, stored columnar in **chunks** (§3.6).
-
-### 3.2 Retention levels
+### 3.2 Levels
 
 | Level | Columns added | Unlocks | Bytes/match |
 |---|---|---|---|
-| `scalar` | *(exact tier only)* | count, cumulative, avg, min, max, error count, **estimated percentiles** | 0 |
-| `timing` | `start_ns i64`, `end_ns i64`, `name_id u32`, `flags u8` | sample-exact percentiles, wall-clock union, warm-up exclusion | 21 |
-| `tree` **(default)** | + `span_id u64`, `parent_span_id u64`, `trace_id u128` | **self time**, nesting detection, per-trace rollups, call-path aggregation, folded output | 53 |
+| `scalar` | *(exact tier only)* | count, total, avg, min, max, error count, estimated percentiles | 0 |
+| `timing` | `start_ns i64`, `end_ns i64`, `name_id u32`, `flags u8` | sample-exact percentiles, wall union, warm-up exclusion | 21 |
+| `tree` **(default)** | + `span_id u64`, `parent_span_id u64`, `trace_id u128` | **self time**, nesting detection, per-trace rollups, call paths, folded output | 53 |
 
-Plus 4 B per match per `group_keys` entry at `timing`+. At `scalar` group keys widen the
-exact tier's key instead — and, correcting a rev-1 leak the gate found, **the exact
-tier's key is widened at every level**, so `groups[].exact` is genuinely exact
-everywhere (§5.1).
+Plus 4 B/match per `group_keys` entry at `timing`+. The exact tier's key is widened by
+`group_keys` **at every level**, so `groups[].exact` is exact everywhere.
 
-`flags` packs status (2 bits) and kind (3 bits). `parent_span_id == 0` means root —
-safe, because `bytes_to_span_id` maps all-zero to `None`, so 0 is never a real id.
+`parent_span_id == 0` means root (`bytes_to_span_id(&[0;8]) → None`, so 0 is never a real id).
+**This is why a level raise may not zero-fill** (§7.1).
 
-> Byte figures are **derived from field sizes, not measured**, and must be re-derived
-> against `size_of` in phase 1 (§12, V1). The gate checked the arithmetic and it is
-> self-consistent, but a re-derivation is still the test.
-
-**Nesting below `tree` is undetectable.** `self_ms` and `nested_matches` both need the
-parent columns. At `scalar` and `timing` a result reports `nesting: "undetected"` and
-labels its cumulative figure accordingly — it never prints a bare sum that a reader
-could mistake for total work (§5.1).
+Below `tree`, nesting is undetectable: results carry `nesting: "undetected"` and never print a
+bare total that could be mistaken for work done.
 
 ### 3.3 `group_keys`
 
-Span attribute names whose values are interned per collector. At `timing`+ they are a
-`u32` column per match, enabling per-group percentiles; at every level they widen the
-exact tier's key.
+Attribute names interned per collector. Values are read **independently of the matcher**,
+because the matcher's `.as_str()` makes a boolean `cache.enabled` — the driving example's
+likely encoding — invisible. Rendering: `Bool` → `"true"`/`"false"`; `Number` → shortest
+round-trip decimal; `String` → itself; `Array`/`Object` → excluded with a reason. A span
+missing the key falls into `__absent__`.
 
-**Value rendering — the gate's flagship failure.** `SpanEntry.attributes` is
-`HashMap<String, serde_json::Value>` holding **typed** JSON, and the matcher's attribute
-arm does `.and_then(|v| v.as_str())`. A kill-switch emitted as an OTel `BoolValue` — the
-normal encoding, and the driving example's own case — matches nothing and would intern
-nothing, silently collapsing a two-arm A/B into one group.
+Per-key cardinality cap 1024 → `__overflow__` + `cardinality_capped: true`.
 
-Resolution: `group_keys` reads attribute values **independently of the matcher**, with a
-declared rendering — `Bool` → `"true"`/`"false"`, `Number` → its shortest round-trip
-decimal, `String` → itself, `Array`/`Object` → excluded with a stated reason. A span
-**missing** the key falls into a literal `__absent__` bucket, which under a broad filter
-is most spans and must not be silently dropped.
+**`__overflow__` is a different population on each side of a comparison** — which values land
+in it is arrival order — so it is **suppressed in `collectors.diff`**, never compared (§5.6).
+`__absent__` has identical semantics on both sides and compares fine.
 
-The matcher's own string-only limitation is noted as a carve-out, **not** fixed here: it
-is shared with the log path and changing it is a filter-semantics change.
+**Caps reset with the window.** The interner and both cardinality counters are part of the
+swapped generation (§3.6), so they are per-window, not lifetime. Otherwise the recommended
+interleaved A/B/A/B workflow would exhaust a cumulative cap and pin `cardinality_capped` on
+for the rest of the run.
 
-**Cardinality.** Per-key cap (default 1024). Past it values fold into `__overflow__` and
-the result carries `cardinality_capped: true` naming the key.
+### 3.4 Sample budget
 
-### 3.4 Cap behaviour, and why not reservoir sampling
+`max_sample_bytes` default 64 MiB (≈1.27 M records at `tree`); daemon-wide
+`max_total_sample_bytes` 256 MiB, enforced as a **reservation** at arm time — so four
+default-sized collectors is the practical ceiling, and `collectors.add` says so when refusing.
 
-Per-collector `max_sample_bytes` default **64 MiB** (≈1.27 M matches at `tree`);
-daemon-wide `max_total_sample_bytes` default **256 MiB**, enforced as a **reservation**
-at arm time — which means four default-sized collectors is the practical ceiling across
-all sessions and domains, and `collectors.add` says so when it refuses.
+Chunks are **record-aligned groups spanning all columns**, not one chunk per column, so
+allocated capacity exceeds payload by at most one partial chunk. Chunks seal only when full;
+a read must never seal (§3.6), or N reads produce N partial chunks and the bound diverges.
 
-The budget is measured against **allocated capacity**, not retained payload. With
-chunked columns (§3.6) the two differ by at most one partial chunk, so the cap is a real
-bound rather than an under-count of up to 2×.
+**`raw_sample_bytes` snapshot prefixes count against the reservation**, at `max_snapshots ×
+raw_sample_bytes` — otherwise 50 retained prefixes sit outside the budget whose entire purpose
+is preventing the daemon OOM that §10 is written around.
 
-On reaching the budget the sample tier **stops retaining** — prefix truncation. The exact
-tier and the sketch keep running.
-
-**Reservoir sampling is rejected.** It gives unbiased percentiles but breaks the
-projections needing *completeness*: self time needs a span's children present, wall union
-needs every interval. Prefix truncation keeps every projection valid *for the retained
-prefix* — a defensible statement — where a reservoir would make self time quietly wrong.
-
-Prefix truncation is cold-biased, which is why `complete: false` is structural. The
-sketch (§3.5) is what keeps that bias away from percentiles: fed at ingest, it covers
-every match regardless of the cap.
+On reaching the budget the sample tier stops retaining — prefix truncation, cold-biased,
+marked `complete: false`. **Reservoir sampling is rejected**: it breaks self time and wall
+union, which need completeness.
 
 ### 3.5 The duration sketch
 
-**Algorithm: DDSketch**, relative accuracy γ configured for 1 % error, **sparse** store.
-Chosen over HdrHistogram for a reason specific to this design: there is one sketch *per
-span name*, and HdrHistogram preallocates a dense counts array sized to the full range,
-so every narrow per-name distribution pays full price. DDSketch allocates only occupied
-buckets, merges exactly, and has a defined protobuf encoding.
+**DDSketch** (`sketches-ddsketch >= 0.4`), relative accuracy α = 0.01.
 
-> **Phase-1 probe, not an assumption:** confirm a viable Rust DDSketch crate before
-> building. If none is, fall back to `hdrhistogram` **with a reduced per-name range**,
-> and re-derive the memory table below — do not keep the DDSketch numbers.
+*Why, stated correctly this time:* it is **occupancy-driven rather than range-driven**, so
+memory scales with what was measured rather than with the declared range. Rev 2 claimed a
+sparse map and an order-of-magnitude advantage; the crate is a **contiguous `Vec` between the
+lowest and highest occupied key**, and at the like-for-like setting (sigfig 2, `u32` counters)
+HdrHistogram is ~18 KiB/name against DDSketch's ~2.7 KiB narrow / ~11.3 KiB fully-occupied.
+The gap is ~1.5–6×, not 10×. HdrHistogram remains a viable fallback; DDSketch wins on
+occupancy, a published proof, and a cross-language binary format.
 
-**Input unit: integer nanoseconds**, range 1 ns – 1 h. rev 1 left this unspecified, and
-the gate found that a millisecond-fed sketch collapses every sub-millisecond span into
-one bucket with no error guarantee — i.e. it would destroy exactly the population a cache
-creates.
+**Input: integer nanoseconds. Declared range 1 ns – 1 h, and the range is *enforced*** —
+inputs are clamped to it before `add()` and out-of-range values counted separately, and
+`max_num_bins` is set explicitly rather than inherited. DDSketch has no upper bound of its own;
+its only ceiling is `bin_limit` (default 2048), and exceeding it **collapses the low end** —
+silently doing the exact thing nanosecond input was chosen to prevent.
 
-**Memory.** rev 1's "~4 KB" was derived from nothing and is 2–3.5× low for a dense
-layout. A sparse sketch is occupancy-driven, so the figure is a **budget, not a
-constant**: `max_histogram_bytes` (default 32 MiB per collector) is charged separately
-from the sample budget, and the per-name sketch count is capped at
-`max_name_sketches` (default 256) with the same `__overflow__` treatment group keys get.
-rev 1 capped group cardinality and group sketches but left the **span-name** axis — the
-one most likely to explode, since inlining ids into span names is a common OTel
-antipattern — with neither cap nor error.
+**Zero and negative durations are handled explicitly, independent of the malformed-timestamp
+path.** A legitimate `start == end` span (a cache hit, or anything below clock resolution) is
+not malformed; it is counted, recorded in the sketch's zero bucket, and reported as `0.0`. A
+**negative** duration is excluded from the sketch entirely — the crate would route it to a
+negative store where it participates in `quantile()`, and a negative p50 is not a
+percentile anyone wants — and counted as `negative_duration_spans`.
 
-**Why at ingest.** A sketch built later from the sample tier inherits its truncation, and
-a long run would be laundered into a clean-looking snapshot. Fed at ingest it is complete
-by construction. This is the single reason percentiles survive truncation *and*
-snapshotting.
+**No byte budget.** Rev 2's `max_histogram_bytes` was derived from nothing, was 7–45× larger
+than the cap it guarded, and had **undefined exhaustion behaviour** — which falsified §5.6's
+premise that `estimated` always covers the whole run. Removed. Sketch memory is bounded by
+`max_name_sketches` (256) and `max_group_sketches` (64), both with `__overflow__` treatment,
+and the derived total is reported by `collectors.add`.
 
-**Layout identity travels with the buckets.** Every sketch carries
-`{algo, accuracy, unit, range}` in results, snapshots, documents, and persisted state.
-Merging or diffing across mismatched layouts is arithmetically wrong, so it is refused
-(§5.6) — the one place a hard block is provable from a recorded fact.
+**Layout identity is logmon's bookkeeping**, recorded at construction as
+`{algo, alpha, unit, range, max_num_bins}` — `Config::min_value` is `pub(crate)` and cannot be
+read back. §5.6's only hard block depends on that record being trustworthy.
 
-**Axis restriction — stated, because rev 1 over-claimed.** Sketches exist per collector,
-per name, and per group. Any projection **outside that key space** — `group_by: "path"`,
-`group_by: "trace"`, a duration band, read-time narrowing on any other axis — has no
-sketch and must fall back to `sampled`. rev 1 said percentiles are "whole run always";
-that is true only on the declared axes. Off-axis, `estimated` is `null` with
-`estimated_unavailable_reason`, so the change of provenance is visible.
+**Persist via `to_java_bytes`/`from_java_bytes`** (0.4+), never the serde derive, whose fields
+are `pub(crate)` and whose layout changed between 0.2 and 0.4 — persisting it would make the
+on-disk format hostage to a 0.x crate's private internals.
 
-### 3.6 Chunked sample tier — the lock discipline
+**Axis restriction.** Sketches exist per collector, per name, per group. Any projection off
+those axes — `group_by: "path"` or `"trace"`, a duration band, read-time narrowing on anything
+else — has no sketch and falls back to `sampled`, with `estimated: null` and a reason.
 
-Columns are stored as a list of **sealed immutable chunks** plus one **active mutable
-chunk** (65 536 records).
+### 3.6 Generations — one critical section, no O(N) under lock
 
-- **Ingest** takes a short lock on the active chunk only. Sealing appends an `Arc` to the
-  sealed list.
-- **Reads** take the lock only long enough to clone the sealed-chunk `Arc` list and copy
-  the active chunk, then project **outside** the lock.
-- **`snapshot(reset=true)`** swaps the whole structure under the lock and projects
-  outside it.
+Rev 2's chunked tier split the sealed list and the active chunk into two lock domains, which
+loses or duplicates a whole 65 536-record chunk depending on read ordering. Replaced.
 
-rev 1 said nothing about mutation locking, and the gate showed that A4/A11's atomicity
-requirements would otherwise force a single coarse write lock held across an O(1.27 M)
-projection — with an O(n log n) interval merge inside it. That stalls the span processor,
-the 65 536-slot channel fills, and spans are dropped **at the receiver**, where the
-collector cannot see them. The mechanism protecting the arm boundary would have been the
-mechanism losing spans at the arm boundary.
+**All collector state lives in one `Generation`**, swapped atomically:
+
+1. sample chunks (record-aligned, all columns)
+2. collector exact tier
+3. per-name exact map · 4. per-group exact map
+5. collector sketch · per-name sketches · per-group sketches
+6. the interner and both cardinality counters
+7. ingest baseline (`ReceiverDropSnapshot` at generation start) and `malformed_timestamps`
+8. `armed_at` / `zeroed_at`, `complete`, sample-byte accounting
+9. `__overflow__` / `name_sketches_capped` flags
+
+**Ingest** takes the generation lock once per matched span and updates every structure inside
+it. Uncontended, because ingest is single-writer per domain (§1).
+
+**Every read is a swap.** `collectors.get`, `snapshot(reset=false)`, `snapshot(reset=true)`,
+and `reset` all swap the live generation out under the lock — O(1) pointer work — project
+outside the lock, and (except for `reset`) fold the projected generation into a **retired
+accumulator**. The live answer is `retired ⊕ active`, exact because exact scalars, sketches,
+and chunk lists are all additive (§6.5). This gives `reset=false` a real definition, which
+rev 2 never had, and guarantees the lock is never held across anything O(N).
+
+Window stamps, the drop baseline, and the `snapshot-<n>` counter increment happen **inside**
+the swap, or they describe a window that does not match the data printed beside them.
+
+**File I/O never happens under the lock**, and never on the runtime — serialize and write
+outside the critical section, on `spawn_blocking` (`RpcHandler::handle` is synchronous and
+the crate uses no `spawn_blocking` today).
 
 ---
 
@@ -312,408 +261,369 @@ mechanism losing spans at the arm boundary.
 
 ### 4.1 Hook
 
-A third step in `process_span_for_domain`, after storing and after trigger evaluation:
-evaluate collectors for this domain.
+A third step in `process_span_for_domain`: evaluate this domain's collectors.
 
-### 4.2 Cost discipline — corrected
+### 4.2 Cost — corrected twice
 
-rev 1 claimed "matching allocates nothing." **False**, and it was the load-bearing claim.
-`matches_pattern` is:
+**Matching allocates.** `matches_pattern` is
+`text.to_lowercase().contains(&s.to_lowercase())` — two heap allocations per pattern per span;
+`sk=` adds a `format!`. **In scope for phase 1:** lowercase in `Pattern`'s `Deserialize` (the
+DSL path already lowercases) and make the matcher use a non-allocating case-insensitive
+comparison. This is shared with the log path — a deliberate shared-code change.
 
-```rust
-Pattern::Substring(s) => text.to_lowercase().contains(&s.to_lowercase()),
-```
+Collector hot-path work: pre-parsed filter; one domain-keyed registry read; one generation
+lock; chunk append; sketch `add`; interner hash lookup.
 
-Two heap allocations per pattern per span. `sv=store_server` — the spec's own flagship
-filter — is a `Substring`. `sk=` adds a `format!("{:?}", …)`; `st=` clones. Only
-`d>=`/`d<=` and `SeqFilter` are allocation-free.
+**The sketch's allocation shape, accurately:** a key arriving *below* `min_key` triggers
+`bins.rotate_right(shift)` — a memmove over the whole occupied span, inside the lock. Bounded
+and self-limiting (log-scaled, a few hundred times per run at most), but biased toward the
+start of a run and toward *fast* spans, i.e. the cache-on arm.
 
-`parse_filter` already lowercases substrings, so the matcher's second lowercase exists
-only to cover the JSON-deserializer path. **In scope for phase 1:** lowercase in
-`Pattern`'s `Deserialize`, then make the matcher use a non-allocating case-insensitive
-comparison. This touches code the log path shares, so it is called out as a deliberate
-shared-code change rather than a local optimisation.
+**Existing path baseline for A14:** a deep `SpanEntry` clone under a `SpanStore` **write**
+lock, `parse_filter` per trigger (twice for span triggers) including a **regex compile per
+span per bound session**, and lock growth of `2 + N_registry + 2×S_bound`.
 
-Everything else the collector does on the hot path:
+### 4.3 Ordering, clocks, malformed input
 
-- Filters **pre-parsed** at `collectors.add`; no parse per span.
-- Domain-keyed registry read under one lock.
-- Append to the active chunk (§3.6); amortised O(1).
-- Sketch update: O(1), no steady-state allocation. Note DDSketch's sparse store
-  allocates on **first** occupancy of a bucket — bounded and self-limiting, but not
-  literally never.
-- Interning: hash lookup returning an existing `u32` in the steady state.
+**Order-independence holds for values, not for the key set.** Integer-nanosecond accumulation
+is associative; sketch insertion is commutative; so the exact tier and sketch are
+order-independent *in arithmetic*. But **which** keys survive the §3.3 cardinality caps depends
+on arrival order, and that reaches per-group exact rows and per-name sketches. And under prefix
+truncation, which records are retained is arrival order. So:
 
-**The existing path's cost, re-audited.** rev 1's "3+ locks, N+M allocations, a full
-parse" was directionally right and materially understated. It omitted the largest cost —
-`store.insert(span.clone())` is a deep clone of `SpanEntry` including `String`s, an
-attribute map, and an events vector, under a `SpanStore` **write** lock. It also missed
-that `is_span_filter_str` parses *every* trigger and the body parses span-filter triggers
-*again*, and that the default seeded trigger is a regex — so **the daemon compiles a
-regex once per span per bound session today**. Lock growth is `2 + N_registry + 2×S_bound`.
+> Arrival order does not affect any result while `sampled.complete` is `true` **and** no
+> cardinality cap has bound.
 
-This is the honest baseline for A14 (§12). Not fixed here; filed separately.
+`start_ns`/`end_ns` are producer clock; the collector window is broker clock; warm-up is
+defined against `min(start_ns)` (§5.5) so the two never mix.
 
-### 4.3 Ordering, clocks, and where order-independence actually holds
+**Malformed timestamps** (the HTTP path defaults missing values to 0) are counted, and excluded
+from the sketch, wall union, and warm-up origin. **Negative durations are excluded from the
+sketch and from `total_ns`**, and counted separately — they are a different population from
+malformed timestamps and rev 2 conflated them.
 
-rev 1: *"span arrival order does not affect any result."* **False, and the gate found the
-counterexample in the spec itself:** under prefix truncation, *which* spans are retained
-is determined entirely by arrival order. So whenever `complete == false`, every
-sample-derived projection is order-dependent.
+### 4.4 The registry is domain-keyed
 
-Corrected statement: **arrival order does not affect any result while
-`sampled.complete` is `true`.** The exact tier and the sketch are order-independent
-unconditionally — the former because it accumulates integer nanoseconds, the latter
-because sketch insertion is commutative.
+A collector is pinned to its creation domain and reached through a **domain-keyed registry**,
+independent of `SessionState::domain`. If collectors were reached the way triggers are — via
+`active_session_ids_for_domain` — then `use_domain` mid-run would silently stop the collector
+while it still reported its pinned domain: the precise failure pinning exists to prevent.
 
-`start_ns`/`end_ns` come from the span's own timestamps — the **producer's** clock. The
-collector's window is broker clock and is reported separately. Warm-up exclusion is
-defined relative to `min(start_ns)` over the matched set (§5.5), producer clock
-throughout, so the two are never mixed.
+Two consequences to state rather than discover:
 
-**Malformed timestamps.** The OTLP HTTP path defaults missing timestamps to 0, so a
-malformed span can sit at the Unix epoch with a zero or negative duration. Such spans are
-counted in `count`, **excluded** from the sketch, from wall-union, and from warm-up
-origin computation, and reported as `malformed_timestamps: n`.
+- **Named sessions keep ingesting while disconnected.** `active_session_ids_for_domain` does
+  not filter on `connected`, and the driving workflow (arm → disconnect → run suite →
+  reconnect → read) depends on it. Today accidental; pinned by a test.
+- **Anonymous sessions are removed on disconnect**, so `collectors.add` on one refuses (§11).
 
 ---
 
 ## 5. Read-time projections
 
-One projection module consumes sample records and produces a `ProfileResult`, fed either
-by a collector's chunks or by a ring-buffer scan (`traces.profile`).
-
 ### 5.1 Result shape
 
 ```jsonc
 {
-  "collector": "cache-ab",
-  "description": "Store suite — schema-cache A/B",
-  "filter": "sv=store_server",
-  "level": "tree",
-  "matched": 48213,
-  "nesting": "detected",              // "detected" | "undetected" (below tree)
-  "window": { "armed_at": "…", "zeroed_at": "…", "read_at": "…", "wall_ms": 812004.0 },
+  "collector": "cache-ab", "description": "…",
+  "filter": "sv=store_server", "level": "tree",
+  "level_raised_at": null,           // sticky; consulted by diff (§5.6)
+  "matched": 1180442,
+  "nesting": "detected",             // "detected" | "undetected"
+  "window": { "armed_at": "…", "zeroed_at": "…", "read_at": "…", "wall_ms": 2540000 },
 
-  "ingest": {                        // NEW — spans lost before the collector saw them
-    "drops_in_window": 0,            // ReceiverMetrics delta over the window
-    "by_source": {},
-    "malformed_timestamps": 0
+  "ingest": {                        // null when the pinned domain is gone
+    "drops_in_window": 0,            // otlp_http_traces + otlp_grpc_traces only
+    "shed_batches": 0,               // NEW plumbing (§5.1.1)
+    "malformed_dropped": 0,          // NEW plumbing
+    "malformed_timestamps": 0, "negative_duration_spans": 0,
+    "attribution": "domain"          // not per-collector; see below
   },
 
-  "exact": {                         // null iff warm-up exclusion is active (§5.5)
-    "count": 48213,
-    "cumulative_ms": 1234567.8,      // sums nested spans more than once — see below
-    "avg_ms": 25.6, "min_ms": 0.1, "max_ms": 4310.2,
-    "error_count": 12
+  "exact": {                         // null under warm-up exclusion (§5.5)
+    "count": 1180442, "total_ms": 1234567.8,
+    "avg_ms": 1.046, "min_ms": 0.01, "max_ms": 4310.2, "error_count": 12
   },
-
-  "estimated": {                     // sketch; null off-axis with a reason (§3.5)
-    "axis": "collector", "error_pct": 1.0,
-    "p50_ms": 12.0, "p80_ms": 41.0, "p95_ms": 181.0, "p99_ms": 900.0
+  "estimated": { "axis": "collector", "alpha_pct": 1.0,
+                 "p50_ms": 0.30, "p80_ms": 1.10, "p95_ms": 4.20, "p99_ms": 22.0 },
+  "sampled": {
+    "complete": true, "sample_count": 1180442,
+    "self_ms": 736201.4, "nested_matches": 412880,
+    "overlapping_child_ms": 3118.4, "overlapping_child_spans": 214,
+    "wall_union_ms": 310221.0, "achieved_concurrency": 3.98,
+    "p50_ms": 0.30, "p80_ms": 1.11, "p95_ms": 4.18, "p99_ms": 22.1
   },
-
-  "sampled": {                       // absent at scalar
-    "complete": true, "sample_count": 48213,
-    "self_ms": 998001.2,             // peer of cumulative_ms — see below
-    "nested_matches": 1204,
-    "overlapping_child_ms": 0.0,     // §5.3
-    "wall_union_ms": 310221.0,
-    "p50_ms": 12.0, "p80_ms": 41.2, "p95_ms": 180.4, "p99_ms": 902.1
-  },
-
   "groups": [ { "key": "…", "exact": {…}, "estimated": {…}, "sampled": {…} } ]
 }
 ```
 
-**Cumulative and self are peers, and they answer different questions.** This is the
-gate's headline change. Mature profilers report both — pprof's *cum* and *flat*, and the
-same split in gprof and async-profiler — and users of those tools read these fields
-through that lens.
+**`total_ms` and `self_ms`, not `cumulative_ms`.** Rev 2 cited pprof, gprof, and
+async-profiler. Only pprof was right: gprof's "cumulative seconds" is a running sum down the
+sorted table, not subtree-inclusive — so the word *cumulative* actively misleads a gprof user.
+`total`/`self` matches Chrome DevTools, Firefox Profiler, Pyroscope, and py-spy's sense.
 
-- **`cumulative_ms`** — every matched span's duration, summed. A matched span nested
-  inside another is counted at both levels. Exact, always available.
-- **`sampled.self_ms`** — each span's duration minus its **retained matched children**.
-  Cannot double-count. Requires `tree`, and is sample-derived.
+**Where the profiler analogy breaks, stated because rev 2 invited the wrong prior:**
 
-They diverge exactly when it matters. A (100 ms) contains B (60 ms), both matched:
-cumulative 160, self 100. A cache that removes B and shortens A to 40 ms gives
-cumulative −75 % and self −60 %. The cumulative figure overstates *because* the cache
-changed nesting depth, which is what caches do.
+- pprof counts a location **once per sample** even under recursion; `total_ms` deliberately
+  counts a matched span nested in another at both levels. The analogy *inverts* here.
+- In pprof, `Σ flat` equals the profile total and `cum ≤ total`. Here spans are concurrent
+  wall-clock intervals: `Σ self_ms` can exceed elapsed time under parallelism, and `total_ms`
+  is unbounded above `wall_ms`. §9.6 carries this for **both** fields — rev 2 covered only
+  the total, which was worse, since self is the field it told readers to prefer.
 
-Therefore: `nested_matches > 0` means a document must not lead with cumulative alone
-(§9.4), and `nesting: "undetected"` means the reader has no way to know — which §9.6
-turns into an instruction.
+**`achieved_concurrency` = `total_ms / wall_union_ms`** — how parallel the matched work
+actually was. Cheap, and it contextualises the "total work, not elapsed time" caveat with a
+number instead of a warning.
 
-**Four categories, structurally distinct.** `exact` (never approximate, never truncated),
-`estimated` (whole run on declared axes, ±`error_pct`), `sampled` (exact for what was
-retained), and `ingest` (what never arrived). A degraded number cannot be quoted as an
-exact one, because they are different objects and their qualifiers sit beside them.
+#### 5.1.1 Ingest accounting needs new plumbing, not a new field
 
-**`groups[].exact` is genuinely exact** — the exact tier's key is widened by
-`group_keys` at every level (§3.2). For `group_by: "trace"` and `group_by: "path"`,
-which have no exact tier, `exact` is `null` with `exact_unavailable_reason`.
+Rev 2 added `drops_in_window` as a `ReceiverMetrics` delta. That counter **cannot see the two
+dominant loss paths**:
 
-**`wall_ms` is measured from `max(armed_at, zeroed_at)`**, so a window whose data was
-discarded by a reset does not read as a window that collected throughout.
+- **HTTP sheds whole batches at ≥80 % occupancy and returns 429 before any `try_send_span`
+  runs**, so no counter moves. The repo's own test asserts `otlp_http_traces == 0` in that
+  case. This is the *primary* load-shedding mechanism on that transport and it engages exactly
+  when load is high — the variable under test in every A/B.
+- **Malformed spans** increment `OtlpTraceService::malformed_count`, which is **never read
+  anywhere**; on HTTP there is no counter at all (`if let Some(entry)` with no else).
 
-### 5.2 Metric catalogue and minimum level
+So phase 1 adds `shed_batches` and `malformed_dropped` counters to `ReceiverMetrics` and wires
+them. Without that, "the exact tier was never exact" is papered over, not fixed.
 
-| Metric | Min level | Tier | Notes |
-|---|---|---|---|
-| `count`, `cumulative_ms`, `avg_ms`, `min_ms`, `max_ms`, `error_count` | `scalar` | exact | Integer-nanosecond accumulation. |
-| `estimated.p*_ms` | `scalar` | sketch | Whole run **on declared axes only** (§3.5). |
-| `sampled.p*_ms` | `timing` | sample | Nearest-rank; convention pinned in §5.7. |
-| `wall_union_ms` | `timing` | sample | Merged `[start, end)` coverage. |
-| `self_ms`, `nested_matches`, `overlapping_child_ms` | `tree` | sample | §5.3. |
-| `group_by: "trace"` / `"path"` | `tree` | sample | No exact or estimated tier. |
+Three further corrections: sum **only** `otlp_http_traces` and `otlp_grpc_traces`, or a GELF
+log burst flips `trustworthy: false` on a run that lost no spans; use `saturating_sub` plus an
+instance-identity check, because a deleted-and-recreated domain gets a fresh counter at zero;
+and hold the `Arc<ReceiverMetrics>` on the collector (captured RPC-side at arm/reset), since
+`process_span_for_domain` has no metrics handle.
 
-Requesting a metric above the collector's level returns a **loud error naming the level**
-— never a zero.
+**Attribution is per-domain, not per-collector**, and the drops are unfiltered — most may be
+spans this filter would never have matched. So §9.6 says `matched` **may** under-count. As a
+conservative marking trigger it is sound; as a stated fact it would be wrong.
 
-### 5.3 Self time — the three ways it lies, and what each does about it
+### 5.2 Catalogue
 
-`self_ms = duration − Σ(retained matched children)`. Three degradations, all now in-band
-rather than in a doc note:
+| Metric | Min level | Tier |
+|---|---|---|
+| `count`, `total_ms`, `avg_ms`, `min_ms`, `max_ms`, `error_count` | `scalar` | exact |
+| `estimated.p*_ms` | `scalar` | sketch, declared axes only |
+| `sampled.p*_ms`, `wall_union_ms`, `achieved_concurrency` | `timing` | sample |
+| `self_ms`, `nested_matches`, `overlapping_child_*` | `tree` | sample |
+| `group_by: "trace"` / `"path"` | `tree` | sample; `exact`/`estimated` null with reason |
 
-- **Filter-excluded children.** With a narrow filter no children are ever retained and
-  `self_ms == cumulative_ms` exactly — a tautology presented as a decomposition. Because
-  `nested_matches == 0` is definitionally equivalent to "self time carries no
-  information", a result with `nested_matches == 0` **suppresses `self_ms`** and states
-  why. Unmatched *descendants* of matched spans are worse than absent: their time is
-  silently attributed to the nearest matched ancestor, which reads as that ancestor
-  doing the work. §9.6 carries this as its own row with its own remedy.
-- **Truncation.** A prefix is not subtree-closed, so boundary parents whose children were
-  cut absorb their time. `complete: false` marks it; the document says "a mixture", not
-  "self time of the prefix".
-- **Ingest drops.** A dropped child silently inflates its parent's self time with
-  `complete` still `true`. This is why `ingest.drops_in_window > 0` demotes
-  `trustworthy`.
+Requesting above the level is a loud error naming the level.
 
-**Negative self time is normal, not exotic.** A child can outlive its parent under
-`tokio::spawn` + `tracing` — which is what this repo itself emits — and under
-cross-process clock skew. Summed naively, negatives cancel positives and produce a
-plausible wrong total. Rule: **per span, clamp `self` at zero and accumulate the
-overflow into `overlapping_child_ms`**, reported beside `self_ms`. A non-zero value
-means the tree is not properly nested and self time should be read with that in mind.
-V4b covers it with a child outliving its parent — rev 1's V4 used a well-nested tree and
-could not have caught this.
+### 5.3 Self time — clipped interval union, not a sum
 
-### 5.4 Call-path aggregation
+```
+self = duration − |union( clip(child_interval, parent_interval) for matched children )|
+```
 
-`group_by: "path"` reconstructs each sample's ancestor chain **within the matched set**
-and aggregates self time by path. "`schema.resolve` costs 40 s" versus "40 s, 90 % of it
-under `reconcile`" — only the second says what to change.
+Rev 2 used `duration − Σ(children)` with a clamp at zero. The **Σ** was the defect. A 100 ms
+parent with two concurrent 60 ms children has self time 40 ms; the sum gives −20, the clamp
+returns 0 plus an uninterpretable residue — on precisely the `tokio::spawn` workload cited as
+motivation. Elastic APM's `ChildDurationTimer` is the prior art: reference-counted child
+intervals contribute their **union**, and a child still running at parent end is **clipped at
+the parent's end**. logmon clips both ends, since OTLP permits a child to start before its
+parent under skew.
 
-Safety: depth cap 64 plus a visited set; a walk stopping at an unretained non-root parent
-marks the path `[?]` with `path_incomplete: true`. Paths only resolve where ancestors are
-matched, so the idiom is a **broad filter plus read-time narrowing** — which is also
-precisely why §5.3's unmatched-descendant attribution is load-bearing, and why that
-guidance belongs in the document rather than only in the skill docs.
+The routine already exists — §5.2's `wall_union_ms` is a merged-interval computation. Rev 2
+applied it at trace scope and not at parent scope. Cost is O(n log k) with children already
+grouped by parent.
+
+**Clamp-and-account survives as a narrow anomaly channel.** After union-and-clip, a negative
+self time means a genuine anomaly (clock skew, a child clipped to zero width), not normal
+concurrency. Those are clamped at zero, with the overflow reported as `overlapping_child_ms`
+**and `overlapping_child_spans`** — one span at −500 ms and 500 spans at −1 ms want opposite
+remedies and rev 2 could not distinguish them.
+
+**The recoverable identity, stated because it makes the pair informative:**
+`Σ(unclamped) = self_ms − overlapping_child_ms` exactly.
+
+Three ways self time still lies, each in-band:
+
+- **Filter-excluded children** — `nested_matches == 0` is definitionally equivalent to "self
+  time carries no information", so `self_ms` is **suppressed** in that case with a reason.
+  Unmatched *descendants* are worse than absent: their time is attributed to the nearest
+  matched ancestor and reads as that ancestor's own work (§9.6 row).
+- **Truncation** — a prefix is not subtree-closed, so boundary parents absorb cut children.
+  A mixture, not "self time of the prefix".
+- **Ingest loss** — a dropped child inflates its parent's self time with `complete` still true.
+
+### 5.4 Call paths
+
+`group_by: "path"` walks ancestors within the matched set and aggregates self time by path.
+Depth cap 64 plus a visited set; a walk stopping at an unretained non-root parent marks `[?]`
+and `path_incomplete: true`. Paths resolve only where ancestors are matched, so the idiom is a
+broad filter plus read-time narrowing — which is also why §5.3's unmatched-descendant
+attribution is load-bearing.
 
 ### 5.5 Warm-up exclusion
 
-`skip_warmup_ms: N` drops samples whose `start_ns` is within N ms of **`min(start_ns)`
-over the matched set** — producer clock throughout. rev 1 defined it against the broker
-clock window, which the gate flagged as conflating the two clocks §4.3 promises never to
-mix: with a 5 s skew it would drop everything or nothing.
+`skip_warmup_ms: N` drops samples within N ms of `min(start_ns)` over the matched set —
+producer clock throughout. Sets **both** `exact: null` and `estimated: null` with reasons,
+since both tiers are unwindowed.
 
-Because the exact tier and the sketch are both unwindowed, warm-up exclusion sets
-**both** `exact: null` and `estimated: null`, each with its reason. rev 1 nulled only
-`exact` and left `estimated` including the warm-up samples — while §5.1 told the reader
-the two percentile sets should agree within `error_pct`. By §5.5's own argument that
-disagreement would be large, and it would appear exactly where the reader had been told
-to expect agreement.
+### 5.6 `collectors.diff` — mark, block, or refuse
 
-### 5.6 `collectors.diff` — mark, don't block
+Deltas for `count`, `total_ms`, `self_ms`, and each percentile, overall and per group, with
+the noise floor propagated per row and sub-threshold deltas suppressed **using the same
+threshold that is printed** (§6.5).
 
-A read-time projection over two results. Reports absolute and relative deltas for
-`count`, `cumulative_ms`, `self_ms`, and **each percentile**, overall and per group,
-with the noise floor propagated per row (§6.5) and sub-floor deltas suppressed.
+**The error bound on an estimated delta, corrected.** Rev 2's ±1.4 % was √2·α — the RSS of
+independent zero-mean *random* errors. DDSketch's α is a **deterministic worst-case bound on a
+quantised value**; the errors do not combine in quadrature, and the relevant quantity is error
+relative to the *delta*:
 
-**Delta error bounds are computed on the delta, not inherited.** Two estimates at
-±1.0 % give roughly ±1.4 % on their difference. rev 1 implied the per-measurement bound
-applied to the delta, which is the arithmetic that turns noise into a finding.
+```
+|Δ̃ − Δ| ≤ α(a + b)      ⟹      relative error on Δ ≤ α(a+b) / |a−b|
+```
 
-Either side may be `collector` or `collector@label`.
+At α = 0.01, a 5 % change carries **±39 %**, a 1 % change **±199 %**. The clean rule, which
+belongs beside the noise floor: **an estimated percentile delta is not resolvable below a ~2 %
+relative change at α = 1 %.** This is a *measurement-resolution* floor, distinct from the
+run-to-run floor, and it bites only `estimated.p*` rows — `count` and `total_ms` are exact, so
+their deltas are exact.
 
-The gate found a legitimate wrongly-blocked case for **every** rev-1 refusal, and noted
-that the design's idiom everywhere else is *mark-don't-block*. Re-scoped:
-
-| Condition | rev 1 | rev 2 |
-|---|---|---|
-| Different `level` | Refuse | **Compare at `min(level)`** and say so. Every exact and sketch figure is identically defined at all levels. rev 1 blocked the driving case: arm A at `tree` blows the budget, arm B is re-armed at `timing` to fit, and the `cumulative_ms` comparison — the whole point — was refused. The correct handling was already two paragraphs away ("compare at the weaker of the two"). |
-| Different `filter` | Refuse (raw string) | Compare **canonicalized `ParsedFilter`s**, so reordered qualifiers and case differences match. A genuine difference emits `filter_mismatch` on the result plus `allow_mismatch` to proceed. Bookmark-windowed arms differ **by necessity** and must not be blocked. |
-| Incomplete side | Refuse whole diff | **Scope to sample-derived rows.** `exact` and `estimated` are provably unaffected by truncation — that is §3.5's entire argument, which rev 1's refusal cancelled out. Sample rows emit null-with-reason. `scalar` collectors, which have no sample tier at all, are explicitly permitted. |
-| Mismatched sketch layout | *(absent)* | **Refuse.** Merging or diffing across layouts is arithmetically wrong and the layout is a recorded fact. This is the only new hard block, and the only one that meets the provability bar. |
-
-**Both arms truncated is still refused by default** — not a false positive. A faster arm
-reaches the match cap later in wall-clock terms, so the two cold prefixes cover different
-slices. `allow_incomplete` remains for the deliberate case.
+| Condition | Behaviour |
+|---|---|
+| Different `level` | Compare at `min(level)`. **But nesting evidence is not discarded**: if *either* side reports `nested_matches > 0`, that fact attaches to the `total_ms` delta row and sets `trustworthy: false`. Rev 2 dropped `nested_matches` along with the level, reintroducing the round-1 headline defect through a different door. |
+| Either side `level_raised_at != null` | Marked; the raised side's `self_ms` and paths are excluded, since its early records predate the parent columns (§7.1). |
+| Different `filter` | Compare canonicalized `ParsedFilter`s (lowercased substrings; `f64` thresholds by `total_cmp`). A genuine difference emits `filter_mismatch` + `allow_mismatch`. Regex spellings that compile identically will mark — acceptable, and not worth "fixing" by normalising regex sources. |
+| Incomplete side | Scope to sample-derived rows; `exact` and `estimated` pass. `scalar` collectors (no sample tier) are explicitly permitted. Both sides truncated is still **refused** by default — a faster arm reaches the cap later in wall-clock terms, so the cold prefixes cover different slices. |
+| **Asymmetric ingest loss** | **Refused**, behind `allow_lossy`. §9.6 says of ingest loss "no number here is safe"; a design that concludes that must not then emit a delta. This is the one place marking is insufficient. |
+| Mismatched sketch layout | **Refused.** Arithmetically wrong, and provable from a recorded fact. |
+| `__overflow__` group rows | **Suppressed**, never compared — different populations by construction (§3.3). |
 
 ### 5.7 Percentile convention
 
-**Nearest-rank, 1-indexed: `ceil(p/100 × n)`**, for `sampled`, for the sketch's quantile
-function over cumulative bucket counts, and for the repaired `traces.slow`. Stated once,
-here, because V3/V12/V13 cannot be written without it and rev 1 left it implicit — the
-existing `traces.slow` uses `floor(n·0.95)`, which returns the maximum at n = 20.
+**Lower quantile: rank = ⌊1 + q(n−1)⌋, 1-indexed** — for `sampled`, for the sketch, and for
+the repaired `traces.slow`.
+
+This is the convention DDSketch's accuracy guarantee is *stated against*
+(Masson–Rim–Lee, PVLDB 12(12), Def. 1), and the crate implements it. Rev 2 specified
+`ceil(p/100 × n)` — the *upper* quantile — which differs by one order statistic: p95 disagrees
+for ~90 % of n, p99 for ~98 %. That made V13's "matched rank convention" unsatisfiable and
+voided the ±α bound the result quotes. There is also no public bucket iterator, so
+"the sketch's quantile function over cumulative bucket counts" was not implementable; use
+`DDSketch::quantile()`.
 
 ---
 
 ## 6. Snapshots and history
 
-### 6.1 Why
+### 6.1–6.2 Operations
 
-The workflow is multi-run: arm, run, snapshot, change one variable, run, snapshot.
-Without in-collector history the numbers are copied out by hand — the error-prone,
-context-losing step the feature exists to remove.
+`collectors.snapshot(name, label?, description?, meta?, reset=true)` records, returns, and by
+default zeroes. `collectors.reset` discards without recording. `collectors.history(name,
+limit?, merge?)`, `collectors.get(name, snapshot=label)`, and `collectors.diff` taking
+`collector` or `collector@label`.
 
-Snapshots are also what make a run durable — **given §10's write-through**, which rev 1
-lacked while claiming durability it did not have.
+**A failed persist must not lose the run.** `reset=true` returns the snapshot bytes in the RPC
+response regardless, and **does not zero unless the write succeeded** (zero after a successful
+`rename`). ENOSPC is realistic when 50 snapshots share a volume with `state.json` and the log.
 
-### 6.2 Operations
-
-| Call | Behaviour |
-|---|---|
-| `collectors.snapshot(name, label?, description?, meta?, reset=true)` | Record, return, and by default zero. |
-| `collectors.reset(name)` | **Discard** without recording — the botched-run path. |
-| `collectors.history(name, limit?, merge?)` | Descriptors; `merge` combines (§6.5). |
-| `collectors.get(name, snapshot=label)` | Read one snapshot. |
-| `collectors.diff(a, b)` | Either side `collector` or `collector@label`. |
-
-Unlabelled snapshots auto-label `snapshot-<n>`; the counter **does not reuse numbers
-after eviction**, so `@snapshot-3` never silently means a different run. Labels are
-restricted to `[A-Za-z0-9._-]` — `@` and `/` would break `collector@label` parsing — and
-must be unique within a collector. `max_snapshots` (default 50) evicts FIFO and reports
-`snapshots_evicted`.
+Labels `[A-Za-z0-9._-]`, unique per collector; auto-labels `snapshot-<n>` never reuse numbers
+after eviction. `max_snapshots` 50, FIFO, `snapshots_evicted` reported.
 
 ### 6.3 What a snapshot records
 
-```jsonc
-"snapshot": {
-  "per_name": true, "per_group": true,
-  "projections": ["self_time", "wall_union", "top_paths:100"],
-  "raw_sample_bytes": 0
-}
-```
+Policy `{per_name, per_group, projections, raw_sample_bytes}`, plus — always, regardless of
+policy — the exact tier, the sketches **with layout identity**, the `ingest` block, and the
+collector's **`filter`, `level`, `level_raised_at`, and policy as of that moment**. Without
+those, `collectors.diff` would read the *live* collector's current definition and call it
+proof.
 
-Always present regardless of policy: the exact tier, the sketches **with their layout
-identity**, `ingest` accounting, and — closing a gap the gate found — the collector's
-**`filter`, `level`, and snapshot policy at the time it was taken**. rev 1 recorded none
-of those, which meant `collectors.diff`'s mismatch check would have read the *live*
-collector's current definition rather than the snapshot's: inference presented as proof,
-and only self-consistent because a second refusal forbade edits.
+### 6.4 Disciplines
 
-`raw_sample_bytes > 0` keeps a **prefix**, with the same `complete` semantics as the live
-cap. Not downsampled: uniform downsampling keeps percentiles honest but breaks self time
-and paths, which need complete parent–child sets.
+Validated at `collectors.add`; size quoted up front from the derived sketch and sample
+figures; each snapshot explains its own gaps; completeness and ingest loss travel with the
+data.
 
-### 6.4 Four disciplines
+### 6.5 Merging and the two floors
 
-1. **Validated at definition time** — `top_paths` on a `timing` collector errors at
-   `collectors.add`, not after a 40-minute run.
-2. **Size quoted up front** — `add` returns the derived per-snapshot size and the total
-   at `max_snapshots`, computed from the *actual* sketch budget (§3.5), not rev 1's
-   unfounded 4 KB.
-3. **Each snapshot echoes its own policy, filter, level, and layout**, so editing a
-   collector never retroactively rewrites history.
-4. **Completeness travels** — a snapshot records the `complete` flag and the `ingest`
-   drop count of what it was computed from.
+Exact scalars and sketches are additive, so `merge` combines runs — **exact only across
+identical sketch layouts**; mismatches refused. Sample-derived projections do not merge and are
+omitted with a reason.
 
-### 6.5 Merging and the noise floor
+Two distinct floors, and a result must not conflate them:
 
-Exact scalars and sketches are additive, so `history(merge: [labels])` combines runs —
-the direct way to beat down run-to-run noise. **Merging is exact only across identical
-sketch layouts**; mismatches are refused (§5.6). rev 1 claimed unconditional exactness.
+- **Run-to-run floor** — min, max, and CV across repeats of one configuration. Covers
+  scheduling variance only; it does **not** cover ingest loss, truncation, or thermal drift.
+- **Measurement-resolution floor** — §5.6's ~2 % on estimated percentile deltas.
 
-Sample-derived projections do not merge and are omitted with a stated reason.
+**One suppression threshold, and it is the one printed.** Rev 2 struck through deltas using a
+different bound than it displayed.
 
-**The noise floor.** With two or more snapshots of the same configuration, the document
-reports min, max, and coefficient of variation across repeats, and **propagates it into
-every delta row** rather than mentioning it once in prose. An 8 % improvement above a
-2 % floor is a finding; the same 8 % above a 15 % floor is nothing, and the floor is
-strictly unrecoverable if not captured at measurement time.
-
-Single-run arms state the floor is **unknown** rather than omitting the field, because an
-absent floor reads as a stable one.
+Single-run arms report the floor as **unknown**, never absent.
 
 ### 6.6 Descriptions and `meta`
 
-`description` on the collector; `label` + `description` + `meta` per snapshot. `meta`
-carries the provenance logmon cannot infer — commit, build profile, varied configuration
-— and is per-snapshot precisely because arms may differ in it.
+Per collector and per snapshot; `meta` carries provenance logmon cannot infer (commit, build
+profile, configuration) and is per-snapshot because arms may differ in it.
 
 ---
 
 ## 7. Contract surface
 
-`noun.verb`, following `triggers.add` / `traces.slow`.
+`collectors.add | list | get | snapshot | history | edit | reset | remove | diff | document`,
+plus `traces.profile`. MCP mirrors 1:1; CLI mirrors MCP 1:1.
 
-| JSON-RPC | MCP | Notes |
-|---|---|---|
-| `collectors.add` | `add_collector` | `name`, `filter`, `level`, `group_keys`, `max_sample_bytes`, `max_histogram_bytes`, `description`, `snapshot`, `threshold`. Returns derived size estimates. |
-| `collectors.list` | `get_collectors` | Definitions, counters, measured memory. |
-| `collectors.get` | `get_collector` | `group_by`, `percentiles`, `skip_warmup_ms`, `snapshot`. Non-destructive. |
-| `collectors.snapshot` | `snapshot_collector` | §6.2. Persists write-through (§10). |
-| `collectors.history` | `get_collector_history` | §6.5. |
-| `collectors.edit` | `edit_collector` | §7.1. |
-| `collectors.reset` | `reset_collector` | Discard; returns what it cleared. |
-| `collectors.remove` | `remove_collector` | |
-| `collectors.diff` | `diff_collectors` | §5.6. |
-| `collectors.document` | `document_collector` | §9. Returns bytes; the **client** writes (§9.9). |
-| `traces.profile` | `profile_spans` | Ring-buffer projection; accepts bookmark windows. |
+**Names** use `is_valid_name` (`[A-Za-z0-9_-]`, non-empty) — the rule session and domain names
+already share. §10 puts collector names in filenames, in the directory holding `state.json`,
+`daemon.pid`, and `config.json`, so `/` or `..` would be path traversal, and `@` would break
+`collector@label`.
 
-**Filter admission.** rev 1 said this "reuses `is_span_filter`". It cannot: that
-predicate returns **false** for bare patterns, attribute-only filters, and pure bookmark
-windows — all legal span filters, and two of them are the spec's own examples. It was
-written as a "should I try this trigger against spans" hint where a false negative is a
-silent no-op; as a rejection gate it converts that gap into a loud refusal of valid
-input. The correct predicate is **"contains no log-only qualifier"**, which needs new
-public parser API — `is_log_filter`, mirroring the private `is_log_qualifier`.
+**Filter admission** replaces rev 2's `is_span_filter` reuse, which returns false for bare
+patterns, attribute-only filters, and bookmark windows — all legal span filters. The predicate
+is "contains no log-only qualifier", plus:
 
-**Bookmarks in a collector filter are rejected**, matching `filters.add` and
-`triggers.add`. A collector pre-parses at arm time, so a bookmark would freeze a stale
-seq bound for the whole run. `traces.profile` still accepts them.
+- **Blocked** (provably never matches, same bar as the layout refusal): `ParsedFilter::None`,
+  and non-finite `d>=`/`d<=` thresholds (`"nan".parse::<f64>()` succeeds; `x >= NaN` is always
+  false, and `d<=inf` matches everything including malformed spans).
+- **Marked**: if no `sn`/`sv`/`st`/`sk`/`d` qualifier appears anywhere, the response carries
+  `no_span_specific_qualifier: true` naming the uninterpreted selectors. `parse_selector`'s
+  catch-all turns every typo into `AdditionalField`, so `SV=store_server` — the flagship
+  filter with the shift key stuck — parses cleanly and matches nothing for forty minutes.
+  The parser's existing typo rule only fires on an lhs ending in `>`/`<`.
+- **Echoed**: `BarePattern` scans **`span.name` only** on the span path, versus every field on
+  the log path. Legal, but narrower than any reader expects.
 
-### 7.1 What `collectors.edit` may change
+**Bookmarks are rejected in collector filters** (a pre-parsed filter would freeze a stale seq
+bound). `traces.profile` accepts `b>=`/`b<=` and **rejects `c>=`** — a cursor is
+read-and-advance, so a "profile" that mutates a cursor would make a second identical call
+return less, contradicting V22. Rev 2 justified the filter loosening partly with
+bookmark-windowed arms, a case §7 makes impossible; that justification is withdrawn.
 
-rev 1 refused all `filter` and `level` changes. The gate found two legitimate blocked
-cases, and noted the justification given was vacuous in the first:
+### 7.1 `collectors.edit` — exhaustive
 
-- **Typo'd filter, no history.** Arm a collector, see zero matches, fix it. Nothing to
-  invalidate — and the prescribed remove-then-add is non-atomic on the name and discards
-  the description, policy, and threshold. **Permitted when `snapshots.is_empty() &&
-  matched == 0`**, which is the provable form of the check.
-- **Raising the level.** A `timing` snapshot correctly describes what `timing` retained.
-  Since §6.4 already echoes each snapshot's own level, a raise invalidates nothing.
-  **Permitted.**
+| Field | Rule |
+|---|---|
+| `description`, `meta` | Free. |
+| `snapshot` policy, `threshold` | Free; each snapshot echoes its own policy. |
+| `filter` | Only when `snapshots.is_empty() && matched == 0`, **checked and swapped inside the generation lock** — otherwise a span matching the old filter lands in a tier the new filter describes. Sets `zeroed_at`. |
+| `level` — raise | Permitted, but **zeroes the sample tier and sets `zeroed_at` and `level_raised_at`**. Rev 2 permitted it outright: from `scalar` the sample tier would start filling at the raise point with no budget hit, so `complete` would read `true` over a *suffix* — falsifying the design's load-bearing honesty flag. From `timing`, zero-filling parent columns is worse, because `parent_span_id == 0` means **root**: every pre-raise span becomes a degenerate root with `span_id == 0`. |
+| `level` — lower | Refused. |
+| `group_keys` | Refused with history or `matched > 0` — they widen the exact tier's key at every level, so pre- and post-edit rows would be keyed differently and the "never approximate" tier becomes a mixture. |
+| `max_sample_bytes` | Raise free; lowering below current usage refused. |
 
-**Still refused:** changing `filter` on a collector with history, and *lowering* level.
-Both would leave stored snapshots described by a definition that does not fit them.
+**Every edit re-runs the full §7 admission gate.** Shipped precedent to avoid: `filters.add`
+rejects bookmark qualifiers and `edit_filter` does not.
 
-Wire discipline: new types additive; `cargo xtask verify-schema` regenerated and
-committed. CLI mirrors MCP 1:1.
+An edit does not reset `armed_at`, so `wall_ms` is measured from `max(armed_at, zeroed_at)`
+(§5.1) and a corrected typo does not leave dead minutes in the window.
 
 ---
 
 ## 8. Threshold triggers (phase 5) — built, not reused
 
-A collector may carry `threshold: { metric, group?, op, value, window_ms }`.
+`threshold: { metric, group?, op, value, window_ms }`, evaluated against a **rolling bucket
+ring advanced by span arrival** — not a timer, so an idle collector costs nothing and the
+zero-CPU-at-idle contract holds.
 
-**rev 1's justification was wrong three ways** and is withdrawn: the cited symbol is the
-session-level storage window, the real per-trigger counter measures **entries** rather
-than time, and `record_match` states explicitly that span triggers are **not** debounced
-because the span path never reaches `evaluate`. Nothing is reused; this is new
-machinery.
+Nothing is reused: rev 2's cited debounce is the session storage window, the real per-trigger
+counter measures *entries*, and span triggers are not debounced at all.
 
-**Rolling window, evaluated on arrival.** A bucket ring advanced by span arrival — not a
-timer — so an idle collector costs nothing and A9's zero-CPU-at-idle contract holds. The
-consequence must be stated rather than discovered: **with no traffic a breached threshold
-neither fires nor clears.** A threshold is a load-time guard, not a liveness check.
-
-Evaluation is against the rolling window, never the since-arm aggregate, which would
-become unmovable as samples accumulate and go silently deaf exactly when a run got long
-enough to matter.
+Stated rather than discovered: **with no traffic a breached threshold neither fires nor
+clears.** A threshold is a load-time guard, not a liveness check.
 
 ---
 
@@ -721,372 +631,251 @@ enough to matter.
 
 `collectors.document(names, format, path?, question?, finding?)`.
 
-### 9.1 Two moments, one artefact
+### 9.1–9.2 Two moments; render, not commit
 
-- **Now.** The run just finished. The document is the *synthesis* — it assembles what
-  would be a dozen scattered `collectors.get` calls into one picture, and shows what
-  moved and what to do next.
-- **Months later.** A new optimisation idea; the job becomes triage and trust.
+**Now**, it is the synthesis that says what moved and what to do next; **months later**, triage
+and trust. `path` is optional — omit it and the document is returned, which matters because
+**`finding` normally arrives after the first read**. Regeneration is free and lossless. No
+import: comparison happens in the reader.
 
-Designing for only the second produces an artefact nobody opens until it is too late to
-fix the measurement; only the first, one that is uninterpretable once the session's
-context is gone.
-
-**A document is a render, not a commit.** `path` is optional; omit it and the document is
-returned in the response. Regenerating is free and lossless, which matters because
-**`finding` normally arrives after the first read** — you render the document in order to
-form the conclusion, then re-render with it attached.
-
-**Not re-imported.** No `collectors.import`. Comparison happens in the reader.
-
-### 9.2 `get` versus `document`
-
-`collectors.get` answers a question you already have and returns one parameterised
-projection. `collectors.document` tells you which questions to ask: a fixed synthesis —
-comparison, noise floor, vocabulary, limitations, ranked movers. If a future change makes
-one a strict subset of the other, that is the signal to remove one.
-
-The name is `document`, not `insights`: logmon computes comparisons, spreads, and
-rankings; the insight is the reader's.
+`collectors.get` answers a question you have; the document tells you which to ask. The name is
+`document`, not `insights` — logmon computes comparisons and rankings; the insight is the
+reader's.
 
 ### 9.3 The reader's five questions
 
-Each item earns its place by answering one. Anything answering none does not belong.
+Is this about my thing? · Can I trust it and is it comparable? · What did it conclude? · Real
+or noise? · **What should I do next?** — the last is what the present-tense moment adds, and
+why §9.6 is written as instructions.
 
-| The reader asks | When | The document must |
-|---|---|---|
-| Is this about my thing? | Later | Be triageable **without being read**, across thirty files (§9.4) |
-| Can I trust it? Is it comparable? | Later | Carry its environment and its own limits (§9.4, §9.6) |
-| What did it conclude? | Both | Record the question and the finding |
-| Real or noise? | Both | Quantify run-to-run spread (§6.5) |
-| **What should I do next?** | **Now** | Rank what moved; pair every limitation with its remedy |
+### 9.4 Front-matter
 
-### 9.4 Triage front-matter
+Fixed-schema YAML, `grep`-able. **No field is ever merely absent** — `null` / `unknown` /
+`varies` are explicit values. `git_sha` and `build_profile` are **per-arm**. `question`,
+`finding`, `filter_intent` carry the triage weight; `build_profile` is promoted out of `meta`
+because comparing debug against release is worse than no data.
 
-Fixed-schema YAML, `grep`-able across a directory:
+**`correctness_evidence`** is an always-present field defaulting to `unknown`. A faster arm may
+be faster because it is wrong, and logmon cannot know — but "we asked and nobody supplied it"
+is a different statement from silence.
 
-```yaml
-format_version: 1
-collector: cache-ab
-question: "Does the schema cache reduce time in store_server spans?"
-finding: "…"                    # absent ⇒ explicitly `finding: null`, never omitted
-measured_at: 2026-07-29T14:02:11Z
-filter: "sv=store_server"
-filter_intent: "all server-side work; renderer and panel work excluded"
-services: [store_server]
-git_sha: { cache-off: a08c119, cache-on: a08c119 }   # per-arm, or `varies`
-build_profile: release          # `unknown` if not supplied — never absent
-parallelism: 16
-host: imac-studio
-runs: 4
-trustworthy: false
-trustworthy_reason: "cache-off single-run; cache-on sample truncated"
-sidecar: 2026-07-29-cache-ab.data.json
-```
+**`aggregation`** is always present: which run each headline figure comes from, or `mean` /
+`median` across runs. Rev 2's document showed single figures against a multi-run claim, and a
+reader could not reconstruct the floor — making the floor simultaneously load-bearing and
+unverifiable.
 
-Three fields carry the triage weight: **`question`/`finding`** (data alone is a log; a
-recorded conclusion is memory), **`filter_intent`** (a filter string is precise and
-nearly useless as a relevance signal months on), and **`build_profile`** (comparing a
-debug measurement against a release run is worse than no data, because it looks like
-data).
+`trustworthy: false` whenever any arm is single-run, truncated, has ingest loss, or reports
+`nesting: "undetected"`.
 
-**No field is ever merely absent.** rev 1 stated the principle — "an absent floor reads
-as a stable one" — and then broke it by leaving `trustworthy` and `build_profile`
-omittable. Every front-matter key is always present, with `null` / `unknown` / `varies`
-as explicit values. `git_sha` and `build_profile` are **per-arm**, because a document
-spanning multiple arms may span multiple commits and a directory-wide `grep git_sha`
-must not return one of several.
+### 9.5 Body order
 
-`trustworthy` is `false` whenever any arm is single-run, any arm is truncated,
-`ingest.drops_in_window > 0`, or `nesting: "undetected"` on a filter that could match
-nested spans.
+Most-decision-relevant first, reference last, and **every caveat travels with the number it
+qualifies**.
 
-Recommended filename `YYYY-MM-DD-<collector>-<slug>.md`.
+1. **What moved** — ranked, `total_ms` and `self_ms` side by side, each row carrying its own
+   error bound, sub-threshold deltas suppressed in place. Ranked tables state they are top-N,
+   carry an `other` row, and give **both** "share of improvement" and "change to this row"
+   (4.4 % and −8.4 % are the same line, and readers conflate them).
+   **`avg_ms` deltas are suppressed when `count` differs materially between arms** — an
+   exact-tier number that is invalid as an effect size, because the denominator moved.
+2. **What to do next** — §9.6 and the floors.
+3. **Per-snapshot detail**, every table declaring its tier. When `complete: false`, that arm's
+   `sampled` percentiles are **visually demoted**, not printed at equal weight beside
+   `estimated` ones they may differ from by 40 %.
+4. **The full vocabulary** — and, when ingest loss is non-zero, a note that the counts
+   reconcile to `count` by construction and so prove consistency, not completeness.
+5. **Definitions and how to read the numbers.** Round 2's cold reader confirmed this section
+   changes conclusions — without it they would have recommended acting on the number — so it
+   stays, with the collector-config block demoted below the tier definitions.
 
-### 9.5 Body, in reading order
+### 9.6 Limitations — per metric, with remedies
 
-Most-decision-relevant first, reference material last — and **every caveat travels with
-the number it qualifies**, which is the gate's sharpest document finding. rev 1 put the
-headline on one line and the reason to disbelieve it forty lines later.
+Rev 2 listed limitations; a reader took the truncation row ("does not affect `total_ms`,
+`count`, `estimated`") at face value and concluded the exact tier was clean, while the ingest
+row said drops affect every tier. Both true, jointly misleading. So the document carries a
+**per-metric effect matrix** — for each reported number, which limitations touch it — alongside
+the remedy list:
 
-1. **What moved** — the computed comparison, ranked by contribution, **cumulative and
-   self side by side**, with each row's error bound and sub-floor deltas visually
-   suppressed in place. Ranked tables state they are top-N and carry an `other` row for
-   the remainder, as `traces.summary` already does with `other_ms`.
-2. **What to do next** — §9.6's remedies and the noise-floor verdict.
-3. **Per-snapshot detail** — with **every table declaring its tier provenance**
-   (exact / estimated / sampled), not only the legend. Units in every column header.
-4. **The full per-span-name vocabulary** — not the top rows. A reader comparing two
-   documents months apart needs to see names appear and disappear; that is the signal
-   the code moved underneath and the comparison is no longer apples to apples.
-5. **Definition and how to read the numbers** — the four categories, last, because it is
-   reference material. A one-line legend precedes the first table so a reader who stops
-   early is not left guessing.
-
-### 9.6 What the document must admit — with remedies
-
-| Limitation | What to do |
+| Limitation | Remedy |
 |---|---|
-| `ingest.drops_in_window > 0` | Spans were lost **before the collector**. `matched` under-counts and every tier is affected. Reduce load, raise the channel, or re-run — no number here is safe. |
-| Arm truncated (`complete: false`) | Self time and paths describe a **mixture**, not the prefix's workload. Raise `max_sample_bytes` or narrow the filter, re-run. |
-| `nesting: "undetected"` | Below `tree`, cumulative may double-count and nothing can tell you. Re-run at `tree` to quantify. |
-| `nested_matches > 0` | Cumulative double-counts. Quote `self_ms`, or quote cumulative as *total work including nesting*. |
-| Unmatched descendants of matched spans | Their time is **silently attributed to the nearest matched ancestor** — it reads as that ancestor doing the work. Broaden the filter, or read self time as self-plus-unmatched-descendants. |
-| `overlapping_child_ms > 0` | The tree is not properly nested (spawned tasks, clock skew). Self time is clamped; treat the overflow as unattributed. |
-| Percentiles `estimated` | ±`error_pct` per measurement, wider on a **delta**. Differences inside it are no difference. |
-| Single-run arm | Floor unknown — repeat before concluding. |
-| Warm-up excluded | By how much; `exact` and `estimated` are both null. |
-| Cumulative under N-way parallelism | Total work, not elapsed time. |
+| Ingest loss (`drops_in_window`, `shed_batches`, `malformed_dropped`) | Spans lost **before the collector**; `matched` may under-count and every tier is affected. Reduce load, raise the channel, re-run. |
+| Arm truncated | Self time and paths are a **mixture**. Raise `max_sample_bytes`, re-run. |
+| `nesting: "undetected"` | Below `tree`, `total_ms` may double-count and nothing can tell you. Re-run at `tree`. |
+| `nested_matches > 0` | `total_ms` double-counts; quote `self_ms`. |
+| Unmatched descendants | Attributed to the nearest matched ancestor — reads as that ancestor's work. |
+| `overlapping_child_spans > 0` | Tree not properly nested; `Σ(unclamped) = self_ms − overlapping_child_ms`. |
+| Estimated percentiles | ±α each; **±α(a+b)/\|a−b\| on a delta**; not resolvable below ~2 %. |
+| Single-run arm | Floor unknown — repeat. |
+| Warm-up excluded | `exact` and `estimated` both null. |
+| **`total_ms` *and* `self_ms` under N-way parallelism** | Both are work, not elapsed time; see `achieved_concurrency`. |
 | Spans outside the filter | Absent entirely. |
-| Several services | Cross-process clock skew reaches wall-union and path timings. |
-| **Time, not correctness** | A faster arm may be faster because it does less, or because it is wrong. This measurement cannot tell you. Check the suite's own pass/fail. |
-| Retried OTLP batches | No `span_id` dedup: a re-delivered batch inflates `count` and subtracts a child twice. |
+| Several services | Clock skew reaches wall union and path timings. |
+| Time, not correctness | See `correctness_evidence`. |
+| Retried OTLP batches | No `span_id` dedup. |
 
-Months later these are caveats; **now they are instructions**, and each is cheap to act
-on now and impossible to act on later.
-
-**Arms measured back-to-back are confounded with time** — thermal drift, background load,
-page-cache state. The document shows arms in chronological order and recommends
-**interleaved A/B/A/B** ordering.
+Arms run back-to-back are confounded with time; the document shows chronological order and
+recommends **interleaved A/B/A/B**.
 
 ### 9.7 Sizing
 
-The readable document stays in the tens of KB; bulk data — raw sketch buckets and their
-layout, per-trace tables, any raw sample prefix — goes to a sidecar named in
-front-matter. The consumer loads the document into a limited context, so
-self-containment is worth less than being readable at all.
+Document in the tens of KB; bulk to a sidecar named in front-matter. **Raw sketch buckets are
+not in the sidecar** — `Store.bins` is `pub(crate)` with no public iterator. The sidecar
+carries a percentile table plus layout identity, which is what §9.3's questions actually need.
+Exposing raw buckets would need an upstream PR; not budgeted.
 
 ### 9.8 Formats
 
-`md` (default), `json` (structured data alone), and `folded` per snapshot.
+`md` (default), `json`, `folded`. Folded emits **integer** microseconds with a single ASCII
+space — speedscope's importer matches `^(.*) (\d+)$` and **drops non-matching lines silently**,
+while flamegraph.pl accepts decimals, so decimals would render in one tool and vanish in the
+other. `;` in span names is escaped to `,`. The sidecar carries the invocation
+(`flamegraph.pl --countname us --nametype Span`), since collapsed-stack format has no unit
+concept. `[?]` renders as a literal root frame; the how-to-read section says so.
 
-**Folded output, corrected against the actual consumers.** Emitting **self time per
-path** is right — in `stackcollapse` output each line is the exclusive weight of that
-exact stack, and viewers derive a frame's width by summing lines with that prefix. Root-
-first ordering is right. Three things rev 1 left open, each a silent failure:
+### 9.9 Who writes
 
-- **Integer weight, single ASCII space.** speedscope's importer matches `^(.*) (\d+)$`
-  and **drops non-matching lines with no error**, while flamegraph.pl accepts decimals.
-  Decimal microseconds would render correctly in one tool and silently vanish in the
-  other. Emit truncated integer microseconds.
-- **Escape `;` in span names.** OTel names are arbitrary; neither consumer defines an
-  escape, so `parse;render` silently becomes two frames. Replace with `,`.
-- **Declare the unit.** The sidecar carries the invocation
-  (`flamegraph.pl --countname us --nametype Span`), since collapsed-stack format has no
-  unit concept.
-
-`[?]` incomplete-path prefixes render as a literal root frame; the how-to-read section
-says so.
-
-### 9.9 Who writes the file
-
-**The daemon returns bytes; the client writes.** rev 1 cited `logs.export` as a
-file-writing precedent — it writes nothing; the writes are in the MCP server and CLI.
-That is the right division: the broker runs as a service, so a relative path would
-resolve against the daemon's cwd and user rather than the caller's. `path` is a
-client-side concern, and the sidecar is written beside it by the same client.
+**The daemon returns bytes; the client writes** — matching `logs.export`, whose writes are in
+the MCP server and CLI. The broker runs as a service, so a relative path would resolve against
+the daemon's cwd.
 
 ---
 
 ## 10. Lifecycle, persistence, restart
 
-- **Definitions persist** for named sessions, as triggers/filters/bookmarks do.
-- **Snapshots persist write-through, on `collectors.snapshot`** — not only at shutdown.
-  rev 1 claimed a run "stops being at risk the moment it is snapshotted" while
-  `save_state` was called only on graceful shutdown, so a crash or OOM lost everything
-  since boot. That composes badly: a profiling run with a 256 MiB sample budget on top
-  of the existing rings is the workload **most likely to OOM the daemon**, which is
-  exactly the case that lost the data.
-- **Snapshots live in per-collector files, not `state.json`.** `state.json` is written
-  with `to_string_pretty` and a non-atomic `std::fs::write`; a multi-MB sketch blob
-  rewritten on every save risks a truncated file taking triggers, filters, and bookmarks
-  with it. Snapshot files are written temp-then-rename.
-- **Sketch layout identity is persisted with the buckets**, so a snapshot written before
-  an upgrade is never read under a newer default layout (§3.5, §5.6).
-- On restore a collector comes back **armed but zeroed**, carrying `zeroed_by:
-  "daemon_restart"`; its history is unaffected.
-- **A collector whose pinned domain no longer exists restores `orphaned`, not armed.**
-  Ephemeral domains are not re-created at boot, and `PersistedSession` does not record a
-  domain binding — so rev 1's restore path would have produced a collector that reads as
-  armed and collects nothing forever, reintroducing the exact failure domain pinning
-  exists to prevent. Restoring a pinned domain requires recording it; where that is not
-  possible the collector is orphaned loudly.
-- **Session TTL disposal takes collectors and their history.** Agent sessions disconnect
-  constantly and the sweep disposes past `session_ttl_secs` (default 24 h). Snapshots
-  persist independently of the session, and disposal is reported.
-- Duplicate collector name within a session → error.
+**One file per collector, holding definition *and* history**, written write-through on
+`collectors.add`, `edit`, and `snapshot`. Rev 2 made snapshots write-through and left
+definitions to graceful shutdown, so a `kill -9` produced orphan history with nothing to
+attach it to and V11 failed by construction.
+
+**Atomicity:** serialize outside the generation lock and off the runtime; write a temp file
+**in the same directory**, `fsync` it, `rename`, then `fsync` the directory. A startup sweep
+removes crash-orphaned temps — the existing sweep removes only `daemon.pid` and the socket.
+
+**`state.json` gets the same treatment.** It is `to_string_pretty` + non-atomic `fs::write`
+today, and `load_state` propagates a parse error with `?`, so **a truncated `state.json` means
+the daemon refuses to start until a human deletes it.** Temp-then-rename, and quarantine-and-warn
+on load rather than abort.
+
+**Restore.** Collectors come back **armed but zeroed**, `zeroed_by: "daemon_restart"`; history
+is unaffected. The pinned domain is recorded in the collector file, since `PersistedSession`
+has no domain field and `restore_named` hard-codes `default`.
+
+**The orphan check is lazy, evaluated on first read** — not at restore. `restore_named` runs at
+`server.rs:228` and the domain registry is not created until `server.rs:379`, so a check at
+restore time would mark *every* collector orphaned, including those pinned to `default`.
+
+**Restart survival applies to `default` and config-declared domains only.** `domains.create
+(persist=true)` is refused today and ephemeral domains are never re-created, so a collector
+pinned to an API-created domain is **always** orphaned after a restart. Rev 2 presented
+orphaning as an exception; for the primary workflow it is the default outcome, and the spec
+says so plainly rather than implying durability it cannot deliver.
+
+**Lifetime and GC.** Session TTL disposal removes the collector and **deletes its file** — rev
+2 said both that disposal takes history and that snapshots persist independently of the
+session, which cannot both hold and would leak files forever on a daemon whose sessions are
+disposed on a 24-hour sweep. A file with no definition, or a definition with no file, is
+quarantined and logged at boot.
+
+Duplicate collector name within a session → error. `collectors.add` on an **anonymous** session
+→ error (§4.4).
 
 ---
 
 ## 11. Error handling
 
-Loud and specific; never a zero, an empty result, or a silent fallback.
-
-| Condition | Response |
-|---|---|
-| Metric above the collector's level | Error naming the level |
-| `group_by: "attr:x"`, `x` not a group key | Error listing available keys |
-| Filter contains a log-only qualifier | Error (new `is_log_filter`, §7) |
-| Bookmark qualifier in a collector filter | Rejected, matching `filters.add`/`triggers.add` |
-| Arming exceeds the daemon reservation | Error stating requested, remaining, and the four-collector default ceiling |
-| Snapshot policy above the level | Error at `add`, not at snapshot time |
-| Reading a snapshot for an excluded projection | Error naming the excluding policy |
-| Unknown snapshot label | Error listing available labels |
-| `edit` changing filter with history, or lowering level | Refused (§7.1) |
-| `diff` across sketch layouts | Refused — arithmetically wrong |
-| `diff` level or filter mismatch | **Marked**, not refused (§5.6) |
-| `diff` incomplete side | Sample rows null-with-reason; exact and estimated pass |
-| Group-key cardinality cap | `__overflow__` + `cardinality_capped: true` |
-| Per-name sketch cap | `__overflow__` + `name_sketches_capped: true` |
-| Sample budget hit | `sampled.complete = false`; exact tier and sketch unaffected |
-| Ingest drops in window | `ingest.drops_in_window > 0`; `trustworthy: false` |
-| `nested_matches == 0` at `tree` | `self_ms` suppressed with a reason (§5.3) |
-| Malformed timestamps | Counted, excluded from sketch/union/warm-up origin |
-| `document` folded on non-`tree` | Error naming the level |
-| `document` with no snapshots | Valid; states history is empty |
-| `document` without question/finding | Valid; recorded as `null`; `trustworthy` not asserted |
-| Zero matches | Well-formed empty result |
+Loud and specific. Beyond §7 and §7.1: metric above level; unknown group key; arming exceeds
+the daemon reservation (stating requested, remaining, and the four-collector ceiling); snapshot
+policy above level; unknown snapshot label; `diff` refusals (layout, asymmetric ingest loss,
+both-truncated) and markings (level, filter, `level_raised_at`); cardinality and sketch caps;
+sample budget hit; ingest loss present; `nested_matches == 0` suppressing `self_ms`; malformed
+timestamps; negative durations; out-of-range sketch input; snapshot **persist failure** (does
+not zero); `document` folded below `tree`; zero matches returning a well-formed empty result.
 
 ---
 
 ## 12. Test list
 
-**Verification**
+**Verification.** V1 per-match memory re-derived from `size_of`, sketch memory measured ·
+V2 exact scalars across the cap · V3 `sampled` percentiles against a hand-computed ⌊1+q(n−1)⌋
+reference · **V4 self time by clipped interval union** on concurrent children, a child
+outliving its parent, and a child starting before its parent · **V4b** distinguishes one large
+overflow from many small ones via `overlapping_child_spans` · V5 wall union · V6 paths and
+`[?]` · V7 `group_by` including **boolean and numeric** attributes and `__absent__` ·
+V8 warm-up origin and both tiers null · V9 diff bounds using α(a+b)/|a−b| · V10 reset atomicity
+and `wall_ms` from `zeroed_at` · **V11 restart including `kill -9`, with definition *and*
+history intact** · V12 `traces.slow` over the full population, display floor after aggregation,
+rank per §5.7 · V13 sketch vs sample-exact at a matched convention and stated minimum n ·
+V14–V17 snapshot/history/merge/descriptions · V18 document completeness incl. per-arm
+provenance, `aggregation`, `correctness_evidence` · V19 both floors, one printed threshold ·
+V20 sizing · V21 bytes-vs-path · V22 lossless regeneration · V23 body order and per-table tier
+· V24 admission: bare patterns and attribute-only filters admitted; `SV=`, `message=`,
+`ParsedFilter::None`, `d>=nan`, `d<=inf` all caught · **V25 zero-duration spans counted and
+reported as 0.0; negative durations excluded from sketch and `total_ns` and counted.**
 
-- **V1** Per-match memory re-derived from `size_of` matches §3.2; sketch memory measured,
-  not assumed.
-- **V2** Exact scalars stay exact across the cap boundary.
-- **V3** `sampled` percentiles match a hand-computed nearest-rank reference (§5.7).
-- **V4** Self time on a hand-built three-level tree.
-- **V4b** **Child outliving its parent** → self clamped at zero, overflow in
-  `overlapping_child_ms`. V4 alone cannot catch this.
-- **V5** Wall union over nested, overlapping, disjoint intervals.
-- **V6** Path aggregation; `[?]` + `path_incomplete` when an ancestor is excluded.
-- **V7** `group_by` name / trace / attr, including **boolean and numeric** attributes and
-  the `__absent__` bucket (§3.3).
-- **V8** `skip_warmup_ms` origin is `min(start_ns)`; both `exact` and `estimated` null.
-- **V9** Diff deltas per percentile, with the **delta** error bound (§5.6).
-- **V10** `reset` returns and zeroes atomically; `wall_ms` measured from `zeroed_at`.
-- **V11** Restart → armed, zeroed, history intact — **including a `kill -9` variant**,
-  since the harness's graceful `restart()` would pass regardless.
-- **V12** `traces.slow` aggregates the full matching population; `min_duration_ms`
-  applied only as a display floor; nearest-rank per §5.7.
-- **V13** Sketch percentiles within `error_pct` of sample-exact on uniform, bimodal, and
-  heavy-tailed distributions, at a stated minimum n and matched rank convention.
-- **V14** Snapshot records/returns/zeroes; `reset` discards; history matches.
-- **V15** Each snapshot echoes its own policy, filter, level, and layout; editing does
-  not alter existing snapshots.
-- **V16** Merge equals the sum of its parts; sample-derived projections omitted with a
-  reason; **mismatched layouts refused**.
-- **V17** Descriptions and `meta` appear in read, diff, history, document.
-- **V18** Document carries everything §9.4–§9.8 requires, per-arm provenance included.
-- **V19** Noise floor propagated into every delta row; single-run states unknown.
-- **V20** Document within its size target; bulk in the sidecar.
-- **V21** Omitting `path` returns bytes; the client writes identical bytes.
-- **V22** Regeneration is lossless.
-- **V23** Body order per §9.5, and each table declares its tier provenance.
-- **V24** `is_log_filter` admits bare patterns, attribute-only filters, and bookmark
-  windows as span filters, and rejects log-only qualifiers.
+**Adversarial.** A1 cap boundary · A2 parent cycle · A3 arrival order, complete **and under
+both cardinality caps** · A3b arrival order truncated: exact and sketch identical, sample rows
+may differ · **A4 concurrent reset, edit, and snapshot during ingest** · **A5 domain rebinding
+*and* domain deletion mid-collection, asserting data flow rather than the label** · A6/A6b
+group and name caps · **A6c a span longer than the declared sketch range — no low-end
+collapse** · A7 diff level/filter/layout/overflow handling · A8 incomplete side · A9 idle CPU ·
+A10 truncation not laundered into a snapshot · **A11 per-field sum invariant across *every*
+structure — `count`, `total_ns`, `sample_count`, sketch count, per-name, per-group,
+`error_count`** · A12 history eviction · **A13 level raise on a collector with prior matches,
+asserting the sample tier zeroed and `level_raised_at` set** · **A14 observer effect: criterion
+bench over `process_span_for_domain` at 0/1/4 collectors; a saturation test asserting zero
+receiver drops; a read-during-ingest test at the cap; stated reps and threshold.**
 
-**Adversarial**
-
-- **A1** Cap boundary: one under / at / one over.
-- **A2** Parent cycle → depth cap terminates; no hang.
-- **A3** Arrival order, **complete case**: identical projections.
-- **A3b** Arrival order, **truncated case**: exact tier and sketch identical across two
-  orderings; sample-derived fields permitted to differ. rev 1's A3 pinned the claim only
-  where it was trivially true.
-- **A4** Concurrent reset during ingest: no lost update, no torn read.
-- **A5** Domain rebinding mid-collection: collector keeps its pinned domain.
-- **A6** High-cardinality group key → `__overflow__`, bounded.
-- **A6b** High-cardinality **span names** → per-name sketch cap holds (§3.5).
-- **A7** Diff level mismatch **compares at `min(level)`**; filter mismatch is marked;
-  layout mismatch is refused.
-- **A8** Incomplete diff: sample rows null, exact and estimated pass; `scalar` permitted.
-- **A9** Idle CPU zero with a collector and a threshold armed.
-- **A10** Truncation must not launder into a snapshot: sketch percentiles still whole-run;
-  sample-derived fields carry `complete: false` through.
-- **A11** Snapshot during ingest: `snapshot.count + live.count` equals total ingested.
-- **A12** History eviction: labels never reused; survivors intact.
-- **A13** `edit` permitted on a virgin collector, refused with history; level raise
-  permitted, lower refused.
-- **A14** **Observer effect, redesigned.** rev 1 ran the suite with and without collectors
-  and compared wall time — structurally unable to detect anything, because ingest is a
-  detached task behind a 65 536-slot `try_send` channel with no backpressure onto the
-  system under test. Overhead could be 10× with no wall-time signal, until the channel
-  overflows and the symptom becomes *dropped spans*, which rev 1 did not measure. Now:
-  1. a **criterion bench** over `process_span_for_domain` with 0/1/4 collectors armed —
-     **there is no bench infrastructure in the repo, so this is a phase-1 dependency**;
-  2. a **saturation test** asserting `ReceiverDropSnapshot` stays at zero with collectors
-     armed at a rate that is clean without them;
-  3. a **read-during-ingest test**: fill to the cap, run `collectors.get(group_by:
-     "path")` while ingesting, assert zero drops — the §3.6 lock discipline;
-  4. stated repetition count and pass threshold, per the spec's own §6.5 rule.
+**Infrastructure phase 1 needs and the repo lacks:** criterion (no `benches/`, no
+`[[bench]]`, no `#[bench]` anywhere). **Phase 3 needs** a crash harness — the test daemon runs
+in-process as a tokio task, so there is no process to `SIGKILL`, and `restart()` is a graceful
+shutdown that would pass V11 regardless. Real-ingest tests must use `spawn_in_dir_no_inject`;
+the default harness leaves the span channel idle.
 
 ---
 
 ## 13. Build order
 
-Each phase ends with targeted tests green and a fresh-eyes self-review. Mid-checkpoint
-after phase 1.
+1. **Core.** Generations (§3.6), exact tier with `i128`, DDSketch with enforced range and
+   zero/negative rules, **the new `ReceiverMetrics` counters**, domain-keyed registry,
+   `add`/`list`/`get`/`reset`/`remove`, `traces.profile`, admission (§7), the §4.2 matcher
+   de-allocation, criterion, and the §1.1 `traces.slow` fix.
+   **Phase 1 ships the complete `ProfileResult` field set**, later-phase fields present and
+   inert — adding them later is a wire break.
+2. **Projections.** Clipped-union self time, paths, wall union, warm-up, `group_keys`.
+3. **History.** Snapshot/history/edit, per-collector files with atomic writes, lazy orphan
+   check, GC, crash harness, merging.
+4. **Comparison.** `collectors.diff`; `collectors.document`.
+5. **Guards.** Threshold triggers.
 
-1. **Core.** Levels, chunked sample tier with the §3.6 lock discipline, exact tier with
-   integer-nanosecond accumulation, ingest-fed sketch, ingest-drop accounting,
-   domain-keyed registry, `add`/`list`/`get`/`reset`/`remove`, `traces.profile`,
-   `is_log_filter`, the §4.2 matcher de-allocation, bench infrastructure, and the §1.1
-   `traces.slow` fix.
-   **Phase 1 ships the complete `ProfileResult` field set**, with later-phase fields
-   present and inert — `exact` nullable, `exact_unavailable_reason`, `cardinality_capped`,
-   `path_incomplete`, `estimated_unavailable_reason`. Adding them later is a wire break
-   on a shipped type.
-2. **Projections.** Path aggregation, wall union, warm-up exclusion, `group_keys` with
-   §3.3 value rendering.
-3. **History.** Snapshot / history / edit, policy validation, write-through persistence
-   in per-collector files, merging.
-4. **Comparison.** `collectors.diff` with §5.6 marking; `collectors.document`.
-5. **Guards.** Threshold triggers, built from scratch (§8).
+Phases 1–3 are the complete driving workflow. Docs are part of done; note the MCP surface grows
+33 → 44 tools, roughly doubling per-session schema context.
 
-Phases 1–3 are the complete driving workflow; 4–5 cut cleanly.
-
-Docs are part of done: README tool table and profiling section, the logmon skill's
-selection table, and deletion of the stale span-trigger roadmap line. Note the MCP
-surface grows from 33 tools to 44, roughly doubling per-session tool-schema context cost
-— worth stating in the skill.
-
-**Deferred:** log-derived durations; cross-collector baselines; multi-key `group_by`;
-reservoir sampling as an opt-in percentile-only mode; `span_id` dedup for retried
-batches.
+Deferred: log-derived durations; cross-collector baselines; multi-key `group_by`; `span_id`
+dedup; raw sketch buckets in the sidecar (needs an upstream PR).
 
 ---
 
-## 14. Design gate — round 1 outcome
+## 14–15. Gate rounds 1 and 2
 
-Four lenses run against `709651b`: buildability, soundness + false-positive,
-performance + prior-art, and cold-reader. Findings resolved throughout this revision and
-logged at the head of this document.
+Round 1 lenses: buildability · soundness+false-positive · performance+prior-art · cold reader.
+Round 2: concurrency+durability · **false-negative** · prior-art+numbers · cold reader.
 
-Two lens choices proved their worth and should be repeated on any similar design:
+Two lens choices earned their place and should be reused on any similar design:
 
-- The **cold reader** — given only a synthetic document, explicitly barred from the spec
-  and the codebase — produced findings no spec-reading lens could, because §9's central
-  claim is that the document is interpretable without context, and that is only testable
-  by trying it. It also independently derived an invariant the spec never stated.
-- Naming a **weak claim** for the gate to attack worked: §4.3's order-independence was
-  flagged as load-bearing and unproven, and came back false.
+- **The cold reader**, given only a synthetic document and barred from the spec, produced
+  findings no spec-reading lens could — and in round 2 confirmed the how-to-read section
+  changes a reader's recommendation, which is two-way evidence for keeping it.
+- **The false-negative lens in round 2**, aimed specifically at checks loosened in response to
+  round 1. Every one of the four had been over-corrected. Loosening a check in response to a
+  false-positive finding should always be followed by this lens.
 
-## 15. Re-gate before build
+## 16. Round 3 — reduced scope
 
-A substantive change made in response to a finding re-arms the gate. These mechanisms are
-new or materially different in rev 2 and were **not** reviewed by round 1:
+New in rev 3 and unreviewed: §3.6 generations and the retired-accumulator fold; §5.3 clipped
+interval union; §5.1.1's new receiver counters; §7.1's exhaustive edit rules; §10's
+single-file write-through and lazy orphan check.
 
-- §3.6 chunked sample tier and its lock discipline — the fix for the most dangerous
-  finding, and itself concurrency-critical.
-- §3.5 sketch choice, unit, range, layout identity, and budgets.
-- §5.1's four-category shape, and cumulative/self as peers.
-- §5.3's clamp-and-account rule for negative self time.
-- §5.6/§7.1's re-scoped checks — a false-positive lens should confirm the *new* boundaries
-  do not swing to false negatives.
-- §10's write-through persistence and per-collector files.
-
-Round 2 should also carry a **fresh cold-reader pass** on a document regenerated under
-the rev-2 shape, since every finding that lens produced changed the artefact it read.
+Round 3 runs **concurrency** (on §3.6's swap-and-fold, which replaced a mechanism that was
+itself the fix for a round-1 finding — third iteration on the same surface, so the highest
+prior for a defect) and **false-negative** (on §7.1, loosened again). A cold-reader pass is
+**not** needed: rev 3's document changes are additive to a shape round 2 validated.
