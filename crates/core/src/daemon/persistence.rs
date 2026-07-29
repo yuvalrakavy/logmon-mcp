@@ -198,21 +198,131 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Suffix for the temp file an atomic write goes through. A crash between
+/// write and rename leaves one behind; [`sweep_temp_files`] clears them at
+/// boot.
+pub const TEMP_SUFFIX: &str = ".tmp-write";
+
+/// Write a file so a reader never sees it half-written.
+///
+/// Temp file **in the same directory** (a rename across filesystems is a copy,
+/// which is not atomic), `fsync` the file so its contents are durable before
+/// anything points at them, `rename` — atomic on POSIX — then `fsync` the
+/// *directory* so the rename itself survives a power loss. Skipping the last
+/// step is the common version of this bug: the data is durable but the name
+/// still points at the old inode.
+pub fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path {} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("path {} has no file name", path.display()))?
+        .to_string_lossy()
+        .to_string();
+    let tmp = parent.join(format!("{file_name}{TEMP_SUFFIX}"));
+
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Best-effort: some filesystems refuse to open a directory for sync, and
+    // failing the whole write over that would be worse than the lost
+    // guarantee.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Remove temp files left by a crash mid-write.
+///
+/// The existing boot sweep clears `daemon.pid` and the socket; without this,
+/// an interrupted write leaks a file per crash forever.
+pub fn sweep_temp_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(TEMP_SUFFIX)
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Move an unreadable file aside so the next boot is not blocked by it.
+///
+/// Returns where it went. Renamed rather than deleted: it is the only evidence
+/// of whatever went wrong, and a daemon that silently destroys the file it
+/// could not parse leaves nothing to diagnose.
+fn quarantine(path: &Path) -> Option<std::path::PathBuf> {
+    let base = format!("{}.corrupt", path.display());
+    for n in 0..10 {
+        let candidate = if n == 0 {
+            std::path::PathBuf::from(&base)
+        } else {
+            std::path::PathBuf::from(format!("{base}.{n}"))
+        };
+        if !candidate.exists() {
+            return std::fs::rename(path, &candidate).ok().map(|_| candidate);
+        }
+    }
+    // Ten corruptions deep, stop accumulating and reuse the first slot.
+    let last = std::path::PathBuf::from(&base);
+    std::fs::rename(path, &last).ok().map(|_| last)
+}
+
+/// Load persisted state, surviving a file that cannot be parsed.
+///
+/// **Never returns an error for a corrupt file.** `state.json` is written on a
+/// path that can be interrupted by a crash or a full disk, and propagating a
+/// parse error meant the daemon refused to start until a human found and
+/// deleted the file by hand — turning a recoverable loss of session bookkeeping
+/// into an outage of the whole broker. The file is moved aside, the loss is
+/// logged loudly, and the daemon comes up empty.
 pub fn load_state(path: &Path) -> anyhow::Result<DaemonState> {
     if !path.exists() {
         return Ok(DaemonState::default());
     }
-    let content = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(), error = %e,
+                "could not read persisted state; starting with none"
+            );
+            return Ok(DaemonState::default());
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(state) => Ok(state),
+        Err(e) => {
+            let moved = quarantine(path);
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                quarantined_to = ?moved,
+                "persisted state is unreadable and has been moved aside; named sessions, \
+                 their filters, triggers and bookmarks are lost, but the daemon is starting"
+            );
+            Ok(DaemonState::default())
+        }
+    }
 }
 
 pub fn save_state(path: &Path, state: &DaemonState) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let content = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, content)?;
-    Ok(())
+    let content = serde_json::to_vec_pretty(state)?;
+    atomic_write(path, &content)
 }
 
 pub fn load_config(path: &Path) -> anyhow::Result<DaemonConfig> {
@@ -229,4 +339,166 @@ pub fn config_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home)
         .join(".config")
         .join("logmon")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every test here writes into its own temp dir. **Nothing in this module
+    /// may touch `config_dir()`** — a developer's live daemon reads that path,
+    /// and a test that wrote there would corrupt a running broker's state.
+    fn tmp() -> tempfile::TempDir {
+        tempfile::TempDir::new().expect("tempdir")
+    }
+
+    #[test]
+    fn a_corrupt_state_file_is_quarantined_rather_than_blocking_the_boot() {
+        // The defect: load_state propagated the parse error, so a truncated
+        // file meant the daemon refused to start until a human deleted it by
+        // hand - a recoverable loss of bookkeeping turned into a broker outage.
+        let d = tmp();
+        let path = d.path().join("state.json");
+        std::fs::write(&path, "{ this is not json").expect("write");
+
+        let state = load_state(&path).expect("must not fail the boot");
+        assert!(state.named_sessions.is_empty(), "started with no state");
+        assert!(
+            !path.exists(),
+            "the unreadable file was moved out of the way"
+        );
+        assert!(
+            d.path().join("state.json.corrupt").exists(),
+            "and kept, because it is the only evidence of what went wrong"
+        );
+    }
+
+    #[test]
+    fn repeated_corruption_does_not_overwrite_the_first_evidence() {
+        let d = tmp();
+        let path = d.path().join("state.json");
+        for _ in 0..3 {
+            std::fs::write(&path, "nonsense").expect("write");
+            load_state(&path).expect("survives");
+        }
+        assert!(d.path().join("state.json.corrupt").exists());
+        assert!(d.path().join("state.json.corrupt.1").exists());
+        assert!(d.path().join("state.json.corrupt.2").exists());
+    }
+
+    #[test]
+    fn a_missing_state_file_is_not_an_error() {
+        let d = tmp();
+        let state = load_state(&d.path().join("nothing-here.json")).expect("fine");
+        assert!(state.named_sessions.is_empty());
+    }
+
+    #[test]
+    fn state_round_trips_through_an_atomic_write() {
+        let d = tmp();
+        let path = d.path().join("state.json");
+        let state = DaemonState {
+            seq_block: 4242,
+            ..Default::default()
+        };
+        save_state(&path, &state).expect("saved");
+        assert_eq!(load_state(&path).expect("loaded").seq_block, 4242);
+    }
+
+    #[test]
+    fn an_atomic_write_leaves_no_temp_file_behind() {
+        let d = tmp();
+        let path = d.path().join("f.json");
+        atomic_write(&path, b"payload").expect("written");
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+        let leftovers: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(TEMP_SUFFIX))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a completed write cleans up after itself"
+        );
+    }
+
+    #[test]
+    fn an_atomic_write_replaces_the_previous_contents_wholesale() {
+        // The property the whole exercise is for: a reader sees either the old
+        // file or the new one, never a prefix of the new one over the old.
+        let d = tmp();
+        let path = d.path().join("f.json");
+        atomic_write(&path, b"a much longer original payload").expect("first");
+        atomic_write(&path, b"short").expect("second");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"short",
+            "no tail of the longer original survives"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_reader_never_observes_a_partial_write() {
+        // THE property, and the only one that distinguishes rename from
+        // copy-then-delete: both leave identical final contents, so a
+        // single-threaded test cannot tell them apart. Only a reader racing
+        // the writer can. With a copy, this reader sees a prefix of the long
+        // payload, or a long payload with the short one's head on it.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let d = tmp();
+        let path = d.path().join("state.json");
+        let short = vec![b'a'; 64];
+        let long = vec![b'b'; 256 * 1024];
+        atomic_write(&path, &long).expect("seed");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let path = path.clone();
+            let (short, long) = (short.clone(), long.clone());
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // A missing file is fine — rename is atomic but the reader
+                    // can still lose the race to open it at all.
+                    if let Ok(seen) = std::fs::read(&path) {
+                        assert!(
+                            seen == short || seen == long,
+                            "observed a partial write: {} bytes",
+                            seen.len()
+                        );
+                        reads += 1;
+                    }
+                }
+                reads
+            })
+        };
+
+        for i in 0..200 {
+            atomic_write(&path, if i % 2 == 0 { &short } else { &long }).expect("write");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let reads = reader.join().expect("reader finished");
+        assert!(
+            reads > 0,
+            "the reader must have actually observed something"
+        );
+    }
+
+    #[test]
+    fn the_boot_sweep_removes_temp_files_a_crash_left_behind() {
+        let d = tmp();
+        std::fs::write(d.path().join(format!("state.json{TEMP_SUFFIX}")), "half").unwrap();
+        std::fs::write(d.path().join(format!("other.json{TEMP_SUFFIX}")), "half").unwrap();
+        std::fs::write(d.path().join("state.json"), "{}").unwrap();
+
+        assert_eq!(sweep_temp_files(d.path()), 2);
+        assert!(
+            d.path().join("state.json").exists(),
+            "and touches nothing else"
+        );
+        assert_eq!(sweep_temp_files(d.path()), 0, "idempotent");
+    }
 }

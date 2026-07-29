@@ -197,6 +197,18 @@ pub async fn run_with_overrides(
     }
     drop(socket_path_for_sweep);
 
+    // 2c. Temp-file sweep. Every durable write goes temp → fsync → rename, so
+    //     a crash between the write and the rename leaves the temp behind.
+    //     The pid sweep above clears only `daemon.pid` and the socket, so
+    //     without this each crash leaks a file forever.
+    let swept = crate::daemon::persistence::sweep_temp_files(&dir);
+    if swept > 0 {
+        info!(
+            count = swept,
+            "removed temp files left by an interrupted write"
+        );
+    }
+
     // 3. Load state, get initial_seq from seq_block
     let state_path = dir.join("state.json");
     let state = load_state(&state_path)?;
