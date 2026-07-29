@@ -1037,3 +1037,59 @@ the mechanism.** Rev 2's chunked tier was right in shape; it needed one lock, no
 **Still open:** a false-negative pass on §7.1, which has now been tightened and loosened once
 each. A cold-reader pass is **not** needed — rev 3's document changes are additive to a shape
 round 2 validated.
+
+---
+
+## 17. Implementation status — updated 2026-07-29
+
+Branch `feat/span-time-collector`. Everything below is committed, with the full
+workspace suite green (60 result lines), clippy silent, and `cargo xtask verify-schema`
+clean. No protocol types have changed yet.
+
+### Landed
+
+| Piece | Where | Notes |
+|---|---|---|
+| Criterion bench harness | `crates/core/benches/span_ingest.rs` | The §12 A14 dependency the repo lacked. |
+| Trigger-path fix | `TriggerManager::evaluate_span` | Pulled into phase 1 from a filed chip once the bench proved it a prerequisite (§4.2). |
+| Duration sketch | `collector/sketch.rs` | §3.5 — DDSketch, ns, enforced range, layout identity. |
+| Exact tier | `collector/exact.rs` | §3.1 — `i128`, malformed/negative accounting. |
+| Sample tier | `collector/sample.rs` | §3.2/§3.4 — chunked, 8 192 records, prefix truncation. |
+| Interning | `collector/intern.rs` | §3.3/§3.5 — caps with `__overflow__` / `__absent__`. |
+| Collector state | `collector/state.rs` | §3.6 — one lock, clone-read, swap. |
+| Registry + ingest wiring | `collector/registry.rs`, `daemon/span_processor.rs` | §4.4 — domain-keyed; `Arc` built in `run_with_overrides`, held by `RpcHandler`. |
+| Filter admission | `filter/admission.rs` | §7 — blocks and marks, both directions mutation-tested. |
+
+### Not yet built
+
+1. **Projections** — `ProfileResult` with its four categories (§5.1), percentiles,
+   self time by clipped interval union (§5.3), wall union, call paths (§5.4),
+   warm-up exclusion (§5.5). The data model they read is complete.
+2. **`ReceiverMetrics` counters** — `shed_batches` and `malformed_dropped` (§5.1.1).
+   **Not optional**: without them `ingest.drops_in_window` is blind to the two
+   dominant loss paths, and the exact tier's central claim stays unproven.
+3. **RPC + MCP surface** — `collectors.add|list|get|reset|remove`, `traces.profile`
+   (§7). `RpcHandler` already holds the registry.
+4. **`traces.slow` fix** — aggregate the full population; `min_duration_ms` becomes a
+   display floor; rank per §5.7 (§1.1).
+5. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
+   cost**; deliberately low priority now that measurement has ranked it.
+
+### Facts that cost time to establish — do not re-derive
+
+- Ingest baseline, measured: 3.94 µs at 0 sessions, 34.6 µs at 1, 118.6 µs at 4 —
+  **now 3.91 / 4.35 / 4.66 µs** after the trigger fix.
+- Chunk size 8 192 is measured, not chosen: 0.29 ms read lock-hold vs 1.80 ms at 65 536.
+- DDSketch's rank is `(q * (n-1)) as u64` — matches §5.7, no adjustment needed.
+- `Config::min_possible()` **is** public (a gate report said otherwise).
+- `Config: PartialEq` and `merge` already refuses mismatched configs — but the layout
+  **record** is the load-bearing guard, since `Config` does not survive persistence.
+- Four test files carry **pre-existing** rustfmt drift (`domains_binding`,
+  `log_processor`, `session_registry`, `trigger_window_defaults`). Not mine; leave them.
+
+### Working discipline that has been paying
+
+Every guard is mutation-tested before commit. That has already found a dead guard, two
+vacuous tests, and three distinct ways a mutation harness can lie (patch miss,
+semantically inert patch, misclassified cargo output). Scripts live in the session
+scratchpad; the pattern is worth recreating rather than the files.
