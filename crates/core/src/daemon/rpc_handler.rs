@@ -3,7 +3,7 @@ use crate::collector::project::{GroupBy, ProfileOptions};
 use crate::collector::registry::{
     ArmedCollector, CollectorEdit, CollectorRegistry, SnapshotRequest,
 };
-use crate::collector::sample::Level;
+use crate::collector::sample::{Level, MAX_GROUP_KEYS};
 use crate::collector::state::{Collector, CollectorDef, DEFAULT_MAX_SAMPLE_BYTES};
 use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
@@ -449,13 +449,26 @@ impl RpcHandler {
                         cleared += d.bookmarks.clear_session(&key);
                     }
                 }
+                // Collectors follow the bookmarks, for the same reason and now
+                // actually. Left behind, the displaced session's collectors —
+                // their live window AND their recorded history — would become
+                // readable and removable by whoever took the name, which is a
+                // different conversation's measurements.
+                let inherited = self.collectors.drop_session(&new_id);
                 tracing::info!(name = %key, bookmarks_cleared = cleared,
+                    collectors_cleared = inherited,
                     "displaced a disconnected session holding the target name");
                 true
             }
             None => false,
         };
-        tracing::info!(old = %session_id, new = %new_id, "session renamed");
+        // The renaming session keeps its OWN collectors: their owner moves with
+        // it. Without this they are orphaned under a name nothing resolves —
+        // invisible to an owner-scoped list, unreachable by session.drop, and
+        // never swept, while still holding their share of the reservation.
+        let moved = self.collectors.rename_owner(session_id, &new_id);
+        tracing::info!(old = %session_id, new = %new_id, collectors_moved = moved,
+            "session renamed");
         serde_json::to_value(SessionRenameResult {
             name: req.name,
             displaced_stale_holder,
@@ -1321,16 +1334,24 @@ impl RpcHandler {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing required parameter: name".to_string())?;
-        self.sessions
-            .drop_session(name)
-            .map_err(|e| e.to_string())?;
-        // Collectors are owned by the session and hold a slice of a daemon-wide
-        // reservation that only four default-sized collectors fit inside. A
-        // dropped session that kept them would take that budget to the grave —
-        // nobody could arm a collector again until the daemon restarted.
+        // Collectors first, and unconditionally. They are owned by the session
+        // and hold a slice of a daemon-wide reservation that only four
+        // default-sized collectors fit inside, so a dropped session that kept
+        // them would take that budget to the grave.
+        //
+        // Ordered BEFORE the session drop on purpose: releasing after it meant
+        // the `?` aborted on a session that no longer existed, which is exactly
+        // the state a restored-after-crash collector is in — the one case where
+        // this call is the only way to reclaim the budget at all.
         let collectors = self
             .collectors
             .drop_session(&SessionId::Named(name.to_string()));
+        let session_result = self.sessions.drop_session(name);
+        if collectors == 0 {
+            // Nothing was reclaimed, so a missing session really is an error
+            // worth reporting rather than a no-op dressed as success.
+            session_result.map_err(|e| e.to_string())?;
+        }
         Ok(json!({ "dropped": name, "collectors_released": collectors }))
     }
 
@@ -1528,15 +1549,7 @@ impl RpcHandler {
                 ))
             }
         };
-        let group_keys: Vec<String> = params
-            .get("group_keys")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let group_keys = group_keys_of(params)?;
         let max_sample_bytes = params
             .get("max_sample_bytes")
             .and_then(|v| v.as_u64())
@@ -1681,14 +1694,19 @@ impl RpcHandler {
                 .map(|w| w.to_string())
                 .collect();
         }
-        let domain = match params.get("domain").and_then(|v| v.as_str()) {
-            None => None,
+        // Resolve the domain to its live instance, and carry its METRICS across
+        // with the pin. The identity check that decides whether ingest loss can
+        // be attributed is pointer equality on this handle, so a re-pin that
+        // moved the name but not the counters would report "the pinned domain
+        // is gone" about a domain it had just successfully re-pinned to.
+        let (domain, new_metrics) = match params.get("domain").and_then(|v| v.as_str()) {
+            None => (None, None),
             Some(d) => {
                 let id = DomainId::new(d).map_err(|e| e.to_string())?;
-                if self.domains.get(&id).is_none() {
+                let Some(dom) = self.domains.get(&id) else {
                     return Err(format!("domain \"{d}\" does not exist"));
-                }
-                Some(id)
+                };
+                (Some(id), Some(dom.metrics.clone()))
             }
         };
 
@@ -1702,14 +1720,13 @@ impl RpcHandler {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             level,
-            group_keys: params
-                .get("group_keys")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                }),
+            // Present-or-absent matters here (absent means "leave alone"), but
+            // when present it goes through the same width check as `add` — §7.1
+            // requires an edit to re-run every gate arming runs, and this is one.
+            group_keys: match params.get("group_keys") {
+                None => None,
+                Some(_) => Some(group_keys_of(params)?),
+            },
             max_sample_bytes: params
                 .get("max_sample_bytes")
                 .and_then(|v| v.as_u64())
@@ -1726,7 +1743,7 @@ impl RpcHandler {
 
         let out = self
             .collectors
-            .edit(session_id, name, change, Utc::now())
+            .edit(session_id, name, change, new_metrics, Utc::now())
             .map_err(|e| e.to_string())?;
         let def = out.collector.def();
         Ok(json!({
@@ -1956,15 +1973,10 @@ impl RpcHandler {
             .map(|w| w.to_string())
             .collect();
 
-        let group_keys: Vec<String> = params
-            .get("group_keys")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Checked here too, and this is the widest surface of the three: the
+        // throwaway collector below is built directly, so it never passes
+        // through the registry's reservation gate at all.
+        let group_keys = group_keys_of(params)?;
 
         // A throwaway collector fed the matching spans, so the ad-hoc path and
         // the armed path share one projection implementation rather than two
@@ -2146,6 +2158,37 @@ fn snapshot_as_profile(s: &StoredSnapshot) -> Value {
         // everywhere else, so a result that omitted it would be unquotable.
         "snapshot": s.label,
     })
+}
+
+/// Caller-supplied `group_keys`, refused if wider than the sample tier will
+/// allocate for.
+///
+/// The width is the one dimension the byte budget cannot see: the group-key
+/// column is reserved eagerly at `CHUNK_RECORDS * width * 4` bytes, so a tiny
+/// declared `max_sample_bytes` with a huge key list passes every reservation
+/// check and then asks for gigabytes — which `Vec::with_capacity` answers by
+/// aborting the process. Refused here, with the number, rather than clamped
+/// silently: a caller who asked to group by fifty things wants to know they did
+/// not get it.
+fn group_keys_of(params: &Value) -> Result<Vec<String>, String> {
+    let keys: Vec<String> = params
+        .get("group_keys")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.len() > MAX_GROUP_KEYS {
+        return Err(format!(
+            "too many group_keys ({} > {MAX_GROUP_KEYS}): each one costs a column in every \
+             retained sample, and the width is not covered by max_sample_bytes. Group by one \
+             attribute — that is the case this is built for",
+            keys.len()
+        ));
+    }
+    Ok(keys)
 }
 
 fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {

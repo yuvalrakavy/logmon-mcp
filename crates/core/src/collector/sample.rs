@@ -61,6 +61,22 @@ impl Level {
 /// 4 bytes per match per declared group key (§3.2).
 pub const BYTES_PER_GROUP_KEY: usize = 4;
 
+/// Declared group keys per collector.
+///
+/// **A hard cap, because the group-key column is allocated eagerly and is the
+/// one dimension the byte budget does not see.** `SampleChunk::with_capacity`
+/// reserves `CHUNK_RECORDS * n_group_keys * 4` bytes the moment a collector is
+/// constructed, while the daemon-wide reservation checks only the *declared*
+/// `max_sample_bytes`. So `max_sample_bytes: 1024` with a hundred thousand
+/// group keys passes every budget gate and then asks for gigabytes — and
+/// `Vec::with_capacity` answers an allocation failure with `handle_alloc_error`,
+/// which aborts the process rather than unwinding. One RPC call could stop the
+/// daemon.
+///
+/// Eight is far above real use: §13 defers multi-key `group_by` entirely, so
+/// the working case is one key.
+pub const MAX_GROUP_KEYS: usize = 8;
+
 /// Status and kind packed into one byte: status in bits 0–1, kind in bits 2–4.
 pub fn pack_flags(status: &SpanStatus, kind: &SpanKind) -> u8 {
     let s: u8 = match status {
@@ -189,6 +205,11 @@ pub struct SampleSnapshot {
 
 impl SampleTier {
     pub fn new(level: Level, n_group_keys: usize, max_bytes: usize) -> Self {
+        // Clamped rather than asserted: this is the allocation site, so it is
+        // the last place that can refuse an absurd width, and aborting the
+        // daemon is never the better outcome. Callers validate first and return
+        // a proper error; this is the backstop for one that forgets.
+        let n_group_keys = n_group_keys.min(MAX_GROUP_KEYS);
         Self {
             level,
             n_group_keys,

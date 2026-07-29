@@ -116,6 +116,22 @@ impl PersistedExact {
             .to_layout_checked()
             .ok_or_else(|| format!("unknown sketch layout `{}`", self.layout.algo))?;
         let sketch = DurationSketch::from_bytes(&self.sketch, layout)?;
+        // `well_formed_count()` is `count - negative - malformed` on `u64`, so a
+        // file whose counts disagree underflows to something astronomical and
+        // silently reports a near-zero average. Unreachable through this
+        // feature's own logic, which is exactly why it belongs here: this is the
+        // boundary where a hand-edited or half-written file arrives, and the
+        // rest of the loader already refuses what it cannot trust.
+        let excluded = self
+            .negative_duration_spans
+            .saturating_add(self.malformed_timestamps);
+        if excluded > self.count {
+            return Err(format!(
+                "inconsistent counts: {excluded} spans excluded from the sum but only \
+                 {} matched",
+                self.count
+            ));
+        }
         Ok(ExactStats::from_parts(
             self.count,
             self.total_ns

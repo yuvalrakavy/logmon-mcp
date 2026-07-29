@@ -3,6 +3,77 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## 0.5.1 — 2026-07-30
+
+Nine defects found by the pre-merge adversarial gate on 0.5.0, all in the
+collector work. Three finders over the frozen diff: line-by-line, cross-file
+tracing, and a mutation-based test-validity pass.
+
+### Fixed
+
+- **A large `group_keys` list could stop the daemon.** The group-key column is
+  reserved eagerly at `8192 × width × 4` bytes when a collector is built, and
+  the width is the one dimension `max_sample_bytes` never covered — so a tiny
+  declared budget with a huge key list passed every reservation check and then
+  asked for gigabytes, which `Vec::with_capacity` answers by *aborting the
+  process*. `traces.profile` was the widest surface: it builds its collector
+  directly and never passes the reservation gate at all. Now capped at 8 with
+  an error naming the number, checked on `add`, `edit` and `traces.profile`.
+
+- **Collectors no longer leak the daemon-wide reservation.** Four ways they
+  could, each leaving up to 64 MiB per collector held by something no RPC could
+  see or release:
+  - After a `kill -9`, collectors were restored but their owning session was
+    not — session names only reach `state.json` on a graceful exit, while
+    collector files are written through immediately. The owner is now
+    re-registered at boot so the existing TTL sweep can reclaim them.
+  - `session.rename` left `Entry::owner` behind, orphaning the renaming
+    session's own collectors. They now move with it.
+  - `session.drop` released collectors *after* dropping the session, so the `?`
+    aborted when the session was already gone — precisely the state a
+    restored-after-crash collector is in. Reordered.
+  - Rename *displacement* handed a dead session's collectors, including their
+    full recorded history, to whoever took the name. They are now cleared
+    alongside that session's bookmarks, which the code already claimed.
+
+- **Persistence no longer writes under the ingest lock.** Every collector write
+  did two `fsync`s while holding the registry lock that `ingest_span` needs on
+  every domain — so one slow disk could stall span ingest daemon-wide until the
+  channel overflowed and dropped spans. Bytes are now serialized under the lock
+  and written outside it. (`edit` keeps its persist-before-mutate ordering by
+  re-acquiring and re-validating.)
+
+- **`edit --domain` now carries the metrics handle.** Ingest attribution turns
+  on pointer equality of that handle, so a re-pin that moved the name but not
+  the counters reported *"the pinned domain is gone or was recreated"* about a
+  domain that existed and had just been re-pinned to — on the design's own
+  documented repair path for an orphaned collector.
+
+- **The boot temp-file sweep now reaches collector files.** It was
+  non-recursive, and collector temps live one directory down, so the files this
+  feature added were exactly the ones it missed.
+
+- **A large `skip_warmup_ms` no longer silently does nothing.** The cutoff used
+  unchecked `i64` addition; with no overflow checks in release it wrapped to a
+  large negative value, excluding nothing.
+
+- **A mutual parent cycle no longer corrupts self time.** Only direct
+  self-parenting was guarded, while the path walker already defended against
+  cycles on the same data.
+
+- **`snapshot` can no longer lose the run it just took** if the collector is
+  removed concurrently — the window is already swapped out by then, so it is
+  returned rather than turned into an error.
+
+- **A corrupt collector file with inconsistent counts is refused** rather than
+  underflowing `well_formed_count` into a nonsensical average.
+
+### Added
+
+- Three tests closing gaps the mutation finder proved were real: a child span
+  entirely outside its parent, `overlapping_child_spans` when nothing was
+  clipped, and a structural `edit` refused by the reservation.
+
 ## 0.5.0 — 2026-07-30
 
 `PROTOCOL_VERSION` stays at **1**, as in 0.4.0: new methods and new fields on

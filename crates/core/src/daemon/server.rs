@@ -201,7 +201,15 @@ pub async fn run_with_overrides(
     //     a crash between the write and the rename leaves the temp behind.
     //     The pid sweep above clears only `daemon.pid` and the socket, so
     //     without this each crash leaks a file forever.
-    let swept = crate::daemon::persistence::sweep_temp_files(&dir);
+    //     Both the config dir AND the collectors subdirectory: `atomic_write`
+    //     puts its temp beside its target, and collector files live one level
+    //     down, so sweeping only the top level misses exactly the files this
+    //     feature added. `load_all` will not reclaim them either — it filters
+    //     on a `.json` extension and a temp ends in `.tmp-write`.
+    let swept = crate::daemon::persistence::sweep_temp_files(&dir)
+        + crate::daemon::persistence::sweep_temp_files(
+            &dir.join(crate::collector::persist::COLLECTORS_DIR),
+        );
     if swept > 0 {
         info!(
             count = swept,
@@ -516,6 +524,37 @@ pub async fn run_with_overrides(
                 collectors = ?report.restored,
                 "restored collectors, armed but zeroed (a live window does not survive a restart)"
             );
+        }
+        // A collector's owner must be a session the daemon can still reach.
+        // Collector files are write-through on `add`, but a named session only
+        // reaches `state.json` on graceful shutdown — so after a `kill -9` the
+        // collectors come back and their owner does not, leaving them invisible
+        // to an owner-scoped `collectors.list`, unreachable by `session.drop`,
+        // and untouched by the TTL sweep, while still holding their share of a
+        // reservation that only four collectors fit inside. Registering the
+        // owner as a disconnected named session puts them back inside the
+        // normal lifecycle, so the existing sweep reclaims them.
+        for owner in collectors.owners() {
+            if let SessionId::Named(name) = &owner {
+                if sessions.get(&owner).is_none() {
+                    sessions.restore_named(
+                        name,
+                        &crate::daemon::persistence::PersistedSession {
+                            triggers: Vec::new(),
+                            filters: Vec::new(),
+                            client_info: None,
+                            bookmarks: Vec::new(),
+                        },
+                        &bookmark_store,
+                    );
+                    warn!(
+                        session = %name,
+                        "re-registered a session that owns collectors but was not in \
+                         state.json (its last shutdown was not graceful); its collectors \
+                         are reachable and sweepable again, its filters and triggers are lost"
+                    );
+                }
+            }
         }
         for (path, reason) in &report.quarantined {
             warn!(?path, %reason, "collector file moved aside; it could not be read");

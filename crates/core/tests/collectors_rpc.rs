@@ -5,6 +5,7 @@
 //! shapes a client actually sees — parameter parsing, admission, error text —
 //! rather than the projection layer, which has its own unit tests.
 
+use logmon_broker_core::collector::state::DEFAULT_MAX_SAMPLE_BYTES;
 use logmon_broker_core::daemon::domain::{
     Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
 };
@@ -663,6 +664,41 @@ fn editing_only_the_description_discards_nothing() {
 }
 
 #[test]
+fn a_structural_edit_that_would_exceed_the_budget_is_refused() {
+    // The code comment names three historical ways an edit walked past the
+    // reservation — a free max_sample_bytes raise among them — and mutation
+    // testing found the re-check itself had no test. Deleting it stayed green.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    // Two collectors, each holding a quarter of the daemon-wide reservation.
+    for name in ["a", "b"] {
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": name, "filter": "ALL", "max_sample_bytes": 64 * 1024 * 1024 }),
+        )
+        .expect("armed");
+    }
+    // Raising one to the whole budget cannot fit beside the other.
+    let err = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "a", "max_sample_bytes": 256 * 1024 * 1024u64 }),
+        )
+        .unwrap_err();
+    assert!(err.contains("remain"), "got: {err}");
+
+    // And the refusal changed nothing — the old size is still in force.
+    let listed = h.call(&sid, "collectors.list", json!({})).unwrap();
+    assert_eq!(
+        listed["reserved_bytes"],
+        (128 * 1024 * 1024u64),
+        "the reservation is unchanged after a refused edit"
+    );
+}
+
+#[test]
 fn a_level_may_be_lowered_which_is_the_only_remedy_for_an_exhausted_budget() {
     let h = harness();
     let sid = h.sessions.create_named("A").unwrap();
@@ -862,6 +898,213 @@ fn an_edit_cannot_re_pin_to_a_domain_that_does_not_exist() {
         )
         .unwrap_err();
     assert!(err.contains("does not exist"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Deep-gate findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_huge_group_key_list_is_refused_rather_than_allocated() {
+    // The group-key column is reserved eagerly at CHUNK_RECORDS * width * 4
+    // bytes, and the width is the one dimension max_sample_bytes does not
+    // cover — so a tiny declared budget with a huge key list passed every gate
+    // and then asked for gigabytes, which Vec::with_capacity answers by
+    // ABORTING the process. One RPC call could stop the daemon.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let many: Vec<String> = (0..50_000).map(|i| format!("k{i}")).collect();
+
+    for method in ["collectors.add", "traces.profile"] {
+        let err = h
+            .call(
+                &sid,
+                method,
+                json!({
+                    "name": "c", "filter": "ALL",
+                    "max_sample_bytes": 1024,
+                    "group_keys": many,
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("too many group_keys"),
+            "{method} must refuse it: {err}"
+        );
+    }
+
+    // And an edit cannot smuggle it in past the same gate.
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    assert!(h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "group_keys": many }),
+        )
+        .unwrap_err()
+        .contains("too many group_keys"));
+}
+
+#[test]
+fn an_absurd_warmup_does_not_silently_become_a_no_op() {
+    // skip_warmup_ms arrives unclamped. A plain `+` overflows i64, and the
+    // release profile has no overflow checks, so it wrapped to a large NEGATIVE
+    // cutoff — excluding nothing and turning the cut into a silent no-op.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL", "level": "timing" }),
+    )
+    .unwrap();
+    for i in 0..3 {
+        h.feed("default", &span_at("svc", "op", 10.0, i * 10_000_000));
+    }
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "c", "skip_warmup_ms": 1e16 }),
+        )
+        .expect("must not panic");
+    assert_eq!(
+        got["sampled"]["sample_count"], 0,
+        "an absurd cut excludes everything; wrapping would have excluded nothing"
+    );
+}
+
+#[test]
+fn a_rename_carries_its_collectors_and_does_not_inherit_a_displaced_session_s() {
+    // Two defects at once. Leaving Entry::owner behind orphaned the renaming
+    // session's own collectors: invisible to its owner-scoped list, unreachable
+    // by session.drop, never swept, still holding the reservation. And a
+    // DISPLACED holder's collectors — window and full history — became readable
+    // and removable by whoever took the name.
+    let h = harness();
+
+    // A disconnected session already holds the target name, with a collector.
+    let beta = h.sessions.create_named("beta").unwrap();
+    h.call(
+        &beta,
+        "collectors.add",
+        json!({ "name": "secret", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.sessions.disconnect(&beta);
+
+    let alpha = h.sessions.create_named("alpha").unwrap();
+    h.call(
+        &alpha,
+        "collectors.add",
+        json!({ "name": "mine", "filter": "ALL" }),
+    )
+    .unwrap();
+
+    h.call(&alpha, "session.rename", json!({ "name": "beta" }))
+        .expect("renamed, displacing the stale holder");
+
+    let now = SessionId::Named("beta".into());
+    let listed = h.call(&now, "collectors.list", json!({})).unwrap();
+    let names: Vec<&str> = listed["collectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"mine"), "kept its own: {names:?}");
+    assert!(
+        !names.contains(&"secret"),
+        "must NOT inherit another conversation's measurements: {names:?}"
+    );
+    // And the displaced one released its budget rather than leaking it.
+    assert_eq!(
+        h.collectors.reserved_bytes(),
+        DEFAULT_MAX_SAMPLE_BYTES,
+        "exactly one collector's worth reserved"
+    );
+}
+
+#[test]
+fn a_re_pin_carries_the_metrics_handle_so_ingest_stays_attributable() {
+    // The identity check behind ingest attribution is pointer equality on the
+    // metrics handle. Moving the domain but not the handle made every later
+    // read say "the pinned domain is gone or was recreated" about a domain that
+    // exists and had just been re-pinned to — on the design's own repair path.
+    let h = harness();
+    h.domains.insert(make_domain("t3"));
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.call(
+        &sid,
+        "collectors.edit",
+        json!({ "name": "c", "domain": "t3" }),
+    )
+    .expect("re-pinned");
+
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert!(
+        got["ingest"].is_object(),
+        "ingest must still be attributable after a re-pin, got: {}",
+        got["ingest"]
+    );
+    // And it collects on the new pin.
+    h.feed("t3", &span("svc", "op", 5.0));
+    assert_eq!(
+        h.call(&sid, "collectors.get", json!({ "name": "c" }))
+            .unwrap()["matched"],
+        1
+    );
+}
+
+#[test]
+fn dropping_a_session_reclaims_collectors_even_when_the_session_is_already_gone() {
+    // The state a restored-after-crash collector is in: its file came back but
+    // its session did not. Releasing collectors AFTER the session drop meant
+    // the `?` aborted on NotFound, so this call — the only way to reclaim that
+    // budget — could not.
+    let h = harness();
+    let sid = SessionId::Named("ghost".into());
+    h.collectors
+        .add(
+            &sid,
+            &DomainId::default_domain(),
+            Arc::new(ReceiverMetrics::new()),
+            logmon_broker_core::collector::state::CollectorDef {
+                name: "orphan".into(),
+                filter_string: "ALL".into(),
+                filter: logmon_broker_core::filter::parser::parse_filter("ALL").unwrap(),
+                level: logmon_broker_core::collector::sample::Level::Tree,
+                group_keys: vec![],
+                max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
+                description: None,
+            },
+            chrono::Utc::now(),
+        )
+        .expect("armed");
+    assert!(h.collectors.reserved_bytes() > 0);
+
+    let caller = h.sessions.create_named("live").unwrap();
+    h.call(&caller, "session.drop", json!({ "name": "ghost" }))
+        .expect("must succeed: there were collectors to reclaim");
+    assert_eq!(
+        h.collectors.reserved_bytes(),
+        0,
+        "the budget came back even though no session by that name existed"
+    );
 }
 
 // ---------------------------------------------------------------------------

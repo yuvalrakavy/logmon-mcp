@@ -183,6 +183,54 @@ fn a_child_starting_before_its_parent_is_clipped_at_both_ends() {
 }
 
 #[test]
+fn a_child_entirely_outside_its_parent_cannot_inflate_self_time() {
+    // Every other clip test uses a PARTIAL overlap. A fully disjoint child is
+    // the case where dropping `Interval::clip`'s `start < end` guard produces a
+    // degenerate interval whose "length" is negative — which, since the clamp
+    // only protects the low end, would inflate the parent's self time PAST its
+    // own duration. Found by mutation testing: the guard was load-bearing and
+    // nothing exercised it.
+    let spans = [
+        span("parent", 1, None, 0, 100 * MS),
+        // Starts after the parent has already ended.
+        span("elsewhere", 2, Some(1), 500 * MS, 600 * MS),
+    ];
+    let r = run(Level::Tree, &spans, ProfileOptions::default());
+    let s = r.sampled.unwrap();
+
+    // The child contributes nothing to the union, so the parent's self time is
+    // its whole duration — never more.
+    assert_eq!(
+        s.self_ms,
+        Some(200.0),
+        "parent 100 (all its own) + child 100"
+    );
+    assert_eq!(s.overlapping_child_ms, 100.0, "all of it was clipped away");
+    assert_eq!(s.overlapping_child_spans, 1);
+}
+
+#[test]
+fn a_fully_nested_child_is_not_counted_as_clipped() {
+    // `overlapping_child_spans` must count children that actually needed
+    // clipping. Counting every child would make a clean run look anomalous, and
+    // the millisecond figure alone cannot contradict it — adding zero leaves the
+    // sum correct while the count lies.
+    let spans = [
+        span("parent", 1, None, 0, 100 * MS),
+        span("inside", 2, Some(1), 10 * MS, 20 * MS),
+        span("also-inside", 3, Some(1), 30 * MS, 40 * MS),
+    ];
+    let s = run(Level::Tree, &spans, ProfileOptions::default())
+        .sampled
+        .unwrap();
+    assert_eq!(s.overlapping_child_ms, 0.0);
+    assert_eq!(
+        s.overlapping_child_spans, 0,
+        "nothing was clipped, so nothing may be reported as clipped"
+    );
+}
+
+#[test]
 fn v4b_one_large_clip_is_distinguishable_from_many_small_ones() {
     // Same total clipped mass, opposite remedies: one badly skewed clock
     // versus a systematic off-by-a-millisecond in the instrumentation.

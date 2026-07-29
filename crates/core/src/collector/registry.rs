@@ -349,13 +349,19 @@ impl CollectorRegistry {
         })
     }
 
-    /// Write one entry's file. Returns the failure rather than swallowing it,
-    /// so each caller can decide: `add` arms anyway, `snapshot` reports the
-    /// loss of durability, `edit` refuses outright.
-    fn persist(&self, entry: &Entry) -> Result<(), String> {
+    /// Write a prepared file. Returns the failure rather than swallowing it, so
+    /// each caller can decide: `add` arms anyway, `snapshot` reports the loss of
+    /// durability, `edit` refuses outright.
+    ///
+    /// **Takes the prepared file, not the entry, so it can be called with no
+    /// lock held.** `atomic_write` does two `fsync`s, and `ingest_span` takes
+    /// this registry's lock for reading on every domain's span processor — so a
+    /// write under the lock lets one slow fsync stall span ingest daemon-wide
+    /// until the 65 536-slot channel overflows and starts dropping. Bookkeeping
+    /// must not be able to cost telemetry.
+    fn write(&self, file: &crate::collector::persist::PersistedCollector) -> Result<(), String> {
         let Some(dir) = &self.dir else { return Ok(()) };
-        let file = entry.to_persisted();
-        crate::collector::persist::save(dir, &file).map_err(|e| {
+        crate::collector::persist::save(dir, file).map_err(|e| {
             tracing::error!(
                 collector = %file.name, error = %e,
                 "could not persist collector; it will not survive a restart"
@@ -406,7 +412,12 @@ impl CollectorRegistry {
         // A failure here does not refuse the arm. The caller wants to measure
         // something now; losing durability is worse than nothing but far
         // better than refusing to collect at all, and the error is logged.
-        let _ = self.persist(g.last().expect("just pushed"));
+        //
+        // Serialized under the lock, written outside it: the write does two
+        // fsyncs and this lock gates every domain's ingest.
+        let file = g.last().expect("just pushed").to_persisted();
+        drop(g);
+        let _ = self.write(&file);
         Ok(collector)
     }
 
@@ -422,14 +433,20 @@ impl CollectorRegistry {
     /// must not happen under it, and a destructive change must not commit
     /// until the write succeeds. So: validate and build under the lock,
     /// persist, then swap — an edit whose persist fails has changed nothing.
+    /// `new_metrics` must be the re-pinned domain's counters whenever
+    /// `change.domain` is set — the caller has already resolved that domain to
+    /// check it exists, so it is the only place that can supply them.
     pub fn edit(
         &self,
         owner: &SessionId,
         name: &str,
         change: CollectorEdit,
+        new_metrics: Option<Arc<ReceiverMetrics>>,
         now: DateTime<Utc>,
     ) -> Result<EditOutcome, RegistryError> {
-        let mut g = self.entries.write().expect("registry lock poisoned");
+        // Read-only in this first phase: everything is validated and the file is
+        // built before anything is mutated, so the write can be the commit point.
+        let g = self.entries.write().expect("registry lock poisoned");
         let idx = g
             .iter()
             .position(|e| &e.owner == owner && e.collector.def().name == name)
@@ -504,17 +521,32 @@ impl CollectorRegistry {
         // live collector while the on-disk definition still held the old
         // filter — so a restart would resurrect a definition the caller
         // believes they replaced.
-        if let Some(dir) = &self.dir {
-            let file = g[idx].persisted_with(&def, &target_domain);
-            crate::collector::persist::save(dir, &file).map_err(|e| {
-                RegistryError::PersistFailed(format!(
-                    "the edit was not applied because it could not be made durable: {e}"
-                ))
-            })?;
-        }
+        let file = g[idx].persisted_with(&def, &target_domain);
+        drop(g);
+        self.write(&file).map_err(|e| {
+            RegistryError::PersistFailed(format!(
+                "the edit was not applied because it could not be made durable: {e}"
+            ))
+        })?;
 
+        // Re-acquire and re-find: the write happened with no lock held, so the
+        // collector could have been removed under us. Nothing has been mutated
+        // yet, so reporting it gone is accurate rather than a partial edit.
+        let mut g = self.entries.write().expect("registry lock poisoned");
+        let idx = g
+            .iter()
+            .position(|e| &e.owner == owner && e.collector.def().name == name)
+            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
         let entry = &mut g[idx];
         entry.domain = target_domain;
+        // The metrics handle must move with the pin. Left behind, the identity
+        // check in `ingest_basis` fails forever and every later read reports
+        // "the pinned domain is gone or was recreated" about a domain that is
+        // present and was just re-pinned to — on the design's own sanctioned
+        // repair path for an orphaned collector.
+        if let Some(m) = new_metrics {
+            entry.metrics = m;
+        }
         if structural {
             entry.collector = Arc::new(Collector::new(def, now));
             entry.ingest_baseline = entry.metrics.trace_ingest_loss();
@@ -643,12 +675,32 @@ impl CollectorRegistry {
             ingest,
             projections,
         );
+        // The window was already taken in step 1, so a collector removed under
+        // us must NOT turn into an error: that would discard a run the caller
+        // asked to keep and which exists nowhere else. Return it instead, and
+        // say it could not be filed.
         let mut g = self.entries.write().expect("registry lock poisoned");
-        let e = g
+        let file = match g
             .iter_mut()
             .find(|e| &e.owner == owner && e.collector.def().name == name)
-            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
-        e.history.push(snap.clone());
+        {
+            Some(e) => {
+                e.history.push(snap.clone());
+                Some(e.to_persisted())
+            }
+            None => None,
+        };
+        drop(g);
+        let Some(file) = file else {
+            return Ok(SnapshotOutcome {
+                snapshot: snap,
+                persist_error: Some(
+                    "the collector was removed while this snapshot was being taken, so the \
+                     run is in this response only — it is in no history and was not written"
+                        .into(),
+                ),
+            });
+        };
         // §6.1 says "does not zero unless the write succeeded". This deviates,
         // deliberately, because the swap above is what makes the recorded
         // window and the fresh one unable to overlap or lose a span — deferring
@@ -657,7 +709,7 @@ impl CollectorRegistry {
         // run, and here it cannot: the run is returned to the caller and is in
         // the in-memory history, which the next successful write persists. What
         // is genuinely at risk is durability, so that is what gets reported.
-        let persist_error = self.persist(e).err();
+        let persist_error = self.write(&file).err();
         Ok(SnapshotOutcome {
             snapshot: snap,
             persist_error,
@@ -707,6 +759,32 @@ impl CollectorRegistry {
         Ok(())
     }
 
+    /// Move every collector owned by `old` to `new`, rewriting their files.
+    ///
+    /// A rename that left `Entry::owner` behind would orphan the session's own
+    /// collectors: invisible to its owner-scoped `list`, unreachable by
+    /// `session.drop` (the old name no longer resolves), and untouched by the
+    /// TTL sweep (it iterates the session map) — while still holding their
+    /// share of a daemon-wide reservation that only four collectors fit inside.
+    pub fn rename_owner(&self, old: &SessionId, new: &SessionId) -> usize {
+        let files: Vec<_> = {
+            let mut g = self.entries.write().expect("registry lock poisoned");
+            let mut moved = Vec::new();
+            for e in g.iter_mut().filter(|e| &e.owner == old) {
+                e.owner = new.clone();
+                moved.push((e.to_persisted(), e.collector.def().name.clone()));
+            }
+            moved
+        };
+        // The filename embeds the owner, so a rename is a new file plus an old
+        // one to unlink — done outside the lock, like every other write.
+        for (file, name) in &files {
+            let _ = self.write(file);
+            self.delete_file(old, name);
+        }
+        files.len()
+    }
+
     fn delete_file(&self, owner: &SessionId, name: &str) {
         if let Some(dir) = &self.dir {
             crate::collector::persist::delete(dir, &owner.to_string(), name);
@@ -716,17 +794,41 @@ impl CollectorRegistry {
     /// Drop every collector owned by a session — the lifecycle counterpart of
     /// session disposal.
     pub fn drop_session(&self, owner: &SessionId) -> usize {
-        let mut g = self.entries.write().expect("registry lock poisoned");
-        let doomed: Vec<String> = g
-            .iter()
-            .filter(|e| &e.owner == owner)
-            .map(|e| e.collector.def().name.clone())
-            .collect();
-        g.retain(|e| &e.owner != owner);
+        let doomed: Vec<String> = {
+            let mut g = self.entries.write().expect("registry lock poisoned");
+            let doomed: Vec<String> = g
+                .iter()
+                .filter(|e| &e.owner == owner)
+                .map(|e| e.collector.def().name.clone())
+                .collect();
+            g.retain(|e| &e.owner != owner);
+            doomed
+        };
+        // Unlink outside the lock: it is filesystem work on the path that gates
+        // every domain's ingest.
         for name in &doomed {
             self.delete_file(owner, name);
         }
         doomed.len()
+    }
+
+    /// Every distinct owner with at least one live collector.
+    ///
+    /// Exists so the daemon can guarantee an owner is a session it can still
+    /// reach. A collector file is written through on `add`, but a named session
+    /// only reaches `state.json` on graceful shutdown — so after a `kill -9` the
+    /// collectors come back and their owner does not, leaving them invisible to
+    /// an owner-scoped `list`, unreachable by `session.drop`, and untouched by
+    /// the TTL sweep, while still holding their share of the reservation.
+    pub fn owners(&self) -> Vec<SessionId> {
+        let g = self.entries.read().expect("registry lock poisoned");
+        let mut seen: Vec<SessionId> = Vec::new();
+        for e in g.iter() {
+            if !seen.contains(&e.owner) {
+                seen.push(e.owner.clone());
+            }
+        }
+        seen
     }
 
     /// Bytes reserved across every armed collector.

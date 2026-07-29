@@ -1,2 +1,5 @@
 /target
 .superpowers/
+
+# Agent worktrees and local Claude Code state — never project content.
+.claude/

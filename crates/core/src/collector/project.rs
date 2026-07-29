@@ -369,7 +369,13 @@ fn warmup_cutoff_ns(samples: &SampleSnapshot, ms: f64) -> Option<i64> {
     // start, not the daemon's idea of when the window opened. A run whose
     // spans arrive late would otherwise have its whole warm-up cut missed.
     let min_start = samples.records().map(|r| r.start_ns).min()?;
-    Some(min_start + (ms * 1_000_000.0) as i64)
+    // Saturating, because `ms` arrives unclamped from an RPC parameter. A plain
+    // `+` overflows on a large value, and the release profile has no overflow
+    // checks — so it would wrap to a large NEGATIVE cutoff, which excludes
+    // nothing and turns the warm-up cut into a silent no-op. Saturating instead
+    // excludes everything: visibly wrong beats invisibly absent.
+    let offset_ns = (ms * 1_000_000.0).min(i64::MAX as f64) as i64;
+    Some(min_start.saturating_add(offset_ns))
 }
 
 fn sampled_view(
@@ -512,8 +518,13 @@ fn self_time(
             continue;
         };
         // A span that is its own parent would otherwise subtract its whole
-        // duration from itself. Malformed, but it arrives over a network.
-        if p == i {
+        // duration from itself. Malformed, but it arrives over a network — and
+        // so does a MUTUAL pair, where each claims the other as its child and
+        // the resulting self time matches neither span's duration nor their
+        // union. `walk_path` already defends against cycles on this same data
+        // with a visited set; this is the same hazard on the same input, so it
+        // gets the same treatment at the depth a child lookup can afford.
+        if p == i || by_id.get(&(traces[p], parents[p])) == Some(&i) {
             continue;
         }
         nested_matches += 1;
