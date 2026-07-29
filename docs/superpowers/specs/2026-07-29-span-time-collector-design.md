@@ -1043,9 +1043,14 @@ round 2 validated.
 ## 17. Implementation status — updated 2026-07-29
 
 Branch `feat/span-time-collector`. **Phase 1 is complete.** Everything below is
-committed, with the full workspace suite green (62 result lines), clippy silent, and
-`cargo xtask verify-schema` clean. The protocol crate now carries the `Profile*`
-types and the schema has been regenerated.
+committed, with the full workspace suite green (63 result lines with
+`--features logmon-broker-core/test-support`), clippy silent, and
+`cargo xtask verify-schema` clean. The protocol crate now carries the `Profile*` and
+`Collectors*` types and the schema has been regenerated.
+
+The end-to-end test is the one worth re-running first after any change here: it posts
+real OTLP over a real socket and checks hand-computed totals, so it fails on a broken
+seam rather than a broken unit.
 
 ### Landed
 
@@ -1065,6 +1070,8 @@ types and the schema has been regenerated.
 | Wire types | `protocol/methods.rs` | §5.1 — the **complete** field set; core builds them directly, so there is no mirror to drift. |
 | Contract surface | `daemon/rpc_handler.rs` | §7 — `collectors.add\|list\|get\|reset\|remove`, `traces.profile`. |
 | MCP surface | `mcp/server.rs` | 6 tools, 1:1 with the RPC methods. 33 → 39. |
+| CLI + SDK mirror | `mcp/cli/collectors.rs`, `sdk/methods.rs` | §7 — `logmon-mcp collectors add\|list\|get\|reset\|remove\|profile`. |
+| End-to-end | `tests/collector_end_to_end.rs` | Real OTLP/HTTP → real daemon → collector → RPC. Hand-computed numbers, exact match. |
 | `traces.slow` repair | `daemon/rpc_handler.rs`, `span/store.rs` | §1.1 — full population, display floor, §5.7 rank, folded inside the read guard. |
 | A14 | `benches/span_ingest.rs`, `tests/collector_concurrency.rs` | Observer effect measured *and* asserted. |
 
@@ -1120,6 +1127,12 @@ are the deviations, and they are deliberate.
   `log_processor`, `session_registry`, `trigger_window_defaults`). Not mine; leave them.
 - Taking the **read** lock in `CollectorRegistry::reset` does not compile — the baseline
   update needs a mutable borrow. The borrow checker enforces there what a test samples.
+- On the **OTLP** transports `port = 0` means *disabled*; it means kernel-assigned only
+  for GELF. A real-receiver test has to bind free ports itself.
+- `receivers_info` entries are `UDP:` / `TCP:` / `gRPC:` / `HTTP:` — not `OTLP-HTTP:`.
+- The state directory is overridable **only** through `DaemonOverrides` (the test
+  harness). There is no env var or flag, so a second daemon cannot be started alongside
+  a developer's own — use `spawn_with_real_receivers_config`.
 
 ### Working discipline that has been paying
 
