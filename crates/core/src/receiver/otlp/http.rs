@@ -1,6 +1,6 @@
 use crate::gelf::message::{LogEntry, LogSource};
 use crate::receiver::otlp::mapping::*;
-use crate::receiver::{ReceiverMetrics, ReceiverSource};
+use crate::receiver::{ReceiverMetrics, ReceiverSource, TraceTransport};
 use crate::span::types::*;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use chrono::Utc;
@@ -448,6 +448,9 @@ async fn handle_traces(
 
 async fn handle_traces_inner(state: &AppState, body: serde_json::Value) -> StatusCode {
     if channel_used_pct(&state.span_sender) >= BACKPRESSURE_THRESHOLD_PCT {
+        state
+            .metrics
+            .record_trace_batch_shed(TraceTransport::OtlpHttp);
         return StatusCode::TOO_MANY_REQUESTS;
     }
 
@@ -460,12 +463,19 @@ async fn handle_traces_inner(state: &AppState, body: serde_json::Value) -> Statu
                 for ss in scope_spans {
                     if let Some(spans) = ss.get("spans").and_then(|v| v.as_array()) {
                         for span_json in spans {
-                            if let Some(entry) = parse_json_span(span_json, &service) {
-                                let _ = state.metrics.try_send_span(
-                                    &state.span_sender,
-                                    entry,
-                                    ReceiverSource::OtlpHttpTraces,
-                                );
+                            match parse_json_span(span_json, &service) {
+                                Some(entry) => {
+                                    let _ = state.metrics.try_send_span(
+                                        &state.span_sender,
+                                        entry,
+                                        ReceiverSource::OtlpHttpTraces,
+                                    );
+                                }
+                                // Previously an `if let` with no else, so a
+                                // span rejected here vanished without trace.
+                                None => state
+                                    .metrics
+                                    .record_trace_malformed(TraceTransport::OtlpHttp),
                             }
                         }
                     }
@@ -554,7 +564,44 @@ mod tests {
         // nothing is dropped at the per-entry level. The 429 response IS
         // the backpressure signal; the body is rejected wholesale.
         assert_eq!(state.metrics.snapshot().otlp_http_traces, 0);
+        // But the shed IS counted, and this is precisely the case the drop
+        // counter cannot see: a collector reading only `otlp_http_traces`
+        // would call this window clean while a whole batch went unread.
+        let loss = state.metrics.trace_ingest_loss();
+        assert_eq!(loss.shed_batches, 1);
+        assert_eq!(loss.dropped, 0, "shedding is not dropping");
+        assert!(!loss.is_clean(), "the window lost spans and must say so");
         drop(span_rx); // explicit drop after assertions to make it clear we kept it alive
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_span_rejected_at_parse_is_counted_as_malformed() {
+        let (state, _log_rx, _span_rx) = make_state(10, 10);
+        let body = serde_json::json!({
+            "resourceSpans": [{
+                "resource": { "attributes": [] },
+                "scopeSpans": [{
+                    "spans": [
+                        { "traceId": "zz", "spanId": "0102030405060708", "name": "bad-trace-id" },
+                        {
+                            "traceId": "0102030405060708090a0b0c0d0e0f10",
+                            "spanId":  "0102030405060708",
+                            "name": "good"
+                        }
+                    ]
+                }]
+            }]
+        });
+
+        assert_eq!(handle_traces_inner(&state, body).await.as_u16(), 200);
+        let loss = state.metrics.trace_ingest_loss();
+        assert_eq!(loss.malformed, 1, "the unparseable span is accounted for");
+        assert_eq!(loss.dropped, 0);
+        assert_eq!(
+            state.span_sender.capacity(),
+            9,
+            "and the good one still went through"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

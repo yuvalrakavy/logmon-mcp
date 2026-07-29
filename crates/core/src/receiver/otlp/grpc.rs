@@ -1,6 +1,6 @@
 use crate::gelf::message::{LogEntry, LogSource};
 use crate::receiver::otlp::mapping::*;
-use crate::receiver::{ReceiverMetrics, ReceiverSource};
+use crate::receiver::{ReceiverMetrics, ReceiverSource, TraceTransport};
 use crate::span::types::*;
 use chrono::Utc;
 use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -267,6 +267,8 @@ impl TraceService for OtlpTraceService {
         let req = request.into_inner();
 
         if channel_used_pct(&self.span_sender) >= BACKPRESSURE_THRESHOLD_PCT {
+            self.metrics
+                .record_trace_batch_shed(TraceTransport::OtlpGrpc);
             return Err(Status::unavailable(
                 "broker span channel under backpressure",
             ));
@@ -282,22 +284,30 @@ impl TraceService for OtlpTraceService {
 
             for scope_spans in resource_spans.scope_spans {
                 for span in scope_spans.spans {
+                    // Both counters move together: `malformed_count` is the
+                    // service's own tally and the metrics one is what a
+                    // collector reads to decide whether its window lost spans.
+                    let malformed = || {
+                        self.malformed_count.fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .record_trace_malformed(TraceTransport::OtlpGrpc);
+                    };
                     let trace_id = match bytes_to_trace_id(&span.trace_id) {
                         Some(id) => id,
                         None => {
-                            self.malformed_count.fetch_add(1, Ordering::Relaxed);
+                            malformed();
                             continue;
                         }
                     };
                     let span_id = match bytes_to_span_id(&span.span_id) {
                         Some(id) => id,
                         None => {
-                            self.malformed_count.fetch_add(1, Ordering::Relaxed);
+                            malformed();
                             continue;
                         }
                     };
                     if span.name.is_empty() {
-                        self.malformed_count.fetch_add(1, Ordering::Relaxed);
+                        malformed();
                         continue;
                     }
 
@@ -453,6 +463,61 @@ mod tests {
         // Counter stays at 0 — the UNAVAILABLE response IS the backpressure signal,
         // body was rejected wholesale before any per-entry try_send_span.
         assert_eq!(metrics.snapshot().otlp_grpc_traces, 0);
+        // The shed is counted separately, so a collector reading span loss is
+        // not blind to the transport's primary load-shedding path.
+        assert_eq!(metrics.trace_ingest_loss().shed_batches, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trace_service_counts_each_way_a_span_can_be_rejected_at_parse() {
+        let (svc, _rx, metrics) = make_trace_service(10);
+        let bad = |span: Span| {
+            Request::new(ExportTraceServiceRequest {
+                resource_spans: vec![ResourceSpans {
+                    resource: None,
+                    scope_spans: vec![ScopeSpans {
+                        scope: None,
+                        spans: vec![span],
+                        schema_url: String::new(),
+                    }],
+                    schema_url: String::new(),
+                }],
+            })
+        };
+
+        // All three rejection arms, so a future edit cannot lose one silently.
+        for span in [
+            Span {
+                trace_id: vec![0; 16], // all-zero trace id
+                span_id: vec![1; 8],
+                name: "n".into(),
+                ..Default::default()
+            },
+            Span {
+                trace_id: vec![1; 16],
+                span_id: vec![0; 8], // all-zero span id
+                name: "n".into(),
+                ..Default::default()
+            },
+            Span {
+                trace_id: vec![1; 16],
+                span_id: vec![1; 8],
+                name: String::new(), // empty name
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                svc.export(bad(span)).await.is_ok(),
+                "a bad span is not an error to the client"
+            );
+        }
+
+        assert_eq!(metrics.trace_ingest_loss().malformed, 3);
+        assert_eq!(
+            svc.malformed_count.load(Ordering::Relaxed),
+            3,
+            "the service's own tally and the collector-visible one agree"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

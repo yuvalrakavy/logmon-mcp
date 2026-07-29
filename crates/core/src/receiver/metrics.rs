@@ -39,6 +39,61 @@ impl ReceiverSource {
 
 const WARN_INTERVAL_NANOS: i64 = 60_000_000_000; // 60 seconds
 
+/// The two transports a span can arrive on.
+///
+/// Deliberately narrower than [`ReceiverSource`]: the span-loss counters below
+/// exist so a collector can say whether spans went missing during its window,
+/// and a GELF burst or a log-side 429 must not be able to reach them. Making
+/// that a type rather than a convention means a log call site cannot feed span
+/// accounting even by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceTransport {
+    OtlpHttp,
+    OtlpGrpc,
+}
+
+/// The three ways a span is lost before it can reach a collector, summed over
+/// both OTLP trace transports.
+///
+/// They are kept apart because they call for different remedies: `dropped`
+/// means the broker's channel was full, `shed_batches` means the broker refused
+/// whole request bodies and told the client so, and `malformed` means the spans
+/// were unusable on arrival. Only the first was previously counted, which is
+/// why a collector could report a clean window through a run that lost most of
+/// its spans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceIngestLoss {
+    /// Per-span, channel full at `try_send_span`.
+    pub dropped: u64,
+    /// Whole request bodies rejected with 429 / UNAVAILABLE before any span in
+    /// them was parsed. The span count behind these is unknowable — the body
+    /// was never read — so this is a count of *batches*, and its name says so.
+    pub shed_batches: u64,
+    /// Discarded at parse: unusable trace id, unusable span id, or empty name.
+    pub malformed: u64,
+}
+
+impl TraceIngestLoss {
+    /// The loss accumulated between two readings of the same counters.
+    ///
+    /// `saturating_sub` throughout: the caller is expected to have checked that
+    /// both readings came from the same `ReceiverMetrics` instance, but a
+    /// wrapped-around subtraction would turn a small bookkeeping mistake into a
+    /// vast fabricated loss, which is worse than reporting zero.
+    pub fn since(self, baseline: Self) -> Self {
+        Self {
+            dropped: self.dropped.saturating_sub(baseline.dropped),
+            shed_batches: self.shed_batches.saturating_sub(baseline.shed_batches),
+            malformed: self.malformed.saturating_sub(baseline.malformed),
+        }
+    }
+
+    /// Whether anything at all was lost.
+    pub fn is_clean(self) -> bool {
+        self == Self::default()
+    }
+}
+
 /// Snapshot of all drop counters, suitable for status.get RPC payloads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReceiverDropSnapshot {
@@ -57,6 +112,15 @@ pub struct ReceiverMetrics {
     otlp_http_traces: AtomicU64,
     otlp_grpc_logs: AtomicU64,
     otlp_grpc_traces: AtomicU64,
+    /// Trace request bodies refused wholesale under backpressure. Counted
+    /// separately from the drop counters above and NOT surfaced as a
+    /// `receiver_drops` figure, because those two mean different things to a
+    /// client: a drop is silent data loss, a shed is a 429 the client saw.
+    otlp_http_traces_shed: AtomicU64,
+    otlp_grpc_traces_shed: AtomicU64,
+    /// Spans discarded at parse time, per transport.
+    otlp_http_traces_malformed: AtomicU64,
+    otlp_grpc_traces_malformed: AtomicU64,
     /// Unix-epoch nanos of the last warn emission. Initialised to a value
     /// that ensures the first drop always warns.
     last_warn_nanos: AtomicI64,
@@ -90,6 +154,10 @@ impl ReceiverMetrics {
             otlp_http_traces: AtomicU64::new(0),
             otlp_grpc_logs: AtomicU64::new(0),
             otlp_grpc_traces: AtomicU64::new(0),
+            otlp_http_traces_shed: AtomicU64::new(0),
+            otlp_grpc_traces_shed: AtomicU64::new(0),
+            otlp_http_traces_malformed: AtomicU64::new(0),
+            otlp_grpc_traces_malformed: AtomicU64::new(0),
             last_warn_nanos: AtomicI64::new(i64::MIN),
             gelf_udp_last: AtomicI64::new(i64::MIN),
             gelf_tcp_last: AtomicI64::new(i64::MIN),
@@ -157,6 +225,45 @@ impl ReceiverMetrics {
                 source = source.as_str(),
                 "receiver dropped entry due to channel backpressure"
             );
+        }
+    }
+
+    /// Record one trace request body refused wholesale under backpressure.
+    ///
+    /// Called from the 429 / UNAVAILABLE gate, which returns *before* any span
+    /// in the body is parsed — so no per-span counter can ever move for it.
+    /// That gate is the primary load-shedding mechanism on these transports and
+    /// it engages exactly when load is high, which is the variable under test
+    /// in any before/after comparison. Left uncounted, a collector would report
+    /// a spotless window through the run that lost the most spans.
+    pub fn record_trace_batch_shed(&self, transport: TraceTransport) {
+        match transport {
+            TraceTransport::OtlpHttp => &self.otlp_http_traces_shed,
+            TraceTransport::OtlpGrpc => &self.otlp_grpc_traces_shed,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one span discarded at parse time.
+    pub fn record_trace_malformed(&self, transport: TraceTransport) {
+        match transport {
+            TraceTransport::OtlpHttp => &self.otlp_http_traces_malformed,
+            TraceTransport::OtlpGrpc => &self.otlp_grpc_traces_malformed,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Span loss across both OTLP trace transports.
+    ///
+    /// Trace sources only. Including the GELF or OTLP-log counters here would
+    /// let a log burst mark a span collector's window untrustworthy on a run
+    /// that lost no spans at all.
+    pub fn trace_ingest_loss(&self) -> TraceIngestLoss {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        TraceIngestLoss {
+            dropped: g(&self.otlp_http_traces) + g(&self.otlp_grpc_traces),
+            shed_batches: g(&self.otlp_http_traces_shed) + g(&self.otlp_grpc_traces_shed),
+            malformed: g(&self.otlp_http_traces_malformed) + g(&self.otlp_grpc_traces_malformed),
         }
     }
 
@@ -238,6 +345,71 @@ mod tests {
         assert_eq!(snap.otlp_http_logs, 2);
         assert_eq!(snap.gelf_udp, 1);
         assert_eq!(snap.otlp_http_traces, 0);
+    }
+
+    #[test]
+    fn trace_loss_ignores_every_non_trace_source() {
+        // The reason this matters: a GELF burst during a run must not mark a
+        // span collector's window as having lost spans. It lost logs.
+        let m = ReceiverMetrics::new();
+        for source in [
+            ReceiverSource::GelfUdp,
+            ReceiverSource::GelfTcp,
+            ReceiverSource::OtlpHttpLogs,
+            ReceiverSource::OtlpGrpcLogs,
+        ] {
+            m.record_drop(source);
+        }
+        assert!(
+            m.trace_ingest_loss().is_clean(),
+            "no span was lost, whatever the log side did"
+        );
+
+        m.record_drop(ReceiverSource::OtlpHttpTraces);
+        m.record_drop(ReceiverSource::OtlpGrpcTraces);
+        assert_eq!(
+            m.trace_ingest_loss().dropped,
+            2,
+            "both trace transports count toward span loss"
+        );
+    }
+
+    #[test]
+    fn shed_and_malformed_are_counted_apart_from_drops_and_from_each_other() {
+        let m = ReceiverMetrics::new();
+        m.record_trace_batch_shed(TraceTransport::OtlpHttp);
+        m.record_trace_batch_shed(TraceTransport::OtlpGrpc);
+        m.record_trace_malformed(TraceTransport::OtlpHttp);
+
+        let loss = m.trace_ingest_loss();
+        assert_eq!(loss.shed_batches, 2);
+        assert_eq!(loss.malformed, 1);
+        assert_eq!(loss.dropped, 0);
+        // And none of it leaked into the wire-facing drop snapshot, which
+        // documents itself as counting only entries the broker silently lost.
+        assert_eq!(m.snapshot(), ReceiverDropSnapshot::default());
+    }
+
+    #[test]
+    fn a_window_delta_never_reports_more_loss_than_happened() {
+        let m = ReceiverMetrics::new();
+        m.record_drop(ReceiverSource::OtlpHttpTraces);
+        let baseline = m.trace_ingest_loss();
+        m.record_drop(ReceiverSource::OtlpHttpTraces);
+        m.record_trace_batch_shed(TraceTransport::OtlpGrpc);
+
+        let delta = m.trace_ingest_loss().since(baseline);
+        assert_eq!(delta.dropped, 1, "only what happened inside the window");
+        assert_eq!(delta.shed_batches, 1);
+
+        // A baseline ahead of the reading means the counters were reset under
+        // us. Zero is the honest answer; wrapping would fabricate 18 quintillion.
+        let stale = TraceIngestLoss {
+            dropped: 99,
+            shed_batches: 99,
+            malformed: 99,
+        };
+        assert!(m.trace_ingest_loss().since(stale).is_clean());
     }
 
     #[tokio::test(flavor = "current_thread")]

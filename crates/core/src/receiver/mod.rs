@@ -2,7 +2,9 @@ pub mod gelf;
 pub mod metrics;
 pub mod otlp;
 
-pub use metrics::{ReceiverDropSnapshot, ReceiverMetrics, ReceiverSource};
+pub use metrics::{
+    ReceiverDropSnapshot, ReceiverMetrics, ReceiverSource, TraceIngestLoss, TraceTransport,
+};
 
 use async_trait::async_trait;
 
