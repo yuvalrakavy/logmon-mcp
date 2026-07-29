@@ -8,6 +8,7 @@
 //! OTLP pre-binds, §9.3) so a port clash surfaces as a clean `Err` here rather
 //! than a silently-dead task.
 
+use crate::collector::registry::CollectorRegistry;
 use crate::daemon::domain::{Domain, DomainConfig, DomainId, DomainReceivers, DomainSource};
 use crate::daemon::log_processor::spawn_log_processor;
 use crate::daemon::session::SessionRegistry;
@@ -50,6 +51,7 @@ pub async fn spawn_ephemeral_domain(
     log_buffer_size: usize,
     span_buffer_size: usize,
     sessions: Arc<SessionRegistry>,
+    collectors: Arc<CollectorRegistry>,
     source: DomainSource,
 ) -> anyhow::Result<Arc<Domain>> {
     let (log_tx, log_rx) = mpsc::channel::<LogEntry>(LOG_CHANNEL_CAP);
@@ -108,6 +110,7 @@ pub async fn spawn_ephemeral_domain(
         domain.span_store.clone(),
         sessions,
         domain.pipeline.clone(),
+        collectors,
         id,
     );
 

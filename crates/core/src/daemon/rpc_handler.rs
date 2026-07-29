@@ -1,3 +1,4 @@
+use crate::collector::registry::CollectorRegistry;
 use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
@@ -96,6 +97,8 @@ pub struct RpcHandler {
     /// unchanged.
     domains: Arc<DomainRegistry>,
     sessions: Arc<SessionRegistry>,
+    /// Daemon-wide, domain-keyed collector registry (spec section 4.4).
+    collectors: Arc<CollectorRegistry>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
     domain_policy: DomainPolicy,
@@ -115,12 +118,14 @@ impl RpcHandler {
     pub fn new(
         domains: Arc<DomainRegistry>,
         sessions: Arc<SessionRegistry>,
+        collectors: Arc<CollectorRegistry>,
         receivers_info: Vec<String>,
         domain_policy: DomainPolicy,
     ) -> Self {
         Self {
             domains,
             sessions,
+            collectors,
             start_time: std::time::Instant::now(),
             receivers_info,
             domain_policy,
@@ -341,6 +346,7 @@ impl RpcHandler {
             log_buffer_size,
             span_buffer_size,
             self.sessions.clone(),
+            self.collectors.clone(),
             DomainSource::Ephemeral,
         )
         .await

@@ -224,6 +224,10 @@ pub async fn run_with_overrides(
     //    BookmarkStore is created here (rather than later) so persisted
     //    bookmarks can be hydrated alongside triggers/filters during restore.
     let sessions = Arc::new(SessionRegistry::new());
+    // Daemon-wide, domain-keyed collector registry (spec section 4.4). One
+    // instance shared by every span processor; entries carry their own pinned
+    // domain, so a collector is never reached via its owner's current binding.
+    let collectors = Arc::new(crate::collector::registry::CollectorRegistry::new());
     let bookmark_store = Arc::new(crate::store::bookmarks::BookmarkStore::new());
     for (name, persisted) in &state.named_sessions {
         sessions.restore_named(name, persisted, &bookmark_store);
@@ -258,6 +262,7 @@ pub async fn run_with_overrides(
                 span_store.clone(),
                 sessions.clone(),
                 pipeline.clone(),
+                collectors.clone(),
                 DomainId::default_domain(),
             );
             (rx, None, None, Vec::<String>::new())
@@ -343,6 +348,7 @@ pub async fn run_with_overrides(
                 span_store.clone(),
                 sessions.clone(),
                 pipeline.clone(),
+                collectors.clone(),
                 DomainId::default_domain(),
             );
             (
@@ -431,6 +437,7 @@ pub async fn run_with_overrides(
             log_sz,
             span_sz,
             sessions.clone(),
+            collectors.clone(),
             DomainSource::Config,
         )
         .await
@@ -458,6 +465,7 @@ pub async fn run_with_overrides(
     let handler = Arc::new(RpcHandler::new(
         domains.clone(),
         sessions.clone(),
+        collectors.clone(),
         all_receivers_info,
         DomainPolicy {
             max_domains: config.max_domains,

@@ -65,6 +65,7 @@ fn build_handler() -> (Arc<RpcHandler>, Arc<LogPipeline>, Arc<SessionRegistry>) 
     let handler = Arc::new(RpcHandler::new(
         domains,
         sessions.clone(),
+        Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new()),
         vec!["test".into()],
         DomainPolicy {
             max_domains: 32,
@@ -265,6 +266,7 @@ fn anonymous_bookmark_cleanup_spans_all_touched_domains() {
     let handler = Arc::new(RpcHandler::new(
         domains,
         sessions.clone(),
+        Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new()),
         vec!["test".into()],
         DomainPolicy {
             max_domains: 32,

@@ -381,7 +381,11 @@ impl SessionRegistry {
             .iter()
             .filter(|(_, s)| {
                 !s.connected.load(Ordering::Relaxed)
-                    && s.last_seen.lock().expect("last_seen lock poisoned").elapsed() > ttl
+                    && s.last_seen
+                        .lock()
+                        .expect("last_seen lock poisoned")
+                        .elapsed()
+                        > ttl
             })
             .map(|(id, _)| id.clone())
             .collect()

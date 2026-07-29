@@ -1,3 +1,4 @@
+use crate::collector::registry::CollectorRegistry;
 use crate::daemon::domain::DomainId;
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::SessionRegistry;
@@ -14,11 +15,19 @@ pub fn spawn_span_processor(
     span_store: Arc<SpanStore>,
     sessions: Arc<SessionRegistry>,
     pipeline: Arc<LogPipeline>,
+    collectors: Arc<CollectorRegistry>,
     domain: DomainId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(span) = receiver.recv().await {
-            process_span_for_domain(&span, &span_store, &sessions, &pipeline, &domain);
+            process_span_for_domain(
+                &span,
+                &span_store,
+                &sessions,
+                &pipeline,
+                &collectors,
+                &domain,
+            );
         }
     })
 }
@@ -31,12 +40,22 @@ pub fn process_span_for_domain(
     store: &SpanStore,
     sessions: &SessionRegistry,
     pipeline: &LogPipeline,
+    collectors: &CollectorRegistry,
     domain: &DomainId,
 ) {
     // 1. Store unconditionally (SpanStore assigns seq)
     store.insert(span.clone());
 
-    // 2. Evaluate span triggers for each session bound to this domain.
+    // 2. Fold into any collector pinned to this domain whose filter matches.
+    //
+    // Ahead of trigger evaluation because it is the cheaper of the two and
+    // does not depend on it. Reached through a DOMAIN-keyed registry rather
+    // than through the sessions bound to this domain: a collector's pin is its
+    // own, so a `use_domain` call by its owning session must not silently stop
+    // it (§4.4).
+    collectors.ingest_span(domain, span);
+
+    // 3. Evaluate span triggers for each session bound to this domain.
     //
     // `evaluate_span` matches against each trigger's STORED `ParsedFilter`.
     // This loop used to clone a `TriggerInfo` per trigger per span and then
@@ -76,7 +95,17 @@ pub fn process_span(
     sessions: &SessionRegistry,
     pipeline: &LogPipeline,
 ) {
-    process_span_for_domain(span, store, sessions, pipeline, &DomainId::default_domain());
+    // No collectors: this helper exists for trigger-side unit tests, and an
+    // empty registry is the honest stand-in rather than a hidden global.
+    let collectors = CollectorRegistry::new();
+    process_span_for_domain(
+        span,
+        store,
+        sessions,
+        pipeline,
+        &collectors,
+        &DomainId::default_domain(),
+    );
 }
 
 fn build_trace_summary(trace_id: u128, store: &SpanStore) -> Option<TraceSummary> {

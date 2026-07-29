@@ -110,6 +110,21 @@ pub struct Collector {
     inner: RwLock<Inner>,
 }
 
+/// Deliberately shallow: the definition and a count, never the contents.
+/// A collector holds up to its whole sample budget, so a derived `Debug` would
+/// turn any diagnostic print into megabytes.
+impl std::fmt::Debug for Collector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let matched = self.inner.read().map(|g| g.total.count).unwrap_or_default();
+        f.debug_struct("Collector")
+            .field("name", &self.def.name)
+            .field("filter", &self.def.filter_string)
+            .field("level", &self.def.level)
+            .field("matched", &matched)
+            .finish()
+    }
+}
+
 impl Collector {
     pub fn new(def: CollectorDef, now: DateTime<Utc>) -> Self {
         let inner = Inner::new(&def, now);

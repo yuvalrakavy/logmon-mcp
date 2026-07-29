@@ -148,7 +148,15 @@ fn span_trigger_in_one_domain_does_not_receive_another_domains_spans() {
 
     // A slow span in domain A. B's span trigger must not receive it.
     let span = make_span("slow_A", 600.0);
-    process_span_for_domain(&span, &a.span_store, &sessions, &a.pipeline, a.id());
+    let collectors = logmon_broker_core::collector::registry::CollectorRegistry::new();
+    process_span_for_domain(
+        &span,
+        &a.span_store,
+        &sessions,
+        &a.pipeline,
+        &collectors,
+        a.id(),
+    );
 
     assert!(
         sessions.drain_notifications(&sb).is_empty(),
