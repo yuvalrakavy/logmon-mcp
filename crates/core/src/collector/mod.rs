@@ -7,4 +7,5 @@
 //! the shape of the question does not have to be known when collection starts.
 
 pub mod exact;
+pub mod sample;
 pub mod sketch;
