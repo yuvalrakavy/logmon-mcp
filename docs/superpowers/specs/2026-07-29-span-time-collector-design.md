@@ -1155,6 +1155,45 @@ Three things worth knowing before touching this again:
   byte-identical final contents; only a reader racing the writer can tell them
   apart. The single-threaded version of that test passed against the mutant.
 
+### Deep gate — run 2026-07-30 on `4115c46`, nine defects, all fixed in `123f9b1`
+
+**Merged and deployed: `master` at `123f9b1`, tag `v0.5.1`, live daemon 0.5.1.**
+Phases 1–3 complete. Three fresh-context finders over the frozen diff:
+line-by-line (sonnet), cross-file tracing (strongest), test-validity by mutation
+(sonnet, own worktree).
+
+The gate found nine defects in code that was already **tested green, clippy-clean,
+and deployed**. That is the evidence for keeping it, stated as a number.
+
+| Defect | Class |
+|---|---|
+| A large `group_keys` list aborts the process (eager `8192 × width × 4` alloc, budget-blind; `traces.profile` never passes the reservation gate at all) | **remote DoS, one call** |
+| Four budget-leak paths: `kill -9`, `session.rename`, `session.drop` ordering, rename displacement | lifecycle |
+| Two `fsync`s under the lock that gates every domain's ingest | latency → span loss |
+| `edit --domain` left the metrics handle behind → false "domain is gone" | wrong output |
+| Boot temp sweep non-recursive, missing the files this feature added | leak |
+| `skip_warmup_ms` overflow → cut silently a no-op | wrong output |
+| Mutual parent cycle corrupts self time | wrong output |
+| `snapshot` could error away a run it had already swapped out | data loss |
+| Corrupt file underflows `well_formed_count` | wrong output |
+
+**Facts worth not re-deriving:**
+
+- `MAX_GROUP_KEYS = 8`. The group-key column is the one dimension
+  `max_sample_bytes` does not cover, and `Vec::with_capacity` answers an
+  allocation failure with `handle_alloc_error` — an **abort**, not an unwind.
+- **Never write a collector file under the registry lock.** `ingest_span` takes
+  it for reading on every domain. Serialize under it, write outside it.
+- **The metrics handle must move with the pin.** Attribution is `Arc::ptr_eq`.
+- **A collector's owner must be a session the daemon can reach.** Collector files
+  are write-through; session names reach `state.json` only on graceful shutdown.
+  `restore` re-registers the owner to reconcile the two regimes.
+- The mutation finder proved three green mutations **inert** rather than reporting
+  them as gaps — one via a 200 k-trial differential fuzzer. Distinguishing
+  untested from untestable is most of that lens's value.
+- `.claude/` is now git-ignored: an agent worktree was committed as an embedded
+  repo and caught in the commit output.
+
 ### Not yet built
 
 1. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
@@ -1164,8 +1203,17 @@ Three things worth knowing before touching this again:
    shutdown path is involved at all — which is what §12's objection to `restart()`
    was actually about. A true out-of-process test additionally needs a config-dir
    override; there is no env var or flag for it, only `DaemonOverrides`.
-3. Phase 4 (**comparison**: `collectors.diff`, `collectors.document`), phase 5
-   (**guards**: threshold triggers).
+3. **Phase 4 — comparison.** `collectors.diff` (§5.6) and `collectors.document`
+   (§9). Read those two sections first; both are unusually specified. §5.6's table
+   of mark/block/refuse conditions is the load-bearing part, and the error bound
+   is `α(a+b)/|a−b|` — **not** √2·α, which an earlier revision got wrong. §9's
+   document is written for a reader who does *not* have the authoring context,
+   so it earns a **cold-reader lens** at design time (hand a fresh agent only the
+   rendered artifact, barred from spec and code, and ask what it cannot conclude).
+4. **Phase 5 — guards.** Threshold triggers (§8), built rather than reused.
+5. **Micro-retro is owed** for this branch, and the log is past five entries since
+   the last `## Consolidated through` marker — so `/process-retro` is due before
+   the next feature starts, not after.
 3. **`status.get` does not surface the new counters.** Deliberate: `receiver_drops`
    documents itself as counting entries the broker *silently* lost, and both transports
    carry a comment explaining why a shed is not one of those. Adding a sibling field is

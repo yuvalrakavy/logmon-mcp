@@ -106,3 +106,52 @@ none of the five entries** — invisible or unused, and absence of evidence is n
 drop it. Still unpromoted after two costings: the **0-tool-use finder guard** (2026-07-15,
 logged as "second time"); no recurrence 2026-07-29, where all eight lenses used 21–52 tool
 calls each.
+
+## 2026-07-30 span time collector, phases 1–3 (T2)
+
+- time: design ~35% (3 gate rounds + a probe) / implement ~30% / test ~15% / review ~15% /
+  friction ~5% — but wall-clock is misleading: a multi-hour permission-classifier outage
+  blocked every `cargo` and `git` call mid-phase-3.
+- catches: probe=1 self-review=4 gate=9 user=3 post-merge=0
+  - **gate=9 is the headline.** Nine defects in code already tested green, clippy-clean,
+    schema-verified AND DEPLOYED. One was a single-RPC process abort (unbounded
+    `group_keys` → eager `8192×width×4` alloc → `handle_alloc_error`, which aborts rather
+    than unwinds). Four were budget-leak paths. One was two `fsync`s under the lock that
+    gates every domain's ingest — three lines below my own comment saying "I/O must not
+    happen under it".
+  - **self-review=4, and 3 of them came from being UNABLE to build.** With `cargo` blocked
+    I hand-audited instead and found `with_def` dropping the sample tier (would give
+    `sample_count < count` with `complete: true`), `edit` persisting after mutating, and
+    `snapshot` not recording why the window emptied. Inspection found what a green suite
+    had not.
+  - user=3: "are the docs updated?" (twice — and the second ask found three surfaces I had
+    missed, incl. the SDK README's whole record-type section); "merge to main before
+    restarting" (correct sequencing I had not proposed).
+- friction:
+  - **Classifier outage, hours, UNGUARDED.** Every `cargo`/`git`/`ls` refused while
+    `grep` intermittently passed. Mitigations that worked: hand-auditing (3 real bugs),
+    batching all remaining verification into one script so a single lucky window finishes
+    it, and `run_in_background` for anything near the 10-min cap.
+  - **A version bump invalidates every crate**, so `cargo test` + `git commit` chained in
+    one call blew the 10-minute timeout and took the commit down with it. >15 min. GUARDED
+    below.
+  - Agent worktree committed as an embedded git repo; caught in the commit output. `.claude/`
+    now git-ignored. GUARDED.
+  - Deployed before the gate finished (at user request, to resolve a shim/daemon version
+    mismatch that was already erroring). For ~1 h the live daemon held the DoS and the
+    leaks. Nothing armed a collector, so nothing bit — but the ordering was luck, not design.
+- tier-call: **right (T2)**, and the contract-surface rule earned it — the tier was called on
+  the wire/persisted format, not the component.
+- delegation: 3 gate finders — line-by-line (sonnet), cross-file depth (strongest),
+  test-validity by mutation (sonnet, own worktree). All three produced confirmed findings.
+  The mutation finder was the best value: 15/21 caught, and for the 6 green it **proved 3
+  inert rather than reporting them as gaps** (one via a 200k-trial differential fuzzer).
+  Distinguishing untested from untestable is most of that lens's worth.
+- improve: **two candidates, both from >15-min costs.**
+  1. *Never chain re-verification and commit in one call after a version bump.* Commit
+     first, verify after — or background the verify. The failure mode is losing the commit
+     to a timeout, not losing the verification.
+  2. *A deploy that precedes its gate is a decision, not a default.* It happened for a
+     defensible reason, but the skill has no line about it. Candidate: when a gate is
+     in flight and a deploy is requested, say what is unreviewed and name the rollback
+     before doing it.
