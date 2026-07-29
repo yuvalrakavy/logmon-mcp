@@ -3,6 +3,73 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## Unreleased
+
+### Added
+
+- **Span time collectors.** Arm a filter, run a workload, read aggregate
+  timings — the measurement logmon could not do before, when the only way to
+  answer "did that change make it faster" was to eyeball individual traces.
+
+  `add_collector` / `list_collectors` / `get_collector` / `reset_collector` /
+  `remove_collector`, plus `profile_traces` for the same numbers over spans
+  already in the buffer. Mirrored to the CLI as `logmon-mcp collectors …`.
+
+  Three retention levels trade memory for what can be asked: `scalar` (counts
+  and totals, no per-span records), `timing` (adds percentiles, wall-clock
+  union, warm-up exclusion), `tree` (adds self time, nesting detection and
+  call paths). `group_keys` splits every number by a span attribute, which is
+  how both arms of an A/B run in one pass — and it reads attribute values
+  directly, so a boolean kill-switch works, which it does not on the filter
+  path.
+
+  A result reports three categories that are **not** three views of one
+  number: `exact` covers every matched span for the collector's life,
+  `estimated` covers the same population to ±1% via a sketch, and `sampled` is
+  exact over retained records — the whole population only while `complete` is
+  true. Anything that cannot be computed is `null` with a named reason and
+  usually a remedy, because `null` and `0` are different claims.
+
+  Self time uses a clipped interval union, not a sum of children. A 100 ms
+  parent with two concurrent 60 ms children has 40 ms of self time; summing
+  gives −20, and clamping that to zero reports a parent that did no work of
+  its own — on exactly the `tokio::spawn` workload the feature exists to
+  measure.
+
+  Cost, measured: about 0.21 µs per armed collector against a 4.10 µs ingest
+  baseline, or 20% at the four-collector reservation ceiling.
+
+- **Span loss is now counted.** `ReceiverMetrics` gained per-transport counters
+  for whole batches shed under backpressure and for spans rejected at parse.
+  Neither was visible before: HTTP sheds whole request bodies at 80% channel
+  occupancy and returns 429 *before* parsing anything, so no per-span counter
+  moved; malformed spans bumped a gRPC field nothing read, and on HTTP were not
+  counted at all. A collector reports these as a window delta so a run can say
+  whether it lost spans while it was measuring.
+
+### Fixed
+
+- **`get_slow_spans(group_by="name")` aggregated a doubly-biased sample.** It
+  grouped the output of the slow-span query, which filters by a duration floor
+  and then truncates to `count` — so `avg_ms` was the mean of the slowest few
+  above a floor, presented as the mean for that span name. A name that ran
+  10 ms a hundred times and 500 ms three times reported 500.
+
+  It now aggregates the full matching population, and `min_duration_ms` is a
+  display floor selecting which *names* appear rather than which spans count.
+  New `population`, `display_floor_ms`, per-row `max_ms` and `p50_ms` make the
+  basis visible: a low `avg_ms` beside a high `max_ms` means "usually fast,
+  with a tail", which the old shape could not express. `p95_ms` also follows
+  the lower-quantile convention — the previous `floor(n × 0.95)` returned the
+  maximum at n = 20. The ungrouped arm is unchanged: a list of the slowest
+  spans is not an aggregate, and truncating it is what it is for.
+
+- **Span triggers re-parsed their filter for every span.** Evaluation went
+  through the filter *string*, so each bound session re-parsed — and
+  recompiled the seeded regex — once per span. Per-span ingest cost at four
+  bound sessions was 118.6 µs; it is now 4.66 µs, and nearly flat in session
+  count rather than linear.
+
 ## 0.3.0 — 2026-07-25
 
 ### Fixed

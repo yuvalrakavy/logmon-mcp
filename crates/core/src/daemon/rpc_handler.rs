@@ -1318,7 +1318,14 @@ impl RpcHandler {
         self.sessions
             .drop_session(name)
             .map_err(|e| e.to_string())?;
-        Ok(json!({ "dropped": name }))
+        // Collectors are owned by the session and hold a slice of a daemon-wide
+        // reservation that only four default-sized collectors fit inside. A
+        // dropped session that kept them would take that budget to the grave —
+        // nobody could arm a collector again until the daemon restarted.
+        let collectors = self
+            .collectors
+            .drop_session(&SessionId::Named(name.to_string()));
+        Ok(json!({ "dropped": name, "collectors_released": collectors }))
     }
 
     // -----------------------------------------------------------------------
@@ -1443,6 +1450,18 @@ impl RpcHandler {
             }
         }
         removed
+    }
+
+    /// Release a session's collectors and the sample budget they reserved.
+    ///
+    /// Deliberately **not** called when a named session merely disconnects.
+    /// Arming a collector, running a workload, and reading the result later is
+    /// the whole point of the feature, and a CLI invocation disconnects between
+    /// every one of those steps. Named sessions therefore keep their collectors
+    /// exactly as they keep their bookmarks; the TTL sweep and an explicit
+    /// `session.drop` are what bound the reservation.
+    pub fn clear_session_collectors(&self, session_id: &SessionId) -> usize {
+        self.collectors.drop_session(session_id)
     }
 
     fn sweep_bookmarks(&self, d: &Domain) {

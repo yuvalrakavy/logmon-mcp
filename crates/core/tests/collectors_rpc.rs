@@ -278,6 +278,73 @@ fn a_collector_keeps_following_its_pinned_domain_after_the_owner_rebinds() {
     );
 }
 
+#[test]
+fn dropping_a_session_hands_back_its_sample_reservation() {
+    // The reservation is daemon-wide and fits about four default-sized
+    // collectors. A dropped session that kept them would take that budget with
+    // it, and nothing could be armed again until the daemon restarted.
+    let h = harness();
+    let sid = h.sessions.create_named("doomed").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .expect("armed");
+    assert!(h.collectors.reserved_bytes() > 0);
+
+    // `session.drop` refuses a connected session, and a named session keeps its
+    // collectors across a disconnect on purpose — that IS the arm, run, read
+    // workflow. So the disconnect first, and the budget must survive it.
+    h.sessions.disconnect(&sid);
+    assert!(
+        h.collectors.reserved_bytes() > 0,
+        "a disconnect alone must not discard an armed collector"
+    );
+
+    let dropped = h
+        .call(&sid, "session.drop", json!({ "name": "doomed" }))
+        .expect("dropped");
+    assert_eq!(dropped["collectors_released"], 1, "and it says how many");
+    assert_eq!(
+        h.collectors.reserved_bytes(),
+        0,
+        "the budget is available again"
+    );
+}
+
+#[test]
+fn clearing_a_sessions_collectors_leaves_every_other_session_alone() {
+    let h = harness();
+    let a = h.sessions.create_named("A").unwrap();
+    let b = h.sessions.create_named("B").unwrap();
+    h.call(
+        &a,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.call(
+        &b,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+
+    assert_eq!(h.handler.clear_session_collectors(&a), 1);
+    assert_eq!(
+        h.call(&b, "collectors.list", json!({})).unwrap()["count"],
+        1,
+        "B's collector survives A's disposal"
+    );
+    assert_eq!(
+        h.call(&a, "collectors.list", json!({})).unwrap()["count"],
+        0
+    );
+    // Idempotent: a TTL sweep can race an explicit drop.
+    assert_eq!(h.handler.clear_session_collectors(&a), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Ingest accounting (§5.1.1)
 // ---------------------------------------------------------------------------

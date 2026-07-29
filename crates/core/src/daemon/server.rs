@@ -497,8 +497,14 @@ pub async fn run_with_overrides(
                 interval.tick().await;
                 for id in sessions.expired_disconnected(ttl) {
                     let cleared = handler.clear_session_bookmarks(&id);
+                    // The TTL is what bounds the collector reservation: a named
+                    // session keeps its collectors across a disconnect (that is
+                    // the arm-run-read workflow), so this sweep is the only
+                    // thing that ever hands the budget back.
+                    let collectors = handler.clear_session_collectors(&id);
                     sessions.dispose(&id);
                     info!(session = %id, bookmarks_cleared = cleared,
+                        collectors_released = collectors,
                         "session TTL sweep: disposed (disconnected past TTL)");
                 }
             }
@@ -965,12 +971,18 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via snapshot).
+    // Collectors follow the same rule and for the same reason: an anonymous
+    // session cannot be reconnected to, so anything it armed is unreachable
+    // and its share of the sample reservation is pure leak.
     if matches!(session_id, SessionId::Anonymous(_)) {
         let removed = handler.clear_session_bookmarks(&session_id);
-        if removed > 0 {
+        let collectors = handler.clear_session_collectors(&session_id);
+        if removed > 0 || collectors > 0 {
             info!(
                 ?session_id,
-                removed, "cleared anonymous-session bookmarks on disconnect"
+                removed,
+                collectors,
+                "cleared anonymous-session bookmarks and collectors on disconnect"
             );
         }
     }
