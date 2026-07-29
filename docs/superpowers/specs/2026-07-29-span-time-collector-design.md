@@ -90,9 +90,11 @@ Verified against the tree at `a08c119`.
 8. `traces.profile` — the same projection over the ring buffer, no collector needed.
 9. `collectors.diff` — deltas at every percentile, with mismatch refusals; accepts
    snapshots on either side.
-10. `collectors.document` — a self-describing, long-lived record of a collector and
-    its full snapshot history, written for a reader months later (§9); folded-stack
-    output for speedscope / flamegraph.pl is one of its formats.
+10. `collectors.document` — a long-lived record of a collector and its full snapshot
+    history, designed backwards from what a reader months later needs: triage
+    front-matter, the recorded question and finding, the computed comparison, a
+    noise floor, and a stated set of limitations (§9). Folded-stack output for
+    speedscope / flamegraph.pl is one of its formats.
 11. Threshold triggers on collectors (phase 5).
 12. Fixing the `traces.slow` grouping bias (§1.1).
 
@@ -544,8 +546,9 @@ them and states that it did, rather than presenting a plausible-looking blend.
 ### 6.6 Descriptions
 
 `description` on the collector (set at `add`, editable); `label` + `description` on
-each snapshot, plus free-form `meta` key/values (§9.3). All are echoed in every read,
-diff, history entry, and document.
+each snapshot, plus free-form `meta` key/values carrying the provenance logmon cannot
+infer — commit, build profile, varied configuration (§9.3). All are echoed in every
+read, diff, history entry, and document.
 
 This is the "a load-bearing number carries the context it was measured in" rule
 enforced by the data structure rather than by memory: there is no path on which a
@@ -569,7 +572,7 @@ Following the existing `noun.verb` convention (`triggers.add`, `traces.slow`).
 | `collectors.reset` | `reset_collector` | **Discard** without recording. Returns what it cleared. |
 | `collectors.remove` | `remove_collector` | |
 | `collectors.diff` | `diff_collectors` | §5.6. Either side may be `collector@label`. |
-| `collectors.document` | `document_collector` | §9. Accepts several collectors in one call. |
+| `collectors.document` | `document_collector` | §9. Params: `names`, `format`, `path`, and the operator-supplied `question` / `finding` that logmon cannot infer. Accepts several collectors in one call. |
 | `traces.profile` | `profile_spans` | Same projection over the ring buffer. Accepts bookmark windows (`b>=`/`b<=`) — already supported on span filters. |
 
 `collectors.snapshot` recording and zeroing in one call makes run→record→zero→run
@@ -637,60 +640,136 @@ a data file, and this produces an artefact meant to be read. (`report` was the
 alternative; `document` won because the artefact is a durable record, not a one-time
 summary.)
 
-### 9.2 Contents
+### 9.2 Derived from the reader's four questions
 
-Default `format: "md"` — a self-contained Markdown document:
+The contents below are not a wish list; each item earns its place by answering one of
+the four questions a consumer actually asks, in order. Anything answering none of them
+does not belong in the document.
 
-- **A preamble explaining how to read it.** Specifically the `exact` / `estimated` /
-  `sampled` distinction and what `complete: false` means. This is unusual for a data
-  format and correct here: the three-category structure exists to stop a degraded
-  number being quoted as an exact one, and that protection is worthless to a reader
-  who no longer remembers the convention. Roughly a kilobyte of static prose.
+| The reader asks | Which means the document must |
+|---|---|
+| Is this about my thing? | Be triageable **without being read** — across a directory of thirty files (§9.3) |
+| Can I trust it, and is it comparable to what I am about to run? | Carry its environment and its own limits (§9.4, §9.6) |
+| What did it conclude? | Record the question and the finding, not only the data (§9.3) |
+| Was the effect real or noise? | Quantify run-to-run spread when it can (§9.5) |
+
+### 9.3 Triage front-matter
+
+The document opens with a YAML front-matter block — small, fixed-schema, and
+`grep`-able, so thirty documents can be scanned without opening any of them:
+
+```yaml
+format_version: 1
+collector: cache-ab
+question: "Does the schema cache reduce total time in store_server spans?"
+finding: "Yes — total work −38%; p95 unchanged, so it helps the common path only."
+measured_at: 2026-07-29T14:02:11Z
+filter: "sv=store_server"
+filter_intent: "all server-side work, broad on purpose so call paths resolve"
+services: [store_server]
+git_sha: a08c119
+build_profile: release
+parallelism: 16
+host: imac-studio
+runs: 6
+trustworthy: true          # false when any arm was truncated or single-run
+headline: "sum_ms 1234567 → 765432 (−38.0%)"
+```
+
+Three of these fields carry most of the triage weight and none of them were in the
+earlier draft:
+
+- **`question` / `finding`.** Data alone is a log; a recorded conclusion is memory.
+  These are supplied by the operator at document time — logmon cannot infer either,
+  and a document that omits them makes a future reader re-derive a judgement that was
+  already made once.
+- **`filter_intent`.** A filter string is precise and nearly useless as a relevance
+  signal months on. One plain sentence about what was deliberately in and out of scope
+  is what actually decides "is this about my thing".
+- **`build_profile`.** The single most damaging silent mismatch available: comparing a
+  debug-build measurement against a release run is worse than having no prior data,
+  because it looks like data. It sits in front-matter rather than buried in `meta`
+  for that reason.
+
+Recommended filename `YYYY-MM-DD-<collector>-<slug>.md`, so `ls` alone is informative.
+
+### 9.4 Body
+
+- **A short how-to-read note** — the `exact` / `estimated` / `sampled` distinction and
+  what `complete: false` means. Unusual for a data format and correct here: the
+  three-category structure exists to stop a degraded number being quoted as an exact
+  one, and that protection is worth nothing to a reader who no longer remembers the
+  convention. This is *not* the triage block; §9.3 answers "should I read this", this
+  answers "how do I read the numbers".
 - **Collector definition** — filter, level, `group_keys`, snapshot policy,
-  description, and `meta` (§9.3).
-- **One section per snapshot** — label, description, `taken_at`, window, and the
-  scalar/percentile tables.
-- **The full per-span-name vocabulary**, not just the top rows. A reader comparing two
-  documents from months apart needs to see that span names appeared or disappeared —
-  that is the signal that the code changed underneath and the comparison is no longer
-  apples to apples. logmon cannot compute this across two files, so its job is to make
-  sure the file contains what the reader needs to spot it.
-- **An embedded JSON block** at the end carrying the complete data, including raw
-  histogram buckets and their layout, so nothing in the document is lossy.
+  description, `meta`.
+- **One section per snapshot** — label, description, `taken_at`, window, `meta`, and
+  the scalar/percentile tables. Units in every column header; `_ms` suffixes retained
+  in field names.
+- **The computed comparison, not just its inputs.** Where snapshots form arms, the
+  document carries the deltas at every percentile (§5.6) already worked out. A reader
+  months later should not be subtracting forty numbers by hand to recover a conclusion
+  that was obvious at the time.
+- **The full per-span-name vocabulary**, not the top rows. A reader comparing two
+  documents from months apart needs to see that names appeared or disappeared — the
+  signal that the code moved underneath and the comparison is no longer apples to
+  apples. logmon cannot compute this across two files it will never read again, so its
+  job is to ensure the file contains what the reader needs to spot it.
 
-`format: "json"` writes that block alone. `format: "folded"` emits
-`nameA;nameB;nameC <self_time_us>` per snapshot — the §5.4 path projection for
-speedscope and flamegraph.pl. Requires `tree`.
+`format: "json"` writes the structured data alone. `format: "folded"` emits
+`nameA;nameB;nameC <self_time_us>` per snapshot for speedscope and flamegraph.pl;
+requires `tree`. Several collectors may be named in one call, so documenting a whole
+session is one operation.
 
-Multiple collectors may be named in one call, so documenting a whole session is one
-operation.
+### 9.5 Noise floor
 
-### 9.3 `meta` — the provenance logmon cannot infer
+When an arm has two or more snapshots, the document reports the run-to-run spread —
+min, max, and coefficient of variation across repeats of the *same* configuration.
 
-Free-form key/value pairs on collectors and on snapshots, echoed into the document:
-`{"git_sha": "a08c119", "config": "cache=on", "host": "imac-studio"}`.
+This is the only thing in the document that lets a future reader decide whether a
+past result should influence a new decision. An 8 % improvement above a 2 % noise
+floor is a finding; the same 8 % above a 15 % floor is nothing, and without the floor
+recorded at measurement time it is unrecoverable afterwards. When an arm has a single
+run, the document says the floor is unknown rather than implying stability.
 
-Months later, "sum was 1 234 567 ms" is uninterpretable without knowing what code
-produced it, and logmon has no way to know what a git SHA is. Every consumer does.
-This is the difference between an archive and a number, and it costs a map.
+### 9.6 What the document must admit
 
-The documentation should establish recording the commit and the varied configuration
-as the convention — a document without provenance is a measurement that cannot be
-acted on.
+A short, always-present section stating what the measurement *cannot* tell you:
+which numbers were estimated and to what bound, whether any arm was truncated,
+whether warm-up was excluded and by how much, that a raw sum under N-way parallelism
+is total work rather than wall clock, that spans outside the filter are absent
+entirely, and — when several services appear — that cross-process clock skew reaches
+wall-union and path timings (§4.3).
 
-### 9.4 Two details that only matter at this timescale
+Every one of these is knowable at document time and unrecoverable later. A reader who
+has to *infer* the limitations will get some of them wrong.
 
-- **Histogram bucket layout travels inside the file**, never assumed from the reading
-  side's defaults. Otherwise a later change to the default layout would silently shift
-  every percentile in every older document.
+### 9.7 Sizing: document small, data beside it
+
+The readable document stays small — target tens of KB — and bulk data goes in a
+sidecar named in the front-matter: raw histogram buckets, per-trace tables, and any
+`raw_sample_bytes` prefix.
+
+**This reverses an earlier draft** that embedded the complete JSON in the document to
+keep it self-contained. From the reading seat that is backwards: the consumer loads
+this file into a limited context, and a multi-megabyte blob means either it cannot be
+opened or it consumes the budget the analysis needed. Self-containment is worth less
+than being readable at all. The document remains useful standalone; the sidecar is
+fetched only when the analysis needs the raw distribution.
+
+### 9.8 Two details that only matter at this timescale
+
+- **Histogram bucket layout travels with the buckets**, never assumed from the reading
+  side's defaults. Otherwise a later change to the default layout silently shifts every
+  percentile in every older document.
 - **`format_version` is stamped.** Informational rather than enforced — nothing
   imports, so there is no compatibility gate to fail — but a reader must be able to
-  tell what convention it is looking at.
+  tell which convention it is looking at.
 
 Because nothing re-imports, there is no round-trip correctness obligation and no
 format compatibility contract to break. This surface is ordinary T2: the failure mode
-is a document that *reads* misleadingly, which is a writing problem, not a data
--integrity one.
+is a document that *reads* misleadingly, which is a writing problem rather than a
+data-integrity one.
 
 ---
 
@@ -741,6 +820,8 @@ silent fallback:
 | Group histogram cap reached | Group keeps exact scalars only; result says so (§3.5) |
 | `document` with `format: "folded"` on a non-`tree` collector | Error naming the level required |
 | `document` of a collector with no snapshots | Valid — documents the definition and live tiers, and states that history is empty |
+| `document` without `question` / `finding` | Valid, but front-matter records them as absent and `trustworthy` is not asserted — a silently missing conclusion must not read like a considered one |
+| Any arm truncated, or every arm single-run | `trustworthy: false` in front-matter, with the reason (§9.3) |
 
 ---
 
@@ -775,10 +856,15 @@ silent fallback:
   omits sample-derived projections with a stated reason.
 - **V17** Descriptions (collector and snapshot) appear in read, diff, history, and
   document output.
-- **V18** A document round-trips its own meaning: definition, every snapshot, the
-  full per-name vocabulary, `meta`, histogram buckets **and their layout**, and the
-  how-to-read preamble are all present, and the embedded JSON block loses nothing
+- **V18** A document carries everything §9.3–§9.7 requires: front-matter with every
+  field, the how-to-read note, definition, every snapshot, the computed comparison,
+  the full per-name vocabulary, `meta`, the limitations section, and a sidecar
+  reference. Histogram buckets **and their layout** are in the sidecar, losing nothing
   relative to `format: "json"`.
+- **V19** Noise floor: an arm with repeats reports spread; an arm with one run states
+  the floor is unknown rather than omitting the field.
+- **V20** The document stays within its size target on a large collector — the bulk
+  goes to the sidecar, not the document.
 
 **Adversarial**
 
