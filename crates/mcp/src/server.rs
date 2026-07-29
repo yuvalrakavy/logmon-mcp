@@ -240,6 +240,57 @@ struct UseDomainParams {
     name: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct AddCollectorParams {
+    /// Collector name. Letters, digits, '_' and '-' only.
+    name: String,
+    /// Span filter DSL. Matched against every span in the domain this session
+    /// is bound to *now*; the collector stays pinned to that domain afterwards.
+    filter: String,
+    /// "scalar" (counts and totals only), "timing" (adds percentiles, wall
+    /// union, warm-up), or "tree" (adds self time, nesting and call paths).
+    /// Default "tree".
+    level: Option<String>,
+    /// Span attributes to split the numbers by, e.g. ["cache.enabled"] for an
+    /// A/B. Values are read directly, so booleans and numbers work.
+    group_keys: Option<Vec<String>>,
+    /// Why this collector exists. Returned with every read, so a result found
+    /// later still carries its context.
+    description: Option<String>,
+    /// Per-collector retained-sample budget in bytes (default 64 MiB).
+    max_sample_bytes: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CollectorNameParams {
+    name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetCollectorParams {
+    name: String,
+    /// Break the numbers down by "name", "group", "trace" or "path".
+    group_by: Option<String>,
+    /// Exclude spans starting within this many ms of the first matched span.
+    skip_warmup_ms: Option<f64>,
+    /// Rows returned in the breakdown (default 20).
+    top_n: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ProfileTracesParams {
+    /// Span filter DSL. Default "ALL".
+    filter: Option<String>,
+    /// Break the numbers down by "name", "group", "trace" or "path".
+    group_by: Option<String>,
+    /// Span attributes to split by. Required for group_by "group".
+    group_keys: Option<Vec<String>>,
+    /// Exclude spans starting within this many ms of the first matched span.
+    skip_warmup_ms: Option<f64>,
+    /// Rows returned in the breakdown (default 20).
+    top_n: Option<u32>,
+}
+
 // ---- Tool router ----
 
 #[rmcp::tool_router]
@@ -633,6 +684,137 @@ impl GelfMcpServer {
                     "count": p.count,
                     "filter": p.filter,
                     "group_by": p.group_by,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Arm a span time collector. Accumulates exact totals, percentiles and \
+                       (at tree level) self time for every span matching the filter, from now \
+                       until reset or removed. Use for before/after measurement: arm, run the \
+                       workload, read, reset, change one thing, run again."
+    )]
+    async fn add_collector(
+        &self,
+        Parameters(p): Parameters<AddCollectorParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.add",
+                serde_json::json!({
+                    "name": p.name,
+                    "filter": p.filter,
+                    "level": p.level,
+                    "group_keys": p.group_keys,
+                    "description": p.description,
+                    "max_sample_bytes": p.max_sample_bytes,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "List this session's collectors and what each has matched so far")]
+    async fn list_collectors(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("collectors.list", serde_json::json!({}))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Read a collector's numbers. Returns exact totals, sketch percentiles, \
+                       and sample-derived figures separately — they cover different \
+                       populations and any field that cannot be computed says why."
+    )]
+    async fn get_collector(
+        &self,
+        Parameters(p): Parameters<GetCollectorParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.get",
+                serde_json::json!({
+                    "name": p.name,
+                    "group_by": p.group_by,
+                    "skip_warmup_ms": p.skip_warmup_ms,
+                    "top_n": p.top_n,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Zero a collector and start a fresh window, keeping it armed. Returns a \
+                       summary of what was discarded. Use between runs of an A/B."
+    )]
+    async fn reset_collector(
+        &self,
+        Parameters(p): Parameters<CollectorNameParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("collectors.reset", serde_json::json!({ "name": p.name }))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(description = "Remove a collector and release its sample budget")]
+    async fn remove_collector(
+        &self,
+        Parameters(p): Parameters<CollectorNameParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call("collectors.remove", serde_json::json!({ "name": p.name }))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Profile spans already in the buffer, without arming anything. Same \
+                       numbers as get_collector but over what is stored now — use it to look \
+                       back at a run that already happened, and a collector to measure one \
+                       that has not started."
+    )]
+    async fn profile_traces(
+        &self,
+        Parameters(p): Parameters<ProfileTracesParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "traces.profile",
+                serde_json::json!({
+                    "filter": p.filter,
+                    "group_by": p.group_by,
+                    "group_keys": p.group_keys,
+                    "skip_warmup_ms": p.skip_warmup_ms,
+                    "top_n": p.top_n,
                 }),
             )
             .await

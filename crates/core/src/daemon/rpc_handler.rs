@@ -1,8 +1,12 @@
-use crate::collector::registry::CollectorRegistry;
+use crate::collector::project::{GroupBy, ProfileOptions};
+use crate::collector::registry::{ArmedCollector, CollectorRegistry};
+use crate::collector::sample::Level;
+use crate::collector::state::{Collector, CollectorDef, DEFAULT_MAX_SAMPLE_BYTES};
 use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::{SessionId, SessionRegistry};
+use chrono::Utc;
 use logmon_broker_protocol::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -186,6 +190,12 @@ impl RpcHandler {
             "bookmarks.list" => self.handle_bookmarks_list(session_id, &request.params),
             "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
             "bookmarks.clear" => self.handle_bookmarks_clear(session_id, &request.params),
+            "collectors.add" => self.handle_collectors_add(session_id, &request.params),
+            "collectors.list" => self.handle_collectors_list(session_id),
+            "collectors.get" => self.handle_collectors_get(session_id, &request.params),
+            "collectors.reset" => self.handle_collectors_reset(session_id, &request.params),
+            "collectors.remove" => self.handle_collectors_remove(session_id, &request.params),
+            "traces.profile" => self.handle_traces_profile(session_id, &request.params),
             _ => Err(format!("unknown method: {}", request.method)),
         };
 
@@ -1158,47 +1168,61 @@ impl RpcHandler {
         }
         let group_by = params.get("group_by").and_then(|v| v.as_str());
 
-        let slow = d
-            .span_store
-            .slow_spans(min_duration, count, resolved.as_ref());
-
         match group_by {
+            // §1.1: the grouped arm aggregates the FULL matching population.
+            // It used to group `slow_spans`'s output, which is filtered by the
+            // duration floor and then truncated to `count` — so `avg_ms` was
+            // the average of the slowest few above a floor, presented as the
+            // average for that span name. `min_duration_ms` is now a display
+            // floor applied after aggregation, and it selects which names to
+            // show rather than which spans to count.
             Some("name") => {
-                // Group by span name, compute aggregates
-                let mut groups: std::collections::HashMap<String, Vec<f64>> =
-                    std::collections::HashMap::new();
-                for s in &slow {
-                    groups
-                        .entry(s.name.clone())
-                        .or_default()
-                        .push(s.duration_ms);
-                }
+                let groups = d.span_store.duration_by_name(resolved.as_ref());
+                let population: usize = groups.values().map(|v| v.len()).sum();
                 let mut result: Vec<Value> = groups
-                    .iter()
-                    .map(|(name, durations)| {
-                        let mut sorted = durations.clone();
-                        sorted
-                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
-                        let p95_idx = ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
-                        json!({
+                    .into_iter()
+                    .filter_map(|(name, mut durations)| {
+                        durations.sort_by(|a, b| a.total_cmp(b));
+                        let max = *durations.last()?;
+                        // A name qualifies when it actually produced a span at
+                        // least this slow. Its statistics then describe every
+                        // span of that name, which is the point.
+                        if max < min_duration {
+                            return None;
+                        }
+                        let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+                        Some(json!({
                             "name": name,
                             "avg_ms": (avg * 10.0).round() / 10.0,
-                            "p95_ms": sorted[p95_idx],
-                            "count": sorted.len(),
-                        })
+                            "p50_ms": quantile_ms(&durations, 0.50),
+                            "p95_ms": quantile_ms(&durations, 0.95),
+                            "max_ms": max,
+                            "count": durations.len(),
+                        }))
                     })
                     .collect();
                 result.sort_by(|a, b| {
                     b["avg_ms"]
                         .as_f64()
                         .unwrap_or(0.0)
-                        .partial_cmp(&a["avg_ms"].as_f64().unwrap_or(0.0))
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .total_cmp(&a["avg_ms"].as_f64().unwrap_or(0.0))
                 });
-                Ok(json!({ "grouped_by": "name", "groups": result }))
+                result.truncate(count);
+                Ok(json!({
+                    "grouped_by": "name",
+                    "groups": result,
+                    // Both stated, because the numbers above mean something
+                    // different from what this method used to return.
+                    "population": population,
+                    "display_floor_ms": min_duration,
+                }))
             }
-            _ => Ok(json!({ "spans": slow, "count": slow.len() })),
+            _ => {
+                let slow = d
+                    .span_store
+                    .slow_spans(min_duration, count, resolved.as_ref());
+                Ok(json!({ "spans": slow, "count": slow.len() }))
+            }
         }
     }
 
@@ -1426,4 +1450,319 @@ impl RpcHandler {
         let oldest_span = d.span_store.oldest_seq();
         d.bookmarks.sweep(oldest_log, oldest_span);
     }
+
+    // -----------------------------------------------------------------------
+    // collectors.* (spec §7)
+    // -----------------------------------------------------------------------
+
+    fn handle_collectors_add(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        if !is_valid_collector_name(name) {
+            return Err(format!(
+                "invalid collector name `{name}`: use letters, digits, `_` and `-` only. \
+                 Collector names appear in filenames and in `collector@label`, so `/`, `..` \
+                 and `@` cannot be permitted"
+            ));
+        }
+        let filter_string = require_str(params, "filter")?;
+        let d = self.resolve_domain(session_id)?;
+
+        let parsed = crate::filter::parser::parse_filter(filter_string)
+            .map_err(|e| format!("invalid filter: {e}"))?;
+        let warnings: Vec<String> = crate::filter::admission::admit_span_filter(&parsed)
+            .map_err(|e| e.to_string())?
+            .warnings
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+
+        let level = match params.get("level").and_then(|v| v.as_str()) {
+            None => Level::Tree,
+            Some("scalar") => Level::Scalar,
+            Some("timing") => Level::Timing,
+            Some("tree") => Level::Tree,
+            Some(other) => {
+                return Err(format!(
+                    "unknown level `{other}`: expected `scalar`, `timing` or `tree`"
+                ))
+            }
+        };
+        let group_keys: Vec<String> = params
+            .get("group_keys")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let max_sample_bytes = params
+            .get("max_sample_bytes")
+            .and_then(|v| v.as_u64())
+            .map(|b| b as usize)
+            .unwrap_or(DEFAULT_MAX_SAMPLE_BYTES);
+
+        let def = CollectorDef {
+            name: name.to_string(),
+            filter_string: filter_string.to_string(),
+            filter: parsed,
+            level,
+            group_keys,
+            max_sample_bytes,
+            description: params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+
+        let domain_id = self.sessions.domain_of(session_id);
+        let collector = self
+            .collectors
+            .add(session_id, &domain_id, d.metrics.clone(), def, Utc::now())
+            .map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "name": collector.def().name,
+            "filter": collector.def().filter_string,
+            "level": collector.def().level.as_str(),
+            "group_keys": collector.def().group_keys,
+            "domain": domain_id.to_string(),
+            "max_sample_bytes": collector.def().max_sample_bytes,
+            // Never a refusal — every one of these is a filter that will
+            // collect something, just perhaps not what the caller meant.
+            // Returned on `add` because that is the moment the caller can
+            // still cheaply change their mind.
+            "warnings": warnings,
+        }))
+    }
+
+    fn handle_collectors_list(&self, session_id: &SessionId) -> Result<Value, String> {
+        let items: Vec<Value> = self
+            .collectors
+            .list(session_id)
+            .iter()
+            .map(|a| {
+                let snap = a.collector.snapshot();
+                json!({
+                    "name": a.collector.def().name,
+                    "filter": a.collector.def().filter_string,
+                    "level": a.collector.def().level.as_str(),
+                    "group_keys": a.collector.def().group_keys,
+                    "description": a.collector.def().description,
+                    "domain": a.domain.to_string(),
+                    "matched": snap.total.count,
+                    "armed_at": snap.armed_at,
+                    "zeroed_at": snap.zeroed_at,
+                    "sample_complete": snap.samples.complete,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "collectors": items,
+            "count": items.len(),
+            "reserved_bytes": self.collectors.reserved_bytes(),
+        }))
+    }
+
+    fn handle_collectors_get(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        let armed = self
+            .collectors
+            .get(session_id, name)
+            .ok_or_else(|| format!("no collector named `{name}` in this session"))?;
+        let opts = self.profile_options(params)?;
+        let result = crate::collector::project::profile(
+            &armed.collector.snapshot(),
+            self.ingest_basis(&armed),
+            &opts,
+            Utc::now(),
+        );
+        serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
+    fn handle_collectors_reset(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        let taken = self
+            .collectors
+            .reset(session_id, name, Utc::now())
+            .map_err(|e| e.to_string())?;
+        // The discarded run is summarised rather than dropped silently: a
+        // reset issued a moment too early is otherwise unrecoverable, and the
+        // headline numbers are cheap to hand back.
+        Ok(json!({
+            "name": name,
+            "discarded": {
+                "matched": taken.total.count,
+                "total_ms": crate::collector::exact::ns_to_ms(taken.total.total_ns),
+                "error_count": taken.total.error_count,
+                "window_start": taken.window_start(),
+            },
+        }))
+    }
+
+    fn handle_collectors_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        self.collectors
+            .remove(session_id, name)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "removed": name,
+            "reserved_bytes": self.collectors.reserved_bytes(),
+        }))
+    }
+
+    /// `traces.profile` — the same projections over an ad-hoc query rather than
+    /// an armed collector.
+    ///
+    /// It answers a question the collector cannot: what the spans *already in
+    /// the buffer* look like. A collector must be armed before the run it
+    /// measures; this reads what is there now, bounded by the span store's ring
+    /// rather than by a sample budget.
+    fn handle_traces_profile(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let filter_string = params
+            .get("filter")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ALL");
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(Some(filter_string), session_id, &d.bookmarks)?;
+        if cursor_commit.is_some() {
+            // A cursor is read-and-advance, so a second identical `profile`
+            // call would return less than the first. A profile must be
+            // repeatable.
+            return Err("cursor qualifier not permitted in traces.profile".to_string());
+        }
+        let parsed = resolved.unwrap_or(crate::filter::parser::ParsedFilter::All);
+        let warnings: Vec<String> = crate::filter::admission::admit_span_filter(&parsed)
+            .map_err(|e| e.to_string())?
+            .warnings
+            .iter()
+            .map(|w| w.to_string())
+            .collect();
+
+        let group_keys: Vec<String> = params
+            .get("group_keys")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A throwaway collector fed the matching spans, so the ad-hoc path and
+        // the armed path share one projection implementation rather than two
+        // that can disagree.
+        let def = CollectorDef {
+            name: "ad-hoc".into(),
+            filter_string: filter_string.to_string(),
+            filter: parsed.clone(),
+            level: Level::Tree,
+            group_keys,
+            max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
+            description: None,
+        };
+        let scratch = Collector::new(def, Utc::now());
+        let matched = d
+            .span_store
+            .for_each_matching(Some(&parsed), |s| scratch.ingest(s));
+
+        let opts = self.profile_options(params)?;
+        let mut result = crate::collector::project::profile(
+            &scratch.snapshot(),
+            // No baseline exists for a query over spans that arrived before it
+            // was asked, so there is no window to attribute loss to.
+            crate::collector::project::IngestBasis::Unavailable,
+            &opts,
+            Utc::now(),
+        );
+        result.collector = None;
+        result.description = Some(format!(
+            "ad-hoc profile over {matched} spans currently in the `{}` span store",
+            d.config.name
+        ));
+        let mut value = serde_json::to_value(result).map_err(|e| e.to_string())?;
+        value["warnings"] = json!(warnings);
+        Ok(value)
+    }
+
+    fn profile_options(&self, params: &Value) -> Result<ProfileOptions, String> {
+        let group_by = match params.get("group_by").and_then(|v| v.as_str()) {
+            None => GroupBy::None,
+            Some(s) => GroupBy::parse(s).ok_or_else(|| {
+                format!("unknown group_by `{s}`: expected `name`, `group`, `trace` or `path`")
+            })?,
+        };
+        Ok(ProfileOptions {
+            group_by,
+            skip_warmup_ms: params.get("skip_warmup_ms").and_then(|v| v.as_f64()),
+            top_n: params
+                .get("top_n")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(20),
+        })
+    }
+
+    /// Whether the collector's ingest baseline and the domain's current
+    /// counters share an origin.
+    ///
+    /// Pointer equality on the `Arc`, not a name comparison: a domain deleted
+    /// and recreated under the same name gets fresh counters starting at zero,
+    /// and a delta against the old baseline would be arithmetic on two
+    /// unrelated sequences.
+    fn ingest_basis(&self, armed: &ArmedCollector) -> crate::collector::project::IngestBasis {
+        use crate::collector::project::IngestBasis;
+        match self.domains.get(&armed.domain) {
+            Some(d) if Arc::ptr_eq(&d.metrics, &armed.metrics) => IngestBasis::Same {
+                baseline: armed.ingest_baseline,
+                current: d.metrics.trace_ingest_loss(),
+            },
+            _ => IngestBasis::Unavailable,
+        }
+    }
+}
+
+fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing required parameter: {key}"))
+}
+
+/// The rule session and domain names already share (§7). Collector names reach
+/// the filesystem and the `collector@label` syntax, so `/`, `..` and `@` are
+/// path traversal and a parse ambiguity respectively.
+fn is_valid_collector_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// §5.7's convention, over `f64` milliseconds.
+fn quantile_ms(sorted: &[f64], q: f64) -> f64 {
+    crate::collector::project::quantile_index(sorted.len(), q)
+        .map(|i| sorted[i])
+        .unwrap_or(0.0)
 }

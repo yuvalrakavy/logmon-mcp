@@ -38,6 +38,8 @@ Skip it (and say so) when:
 | Drill into one request end-to-end | `get_trace(trace_id=…)` |
 | Get the timing breakdown of a trace | `get_trace_summary(trace_id=…)` |
 | Compare before/after a code change | `add_bookmark` → make change → query with `b>=name` |
+| Measure how long something takes, in aggregate | `add_collector(name=…, filter=…)` → run it → `get_collector` |
+| Profile what already ran | `profile_traces(filter=…, group_by="name")` |
 | Stream "what's new since I last checked" | `c>=name` filter (cursor — see below) |
 | Get notified when X happens later | `add_trigger(filter=…, pre_window=…, post_window=…)` |
 | See the daemon's health | `get_status` |
@@ -116,9 +118,31 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 - **`get_recent_traces(count?, filter?)`** — index page: trace id, root span, total duration, error flag.
 - **`get_trace(trace_id, include_logs?, filter?)`** — full span tree + linked logs. `include_logs` defaults to **`true`** — only pass `false` if you specifically want just the spans.
 - **`get_trace_summary(trace_id)`** — timing breakdown of the root span's direct children, with percentages.
-- **`get_slow_spans(min_duration_ms?, count?, filter?, group_by?)`** — slow individual spans, or aggregates when `group_by="name"`. Defaults: `min_duration_ms=100`, `count=20`.
+- **`get_slow_spans(min_duration_ms?, count?, filter?, group_by?)`** — slow individual spans, or aggregates when `group_by="name"`. Defaults: `min_duration_ms=100`, `count=20`. In the grouped arm the statistics cover **every** matching span of that name, and `min_duration_ms` only decides which names are shown — so `avg_ms` far below the floor beside a high `max_ms` means "usually fast, with a tail", which is the useful reading.
 - **`get_span_context(seq, before?, after?)`** — spans surrounding a given span.
 - **`get_trace_logs(trace_id, filter?)`** — only the logs linked to one trace.
+
+### Time profiling
+
+Measuring the effect of a change means comparing two runs. A collector accumulates timings for every span matching a filter, so you arm it once and read totals rather than eyeballing individual traces.
+
+- **`add_collector(name, filter, level?, group_keys?, description?)`** — arm it. `level`: `scalar` (counts and totals), `timing` (adds percentiles, wall union, warm-up exclusion), `tree` (adds self time, nesting and call paths — the default). `group_keys` splits the numbers by span attribute, which is how you run both arms of an A/B in one pass: `group_keys=["cache.enabled"]`. Always give a `description` — it comes back with every read.
+- **`get_collector(name, group_by?, skip_warmup_ms?, top_n?)`** — read it. `group_by`: `name`, `group`, `trace`, `path`.
+- **`reset_collector(name)`** — zero it and start a fresh window, staying armed. Returns what it discarded.
+- **`profile_traces(filter?, …)`** — same numbers over what is already in the buffer. A collector must be armed *before* the run it measures; this looks back at one that already happened.
+
+**Reading the result.** `exact`, `estimated` and `sampled` are not three views of one number:
+
+- `exact` — every matched span, for the collector's whole life. Trust `count`, `total_ms`, `avg_ms`.
+- `estimated` — percentiles from a sketch over the same population, accurate to ±1%.
+- `sampled` — exact over the records retained, which is everything only while `complete` is `true`. Self time, wall union and call paths live here.
+
+Any field that could not be computed is `null` with an entry in `suppressed` saying why and, usually, what to change. `null` and `0` mean different things — `self_ms: null` with `nested_matches: 0` means the filter matched no nested spans, not that no time was spent.
+
+Two ways to run an A/B:
+
+1. **One pass, `group_keys`** — emit a span attribute naming the arm, run both interleaved, read `group_by="group"`. Immune to drift between runs.
+2. **Two passes, `reset_collector`** — arm, run A, read, reset, change the code, run B, read. Use when the arm cannot be an attribute.
 
 ### Status
 

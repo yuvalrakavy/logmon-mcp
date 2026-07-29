@@ -106,6 +106,62 @@ impl SpanStore {
         matching
     }
 
+    /// Visit every stored span matching `filter`, in insertion order, without
+    /// cloning any of them. Returns how many were visited.
+    ///
+    /// The ad-hoc profile path needs to fold thousands of spans into a
+    /// throwaway collector; materialising them into a `Vec<SpanEntry>` first
+    /// would deep-clone an attribute map and an event vector per span, under
+    /// the read lock, for data thrown away immediately after.
+    pub fn for_each_matching<F>(&self, filter: Option<&ParsedFilter>, mut f: F) -> usize
+    where
+        F: FnMut(&SpanEntry),
+    {
+        let inner = self.inner.read().unwrap();
+        let mut n = 0;
+        for s in inner
+            .buffer
+            .iter()
+            .filter(|s| filter.is_none_or(|p| matches_span(p, s)))
+        {
+            f(s);
+            n += 1;
+        }
+        n
+    }
+
+    /// Per-name duration aggregates over the **full** matching population.
+    ///
+    /// `slow_spans` exists to answer "show me the slowest N"; aggregating its
+    /// output answers a different question badly. Filtering by a duration floor
+    /// and then truncating to N produces a set that is biased twice over, and
+    /// an average taken across it is an average of the tail — reported without
+    /// any hint that it is. This aggregates everything that matches the filter
+    /// and leaves the floor to the caller as a display decision.
+    ///
+    /// **Folded inside the read guard on purpose.** Dropping the truncation
+    /// would otherwise grow `slow_spans`'s clone set to the whole buffer, and
+    /// each `SpanEntry` carries an attribute map and an event vector — paid
+    /// while `insert` is waiting for the write lock. Only the durations leave
+    /// the guard.
+    pub fn duration_by_name(&self, filter: Option<&ParsedFilter>) -> HashMap<String, Vec<f64>> {
+        let inner = self.inner.read().unwrap();
+        let mut out: HashMap<String, Vec<f64>> = HashMap::new();
+        for s in inner
+            .buffer
+            .iter()
+            .filter(|s| filter.is_none_or(|f| matches_span(f, s)))
+        {
+            match out.get_mut(&s.name) {
+                Some(v) => v.push(s.duration_ms),
+                None => {
+                    out.insert(s.name.clone(), vec![s.duration_ms]);
+                }
+            }
+        }
+        out
+    }
+
     pub fn recent_traces<F>(
         &self,
         count: usize,

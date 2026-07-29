@@ -532,20 +532,26 @@ fn union_len(intervals: &mut [(i64, i64)]) -> i128 {
     total + (ce - cs) as i128
 }
 
-/// §5.7 — the lower quantile, rank `⌊1 + q(n−1)⌋`, 1-indexed.
+/// §5.7 — the lower quantile's 0-based index into a sorted slice of `n`, from
+/// rank `⌊1 + q(n−1)⌋`, 1-indexed.
 ///
 /// This is the convention DDSketch's accuracy guarantee is stated against, so
 /// it is also the convention the sketch's own percentiles follow. Using a
-/// different one here would make `estimated` and `sampled` disagree by one
+/// different one anywhere would make `estimated` and `sampled` disagree by one
 /// order statistic on the same data, which reads as sketch error and is not.
-fn quantile_sorted(sorted: &[i64], q: f64) -> Option<i64> {
-    if sorted.is_empty() {
+///
+/// One function, three callers — the sketch, the sample tier, and the repaired
+/// `traces.slow`. Two implementations of a convention is how they drift.
+pub fn quantile_index(n: usize, q: f64) -> Option<usize> {
+    if n == 0 {
         return None;
     }
-    let n = sorted.len();
     let rank = 1.0 + q * (n as f64 - 1.0);
-    let idx = (rank.floor() as usize).clamp(1, n) - 1;
-    Some(sorted[idx])
+    Some((rank.floor() as usize).clamp(1, n) - 1)
+}
+
+fn quantile_sorted(sorted: &[i64], q: f64) -> Option<i64> {
+    quantile_index(sorted.len(), q).map(|i| sorted[i])
 }
 
 // ---------------------------------------------------------------------------

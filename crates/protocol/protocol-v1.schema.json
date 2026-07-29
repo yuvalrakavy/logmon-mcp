@@ -1654,6 +1654,23 @@
           "items": {
             "$ref": "#/$defs/TracesSlowGroup"
           }
+        },
+        "population": {
+          "description": "Grouped arm only: how many spans the aggregates were computed over.\nStated because it is not `count` and not the number of rows — it is the\nwhole matching population, which is the change that makes the grouped\nnumbers trustworthy.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "display_floor_ms": {
+          "description": "Grouped arm only: the `min_duration_ms` that decided which names appear.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         }
       },
       "$defs": {
@@ -1809,7 +1826,7 @@
           ]
         },
         "TracesSlowGroup": {
-          "description": "One row in a grouped `TracesSlowResult` (when `group_by == \"name\"`).",
+          "description": "One row in a grouped `TracesSlowResult` (when `group_by == \"name\"`).\n\nThese statistics describe **every** stored span of this name that matched\nthe filter, not only the ones above `min_duration_ms`. The floor decides\nwhich names appear, not which spans are counted — so a name can qualify on\nits `max_ms` while its `avg_ms` sits far below the floor, and that gap is\nthe useful signal.",
           "type": "object",
           "properties": {
             "name": {
@@ -1819,9 +1836,20 @@
               "type": "number",
               "format": "double"
             },
+            "p50_ms": {
+              "type": "number",
+              "format": "double",
+              "default": 0.0
+            },
             "p95_ms": {
               "type": "number",
               "format": "double"
+            },
+            "max_ms": {
+              "description": "The slowest span of this name. This is what the display floor tests.",
+              "type": "number",
+              "format": "double",
+              "default": 0.0
             },
             "count": {
               "type": "integer",
@@ -3837,7 +3865,7 @@
     "TracesSlowGroup": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TracesSlowGroup",
-      "description": "One row in a grouped `TracesSlowResult` (when `group_by == \"name\"`).",
+      "description": "One row in a grouped `TracesSlowResult` (when `group_by == \"name\"`).\n\nThese statistics describe **every** stored span of this name that matched\nthe filter, not only the ones above `min_duration_ms`. The floor decides\nwhich names appear, not which spans are counted — so a name can qualify on\nits `max_ms` while its `avg_ms` sits far below the floor, and that gap is\nthe useful signal.",
       "type": "object",
       "properties": {
         "name": {
@@ -3847,9 +3875,20 @@
           "type": "number",
           "format": "double"
         },
+        "p50_ms": {
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
         "p95_ms": {
           "type": "number",
           "format": "double"
+        },
+        "max_ms": {
+          "description": "The slowest span of this name. This is what the display floor tests.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
         },
         "count": {
           "type": "integer",

@@ -1,0 +1,695 @@
+//! The `collectors.*` and `traces.profile` contract surface (spec §7), plus the
+//! §1.1 `traces.slow` repair.
+//!
+//! Everything goes through `RpcHandler::handle`, so these exercise the wire
+//! shapes a client actually sees — parameter parsing, admission, error text —
+//! rather than the projection layer, which has its own unit tests.
+
+use logmon_broker_core::daemon::domain::{
+    Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
+};
+use logmon_broker_core::daemon::rpc_handler::{DomainPolicy, RpcHandler};
+use logmon_broker_core::daemon::session::{SessionId, SessionRegistry};
+use logmon_broker_core::daemon::span_processor::process_span_for_domain;
+use logmon_broker_core::engine::pipeline::LogPipeline;
+use logmon_broker_core::engine::seq_counter::SeqCounter;
+use logmon_broker_core::receiver::ReceiverMetrics;
+use logmon_broker_core::span::store::SpanStore;
+use logmon_broker_core::span::types::{SpanEntry, SpanKind, SpanStatus};
+use logmon_broker_core::store::bookmarks::BookmarkStore;
+use logmon_broker_protocol::RpcRequest;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+struct Harness {
+    handler: Arc<RpcHandler>,
+    domains: Arc<DomainRegistry>,
+    sessions: Arc<SessionRegistry>,
+    collectors: Arc<logmon_broker_core::collector::registry::CollectorRegistry>,
+    pipeline: Arc<LogPipeline>,
+}
+
+fn make_domain(name: &str) -> Arc<Domain> {
+    let seq = Arc::new(SeqCounter::new());
+    Arc::new(Domain::from_parts(
+        DomainConfig {
+            name: DomainId::new(name).unwrap_or_else(|_| DomainId::default_domain()),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
+            log_buffer_size: 1000,
+            span_buffer_size: 1000,
+            source: DomainSource::Config,
+        },
+        Arc::new(LogPipeline::new_with_seq_counter(1000, seq.clone())),
+        Arc::new(SpanStore::new(1000, seq)),
+        Arc::new(BookmarkStore::new()),
+        Arc::new(ReceiverMetrics::new()),
+    ))
+}
+
+fn harness() -> Harness {
+    let domains = Arc::new(DomainRegistry::new());
+    let default = make_domain("default");
+    let pipeline = default.pipeline.clone();
+    domains.insert(default);
+    let sessions = Arc::new(SessionRegistry::new());
+    let collectors = Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new());
+    let handler = Arc::new(RpcHandler::new(
+        domains.clone(),
+        sessions.clone(),
+        collectors.clone(),
+        vec!["test".into()],
+        DomainPolicy {
+            max_domains: 32,
+            default_log_buffer_size: 1000,
+            default_span_buffer_size: 1000,
+            stale_after_secs: 60,
+        },
+    ));
+    Harness {
+        handler,
+        domains,
+        sessions,
+        collectors,
+        pipeline,
+    }
+}
+
+impl Harness {
+    fn call(&self, sid: &SessionId, method: &str, params: Value) -> Result<Value, String> {
+        let req = RpcRequest::new(1, method, params);
+        let resp = self.handler.handle(sid, &req);
+        match resp.error {
+            Some(e) => Err(e.message),
+            None => Ok(resp.result.unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Feed a span through the real ingest path for `domain`, so collectors see
+    /// it exactly as they would in the daemon.
+    fn feed(&self, domain: &str, span: &SpanEntry) {
+        let id = DomainId::new(domain).expect("valid domain name");
+        let d = self.domains.get(&id).expect("domain exists");
+        process_span_for_domain(
+            span,
+            &d.span_store,
+            &self.sessions,
+            &self.pipeline,
+            &self.collectors,
+            &id,
+        );
+    }
+}
+
+fn span(service: &str, name: &str, ms: f64) -> SpanEntry {
+    span_at(service, name, ms, 0)
+}
+
+fn span_at(service: &str, name: &str, ms: f64, start_offset_ns: i64) -> SpanEntry {
+    let base = chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000 + start_offset_ns);
+    SpanEntry {
+        seq: 0,
+        trace_id: 7,
+        span_id: 1,
+        parent_span_id: None,
+        start_time: base,
+        end_time: base + chrono::Duration::nanoseconds((ms * 1_000_000.0) as i64),
+        duration_ms: ms,
+        name: name.into(),
+        kind: SpanKind::Internal,
+        service_name: service.into(),
+        status: SpanStatus::Ok,
+        attributes: HashMap::new(),
+        events: vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_collector_round_trips_through_add_list_get_reset_and_remove() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").expect("session");
+
+    let added = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({
+                "name": "cache-ab",
+                "filter": "sv=store_server",
+                "level": "tree",
+                "description": "measuring the read-through cache",
+            }),
+        )
+        .expect("armed");
+    assert_eq!(added["name"], "cache-ab");
+    assert_eq!(added["level"], "tree");
+    assert_eq!(added["domain"], "default");
+
+    for i in 0..5 {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", 10.0, i * 20_000_000),
+        );
+    }
+    h.feed("default", &span("other_service", "ignored", 500.0));
+
+    let listed = h.call(&sid, "collectors.list", json!({})).expect("listed");
+    assert_eq!(listed["count"], 1);
+    assert_eq!(listed["collectors"][0]["matched"], 5, "only matching spans");
+    assert_eq!(
+        listed["collectors"][0]["description"], "measuring the read-through cache",
+        "the reason is carried, so a number found later still has context"
+    );
+
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "cache-ab" }))
+        .expect("read");
+    assert_eq!(got["matched"], 5);
+    assert_eq!(got["exact"]["count"], 5);
+    assert_eq!(got["exact"]["total_ms"], 50.0);
+    assert_eq!(got["exact"]["avg_ms"], 10.0);
+    assert_eq!(got["sampled"]["sample_count"], 5);
+    assert_eq!(got["sampled"]["complete"], true);
+    assert!(got["window"]["wall_ms"].as_f64().is_some());
+
+    let reset = h
+        .call(&sid, "collectors.reset", json!({ "name": "cache-ab" }))
+        .expect("reset");
+    assert_eq!(
+        reset["discarded"]["matched"], 5,
+        "a reset one call too early is otherwise unrecoverable"
+    );
+    assert_eq!(reset["discarded"]["total_ms"], 50.0);
+
+    let after = h
+        .call(&sid, "collectors.get", json!({ "name": "cache-ab" }))
+        .expect("read");
+    assert_eq!(after["matched"], 0, "and the collector starts clean");
+    assert!(after["window"]["zeroed_at"].is_string());
+
+    h.call(&sid, "collectors.remove", json!({ "name": "cache-ab" }))
+        .expect("removed");
+    assert_eq!(
+        h.call(&sid, "collectors.list", json!({})).unwrap()["count"],
+        0
+    );
+    assert!(h
+        .call(&sid, "collectors.get", json!({ "name": "cache-ab" }))
+        .unwrap_err()
+        .contains("no collector named"));
+}
+
+#[test]
+fn collectors_are_scoped_to_the_session_that_armed_them() {
+    let h = harness();
+    let a = h.sessions.create_named("A").unwrap();
+    let b = h.sessions.create_named("B").unwrap();
+
+    h.call(
+        &a,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .expect("armed");
+    assert_eq!(
+        h.call(&b, "collectors.list", json!({})).unwrap()["count"],
+        0
+    );
+    // The same name in another session is a different collector, not a clash.
+    h.call(
+        &b,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .expect("a name is unique per session, not per daemon");
+    assert!(h
+        .call(
+            &a,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL" })
+        )
+        .unwrap_err()
+        .contains("already exists"));
+}
+
+#[test]
+fn a_collector_keeps_following_its_pinned_domain_after_the_owner_rebinds() {
+    // §4.4: ownership and pinning are different questions. Reaching collectors
+    // through the session's *current* binding would silently stop this one
+    // while it still reported the domain it was armed in.
+    let h = harness();
+    h.domains.insert(make_domain("t3"));
+    h.domains.insert(make_domain("t9"));
+    let sid = h.sessions.create_named("A").unwrap();
+
+    // Armed while bound to t3 — deliberately NOT the default domain, so the
+    // test distinguishes "pinned to where it was armed" from "pinned to
+    // whatever domain happens to be first".
+    h.call(&sid, "domains.use", json!({ "name": "t3" }))
+        .unwrap();
+    let added = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL" }),
+        )
+        .expect("armed in t3");
+    assert_eq!(added["domain"], "t3", "and it reports where it is pinned");
+
+    h.call(&sid, "domains.use", json!({ "name": "t9" }))
+        .expect("rebound");
+
+    h.feed("t3", &span("svc", "still-collected", 5.0));
+    h.feed("t9", &span("svc", "not-mine", 5.0));
+    h.feed("default", &span("svc", "also-not-mine", 5.0));
+
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(
+        got["matched"], 1,
+        "the pin held: it did not follow the owner, and it is not the default"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ingest accounting (§5.1.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn span_loss_is_attributed_to_the_window_it_happened_in() {
+    use logmon_broker_core::receiver::TraceTransport;
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+
+    // Loss before arming belongs to nobody: the collector was not running.
+    d.metrics.record_trace_batch_shed(TraceTransport::OtlpHttp);
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .expect("armed");
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(
+        got["ingest"]["shed_batches"], 0,
+        "a batch shed before arming is not this window's loss"
+    );
+
+    d.metrics.record_trace_batch_shed(TraceTransport::OtlpGrpc);
+    d.metrics.record_trace_malformed(TraceTransport::OtlpHttp);
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(got["ingest"]["shed_batches"], 1);
+    assert_eq!(got["ingest"]["malformed_dropped"], 1);
+    assert_eq!(
+        got["ingest"]["attribution"], "domain",
+        "the counters are unfiltered, and the result says so"
+    );
+
+    // A reset starts a new window, and the baseline must move with it — or the
+    // pre-reset loss is charged to the run after it.
+    h.call(&sid, "collectors.reset", json!({ "name": "c" }))
+        .expect("reset");
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(
+        got["ingest"]["shed_batches"], 0,
+        "the previous window's loss does not follow the reset"
+    );
+    assert_eq!(got["ingest"]["malformed_dropped"], 0);
+
+    d.metrics.record_trace_batch_shed(TraceTransport::OtlpHttp);
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(
+        got["ingest"]["shed_batches"], 1,
+        "and the new window counts"
+    );
+}
+
+#[test]
+fn a_domain_recreated_under_a_collector_withholds_the_ingest_block() {
+    // Pointer identity, not the name: a fresh domain with the same name has
+    // fresh counters at zero, and a delta against the old baseline would be
+    // arithmetic across two unrelated sequences.
+    let h = harness();
+    h.domains.insert(make_domain("t3"));
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(&sid, "domains.use", json!({ "name": "t3" }))
+        .unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .expect("armed");
+    assert!(
+        h.call(&sid, "collectors.get", json!({ "name": "c" }))
+            .unwrap()["ingest"]
+            .is_object(),
+        "same instance, so a delta is meaningful"
+    );
+
+    h.domains.insert(make_domain("t3")); // same name, new counters
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert!(got["ingest"].is_null());
+    let sup = got["suppressed"].as_array().unwrap();
+    assert!(
+        sup.iter().any(|s| s["field"] == "ingest"),
+        "and it says why: {sup:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Admission (§7, V24)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v24_a_filter_that_provably_matches_nothing_is_refused() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for filter in ["d>=100, d<=50", "d>=NaN"] {
+        let err = h
+            .call(
+                &sid,
+                "collectors.add",
+                json!({ "name": "c", "filter": filter }),
+            )
+            .unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "`{filter}` can never match and must be refused, not armed"
+        );
+    }
+}
+
+#[test]
+fn v24_a_surprising_but_legal_filter_is_armed_with_a_warning() {
+    // The flagship failure: a filter with the shift key stuck. It parses, it
+    // arms, and it matches nothing — so the warning is the whole defence.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let added = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "SV=store_server" }),
+        )
+        .expect("armed, never refused");
+    let warnings = added["warnings"].as_array().expect("a warnings list");
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("SV")),
+        "the offending qualifier is named: {warnings:?}"
+    );
+}
+
+#[test]
+fn a_collector_name_that_could_reach_the_filesystem_is_refused() {
+    // Collector names end up in filenames beside state.json, and in the
+    // `collector@label` syntax.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for name in ["../escape", "a/b", "with@label", ""] {
+        assert!(
+            h.call(
+                &sid,
+                "collectors.add",
+                json!({ "name": name, "filter": "ALL" })
+            )
+            .is_err(),
+            "`{name}` must be refused"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_level_names_the_ones_that_exist() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL", "level": "detailed" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("scalar") && err.contains("timing") && err.contains("tree"));
+}
+
+// ---------------------------------------------------------------------------
+// Breakdowns through the wire
+// ---------------------------------------------------------------------------
+
+#[test]
+fn group_by_group_splits_an_ab_by_a_boolean_attribute() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({
+            "name": "ab",
+            "filter": "sv=svc",
+            "level": "timing",
+            "group_keys": ["cache.enabled"],
+        }),
+    )
+    .expect("armed");
+
+    for i in 0..3 {
+        let mut on = span_at("svc", "op", 10.0, i * 100_000_000);
+        on.attributes.insert("cache.enabled".into(), json!(true));
+        let mut off = span_at("svc", "op", 40.0, i * 100_000_000 + 50_000_000);
+        off.attributes.insert("cache.enabled".into(), json!(false));
+        h.feed("default", &on);
+        h.feed("default", &off);
+    }
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "ab", "group_by": "group" }),
+        )
+        .expect("read");
+    assert_eq!(got["grouped_by"], "group");
+    let groups = got["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["key"], "false");
+    assert_eq!(groups[0]["exact"]["total_ms"], 120.0);
+    assert_eq!(groups[1]["key"], "true");
+    assert_eq!(groups[1]["exact"]["total_ms"], 30.0);
+}
+
+#[test]
+fn an_unknown_group_by_names_the_ones_that_exist() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "c", "group_by": "service" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("name") && err.contains("path"), "got: {err}");
+}
+
+#[test]
+fn a_scalar_collector_says_why_it_has_no_sampled_block() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL", "level": "scalar" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(got["exact"]["count"], 1, "the exact tier still works");
+    assert!(got["sampled"].is_null());
+    let sup = got["suppressed"].as_array().unwrap();
+    assert!(
+        sup.iter()
+            .any(|s| s["field"] == "sampled" && s["reason"].as_str().unwrap().contains("scalar")),
+        "a null must come with a reason: {sup:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// traces.profile
+// ---------------------------------------------------------------------------
+
+#[test]
+fn traces_profile_reads_what_is_already_in_the_buffer() {
+    // The complement of a collector: a collector must be armed before the run
+    // it measures, this looks back at one that already happened.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for i in 0..4 {
+        h.feed("default", &span_at("svc", "op", 25.0, i * 100_000_000));
+    }
+    h.feed("default", &span("other", "elsewhere", 900.0));
+
+    let got = h
+        .call(&sid, "traces.profile", json!({ "filter": "sv=svc" }))
+        .expect("profiled");
+    assert!(got["collector"].is_null(), "nothing was armed");
+    assert_eq!(got["matched"], 4);
+    assert_eq!(got["exact"]["total_ms"], 100.0);
+    assert!(got["description"]
+        .as_str()
+        .unwrap()
+        .contains("ad-hoc profile"));
+}
+
+#[test]
+fn traces_profile_refuses_a_cursor_because_a_profile_must_repeat() {
+    // A cursor is read-and-advance, so a second identical call would return
+    // less than the first.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let err = h
+        .call(&sid, "traces.profile", json!({ "filter": "c>=mycursor" }))
+        .unwrap_err();
+    assert!(err.contains("cursor"), "got: {err}");
+}
+
+#[test]
+fn traces_profile_returns_the_same_numbers_twice() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for i in 0..3 {
+        h.feed("default", &span_at("svc", "op", 7.0, i * 10_000_000));
+    }
+    let a = h.call(&sid, "traces.profile", json!({})).unwrap();
+    let b = h.call(&sid, "traces.profile", json!({})).unwrap();
+    assert_eq!(
+        a["exact"], b["exact"],
+        "a profile does not consume anything"
+    );
+    assert_eq!(a["matched"], b["matched"]);
+}
+
+// ---------------------------------------------------------------------------
+// traces.slow — the §1.1 repair
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v12_the_grouped_arm_aggregates_the_full_population_not_the_slow_tail() {
+    // 100 fast spans and 3 slow ones, all named "query". Grouping the output
+    // of `slow_spans` gave avg 500 ms — the average of the three above the
+    // floor — reported as the average for "query". The honest answer is that
+    // "query" averages about 15 ms and has a tail at 500.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for _ in 0..100 {
+        d.span_store.insert(span("svc", "query", 10.0));
+    }
+    for _ in 0..3 {
+        d.span_store.insert(span("svc", "query", 500.0));
+    }
+
+    let got = h
+        .call(
+            &sid,
+            "traces.slow",
+            json!({ "min_duration_ms": 100.0, "group_by": "name" }),
+        )
+        .expect("grouped");
+
+    assert_eq!(got["population"], 103, "every matching span was aggregated");
+    assert_eq!(got["display_floor_ms"], 100.0);
+    let g = &got["groups"][0];
+    assert_eq!(g["name"], "query");
+    assert_eq!(g["count"], 103, "not 3, and not 20");
+    let avg = g["avg_ms"].as_f64().unwrap();
+    assert!(
+        (24.0..25.0).contains(&avg),
+        "avg over all 103 spans is 24.3, not 500: got {avg}"
+    );
+    assert_eq!(g["max_ms"], 500.0, "the outlier is visible as an outlier");
+    assert_eq!(
+        g["p50_ms"], 10.0,
+        "the median of the population, not of the tail"
+    );
+}
+
+#[test]
+fn v12_the_floor_selects_names_and_the_rank_follows_the_lower_convention() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    // "fast" never reaches the floor and must not appear at all.
+    for _ in 0..20 {
+        d.span_store.insert(span("svc", "fast", 1.0));
+    }
+    // "slow" has exactly 20 spans at 1..20 ms — p95 by §5.7 is
+    // floor(1 + 0.95*19) = 19 → the 19th smallest = 19 ms, NOT the maximum.
+    for i in 1..=20 {
+        d.span_store.insert(span("svc", "slow", i as f64));
+    }
+
+    let got = h
+        .call(
+            &sid,
+            "traces.slow",
+            json!({ "min_duration_ms": 15.0, "group_by": "name" }),
+        )
+        .unwrap();
+    let groups = got["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "only names with a span above the floor");
+    assert_eq!(groups[0]["name"], "slow");
+    assert_eq!(
+        groups[0]["p95_ms"], 19.0,
+        "floor(n*0.95) returned the maximum at n=20; the lower quantile is 19"
+    );
+    assert_eq!(groups[0]["max_ms"], 20.0);
+}
+
+#[test]
+fn the_ungrouped_arm_still_returns_the_slowest_n_above_the_floor() {
+    // Unchanged on purpose: a list of the slowest spans is not an aggregate,
+    // and truncating it is exactly what it is for.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=50 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
+    let got = h
+        .call(
+            &sid,
+            "traces.slow",
+            json!({ "min_duration_ms": 100.0, "count": 5 }),
+        )
+        .unwrap();
+    assert_eq!(got["count"], 5);
+    assert_eq!(got["spans"][0]["duration_ms"], 500.0);
+}

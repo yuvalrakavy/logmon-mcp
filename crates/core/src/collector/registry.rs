@@ -9,10 +9,11 @@
 //! was created in for ingest. Those are different questions and the registry
 //! keeps them apart.
 
-use crate::collector::state::{Collector, CollectorDef};
+use crate::collector::state::{Collector, CollectorDef, CollectorSnapshot};
 use crate::daemon::domain::DomainId;
 use crate::daemon::session::SessionId;
 use crate::filter::matcher::matches_span;
+use crate::receiver::{ReceiverMetrics, TraceIngestLoss};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
 use std::sync::{Arc, RwLock};
@@ -62,6 +63,35 @@ struct Entry {
     owner: SessionId,
     domain: DomainId,
     collector: Arc<Collector>,
+    /// The pinned domain's counters, held from arm time so a later read can
+    /// prove the baseline and the current reading share an origin.
+    metrics: Arc<ReceiverMetrics>,
+    /// Span loss at arm time (or at the last reset). Lives here rather than on
+    /// the collector because it is zeroed under the *registry's* write lock,
+    /// which is the lock that excludes ingest — so a reset moves the data and
+    /// the baseline together, with nothing able to slip between them (A13).
+    ingest_baseline: TraceIngestLoss,
+}
+
+/// A collector plus everything the read path needs to interpret it.
+pub struct ArmedCollector {
+    pub collector: Arc<Collector>,
+    /// The domain the collector was pinned to at arm time. A `use_domain` by
+    /// the owning session does not move it.
+    pub domain: DomainId,
+    pub metrics: Arc<ReceiverMetrics>,
+    pub ingest_baseline: TraceIngestLoss,
+}
+
+impl Entry {
+    fn armed(&self) -> ArmedCollector {
+        ArmedCollector {
+            collector: self.collector.clone(),
+            domain: self.domain.clone(),
+            metrics: self.metrics.clone(),
+            ingest_baseline: self.ingest_baseline,
+        }
+    }
 }
 
 pub struct CollectorRegistry {
@@ -88,6 +118,7 @@ impl CollectorRegistry {
         &self,
         owner: &SessionId,
         domain: &DomainId,
+        metrics: Arc<ReceiverMetrics>,
         def: CollectorDef,
         now: DateTime<Utc>,
     ) -> Result<Arc<Collector>, RegistryError> {
@@ -113,23 +144,48 @@ impl CollectorRegistry {
             owner: owner.clone(),
             domain: domain.clone(),
             collector: collector.clone(),
+            ingest_baseline: metrics.trace_ingest_loss(),
+            metrics,
         });
         Ok(collector)
     }
 
-    pub fn get(&self, owner: &SessionId, name: &str) -> Option<Arc<Collector>> {
+    pub fn get(&self, owner: &SessionId, name: &str) -> Option<ArmedCollector> {
         let g = self.entries.read().expect("registry lock poisoned");
         g.iter()
             .find(|e| &e.owner == owner && e.collector.def().name == name)
-            .map(|e| e.collector.clone())
+            .map(Entry::armed)
     }
 
-    pub fn list(&self, owner: &SessionId) -> Vec<Arc<Collector>> {
+    pub fn list(&self, owner: &SessionId) -> Vec<ArmedCollector> {
         let g = self.entries.read().expect("registry lock poisoned");
         g.iter()
             .filter(|e| &e.owner == owner)
-            .map(|e| e.collector.clone())
+            .map(Entry::armed)
             .collect()
+    }
+
+    /// Discard a collector's data and start a fresh window.
+    ///
+    /// Under the registry's **write** lock, which is the lock `ingest_span`
+    /// takes for reading — so the data, the window, and the ingest baseline all
+    /// move together and no span can land between the swap and the re-baseline.
+    /// Returns what was discarded, so a caller that wanted the run can still
+    /// have it.
+    pub fn reset(
+        &self,
+        owner: &SessionId,
+        name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<CollectorSnapshot, RegistryError> {
+        let mut g = self.entries.write().expect("registry lock poisoned");
+        let e = g
+            .iter_mut()
+            .find(|e| &e.owner == owner && e.collector.def().name == name)
+            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        let taken = e.collector.swap(now);
+        e.ingest_baseline = e.metrics.trace_ingest_loss();
+        Ok(taken)
     }
 
     pub fn remove(&self, owner: &SessionId, name: &str) -> Result<(), RegistryError> {
@@ -211,6 +267,10 @@ mod tests {
         Utc.timestamp_nanos(S)
     }
 
+    fn metrics() -> Arc<ReceiverMetrics> {
+        Arc::new(ReceiverMetrics::new())
+    }
+
     fn def(name: &str, filter: &str, bytes: usize) -> CollectorDef {
         CollectorDef {
             name: name.into(),
@@ -255,7 +315,13 @@ mod tests {
         let d_a = dom("a");
         let d_b = dom("b");
         let c = r
-            .add(&sid("s1"), &d_a, def("c", "sv=svc", 1 << 20), now())
+            .add(
+                &sid("s1"),
+                &d_a,
+                metrics(),
+                def("c", "sv=svc", 1 << 20),
+                now(),
+            )
             .expect("armed");
 
         r.ingest_span(&d_a, &span("svc")); // matches, right domain
@@ -272,7 +338,13 @@ mod tests {
         let r = CollectorRegistry::new();
         let pinned = dom("t3");
         let c = r
-            .add(&sid("s1"), &pinned, def("c", "ALL", 1 << 20), now())
+            .add(
+                &sid("s1"),
+                &pinned,
+                metrics(),
+                def("c", "ALL", 1 << 20),
+                now(),
+            )
             .expect("armed");
 
         r.ingest_span(&pinned, &span("svc"));
@@ -289,16 +361,16 @@ mod tests {
     fn duplicate_names_are_rejected_per_session_not_globally() {
         let r = CollectorRegistry::new();
         let d = dom("a");
-        r.add(&sid("s1"), &d, def("c", "ALL", 1 << 20), now())
+        r.add(&sid("s1"), &d, metrics(), def("c", "ALL", 1 << 20), now())
             .expect("first");
         assert_eq!(
-            r.add(&sid("s1"), &d, def("c", "ALL", 1 << 20), now())
+            r.add(&sid("s1"), &d, metrics(), def("c", "ALL", 1 << 20), now())
                 .expect_err("a duplicate name in one session is refused"),
             RegistryError::DuplicateName("c".into())
         );
         // A different session may reuse the name.
         assert!(r
-            .add(&sid("s2"), &d, def("c", "ALL", 1 << 20), now())
+            .add(&sid("s2"), &d, metrics(), def("c", "ALL", 1 << 20), now())
             .is_ok());
     }
 
@@ -306,10 +378,10 @@ mod tests {
     fn the_daemon_budget_is_a_reservation_checked_at_arm_time() {
         let r = CollectorRegistry::with_budget(100);
         let d = dom("a");
-        r.add(&sid("s1"), &d, def("a", "ALL", 60), now())
+        r.add(&sid("s1"), &d, metrics(), def("a", "ALL", 60), now())
             .expect("fits");
         let err = r
-            .add(&sid("s1"), &d, def("b", "ALL", 60), now())
+            .add(&sid("s1"), &d, metrics(), def("b", "ALL", 60), now())
             .expect_err("does not fit");
         assert_eq!(
             err,
@@ -322,7 +394,9 @@ mod tests {
         );
         // Removing frees the reservation.
         r.remove(&sid("s1"), "a").expect("removed");
-        assert!(r.add(&sid("s1"), &d, def("b", "ALL", 60), now()).is_ok());
+        assert!(r
+            .add(&sid("s1"), &d, metrics(), def("b", "ALL", 60), now())
+            .is_ok());
     }
 
     #[test]
@@ -330,7 +404,7 @@ mod tests {
         let r = CollectorRegistry::new();
         let d = dom("a");
         let c = r
-            .add(&sid("s1"), &d, def("c", "ALL", 1 << 20), now())
+            .add(&sid("s1"), &d, metrics(), def("c", "ALL", 1 << 20), now())
             .expect("armed");
         r.ingest_span(&d, &span("svc"));
         assert_eq!(c.snapshot().total.count, 1);
@@ -344,7 +418,7 @@ mod tests {
         );
         assert_eq!(r.reserved_bytes(), 0, "and its reservation is released");
 
-        r.add(&sid("s2"), &d, def("x", "ALL", 1 << 20), now())
+        r.add(&sid("s2"), &d, metrics(), def("x", "ALL", 1 << 20), now())
             .expect("armed");
         assert_eq!(r.drop_session(&sid("s2")), 1);
         assert!(r.is_empty());
@@ -363,11 +437,11 @@ mod tests {
     fn list_and_get_are_scoped_to_the_owning_session() {
         let r = CollectorRegistry::new();
         let d = dom("a");
-        r.add(&sid("s1"), &d, def("a", "ALL", 1 << 20), now())
+        r.add(&sid("s1"), &d, metrics(), def("a", "ALL", 1 << 20), now())
             .unwrap();
-        r.add(&sid("s1"), &d, def("b", "ALL", 1 << 20), now())
+        r.add(&sid("s1"), &d, metrics(), def("b", "ALL", 1 << 20), now())
             .unwrap();
-        r.add(&sid("s2"), &d, def("c", "ALL", 1 << 20), now())
+        r.add(&sid("s2"), &d, metrics(), def("c", "ALL", 1 << 20), now())
             .unwrap();
 
         assert_eq!(r.list(&sid("s1")).len(), 2);

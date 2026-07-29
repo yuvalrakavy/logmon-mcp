@@ -51,6 +51,10 @@ impl Harness {
     }
 }
 
+fn metrics() -> Arc<logmon_broker_core::receiver::ReceiverMetrics> {
+    Arc::new(logmon_broker_core::receiver::ReceiverMetrics::new())
+}
+
 fn def(name: &str, filter: &str, level: Level, group_keys: &[&str]) -> CollectorDef {
     CollectorDef {
         name: name.into(),
@@ -94,6 +98,7 @@ fn a_collector_receives_matching_spans_through_the_processing_path() {
         .add(
             &SessionId::Named("s".into()),
             &d,
+            metrics(),
             def("perf", "sv=store_server", Level::Tree, &[]),
             Utc::now(),
         )
@@ -121,6 +126,7 @@ fn a_collector_is_deaf_to_other_domains() {
         .add(
             &SessionId::Named("s".into()),
             &t1,
+            metrics(),
             def("perf", "ALL", Level::Timing, &[]),
             Utc::now(),
         )
@@ -147,6 +153,7 @@ fn the_owning_sessions_binding_does_not_move_the_collector() {
         .add(
             &owner,
             &pinned,
+            metrics(),
             def("perf", "ALL", Level::Timing, &[]),
             Utc::now(),
         )
@@ -185,7 +192,13 @@ fn collectors_and_span_triggers_coexist_without_interfering() {
         .expect("trigger added");
     let c = h
         .collectors
-        .add(&sid, &d, def("perf", "ALL", Level::Tree, &[]), Utc::now())
+        .add(
+            &sid,
+            &d,
+            metrics(),
+            def("perf", "ALL", Level::Tree, &[]),
+            Utc::now(),
+        )
         .expect("armed");
 
     h.feed(&d, &span("svc", "op", 5_000_000));
@@ -214,6 +227,7 @@ fn group_keys_split_an_ab_run_through_the_real_path() {
         .add(
             &SessionId::Named("s".into()),
             &d,
+            metrics(),
             def("cache-ab", "sv=svc", Level::Timing, &["cache.enabled"]),
             Utc::now(),
         )

@@ -538,11 +538,22 @@ pub struct TracesSlow {
 }
 
 /// One row in a grouped `TracesSlowResult` (when `group_by == "name"`).
+///
+/// These statistics describe **every** stored span of this name that matched
+/// the filter, not only the ones above `min_duration_ms`. The floor decides
+/// which names appear, not which spans are counted — so a name can qualify on
+/// its `max_ms` while its `avg_ms` sits far below the floor, and that gap is
+/// the useful signal.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TracesSlowGroup {
     pub name: String,
     pub avg_ms: f64,
+    #[serde(default)]
+    pub p50_ms: f64,
     pub p95_ms: f64,
+    /// The slowest span of this name. This is what the display floor tests.
+    #[serde(default)]
+    pub max_ms: f64,
     pub count: usize,
 }
 
@@ -559,6 +570,15 @@ pub struct TracesSlowResult {
     pub grouped_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<TracesSlowGroup>>,
+    /// Grouped arm only: how many spans the aggregates were computed over.
+    /// Stated because it is not `count` and not the number of rows — it is the
+    /// whole matching population, which is the change that makes the grouped
+    /// numbers trustworthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub population: Option<usize>,
+    /// Grouped arm only: the `min_duration_ms` that decided which names appear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_floor_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

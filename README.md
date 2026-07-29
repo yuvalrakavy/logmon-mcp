@@ -277,9 +277,11 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `get_recent_traces` | List recent traces with timing and error info. |
 | `get_trace` | Full span tree for a trace; `include_logs` (default `true`) interleaves linked logs. |
 | `get_trace_summary` | Compact timing breakdown highlighting bottlenecks. |
-| `get_slow_spans` | Find slow spans (default `min_duration_ms=100`, `count=20`); aggregate by name with `group_by="name"`. |
+| `get_slow_spans` | Find slow spans (default `min_duration_ms=100`, `count=20`). With `group_by="name"` the aggregates cover **every** stored span of that name, and `min_duration_ms` becomes a display floor deciding which names appear — so a name can qualify on its `max_ms` while its `avg_ms` sits far below the floor. |
 | `get_span_context` | Spans surrounding a given span by `seq`. |
 | `get_trace_logs` | All logs linked to a trace. |
+| `add_collector` / `list_collectors` / `get_collector` / `reset_collector` / `remove_collector` | Span time collectors: arm a filter, run the workload, read exact totals, percentiles and self time. `reset_collector` starts a fresh window between runs of an A/B. |
+| `profile_traces` | The same numbers over spans already in the buffer, without arming anything. |
 | `get_filters` / `add_filter` / `edit_filter` / `remove_filter` | Per-session buffer filters. |
 | `get_triggers` / `add_trigger` / `edit_trigger` / `remove_trigger` | Per-session triggers. |
 | `add_bookmark` / `list_bookmarks` / `remove_bookmark` / `clear_bookmarks` | Bookmarks (also act as cursors via `c>=`). |
