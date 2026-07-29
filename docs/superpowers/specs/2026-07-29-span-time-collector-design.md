@@ -572,7 +572,7 @@ Following the existing `noun.verb` convention (`triggers.add`, `traces.slow`).
 | `collectors.reset` | `reset_collector` | **Discard** without recording. Returns what it cleared. |
 | `collectors.remove` | `remove_collector` | |
 | `collectors.diff` | `diff_collectors` | §5.6. Either side may be `collector@label`. |
-| `collectors.document` | `document_collector` | §9. Params: `names`, `format`, `path`, and the operator-supplied `question` / `finding` that logmon cannot infer. Accepts several collectors in one call. |
+| `collectors.document` | `document_collector` | §9. Params: `names`, `format`, optional `path` (omit to get the document back in the response), and the operator-supplied `question` / `finding`. Regenerable and lossless — re-render once the finding is known. Accepts several collectors in one call. |
 | `traces.profile` | `profile_spans` | Same projection over the ring buffer. Accepts bookmark windows (`b>=`/`b<=`) — already supported on span filters. |
 
 `collectors.snapshot` recording and zeroing in one call makes run→record→zero→run
@@ -618,40 +618,81 @@ matter. Rolling-window evaluation is the requirement, not an optimisation.
 
 `collectors.document(names, format, path)` — MCP `document_collector`.
 
-### 9.1 What it is for
+### 9.1 What it is for — two moments, one artefact
 
-**A document is long-term memory, and its consumer is a reader — an AI assistant or a
-person — months later.** The use case is returning to a measurement when a *new*
-optimisation idea comes up: what did this cost before, and what has changed since.
+A document serves two readers who turn out to want the same content for different
+reasons:
 
-That purpose sets three requirements that a plain data dump fails:
+- **Now.** The run has just finished. The document is the *synthesis* — it assembles
+  what would otherwise be a dozen scattered `collectors.get` calls into one picture,
+  and its job is to show what moved and what to do next.
+- **Months later.** A new optimisation idea comes up and the question is what this
+  cost before and what has changed since. Now the job is triage and trust.
+
+Designing for only the second produces an artefact nobody opens until it is too late
+to fix the measurement; designing for only the first produces one that is
+uninterpretable once the session's context is gone. Both are cheap to serve together
+because the same content answers both — the differences are in *ordering* (§9.4) and
+in whether a limitation reads as a caveat or an instruction (§9.6).
+
+Three requirements follow that a plain data dump fails:
 
 1. **It documents the snapshots, not just the live state.** A collector's history *is*
-   the record; documenting only the current tiers would archive the least interesting
+   the record; documenting only the current tiers would capture the least interesting
    moment.
-2. **It is self-describing.** The reader has no logmon, no spec, and no memory of the
-   session. Everything needed to interpret the numbers travels in the file.
+2. **It is self-describing.** The later reader has no logmon, no spec, and no memory of
+   the session. Everything needed to interpret the numbers travels in the file.
 3. **It is not re-imported.** There is deliberately no `collectors.import` and no
    frozen-collector concept. Comparison happens in the reader, not in the broker —
-   which is why the file is optimised for being *read*, not for round-tripping.
+   which is why the artefact is optimised for being *read*, not for round-tripping.
 
-The name is `document`, not `export`, for exactly that reason: `logs.export` produces
-a data file, and this produces an artefact meant to be read. (`report` was the
-alternative; `document` won because the artefact is a durable record, not a one-time
-summary.)
+**A document is a render, not a commit.** `path` is optional: omit it and the document
+is returned in the response, which is the present-tense path — writing to disk and
+reading it back is two round trips and a filesystem dependency for something that can
+be one call. Because the collector still holds every snapshot, regenerating is free
+and lossless.
 
-### 9.2 Derived from the reader's four questions
+That property is load-bearing rather than incidental: **`finding` normally arrives
+after the first read.** You render the document in order to *form* the conclusion,
+then re-render with the conclusion attached. A design that demanded the finding up
+front would be demanding the answer before the question.
+
+### 9.1.1 `get` versus `document`
+
+Two reads of the same collector, and the difference should never be guessed at:
+
+- **`collectors.get`** answers a question you already have. It is parameterised —
+  `group_by`, `percentiles`, `skip_warmup_ms` — and returns one projection.
+- **`collectors.document`** tells you which questions to ask. It is a fixed,
+  comprehensive synthesis: comparison, noise floor, vocabulary, limitations, ranked
+  movers.
+
+The document is where you start; `get` is where you follow up. Neither replaces the
+other, and if a future change makes one a strict subset of the other, that is the
+signal that one of them should be removed.
+
+The name is `document`, not `export`: `logs.export` produces a data file, and this
+produces an artefact meant to be read. It is deliberately not `insights` — logmon
+computes comparisons, spreads, vocabularies, and rankings; the insight is the reader's.
+A file promising insight and containing only data is worse than one that promised
+data.
+
+### 9.2 Derived from the reader's five questions
 
 The contents below are not a wish list; each item earns its place by answering one of
-the four questions a consumer actually asks, in order. Anything answering none of them
-does not belong in the document.
+the five questions a consumer actually asks. Anything answering none of them does not
+belong in the document.
 
-| The reader asks | Which means the document must |
-|---|---|
-| Is this about my thing? | Be triageable **without being read** — across a directory of thirty files (§9.3) |
-| Can I trust it, and is it comparable to what I am about to run? | Carry its environment and its own limits (§9.4, §9.6) |
-| What did it conclude? | Record the question and the finding, not only the data (§9.3) |
-| Was the effect real or noise? | Quantify run-to-run spread when it can (§9.5) |
+| The reader asks | When | Which means the document must |
+|---|---|---|
+| Is this about my thing? | Later | Be triageable **without being read** — across a directory of thirty files (§9.3) |
+| Can I trust it, and is it comparable to what I am about to run? | Later | Carry its environment and its own limits (§9.3, §9.6) |
+| What did it conclude? | Both | Record the question and the finding, not only the data (§9.3) |
+| Was the effect real or noise? | Both | Quantify run-to-run spread when it can (§9.5) |
+| **What should I do next?** | **Now** | Rank what moved, and pair every limitation with its remedy (§9.4, §9.6) |
+
+The last row is what the present-tense moment adds, and it is why §9.6 is written as
+instructions rather than disclaimers.
 
 ### 9.3 Triage front-matter
 
@@ -693,28 +734,35 @@ earlier draft:
 
 Recommended filename `YYYY-MM-DD-<collector>-<slug>.md`, so `ls` alone is informative.
 
-### 9.4 Body
+### 9.4 Body, in reading order
 
-- **A short how-to-read note** — the `exact` / `estimated` / `sampled` distinction and
-  what `complete: false` means. Unusual for a data format and correct here: the
-  three-category structure exists to stop a degraded number being quoted as an exact
-  one, and that protection is worth nothing to a reader who no longer remembers the
-  convention. This is *not* the triage block; §9.3 answers "should I read this", this
-  answers "how do I read the numbers".
-- **Collector definition** — filter, level, `group_keys`, snapshot policy,
-  description, `meta`.
-- **One section per snapshot** — label, description, `taken_at`, window, `meta`, and
-  the scalar/percentile tables. Units in every column header; `_ms` suffixes retained
-  in field names.
-- **The computed comparison, not just its inputs.** Where snapshots form arms, the
-  document carries the deltas at every percentile (§5.6) already worked out. A reader
-  months later should not be subtracting forty numbers by hand to recover a conclusion
-  that was obvious at the time.
-- **The full per-span-name vocabulary**, not the top rows. A reader comparing two
-  documents from months apart needs to see that names appeared or disappeared — the
-  signal that the code moved underneath and the comparison is no longer apples to
-  apples. logmon cannot compute this across two files it will never read again, so its
-  job is to ensure the file contains what the reader needs to spot it.
+**Order is part of the design, not formatting.** The body runs most-decision-relevant
+first and reference material last — the reverse of how a spec would naturally be
+written. The present-tense reader wants the conclusion and the next action on the
+first screen, and the later reader has already triaged on front-matter and wants
+exactly the same thing.
+
+1. **What moved.** The computed comparison across arms, at every percentile (§5.6),
+   already worked out and **ranked by contribution**. A reader should not be
+   subtracting forty numbers by hand to recover a conclusion that was obvious at the
+   time, and ranking is what turns a table into a starting point.
+2. **What to do next.** The actionable limitations (§9.6) and the noise-floor verdict
+   (§9.5). This is the present-tense payload.
+3. **Per-snapshot detail** — label, description, `taken_at`, window, `meta`, and the
+   scalar/percentile tables. Units in every column header; `_ms` suffixes retained in
+   field names.
+4. **The full per-span-name vocabulary**, not the top rows. A reader comparing two
+   documents months apart needs to see that names appeared or disappeared — the signal
+   that the code moved underneath and the comparison is no longer apples to apples.
+   logmon cannot compute this across two files it will never read again, so its job is
+   to ensure the file contains what the reader needs to spot it.
+5. **Definition and how to read the numbers** — filter, level, `group_keys`, snapshot
+   policy, description, `meta`, and the `exact` / `estimated` / `sampled` distinction
+   with what `complete: false` means. Last because it is reference material: needed to
+   interpret, never the reason you opened the document. A data format explaining its
+   own conventions in prose is unusual and correct here — the three-category structure
+   exists to stop a degraded number being quoted as an exact one, and that protection
+   is worth nothing to a reader who no longer remembers the convention.
 
 `format: "json"` writes the structured data alone. `format: "folded"` emits
 `nameA;nameB;nameC <self_time_us>` per snapshot for speedscope and flamegraph.pl;
@@ -726,23 +774,39 @@ session is one operation.
 When an arm has two or more snapshots, the document reports the run-to-run spread —
 min, max, and coefficient of variation across repeats of the *same* configuration.
 
-This is the only thing in the document that lets a future reader decide whether a
-past result should influence a new decision. An 8 % improvement above a 2 % noise
-floor is a finding; the same 8 % above a 15 % floor is nothing, and without the floor
-recorded at measurement time it is unrecoverable afterwards. When an arm has a single
-run, the document says the floor is unknown rather than implying stability.
+An 8 % improvement above a 2 % noise floor is a finding; the same 8 % above a 15 %
+floor is nothing. This is the only thing in the document that separates the two, and
+it is **strictly unrecoverable** if not captured at measurement time — a document can
+be re-read, a suite from six months ago cannot be re-run.
+
+It reads differently at the two moments, which is the clearest illustration of why
+§9.6 is phrased as instructions. Later, "floor unknown, single run" is a reason to
+discount the result. **Now, it is a reason to run it again** — and acting on it costs
+one more run, where discovering it later costs the whole measurement.
+
+When an arm has a single run the document states the floor is unknown rather than
+omitting the field, because an absent floor reads as a stable one.
 
 ### 9.6 What the document must admit
 
-A short, always-present section stating what the measurement *cannot* tell you:
-which numbers were estimated and to what bound, whether any arm was truncated,
-whether warm-up was excluded and by how much, that a raw sum under N-way parallelism
-is total work rather than wall clock, that spans outside the filter are absent
-entirely, and — when several services appear — that cross-process clock skew reaches
-wall-union and path timings (§4.3).
+A short, always-present section stating what the measurement *cannot* tell you — and,
+because the reader is often standing at the machine that produced it, **what to do
+about each one**:
 
-Every one of these is knowable at document time and unrecoverable later. A reader who
-has to *infer* the limitations will get some of them wrong.
+| Limitation | Remedy, stated in the document |
+|---|---|
+| An arm was truncated (`complete: false`) | Raise `max_sample_bytes` or narrow the filter, and re-run that arm — its self-time and paths describe only the cold prefix |
+| Percentiles are `estimated` | Bound is ±`error_pct`; treat differences inside it as no difference |
+| Single-run arm | Floor unknown — repeat the arm before concluding (§9.5) |
+| Warm-up excluded | By how much, and that `exact` is therefore null (§5.5) |
+| Raw sum under N-way parallelism | This is total work, not wall clock; do not read it as elapsed time |
+| Spans outside the filter | Absent entirely — the document cannot tell you what it never saw |
+| Several services present | Cross-process clock skew reaches wall-union and path timings (§4.3) |
+
+This table is the difference between the two moments. Months later these are caveats
+governing how much to trust a number. In the present they are instructions, and each
+one is cheap to act on now and impossible to act on later. Every entry is knowable at
+document time, and a reader forced to *infer* them will get some wrong.
 
 ### 9.7 Sizing: document small, data beside it
 
@@ -865,6 +929,13 @@ silent fallback:
   the floor is unknown rather than omitting the field.
 - **V20** The document stays within its size target on a large collector — the bulk
   goes to the sidecar, not the document.
+- **V21** Omitting `path` returns the document in the response; supplying it writes
+  the same bytes to disk. Neither path is a special case of the other.
+- **V22** Regeneration is lossless: render, then re-render with `finding` supplied,
+  and nothing but the finding and the render timestamp differs.
+- **V23** Body order matches §9.4 — what moved, then what to do next, then detail,
+  then vocabulary, then definitions. A reader hitting reference material first is a
+  regression, not a formatting preference.
 
 **Adversarial**
 
@@ -954,6 +1025,10 @@ improvised:
   (`edit` refusing filter/level changes). A blocking check must reject only the
   provable, or it gets routed around and stops protecting anything. Verify all three
   fire only on recorded facts.
+- **Reader** — hand a synthetic document to a fresh agent with **no session context**
+  and ask what it can and cannot conclude from it. §9 claims the document is
+  interpretable cold; that claim is only testable by trying it, and inspection cannot
+  substitute. Run it for both moments: immediately-after-a-run, and cold months later.
 - **Durability** — snapshots persist (§10), which puts user-visible measurement
   history on disk for the first time in this feature. Not a migration, so not T3, but
   the restore path deserves the same scrutiny: a snapshot that restores subtly wrong
