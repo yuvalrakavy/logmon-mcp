@@ -6,8 +6,8 @@
 
 use clap::{Args, Subcommand};
 use logmon_broker_protocol::{
-    CollectorsAdd, CollectorsGet, CollectorsHistory, CollectorsList, CollectorsName,
-    CollectorsSnapshot, ProfileResult, TracesProfile,
+    CollectorsAdd, CollectorsEdit, CollectorsGet, CollectorsHistory, CollectorsList,
+    CollectorsName, CollectorsSnapshot, ProfileResult, TracesProfile,
 };
 use logmon_broker_sdk::Broker;
 
@@ -54,6 +54,26 @@ enum ColVerb {
         skip_warmup_ms: Option<f64>,
         #[arg(long)]
         top_n: Option<u64>,
+    },
+    /// Change an armed collector. Anything but --description discards the live
+    /// window; recorded snapshots are never touched.
+    Edit {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        filter: Option<String>,
+        /// scalar | timing | tree
+        #[arg(long)]
+        level: Option<String>,
+        #[arg(long = "group-key")]
+        group_keys: Vec<String>,
+        #[arg(long)]
+        max_sample_bytes: Option<u64>,
+        /// Re-pin to another domain (only while zeroed).
+        #[arg(long)]
+        domain: Option<String>,
     },
     /// Record the current window as a named run and start the next one.
     Snapshot {
@@ -191,6 +211,51 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
                 "{} collector(s), {} bytes reserved",
                 result.count, result.reserved_bytes
             );
+            0
+        }
+
+        ColVerb::Edit {
+            name,
+            description,
+            filter,
+            level,
+            group_keys,
+            max_sample_bytes,
+            domain,
+        } => {
+            let result = match broker
+                .collectors_edit(CollectorsEdit {
+                    name,
+                    description,
+                    filter,
+                    level,
+                    group_keys: (!group_keys.is_empty()).then_some(group_keys),
+                    max_sample_bytes,
+                    domain,
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    format::error(&format!("collectors.edit failed: {e}"), json);
+                    return 1;
+                }
+            };
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            println!(
+                "{} is now level {} on domain {} — {}",
+                result.name, result.level, result.domain, result.filter
+            );
+            // Printed whether or not anything was discarded: "nothing was
+            // discarded" is the reassurance a caller wants after an edit they
+            // were not sure was structural.
+            println!("  {}", result.note);
+            for w in &result.warnings {
+                println!("  warning: {w}");
+            }
             0
         }
 

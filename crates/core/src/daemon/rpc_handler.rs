@@ -1,6 +1,8 @@
 use crate::collector::history::{RunToRunFloor, SnapshotPolicy, StoredSnapshot};
 use crate::collector::project::{GroupBy, ProfileOptions};
-use crate::collector::registry::{ArmedCollector, CollectorRegistry, SnapshotRequest};
+use crate::collector::registry::{
+    ArmedCollector, CollectorEdit, CollectorRegistry, SnapshotRequest,
+};
 use crate::collector::sample::Level;
 use crate::collector::state::{Collector, CollectorDef, DEFAULT_MAX_SAMPLE_BYTES};
 use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
@@ -194,6 +196,7 @@ impl RpcHandler {
             "collectors.add" => self.handle_collectors_add(session_id, &request.params),
             "collectors.list" => self.handle_collectors_list(session_id),
             "collectors.get" => self.handle_collectors_get(session_id, &request.params),
+            "collectors.edit" => self.handle_collectors_edit(session_id, &request.params),
             "collectors.snapshot" => self.handle_collectors_snapshot(session_id, &request.params),
             "collectors.history" => self.handle_collectors_history(session_id, &request.params),
             "collectors.reset" => self.handle_collectors_reset(session_id, &request.params),
@@ -1490,6 +1493,18 @@ impl RpcHandler {
                  and `@` cannot be permitted"
             ));
         }
+        // §10: an anonymous session cannot own a collector. Its name is a UUID
+        // that will never be presented again, so the collector would be
+        // unreachable the moment the session disconnected — holding a slice of
+        // the daemon-wide reservation that nothing could ever release.
+        if matches!(session_id, SessionId::Anonymous(_)) {
+            return Err(
+                "collectors require a named session: they outlive a disconnect, and \
+                        an anonymous session's identity does not. Call session.start with a \
+                        name, or use traces.profile for a one-off measurement"
+                    .to_string(),
+            );
+        }
         let filter_string = require_str(params, "filter")?;
         let d = self.resolve_domain(session_id)?;
 
@@ -1569,6 +1584,11 @@ impl RpcHandler {
             .iter()
             .map(|a| {
                 let snap = a.collector.snapshot();
+                // §10: the orphan check is LAZY, evaluated here rather than at
+                // restore. Session restore runs long before the domain
+                // registry is built, so a check at that point would mark every
+                // collector orphaned — including those pinned to `default`.
+                let orphaned = self.domains.get(&a.domain).is_none();
                 json!({
                     "name": a.collector.def().name,
                     "filter": a.collector.def().filter_string,
@@ -1579,7 +1599,16 @@ impl RpcHandler {
                     "matched": snap.total.count,
                     "armed_at": snap.armed_at,
                     "zeroed_at": snap.zeroed_at,
+                    "zeroed_by": a.zeroed_by,
+                    "snapshots": a.snapshot_count,
                     "sample_complete": snap.samples.complete,
+                    "orphaned": orphaned,
+                    "orphan_note": orphaned.then_some(
+                        "the pinned domain no longer exists, so this collector can never \
+                         match another span. Ephemeral domains are not re-created at boot, \
+                         so this is the normal outcome of a restart for a collector armed \
+                         on one. Re-pin it with collectors.edit, or remove it."
+                    ),
                 })
             })
             .collect();
@@ -1619,6 +1648,106 @@ impl RpcHandler {
             Utc::now(),
         );
         serde_json::to_value(result).map_err(|e| e.to_string())
+    }
+
+    fn handle_collectors_edit(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let name = require_str(params, "name")?;
+        let level = match params.get("level").and_then(|v| v.as_str()) {
+            None => None,
+            Some("scalar") => Some(Level::Scalar),
+            Some("timing") => Some(Level::Timing),
+            Some("tree") => Some(Level::Tree),
+            Some(other) => {
+                return Err(format!(
+                    "unknown level `{other}`: expected `scalar`, `timing` or `tree`"
+                ))
+            }
+        };
+        // A filter is admitted here on exactly the terms `add` uses. §7.1's
+        // rule is "re-run every gate add runs", and admission is one of them —
+        // an edit that skipped it could arm a filter `add` would have refused.
+        let mut warnings: Vec<String> = Vec::new();
+        if let Some(f) = params.get("filter").and_then(|v| v.as_str()) {
+            let parsed = crate::filter::parser::parse_filter(f)
+                .map_err(|e| format!("invalid filter: {e}"))?;
+            warnings = crate::filter::admission::admit_span_filter(&parsed)
+                .map_err(|e| e.to_string())?
+                .warnings
+                .iter()
+                .map(|w| w.to_string())
+                .collect();
+        }
+        let domain = match params.get("domain").and_then(|v| v.as_str()) {
+            None => None,
+            Some(d) => {
+                let id = DomainId::new(d).map_err(|e| e.to_string())?;
+                if self.domains.get(&id).is_none() {
+                    return Err(format!("domain \"{d}\" does not exist"));
+                }
+                Some(id)
+            }
+        };
+
+        let change = CollectorEdit {
+            description: params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            filter: params
+                .get("filter")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            level,
+            group_keys: params
+                .get("group_keys")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                }),
+            max_sample_bytes: params
+                .get("max_sample_bytes")
+                .and_then(|v| v.as_u64())
+                .map(|b| b as usize),
+            domain,
+        };
+        if change.is_empty() {
+            return Err(
+                "nothing to edit: pass at least one of description, filter, level, \
+                        group_keys, max_sample_bytes or domain"
+                    .to_string(),
+            );
+        }
+
+        let out = self
+            .collectors
+            .edit(session_id, name, change, Utc::now())
+            .map_err(|e| e.to_string())?;
+        let def = out.collector.def();
+        Ok(json!({
+            "name": def.name,
+            "filter": def.filter_string,
+            "level": def.level.as_str(),
+            "group_keys": def.group_keys,
+            "description": def.description,
+            "domain": out.domain.to_string(),
+            "max_sample_bytes": def.max_sample_bytes,
+            // Stated plainly, because it is the whole consequence of the edit:
+            // a structural change discards the live window. History never.
+            "zeroed": out.zeroed,
+            "note": if out.zeroed {
+                "the live window was discarded; recorded snapshots are untouched and each \
+                 keeps the definition it was taken under"
+            } else {
+                "nothing was discarded"
+            },
+            "warnings": warnings,
+        }))
     }
 
     fn handle_collectors_snapshot(
@@ -1670,7 +1799,19 @@ impl RpcHandler {
                 crate::collector::project::project_samples,
             )
             .map_err(|e| e.to_string())?;
-        Ok(snapshot_summary(&snap))
+        let mut out = snapshot_summary(&snap.snapshot);
+        if let Some(e) = snap.persist_error {
+            // Surfaced on the successful response, not raised as an error: the
+            // run WAS recorded and is in the response. What failed is that it
+            // will not survive a restart, and a caller collecting runs to
+            // compare later is exactly who needs to know that.
+            out["durable"] = json!(false);
+            out["durability_warning"] = json!(format!(
+                "this run is in memory and in the response, but could not be written to \
+                 disk, so it will not survive a daemon restart: {e}"
+            ));
+        }
+        Ok(out)
     }
 
     fn handle_collectors_history(

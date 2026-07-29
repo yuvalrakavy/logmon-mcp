@@ -162,6 +162,11 @@ impl SampleChunk {
 }
 
 /// The capped, chunked sample tier.
+///
+/// `Clone` is cheap by construction: sealed chunks are `Arc` pointer copies, so
+/// only the active chunk is really copied — the same bound that makes a
+/// non-destructive read O(active chunk) rather than O(retained).
+#[derive(Clone)]
 pub struct SampleTier {
     level: Level,
     n_group_keys: usize,

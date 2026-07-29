@@ -50,12 +50,25 @@ fn make_domain(name: &str) -> Arc<Domain> {
 }
 
 fn harness() -> Harness {
+    harness_in(None)
+}
+
+/// A harness whose collectors persist into `dir`.
+///
+/// `None` disables persistence, which is what almost every test wants: a test
+/// that persisted would write into whatever directory it was handed, and the
+/// live daemon's is one wrong argument away.
+fn harness_in(dir: Option<std::path::PathBuf>) -> Harness {
     let domains = Arc::new(DomainRegistry::new());
     let default = make_domain("default");
     let pipeline = default.pipeline.clone();
     domains.insert(default);
     let sessions = Arc::new(SessionRegistry::new());
-    let collectors = Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new());
+    let registry = logmon_broker_core::collector::registry::CollectorRegistry::new();
+    let collectors = Arc::new(match dir {
+        Some(d) => registry.with_persistence(d),
+        None => registry,
+    });
     let handler = Arc::new(RpcHandler::new(
         domains.clone(),
         sessions.clone(),
@@ -343,6 +356,512 @@ fn clearing_a_sessions_collectors_leaves_every_other_session_alone() {
     );
     // Idempotent: a TTL sweep can race an explicit drop.
     assert_eq!(h.handler.clear_session_collectors(&a), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Persistence and restart (§10, V11)
+// ---------------------------------------------------------------------------
+
+/// A second daemon over the same directory. Deliberately **no shutdown** on the
+/// first one — §12 notes that a graceful `restart()` would pass V11 regardless,
+/// so the point is to prove the files were already complete while the first
+/// daemon was still running.
+fn restart_over(dir: &std::path::Path) -> Harness {
+    let h = harness_in(Some(dir.to_path_buf()));
+    let report = h.collectors.restore(|_| Arc::new(ReceiverMetrics::new()));
+    assert!(
+        report.quarantined.is_empty() && report.rejected.is_empty(),
+        "restore had problems: {:?} {:?}",
+        report.quarantined,
+        report.rejected
+    );
+    h
+}
+
+#[test]
+fn v11_a_definition_is_on_disk_before_anything_is_shut_down() {
+    // The defect: writing definitions at graceful shutdown means a kill -9
+    // loses them, leaving snapshots with nothing to attach to. Asserted
+    // mid-life rather than across a shutdown, which is a stricter test than
+    // restarting cleanly would be.
+    let d = tempfile::TempDir::new().unwrap();
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let sid = h.sessions.create_named("perf").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sv=svc", "level": "tree" }),
+    )
+    .expect("armed");
+
+    let path = logmon_broker_core::collector::persist::collector_path(d.path(), "perf", "c");
+    assert!(path.exists(), "the definition reached disk at arm time");
+}
+
+#[test]
+fn v11_definition_and_history_survive_a_restart_and_the_window_does_not() {
+    let d = tempfile::TempDir::new().unwrap();
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let sid = h.sessions.create_named("perf").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({
+            "name": "c", "filter": "sv=svc", "level": "tree",
+            "group_keys": ["cache.enabled"],
+            "description": "the read-through cache",
+        }),
+    )
+    .unwrap();
+
+    for i in 0..4 {
+        h.feed("default", &span_at("svc", "op", 25.0, i * 100_000_000));
+    }
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "baseline", "description": "before" }),
+    )
+    .unwrap();
+    // A second window with live, unsnapshotted data — this is what must NOT
+    // come back.
+    h.feed("default", &span("svc", "op", 999.0));
+
+    let after = restart_over(d.path());
+    let sid2 = after.sessions.create_named("perf").unwrap();
+
+    let listed = after
+        .call(&sid2, "collectors.list", json!({}))
+        .expect("listed");
+    assert_eq!(listed["count"], 1, "the collector came back armed");
+    let c = &listed["collectors"][0];
+    assert_eq!(c["filter"], "sv=svc");
+    assert_eq!(c["level"], "tree");
+    assert_eq!(c["group_keys"][0], "cache.enabled");
+    assert_eq!(c["description"], "the read-through cache");
+    assert_eq!(c["snapshots"], 1);
+    // Zeroed, and it says why — so a caller seeing 0 can tell "no traffic yet"
+    // from "the run you were measuring did not survive".
+    assert_eq!(c["matched"], 0);
+    assert_eq!(c["zeroed_by"], "daemon_restart");
+
+    // The recorded run is intact, with its own definition and description.
+    let hist = after
+        .call(&sid2, "collectors.history", json!({ "name": "c" }))
+        .expect("history");
+    assert_eq!(hist["count"], 1);
+    assert_eq!(hist["snapshots"][0]["label"], "baseline");
+    assert_eq!(hist["snapshots"][0]["description"], "before");
+    assert_eq!(hist["snapshots"][0]["exact"]["total_ms"], 100.0);
+    assert_eq!(hist["snapshots"][0]["filter"], "sv=svc");
+    // The sketch survived, so estimated percentiles still work.
+    assert!(hist["snapshots"][0]["estimated"]["p50_ms"].is_number());
+}
+
+#[test]
+fn a_restored_collector_still_collects() {
+    // Armed, not merely remembered.
+    let d = tempfile::TempDir::new().unwrap();
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "sv=svc" }),
+        )
+        .unwrap();
+    }
+    let after = restart_over(d.path());
+    let sid = after.sessions.create_named("perf").unwrap();
+    after.feed("default", &span("svc", "op", 12.0));
+
+    let got = after
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .expect("read");
+    assert_eq!(got["matched"], 1, "it is collecting, not just listed");
+    assert_eq!(got["exact"]["total_ms"], 12.0);
+}
+
+#[test]
+fn a_collector_pinned_to_a_vanished_domain_is_reported_orphaned_with_the_remedy() {
+    // §10: ephemeral domains are never re-created, so for a collector armed on
+    // one this is the NORMAL outcome of a restart, not an exception.
+    let d = tempfile::TempDir::new().unwrap();
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        h.domains.insert(make_domain("t9"));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(&sid, "domains.use", json!({ "name": "t9" }))
+            .unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL" }),
+        )
+        .unwrap();
+    }
+    // The restart brings back `default` only.
+    let after = restart_over(d.path());
+    let sid = after.sessions.create_named("perf").unwrap();
+    let listed = after.call(&sid, "collectors.list", json!({})).unwrap();
+    let c = &listed["collectors"][0];
+    assert_eq!(c["domain"], "t9");
+    assert_eq!(c["orphaned"], true);
+    let note = c["orphan_note"].as_str().expect("a note");
+    assert!(note.contains("collectors.edit"), "and the remedy: {note}");
+
+    // And the remedy works.
+    after
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "domain": "default" }),
+        )
+        .expect("re-pinned");
+    after.feed("default", &span("svc", "op", 5.0));
+    assert_eq!(
+        after
+            .call(&sid, "collectors.get", json!({ "name": "c" }))
+            .unwrap()["matched"],
+        1,
+        "collecting again on the new pin"
+    );
+}
+
+#[test]
+fn removing_a_collector_deletes_its_file() {
+    let d = tempfile::TempDir::new().unwrap();
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let sid = h.sessions.create_named("perf").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    let path = logmon_broker_core::collector::persist::collector_path(d.path(), "perf", "c");
+    assert!(path.exists());
+
+    h.call(&sid, "collectors.remove", json!({ "name": "c" }))
+        .unwrap();
+    assert!(
+        !path.exists(),
+        "otherwise a daemon whose sessions are swept daily leaks files forever"
+    );
+    assert!(restart_over(d.path())
+        .call(
+            &h.sessions.create_named("perf2").unwrap(),
+            "collectors.list",
+            json!({})
+        )
+        .unwrap()["collectors"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn an_anonymous_session_cannot_arm_a_collector() {
+    // §10/§4.4: its name is a UUID that will never be presented again, so the
+    // collector would be unreachable the moment it disconnected while still
+    // holding a slice of the daemon-wide reservation.
+    let h = harness();
+    let sid = h.sessions.create_anonymous();
+    let err = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("named session"), "got: {err}");
+    assert!(err.contains("traces.profile"), "and the alternative");
+}
+
+// ---------------------------------------------------------------------------
+// collectors.edit (§7.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a13_a_structural_edit_zeroes_the_window_and_keeps_the_history() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sv=svc", "level": "tree" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "before-edit" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 20.0));
+
+    let edited = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "filter": "sn=op", "level": "timing" }),
+        )
+        .expect("edited");
+    assert_eq!(edited["zeroed"], true);
+    assert_eq!(edited["filter"], "sn=op");
+    assert_eq!(edited["level"], "timing");
+
+    assert_eq!(
+        h.call(&sid, "collectors.get", json!({ "name": "c" }))
+            .unwrap()["matched"],
+        0,
+        "the live window went"
+    );
+    let hist = h
+        .call(&sid, "collectors.history", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(hist["count"], 1, "history did not");
+    assert_eq!(
+        hist["snapshots"][0]["filter"], "sv=svc",
+        "and the snapshot still reports the definition IT was taken under"
+    );
+}
+
+#[test]
+fn editing_only_the_description_discards_nothing() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sv=svc" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+
+    let edited = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "description": "now with context" }),
+        )
+        .expect("edited");
+    assert_eq!(edited["zeroed"], false);
+    assert_eq!(edited["description"], "now with context");
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(got["matched"], 1, "a rename must not cost a measurement");
+    // And not only the exact tier. Rebuilding the inner state around a new
+    // definition is easy to get half-right: keep the counts, lose the samples,
+    // and the result is `sample_count < count` with `complete: true` — the one
+    // reconciliation rule this design has, broken by a rename.
+    assert_eq!(got["sampled"]["sample_count"], 1);
+    assert_eq!(got["sampled"]["complete"], true);
+}
+
+#[test]
+fn a_level_may_be_lowered_which_is_the_only_remedy_for_an_exhausted_budget() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL", "level": "tree" }),
+    )
+    .unwrap();
+    let edited = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "level": "timing" }),
+        )
+        .expect("lowering is permitted");
+    assert_eq!(edited["level"], "timing");
+}
+
+#[test]
+fn an_edit_re_runs_admission_so_it_cannot_arm_what_add_would_refuse() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    assert!(
+        h.call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "filter": "d>=100, d<=50" }),
+        )
+        .is_err(),
+        "an empty duration interval can never match, and edit must refuse it too"
+    );
+    // And a legal-but-surprising filter is armed WITH the warning.
+    let edited = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "filter": "SV=store_server" }),
+        )
+        .expect("armed");
+    assert!(!edited["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn an_empty_window_says_why_it_is_empty() {
+    // `zeroed_by` is what lets a caller reading `matched: 0` tell "no traffic
+    // yet" from "something emptied this window" — and WHICH something, because
+    // "snapshot" means the run was kept while "reset" means it was discarded.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let zeroed_by = |h: &Harness| {
+        h.call(&sid, "collectors.list", json!({})).unwrap()["collectors"][0]["zeroed_by"].clone()
+    };
+
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    assert!(
+        zeroed_by(&h).is_null(),
+        "nothing has zeroed a fresh collector"
+    );
+
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(zeroed_by(&h), "snapshot", "the run was kept");
+
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(&sid, "collectors.reset", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(zeroed_by(&h), "reset", "the run was discarded");
+
+    h.feed("default", &span("svc", "op", 10.0));
+    h.call(
+        &sid,
+        "collectors.edit",
+        json!({ "name": "c", "filter": "sv=svc" }),
+    )
+    .unwrap();
+    assert_eq!(zeroed_by(&h), "edit", "the definition changed under it");
+}
+
+#[test]
+fn an_edit_that_cannot_be_made_durable_is_refused_and_changes_nothing() {
+    // §7.1's ordering rule, exercised end to end: the write is the commit
+    // point. If the mutation happened first and the write failed after it, the
+    // daemon would hold a zeroed collector while the on-disk file still said
+    // the old filter — and a restart would resurrect a definition the caller
+    // believes they replaced.
+    let d = tempfile::TempDir::new().unwrap();
+    // Occupy the collectors/ path with a FILE, so every persist fails.
+    std::fs::write(d.path().join("collectors"), "in the way").unwrap();
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let sid = h.sessions.create_named("perf").unwrap();
+
+    // Arming still works: a failed persist costs durability (logged), not the
+    // measurement the caller asked for.
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sv=svc" }),
+    )
+    .expect("armed despite the broken directory");
+    h.feed("default", &span("svc", "op", 10.0));
+
+    let err = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "filter": "sn=op" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("durable"), "got: {err}");
+
+    let got = h
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .unwrap();
+    assert_eq!(got["filter"], "sv=svc", "the definition did not change");
+    assert_eq!(got["matched"], 1, "and the window was not zeroed");
+}
+
+#[test]
+fn an_edit_that_changes_nothing_is_an_error_rather_than_a_silent_no_op() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    let err = h
+        .call(&sid, "collectors.edit", json!({ "name": "c" }))
+        .unwrap_err();
+    assert!(err.contains("nothing to edit"), "got: {err}");
+}
+
+#[test]
+fn re_pinning_a_collector_with_a_live_window_is_refused() {
+    // Otherwise the recorded window and the domain it was measured on disagree.
+    let h = harness();
+    h.domains.insert(make_domain("t3"));
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    h.feed("default", &span("svc", "op", 10.0));
+    let err = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "domain": "t3" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("zeroed"), "got: {err}");
+
+    // Snapshot it, and the re-pin goes through.
+    h.call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+        .unwrap();
+    let edited = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "domain": "t3" }),
+        )
+        .expect("now permitted");
+    assert_eq!(edited["domain"], "t3");
+}
+
+#[test]
+fn an_edit_cannot_re_pin_to_a_domain_that_does_not_exist() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "c", "domain": "nowhere" }),
+        )
+        .unwrap_err();
+    assert!(err.contains("does not exist"), "got: {err}");
 }
 
 // ---------------------------------------------------------------------------

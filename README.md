@@ -280,7 +280,10 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `get_slow_spans` | Find slow spans (default `min_duration_ms=100`, `count=20`). With `group_by="name"` the aggregates cover **every** stored span of that name, and `min_duration_ms` becomes a display floor deciding which names appear — so a name can qualify on its `max_ms` while its `avg_ms` sits far below the floor. |
 | `get_span_context` | Spans surrounding a given span by `seq`. |
 | `get_trace_logs` | All logs linked to a trace. |
-| `add_collector` / `list_collectors` / `get_collector` / `reset_collector` / `remove_collector` | Span time collectors: arm a filter, run the workload, read exact totals, percentiles and self time. `reset_collector` starts a fresh window between runs of an A/B. |
+| `add_collector` / `list_collectors` / `get_collector` / `remove_collector` | Span time collectors: arm a filter, run the workload, read exact totals, percentiles and self time. Needs a **named** session — an anonymous one's identity is a UUID that never returns, so anything it armed would be unreachable after a disconnect. `matched: 0` comes with `zeroed_by` (`snapshot` / `reset` / `edit` / `daemon_restart`, or absent for "no traffic yet"), so an empty window is never ambiguous. |
+| `snapshot_collector` / `get_collector_history` | Record a window as a named run and start the next — the between-runs move for a before/after comparison. History carries each run's own definition, and `merge` reports the run-to-run spread so you can tell a real difference from noise. Survives a daemon restart; a run that could not be written reports `durable: false` rather than pretending otherwise. |
+| `edit_collector` | Change an armed collector. Description is free; anything structural discards the live window (never the history). Re-pins a collector orphaned by a restart. |
+| `reset_collector` | Zero a collector and **discard** the run. Prefer `snapshot_collector`. |
 | `profile_traces` | The same numbers over spans already in the buffer, without arming anything. |
 | `get_filters` / `add_filter` / `edit_filter` / `remove_filter` | Per-session buffer filters. |
 | `get_triggers` / `add_trigger` / `edit_trigger` / `remove_trigger` | Per-session triggers. |

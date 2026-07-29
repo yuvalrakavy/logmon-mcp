@@ -130,10 +130,15 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 
 Measuring the effect of a change means comparing two runs. A collector accumulates timings for every span matching a filter, so you arm it once and read totals rather than eyeballing individual traces.
 
+Collectors need a **named** session (`--session NAME`, or `session.start` with a name). An anonymous session's identity is a UUID that is never presented again, so anything it armed would be unreachable the moment it disconnected. For a one-off measurement with no session, use `profile_traces`.
+
 - **`add_collector(name, filter, level?, group_keys?, description?)`** — arm it. `level`: `scalar` (counts and totals), `timing` (adds percentiles, wall union, warm-up exclusion), `tree` (adds self time, nesting and call paths — the default). `group_keys` splits the numbers by span attribute, which is how you run both arms of an A/B in one pass: `group_keys=["cache.enabled"]`. Always give a `description` — it comes back with every read.
 - **`get_collector(name, group_by?, skip_warmup_ms?, top_n?)`** — read it. `group_by`: `name`, `group`, `trace`, `path`.
 - **`list_collectors()`** — what this session has armed, and how much each has matched. Check this before arming: only about four default-sized collectors fit in the daemon-wide budget.
-- **`reset_collector(name)`** — zero it and start a fresh window, staying armed. Returns what it discarded.
+- **`snapshot_collector(name, label?, description?, meta?)`** — record the current window as a named run and start the next one. **This is the between-runs move**, not `reset_collector`: it keeps the run. Pass a `description` and, when you have one, a `meta` like `{"commit": "abc123"}`.
+- **`get_collector_history(name, limit?, merge?)`** — the recorded runs, oldest first, each with the definition it was taken under. `merge=true` also combines them and reports the run-to-run spread — which is what tells you whether a gap between two runs is real or noise. A single run reports that spread as *unknown*, never zero.
+- **`edit_collector(name, …)`** — change an armed collector. Editing only `description` costs nothing; editing `filter`, `level`, `group_keys`, `max_sample_bytes` or `domain` **discards the live window** (snapshots are never touched). Use it to re-pin a collector orphaned by a restart, or to drop `tree` → `timing` for 2.5× the records when the sample budget runs out.
+- **`reset_collector(name)`** — zero it and **discard** the run. Prefer `snapshot_collector` unless you genuinely want it gone.
 - **`remove_collector(name)`** — unarm it and hand the budget back. Do this when you're done; a collector left armed keeps costing ingest time and reserved memory.
 - **`profile_traces(filter?, …)`** — same numbers over what is already in the buffer. A collector must be armed *before* the run it measures; this looks back at one that already happened.
 
@@ -145,10 +150,18 @@ Measuring the effect of a change means comparing two runs. A collector accumulat
 
 Any field that could not be computed is `null` with an entry in `suppressed` saying why and, usually, what to change. `null` and `0` mean different things — `self_ms: null` with `nested_matches: 0` means the filter matched no nested spans, not that no time was spent.
 
+**`matched: 0` is ambiguous on its own, so read `zeroed_by` beside it.** Absent means nothing has emptied the window — no traffic yet. Otherwise it names what did: `snapshot` (the run was kept), `reset` (it was discarded), `edit` (the definition changed under it), or `daemon_restart`.
+
+**If `snapshot_collector` returns `durable: false`**, the run is in the response and in the daemon's memory but was not written to disk, so it will not survive a restart. Read the `durability_warning`, and if you need that run, copy the numbers out now.
+
 Two ways to run an A/B:
 
 1. **One pass, `group_keys`** — emit a span attribute naming the arm, run both interleaved, read `group_by="group"`. Immune to drift between runs.
-2. **Two passes, `reset_collector`** — arm, run A, read, reset, change the code, run B, read. Use when the arm cannot be an attribute.
+2. **Two passes, `snapshot_collector`** — arm, run A, `snapshot_collector(label="before")`, change the code, run B, `snapshot_collector(label="after")`, then `get_collector_history(merge=true)`. Use when the arm cannot be an attribute. Both runs are kept, each with its own definition and description.
+
+**Repeat before you conclude.** Two runs differing by 5% tell you nothing until you know the run-to-run spread. Take three snapshots of the *same* configuration first, read the `floor` from `get_collector_history(merge=true)`, and treat differences below it as noise. A single run reports the spread as unknown, which is the honest answer, not zero.
+
+**Across a restart.** Collectors and their history survive; the live window does not. A restored collector reports `zeroed_by: "daemon_restart"`, so `matched: 0` is distinguishable from "no traffic yet". One armed on an ephemeral domain comes back `orphaned` — that domain is not re-created — and the result says to re-pin it with `edit_collector`.
 
 ### Status
 

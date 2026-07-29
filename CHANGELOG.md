@@ -3,6 +3,68 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## 0.5.0 — 2026-07-30
+
+`PROTOCOL_VERSION` stays at **1**, as in 0.4.0: new methods and new fields on
+existing results, so a 0.4.0 client keeps working against a 0.5.0 broker.
+
+### Added
+
+- **Snapshot history.** A `reset` throws a run away; a snapshot keeps it and
+  starts the next window in the same call. `snapshot_collector`,
+  `get_collector_history`, and `get_collector(snapshot=…)` — so the shape of a
+  before/after comparison is: arm, run A, snapshot, change one thing, run B,
+  snapshot, compare.
+
+  **A snapshot carries its own definition** — the filter, level and group keys
+  as they were when it was taken, not a pointer to the live collector's.
+  Without that, a comparison reads *today's* definition and presents it as
+  proof of what the recorded run measured, which is wrong exactly when someone
+  edited the collector between runs.
+
+  Sample-derived figures are computed at snapshot time or never, because the
+  raw samples are not retained. `merge` combines the exact tiers and sketches
+  across runs and reports a run-to-run spread; for a **single** run it reports
+  that spread as *unknown* rather than zero, since zero would license calling
+  any difference significant.
+
+- **Collectors survive a restart.** One file per collector holding definition
+  *and* history, written through at arm, edit and snapshot time rather than at
+  shutdown — a definition that only reaches disk on a graceful exit is one a
+  `kill -9` loses, leaving snapshots with nothing to attach to. The duration
+  sketch round-trips, so recorded percentiles still work after a restart.
+
+  A collector comes back **armed but zeroed**, and says so (`zeroed_by:
+  "daemon_restart"`): a live window is a partial measurement interrupted by a
+  restart, and resuming it would report a `wall_ms` spanning an outage with a
+  span count that skipped it. History is unaffected.
+
+  A collector pinned to an API-created domain is reported `orphaned` after a
+  restart — those domains are not re-created, so this is the normal outcome
+  rather than an exception, and the result carries the remedy.
+
+- **`edit_collector`.** Editing the description is free. Editing the filter,
+  level, `group_keys`, `max_sample_bytes` or domain **discards the live
+  window** and re-runs every gate arming does — a window and the definition
+  describing it must not disagree. Recorded snapshots are never touched. Levels
+  move in both directions: dropping `tree` to `timing` buys 2.5× the retained
+  records, which is the only remedy left once the sample budget is exhausted.
+
+### Fixed
+
+- **A corrupt `state.json` no longer stops the daemon from starting.** It was
+  written with a plain `fs::write` and read with a `?` on the parse, so an
+  interrupted write — a crash, a full disk — meant the broker refused to start
+  until a human found and deleted the file by hand. A recoverable loss of
+  session bookkeeping became an outage of everything.
+
+  Durable writes now go temp → fsync → rename → fsync the directory, so a
+  reader sees either the old file or the new one and never a prefix of the new
+  one over the old. A boot sweep clears temps a crash left behind. On load, an
+  unreadable file is moved aside (renamed, not deleted — it is the only
+  evidence of what went wrong) and the daemon starts empty, saying loudly what
+  was lost.
+
 ## 0.4.0 — 2026-07-29
 
 `PROTOCOL_VERSION` stays at **1**. Everything here is additive on the wire —

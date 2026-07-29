@@ -812,8 +812,24 @@ pub struct CollectorInfo {
     pub armed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zeroed_at: Option<DateTime<Utc>>,
+    /// Why the live window is empty, when there is a reason: `daemon_restart`,
+    /// `reset`, or `edit`. Absent means nothing has zeroed it — so a caller
+    /// seeing `matched: 0` can tell "no traffic yet" from "the run you were
+    /// measuring did not survive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zeroed_by: Option<String>,
+    /// Recorded runs held for this collector.
+    #[serde(default)]
+    pub snapshots: usize,
     /// `false` once the sample budget stopped retention.
     pub sample_complete: bool,
+    /// The pinned domain no longer exists, so this collector can never match
+    /// another span. The normal outcome of a restart for one armed on an
+    /// ephemeral domain, since those are not re-created.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orphaned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -865,6 +881,51 @@ pub struct CollectorsResetResult {
 pub struct CollectorsRemoveResult {
     pub removed: String,
     pub reserved_bytes: u64,
+}
+
+/// An edit (§7.1). `description` is free; **any other field discards the live
+/// window** and re-runs every gate `collectors.add` runs. Recorded snapshots
+/// are untouched and each keeps the definition it was taken under.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsEdit {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// `scalar`, `timing` or `tree`. Permitted in **both** directions: a `tree`
+    /// collector heading for the sample cap mid-run can drop to `timing` for
+    /// 2.5× the records, which is the only remedy left once the daemon-wide
+    /// reservation is exhausted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sample_bytes: Option<u64>,
+    /// Re-pin to another domain. Only while the collector is zeroed, so a
+    /// recorded window and the domain it was measured on cannot disagree. This
+    /// is the remedy for a collector orphaned by a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsEditResult {
+    pub name: String,
+    pub filter: String,
+    pub level: String,
+    #[serde(default)]
+    pub group_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub domain: String,
+    pub max_sample_bytes: u64,
+    /// Whether the live window was discarded. History never is.
+    pub zeroed: bool,
+    pub note: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -924,6 +985,13 @@ pub struct SnapshotSummary {
     pub sample_complete: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cardinality_capped: bool,
+    /// Absent means durable. `false` means the run is in this response and in
+    /// the daemon's memory but was not written, so it will not survive a
+    /// restart — which matters to anyone collecting runs to compare later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

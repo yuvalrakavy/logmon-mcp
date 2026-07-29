@@ -4078,9 +4078,33 @@
               ],
               "format": "date-time"
             },
+            "zeroed_by": {
+              "description": "Why the live window is empty, when there is a reason: `daemon_restart`,\n`reset`, or `edit`. Absent means nothing has zeroed it — so a caller\nseeing `matched: 0` can tell \"no traffic yet\" from \"the run you were\nmeasuring did not survive\".",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "snapshots": {
+              "description": "Recorded runs held for this collector.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
             "sample_complete": {
               "description": "`false` once the sample budget stopped retention.",
               "type": "boolean"
+            },
+            "orphaned": {
+              "description": "The pinned domain no longer exists, so this collector can never match\nanother span. The normal outcome of a restart for one armed on an\nephemeral domain, since those are not re-created.",
+              "type": "boolean"
+            },
+            "orphan_note": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -4143,9 +4167,33 @@
           ],
           "format": "date-time"
         },
+        "zeroed_by": {
+          "description": "Why the live window is empty, when there is a reason: `daemon_restart`,\n`reset`, or `edit`. Absent means nothing has zeroed it — so a caller\nseeing `matched: 0` can tell \"no traffic yet\" from \"the run you were\nmeasuring did not survive\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "snapshots": {
+          "description": "Recorded runs held for this collector.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
         "sample_complete": {
           "description": "`false` once the sample budget stopped retention.",
           "type": "boolean"
+        },
+        "orphaned": {
+          "description": "The pinned domain no longer exists, so this collector can never match\nanother span. The normal outcome of a restart for one armed on an\nephemeral domain, since those are not re-created.",
+          "type": "boolean"
+        },
+        "orphan_note": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -4359,6 +4407,122 @@
           "minimum": 0
         }
       }
+    },
+    "CollectorsEdit": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsEdit",
+      "description": "An edit (§7.1). `description` is free; **any other field discards the live\nwindow** and re-runs every gate `collectors.add` runs. Recorded snapshots\nare untouched and each keeps the definition it was taken under.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filter": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "description": "`scalar`, `timing` or `tree`. Permitted in **both** directions: a `tree`\ncollector heading for the sample cap mid-run can drop to `timing` for\n2.5× the records, which is the only remedy left once the daemon-wide\nreservation is exhausted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_keys": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_sample_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "domain": {
+          "description": "Re-pin to another domain. Only while the collector is zeroed, so a\nrecorded window and the domain it was measured on cannot disagree. This\nis the remedy for a collector orphaned by a restart.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "CollectorsEditResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsEditResult",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "filter": {
+          "type": "string"
+        },
+        "level": {
+          "type": "string"
+        },
+        "group_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "domain": {
+          "type": "string"
+        },
+        "max_sample_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "zeroed": {
+          "description": "Whether the live window was discarded. History never is.",
+          "type": "boolean"
+        },
+        "note": {
+          "type": "string"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "filter",
+        "level",
+        "domain",
+        "max_sample_bytes",
+        "zeroed",
+        "note"
+      ]
     },
     "CollectorsSnapshot": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4600,6 +4764,19 @@
             },
             "cardinality_capped": {
               "type": "boolean"
+            },
+            "durable": {
+              "description": "Absent means durable. `false` means the run is in this response and in\nthe daemon's memory but was not written, so it will not survive a\nrestart — which matters to anyone collecting runs to compare later.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "durability_warning": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -5007,6 +5184,19 @@
         },
         "cardinality_capped": {
           "type": "boolean"
+        },
+        "durable": {
+          "description": "Absent means durable. `false` means the run is in this response and in\nthe daemon's memory but was not written, so it will not survive a\nrestart — which matters to anyone collecting runs to compare later.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "durability_warning": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

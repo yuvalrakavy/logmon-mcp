@@ -138,6 +138,23 @@ impl Collector {
         &self.def
     }
 
+    /// When this collector was armed. Cheap enough to read on the persistence
+    /// path without cloning a whole view.
+    pub fn armed_at(&self) -> DateTime<Utc> {
+        self.inner.read().expect("collector lock poisoned").armed_at
+    }
+
+    /// Whether the live window holds anything. `edit` re-pins a domain only on
+    /// a zeroed collector, and a restored one is zeroed by definition.
+    pub fn is_zeroed(&self) -> bool {
+        self.inner
+            .read()
+            .expect("collector lock poisoned")
+            .total
+            .count
+            == 0
+    }
+
     /// Fold one matched span in. Takes the lock once and updates every
     /// structure inside it.
     ///
@@ -202,6 +219,32 @@ impl Collector {
                 trace_id: span.trace_id,
             };
             g.samples.push(&rec, &group_ids);
+        }
+    }
+
+    /// A collector with a new definition and the same live data.
+    ///
+    /// Only sound when the change cannot alter what was already collected — a
+    /// description. Anything structural goes through a fresh `Collector`, so
+    /// the window and the definition describing it can never disagree.
+    pub fn with_def(&self, def: CollectorDef) -> Self {
+        let g = self.inner.read().expect("collector lock poisoned");
+        let mut inner = Inner::new(&def, g.armed_at);
+        inner.total = g.total.clone();
+        inner.per_name = g.per_name.clone();
+        inner.per_group = g.per_group.clone();
+        inner.names = g.names.clone();
+        inner.group_values = g.group_values.clone();
+        // The sample tier comes across too. Leaving `Inner::new`'s fresh one in
+        // place would give `sample_count < count` with `complete: true` — the
+        // one reconciliation rule this design has, broken by a rename.
+        inner.samples = g.samples.clone();
+        inner.zeroed_at = g.zeroed_at;
+        inner.group_tuples_capped = g.group_tuples_capped;
+        drop(g);
+        Self {
+            def: Arc::new(def),
+            inner: RwLock::new(inner),
         }
     }
 

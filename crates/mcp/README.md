@@ -37,7 +37,10 @@ Global flags:
 | `traces` | `recent` / `get` / `summary` / `slow` / `logs` | Query traces. With `slow --group-by name` the aggregates cover every matching span of that name; `--min-duration-ms` is then a display floor deciding which names appear. |
 | `spans` | `context` | Fetch spans surrounding a seq. |
 | `collectors` | `add` | Arm a span time collector (`--filter`, `--level`, repeatable `--group-key`, `--description`). |
-| `collectors` | `list` / `get` / `reset` / `remove` | Read totals, percentiles and self time; zero between runs; release the budget. |
+| `collectors` | `list` / `get` / `remove` | Read totals, percentiles and self time; release the budget. `get --snapshot LABEL` reads a recorded run. |
+| `collectors` | `snapshot` / `history` | Record a window as a named run and start the next; list the runs. `history --merge` adds them up and reports the run-to-run spread. |
+| `collectors` | `edit` | Change an armed collector. `--description` is free; anything else discards the live window (never the history). |
+| `collectors` | `reset` | Zero and **discard** the run. Prefer `snapshot`. |
 | `collectors` | `profile` | Same numbers over spans already buffered, without arming anything. |
 | `sessions` | `list` / `drop` | List or drop sessions. (Renaming the *current* session is an MCP-mode tool — `rename_session` — not a CLI verb: the CLI's per-invocation session has nothing durable to rename.) |
 | `domains` | `create` / `delete` / `list` / `clear` | Manage isolated domains (each with its own buffers, receivers, triggers). |

@@ -1130,14 +1130,42 @@ are the deviations, and they are deliberate.
 4. **Children are keyed on `(trace_id, span_id)`.** Span ids are only unique *within* a
    trace; sequential-per-trace instrumentation collides constantly across traces.
 
+### Phase 3 — landed
+
+| Piece | Where | Notes |
+|---|---|---|
+| Snapshot history | `collector/history.rs` | §6 — labels never reused, eviction counted, merge + run-to-run floor. |
+| Persistence | `collector/persist.rs` | §10 — one file, definition *and* history; sketches round-trip. |
+| Atomic writes | `daemon/persistence.rs` | §10 — temp → fsync → rename → fsync dir, boot sweep, quarantine-not-abort. |
+| Restore | `CollectorRegistry::restore` | §10 — armed but zeroed, `zeroed_by: "daemon_restart"`. |
+| Lazy orphan check | `handle_collectors_list` | §10 — at read time, never at restore. |
+| `collectors.edit` | `CollectorRegistry::edit` | §7.1 — description free, everything else a reset. |
+| GC | `remove` / `drop_session` | §10 — disposal deletes the file. |
+
+Three things worth knowing before touching this again:
+
+- **A description edit must carry the sample tier across.** `Collector::with_def`
+  rebuilds `Inner` around a new definition, and the first version left
+  `Inner::new`'s fresh `SampleTier` in place — which gives `sample_count < count`
+  with `complete: true`, the one reconciliation rule this design has, broken by a
+  rename. Caught by re-reading, not by a test; there is a test now.
+- **The `state.json` atomicity fix was load-bearing for more than collectors.** A
+  truncated file used to stop the daemon booting until a human deleted it.
+- **A rename-vs-copy guard needs a concurrent test.** `copy` then `remove` leaves
+  byte-identical final contents; only a reader racing the writer can tell them
+  apart. The single-threaded version of that test passed against the mutant.
+
 ### Not yet built
 
 1. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
    cost**; deliberately deprioritised now that measurement has ranked it.
-2. Phases 2–5 per §13: remaining projections work is done, so phase 3 (**history**:
-   snapshot/history/edit, per-collector files, crash harness, merging), phase 4
-   (**comparison**: `collectors.diff`, `collectors.document`), phase 5 (**guards**:
-   threshold triggers).
+2. **A real `kill -9` harness.** V11 is covered by a stricter test instead: the
+   definition is asserted present on disk *while the daemon is still running*, so no
+   shutdown path is involved at all — which is what §12's objection to `restart()`
+   was actually about. A true out-of-process test additionally needs a config-dir
+   override; there is no env var or flag for it, only `DaemonOverrides`.
+3. Phase 4 (**comparison**: `collectors.diff`, `collectors.document`), phase 5
+   (**guards**: threshold triggers).
 3. **`status.get` does not surface the new counters.** Deliberate: `receiver_drops`
    documents itself as counting entries the broker *silently* lost, and both transports
    carry a comment explaining why a shed is not one of those. Adding a sibling field is

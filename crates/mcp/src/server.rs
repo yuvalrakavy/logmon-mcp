@@ -280,6 +280,25 @@ struct GetCollectorParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct EditCollectorParams {
+    name: String,
+    /// Free — changes nothing about what is collected.
+    description: Option<String>,
+    /// Any of the fields below DISCARDS the live window. Recorded snapshots are
+    /// untouched and each keeps the definition it was taken under.
+    filter: Option<String>,
+    /// scalar | timing | tree. Permitted in both directions — dropping a
+    /// `tree` collector to `timing` buys 2.5x the retained records, which is
+    /// the only remedy left once the sample budget is exhausted.
+    level: Option<String>,
+    group_keys: Option<Vec<String>>,
+    max_sample_bytes: Option<u64>,
+    /// Re-pin to another domain, only while zeroed. The remedy for a collector
+    /// orphaned by a restart.
+    domain: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct SnapshotCollectorParams {
     name: String,
     /// Unique per collector. Omitted → "snapshot-<n>", and n never repeats.
@@ -783,6 +802,39 @@ impl GelfMcpServer {
                     "group_by": p.group_by,
                     "skip_warmup_ms": p.skip_warmup_ms,
                     "top_n": p.top_n,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Change an armed collector. Editing only the description changes \
+                       nothing else; editing the filter, level, group_keys, max_sample_bytes \
+                       or domain DISCARDS the live window, because a window and the \
+                       definition describing it must not disagree. Recorded snapshots are \
+                       never touched. Use it to re-pin a collector orphaned by a restart, or \
+                       to drop a level when the sample budget runs out."
+    )]
+    async fn edit_collector(
+        &self,
+        Parameters(p): Parameters<EditCollectorParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.edit",
+                serde_json::json!({
+                    "name": p.name,
+                    "description": p.description,
+                    "filter": p.filter,
+                    "level": p.level,
+                    "group_keys": p.group_keys,
+                    "max_sample_bytes": p.max_sample_bytes,
+                    "domain": p.domain,
                 }),
             )
             .await

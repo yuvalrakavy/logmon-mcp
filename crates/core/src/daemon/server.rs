@@ -239,7 +239,12 @@ pub async fn run_with_overrides(
     // Daemon-wide, domain-keyed collector registry (spec section 4.4). One
     // instance shared by every span processor; entries carry their own pinned
     // domain, so a collector is never reached via its owner's current binding.
-    let collectors = Arc::new(crate::collector::registry::CollectorRegistry::new());
+    // Persistence goes into the same directory the rest of the daemon's state
+    // does, under a `collectors/` subdirectory so the boot sweeps for
+    // `daemon.pid` and the socket cannot reach these files by accident.
+    let collectors = Arc::new(
+        crate::collector::registry::CollectorRegistry::new().with_persistence(dir.clone()),
+    );
     let bookmark_store = Arc::new(crate::store::bookmarks::BookmarkStore::new());
     for (name, persisted) in &state.named_sessions {
         sessions.restore_named(name, persisted, &bookmark_store);
@@ -486,6 +491,39 @@ pub async fn run_with_overrides(
             stale_after_secs: config.stale_after_secs,
         },
     ));
+
+    // 13a2. Restore collectors (§10). Deliberately AFTER the domain registry
+    //       exists, so a restored collector can be handed the metrics of the
+    //       domain it was pinned to. The ORPHAN check stays lazy regardless —
+    //       config-declared domains are built above but an API-created one
+    //       never comes back, and marking that at boot would report a failure
+    //       the caller cannot yet see the context for.
+    {
+        let domains_for_restore = domains.clone();
+        let fallback_metrics = receiver_metrics.clone();
+        let report = collectors.restore(move |id| {
+            domains_for_restore
+                .get(id)
+                .map(|d| d.metrics.clone())
+                // A collector whose domain is gone gets a private counter set
+                // it shares with nobody. Its ingest figures are then trivially
+                // zero, which is correct: no span can reach it, so none is
+                // lost on its behalf either.
+                .unwrap_or_else(|| fallback_metrics.clone())
+        });
+        if !report.restored.is_empty() {
+            info!(
+                collectors = ?report.restored,
+                "restored collectors, armed but zeroed (a live window does not survive a restart)"
+            );
+        }
+        for (path, reason) in &report.quarantined {
+            warn!(?path, %reason, "collector file moved aside; it could not be read");
+        }
+        for (name, reason) in &report.rejected {
+            warn!(%name, %reason, "collector file describes something this build cannot arm");
+        }
+    }
 
     // 13b. Session TTL sweep (meaningful-session-names spec, 2026-07-17):
     //      a session DISCONNECTED longer than `session_ttl_secs` is disposed —

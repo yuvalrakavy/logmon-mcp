@@ -211,6 +211,9 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `collectors_add` | `CollectorsAdd` | `CollectorsAddResult` |
 | `collectors_list` | `CollectorsList` | `CollectorsListResult` |
 | `collectors_get` | `CollectorsGet` | `ProfileResult` |
+| `collectors_edit` | `CollectorsEdit` | `CollectorsEditResult` |
+| `collectors_snapshot` | `CollectorsSnapshot` | `SnapshotSummary` |
+| `collectors_history` | `CollectorsHistory` | `CollectorsHistoryResult` |
 | `collectors_reset` | `CollectorsName` | `CollectorsResetResult` |
 | `collectors_remove` | `CollectorsName` | `CollectorsRemoveResult` |
 | `traces_profile` | `TracesProfile` | `ProfileResult` |

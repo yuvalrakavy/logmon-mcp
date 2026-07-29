@@ -149,6 +149,8 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "CollectorsDiscarded":   schema_for!(CollectorsDiscarded),
             "CollectorsRemoveResult": schema_for!(CollectorsRemoveResult),
             "TracesProfile":         schema_for!(TracesProfile),
+            "CollectorsEdit":        schema_for!(CollectorsEdit),
+            "CollectorsEditResult":  schema_for!(CollectorsEditResult),
             "CollectorsSnapshot":    schema_for!(CollectorsSnapshot),
             "CollectorsHistory":     schema_for!(CollectorsHistory),
             "CollectorsHistoryResult": schema_for!(CollectorsHistoryResult),
