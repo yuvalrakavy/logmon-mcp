@@ -51,7 +51,7 @@ Verified against the tree at `a08c119`.
 | Bookmark windows on spans | `matches_span_qualifier` `SeqFilter` arm | Bookmarks resolve to `SeqFilter` at the RPC layer, and spans/logs share one seq counter — so `b>=start, b<=end` **already works on span filters today**. `traces.profile` gets window-scoping for free. |
 | Per-session state registry | `SessionRegistry` (`crates/core/src/daemon/session.rs`) | Collectors follow the triggers/filters/bookmarks pattern for lifecycle and persistence. |
 | Per-trigger debounce | `post_window_remaining` (`crates/core/src/daemon/session.rs`) | Landed in 0.3.0. Threshold triggers (§8) reuse it rather than inventing cooldown. |
-| File export | `logs.export` | Establishes the pattern `collectors.export` (§9) follows. |
+| File export | `logs.export` | Establishes the file-writing pattern `collectors.document` (§9) follows — though it produces a data file, where §9 produces a document meant to be read. |
 | Span ring buffer | `SpanStore`, default `span_buffer_size` **10 000** (`crates/core/src/daemon/persistence.rs`) | The reason a query-only design is insufficient: a suite-length run overflows this and eviction is silent. |
 
 ### 1.1 Two existing defects this work touches
@@ -90,7 +90,9 @@ Verified against the tree at `a08c119`.
 8. `traces.profile` — the same projection over the ring buffer, no collector needed.
 9. `collectors.diff` — deltas at every percentile, with mismatch refusals; accepts
    snapshots on either side.
-10. `collectors.export` — folded-stack output for speedscope / flamegraph.pl.
+10. `collectors.document` — a self-describing, long-lived record of a collector and
+    its full snapshot history, written for a reader months later (§9); folded-stack
+    output for speedscope / flamegraph.pl is one of its formats.
 11. Threshold triggers on collectors (phase 5).
 12. Fixing the `traces.slow` grouping bias (§1.1).
 
@@ -103,6 +105,10 @@ Verified against the tree at `a08c119`.
   projects or machines. Snapshot history (§6) absorbs the in-collector case, which
   is what the driving workflow needs; a global baseline store is a separate surface
   with its own naming and retention questions. Deferred (§13).
+- **Re-importing a document.** There is no `collectors.import` and no frozen-collector
+  concept. A document's consumer is a reader — an AI assistant or a person — doing the
+  comparison themselves (§9.1). Dropping the round trip removes an RPC, a lifecycle
+  state, and an entire format-compatibility obligation.
 - Multi-key `group_by`. Single dimension in v1.
 - Reservoir sampling. Explicitly rejected — see §3.4.
 - Any change to how spans are received or stored.
@@ -538,7 +544,8 @@ them and states that it did, rather than presenting a plausible-looking blend.
 ### 6.6 Descriptions
 
 `description` on the collector (set at `add`, editable); `label` + `description` on
-each snapshot. Both are echoed in every read, diff, history entry, and export.
+each snapshot, plus free-form `meta` key/values (§9.3). All are echoed in every read,
+diff, history entry, and document.
 
 This is the "a load-bearing number carries the context it was measured in" rule
 enforced by the data structure rather than by memory: there is no path on which a
@@ -562,7 +569,7 @@ Following the existing `noun.verb` convention (`triggers.add`, `traces.slow`).
 | `collectors.reset` | `reset_collector` | **Discard** without recording. Returns what it cleared. |
 | `collectors.remove` | `remove_collector` | |
 | `collectors.diff` | `diff_collectors` | §5.6. Either side may be `collector@label`. |
-| `collectors.export` | `export_profile` | §9 |
+| `collectors.document` | `document_collector` | §9. Accepts several collectors in one call. |
 | `traces.profile` | `profile_spans` | Same projection over the ring buffer. Accepts bookmark windows (`b>=`/`b<=`) — already supported on span filters. |
 
 `collectors.snapshot` recording and zeroing in one call makes run→record→zero→run
@@ -604,16 +611,86 @@ matter. Rolling-window evaluation is the requirement, not an optimisation.
 
 ---
 
-## 9. Folded-stack export
+## 9. Documenting a collector
 
-`collectors.export(name, format, path)`. `format: "folded"` emits
-`nameA;nameB;nameC <self_time_us>` — the §5.4 path projection serialised
-differently, read directly by speedscope and flamegraph.pl. `format: "json"` writes
-the `ProfileResult`. Requires `tree` for folded.
+`collectors.document(names, format, path)` — MCP `document_collector`.
 
-The value is division of labour: the assistant reads the table, the human looks at
-the shape, and shapes are where the unqueried problem shows up. Follows the existing
-`logs.export` file-export pattern.
+### 9.1 What it is for
+
+**A document is long-term memory, and its consumer is a reader — an AI assistant or a
+person — months later.** The use case is returning to a measurement when a *new*
+optimisation idea comes up: what did this cost before, and what has changed since.
+
+That purpose sets three requirements that a plain data dump fails:
+
+1. **It documents the snapshots, not just the live state.** A collector's history *is*
+   the record; documenting only the current tiers would archive the least interesting
+   moment.
+2. **It is self-describing.** The reader has no logmon, no spec, and no memory of the
+   session. Everything needed to interpret the numbers travels in the file.
+3. **It is not re-imported.** There is deliberately no `collectors.import` and no
+   frozen-collector concept. Comparison happens in the reader, not in the broker —
+   which is why the file is optimised for being *read*, not for round-tripping.
+
+The name is `document`, not `export`, for exactly that reason: `logs.export` produces
+a data file, and this produces an artefact meant to be read. (`report` was the
+alternative; `document` won because the artefact is a durable record, not a one-time
+summary.)
+
+### 9.2 Contents
+
+Default `format: "md"` — a self-contained Markdown document:
+
+- **A preamble explaining how to read it.** Specifically the `exact` / `estimated` /
+  `sampled` distinction and what `complete: false` means. This is unusual for a data
+  format and correct here: the three-category structure exists to stop a degraded
+  number being quoted as an exact one, and that protection is worthless to a reader
+  who no longer remembers the convention. Roughly a kilobyte of static prose.
+- **Collector definition** — filter, level, `group_keys`, snapshot policy,
+  description, and `meta` (§9.3).
+- **One section per snapshot** — label, description, `taken_at`, window, and the
+  scalar/percentile tables.
+- **The full per-span-name vocabulary**, not just the top rows. A reader comparing two
+  documents from months apart needs to see that span names appeared or disappeared —
+  that is the signal that the code changed underneath and the comparison is no longer
+  apples to apples. logmon cannot compute this across two files, so its job is to make
+  sure the file contains what the reader needs to spot it.
+- **An embedded JSON block** at the end carrying the complete data, including raw
+  histogram buckets and their layout, so nothing in the document is lossy.
+
+`format: "json"` writes that block alone. `format: "folded"` emits
+`nameA;nameB;nameC <self_time_us>` per snapshot — the §5.4 path projection for
+speedscope and flamegraph.pl. Requires `tree`.
+
+Multiple collectors may be named in one call, so documenting a whole session is one
+operation.
+
+### 9.3 `meta` — the provenance logmon cannot infer
+
+Free-form key/value pairs on collectors and on snapshots, echoed into the document:
+`{"git_sha": "a08c119", "config": "cache=on", "host": "imac-studio"}`.
+
+Months later, "sum was 1 234 567 ms" is uninterpretable without knowing what code
+produced it, and logmon has no way to know what a git SHA is. Every consumer does.
+This is the difference between an archive and a number, and it costs a map.
+
+The documentation should establish recording the commit and the varied configuration
+as the convention — a document without provenance is a measurement that cannot be
+acted on.
+
+### 9.4 Two details that only matter at this timescale
+
+- **Histogram bucket layout travels inside the file**, never assumed from the reading
+  side's defaults. Otherwise a later change to the default layout would silently shift
+  every percentile in every older document.
+- **`format_version` is stamped.** Informational rather than enforced — nothing
+  imports, so there is no compatibility gate to fail — but a reader must be able to
+  tell what convention it is looking at.
+
+Because nothing re-imports, there is no round-trip correctness obligation and no
+format compatibility contract to break. This surface is ordinary T2: the failure mode
+is a document that *reads* misleadingly, which is a writing problem, not a data
+-integrity one.
 
 ---
 
@@ -662,6 +739,8 @@ silent fallback:
 | `max_snapshots` reached | Oldest evicted FIFO; `snapshots_evicted` reported |
 | Merging snapshots with sample-derived projections requested | Those fields omitted, with a stated reason (§6.5) |
 | Group histogram cap reached | Group keeps exact scalars only; result says so (§3.5) |
+| `document` with `format: "folded"` on a non-`tree` collector | Error naming the level required |
+| `document` of a collector with no snapshots | Valid — documents the definition and live tiers, and states that history is empty |
 
 ---
 
@@ -695,7 +774,11 @@ silent fallback:
 - **V16** Merged history equals the sum of its parts for scalars and histograms, and
   omits sample-derived projections with a stated reason.
 - **V17** Descriptions (collector and snapshot) appear in read, diff, history, and
-  export output.
+  document output.
+- **V18** A document round-trips its own meaning: definition, every snapshot, the
+  full per-name vocabulary, `meta`, histogram buckets **and their layout**, and the
+  how-to-read preamble are all present, and the embedded JSON block loses nothing
+  relative to `format: "json"`.
 
 **Adversarial**
 
@@ -751,7 +834,7 @@ diff. Mid-checkpoint after phase 1.
 3. **History.** `snapshot` / `history` / `edit`, snapshot policy with
    definition-time validation, persistence of snapshots, merging.
 4. **Comparison.** `collectors.diff` with its refusals and cross-representation
-   handling; folded export.
+   handling; `collectors.document` in all three formats.
 5. **Guards.** Threshold triggers with rolling-window evaluation.
 
 Phases 1–3 are the complete driving workflow. If phases 4–5 are cut or deferred, the
