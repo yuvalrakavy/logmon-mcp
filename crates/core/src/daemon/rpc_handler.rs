@@ -199,6 +199,7 @@ impl RpcHandler {
             "collectors.edit" => self.handle_collectors_edit(session_id, &request.params),
             "collectors.snapshot" => self.handle_collectors_snapshot(session_id, &request.params),
             "collectors.history" => self.handle_collectors_history(session_id, &request.params),
+            "collectors.diff" => self.handle_collectors_diff(session_id, &request.params),
             "collectors.reset" => self.handle_collectors_reset(session_id, &request.params),
             "collectors.remove" => self.handle_collectors_remove(session_id, &request.params),
             "traces.profile" => self.handle_traces_profile(session_id, &request.params),
@@ -1813,7 +1814,7 @@ impl RpcHandler {
                         .unwrap_or(true),
                     now: Utc::now(),
                 },
-                crate::collector::project::project_samples,
+                crate::collector::project::project_for_snapshot,
             )
             .map_err(|e| e.to_string())?;
         let mut out = snapshot_summary(&snap.snapshot);
@@ -1899,6 +1900,116 @@ impl RpcHandler {
             result["suppressed"] = json!(suppressed);
         }
         Ok(result)
+    }
+
+    /// `collectors.diff` — compare two arms (§5.6).
+    fn handle_collectors_diff(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        use crate::collector::diff::{diff, DiffAllowances, DiffGroupBy, DiffOptions};
+
+        let a = self.resolve_arm(session_id, require_str(params, "a")?)?;
+        let b = self.resolve_arm(session_id, require_str(params, "b")?)?;
+
+        let group_by = match params.get("group_by").and_then(|v| v.as_str()) {
+            None => DiffGroupBy::None,
+            Some(s) => DiffGroupBy::parse(s).ok_or_else(|| {
+                format!(
+                    "unknown group_by `{s}` for a diff: expected `name` or `group`. `trace` \
+                     and `path` are projected from per-span records, which a recorded run \
+                     does not retain, so there is nothing to compare"
+                )
+            })?,
+        };
+        let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        let opts = DiffOptions {
+            group_by,
+            top_n: params
+                .get("top_n")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(20),
+            allow: DiffAllowances {
+                mismatch: flag("allow_mismatch"),
+                lossy: flag("allow_lossy"),
+                truncated: flag("allow_truncated"),
+            },
+        };
+
+        let result = diff(a, b, &opts).map_err(|e| e.to_string())?;
+        serde_json::to_value(result.to_wire()).map_err(|e| e.to_string())
+    }
+
+    /// Resolve `<collector>`, `<collector>@<label>`, or `<collector>@*` into an
+    /// arm.
+    ///
+    /// `*` cannot be a valid snapshot label (`is_valid_label` admits only
+    /// `[A-Za-z0-9._-]`), so the wildcard can never collide with a real one —
+    /// which is why it is spelled this way rather than as a separate parameter.
+    fn resolve_arm(
+        &self,
+        session_id: &SessionId,
+        spec: &str,
+    ) -> Result<crate::collector::diff::Arm, String> {
+        use crate::collector::diff::Arm;
+
+        let (name, selector) = match spec.split_once('@') {
+            None => (spec, None),
+            Some((n, label)) => (n, Some(label)),
+        };
+        if name.is_empty() {
+            return Err(format!(
+                "`{spec}` names no collector: use `<collector>`, `<collector>@<label>`, or \
+                 `<collector>@*` for every recorded run merged"
+            ));
+        }
+
+        match selector {
+            // The live window. Its ingest basis is resolved exactly as
+            // `collectors.get` resolves it — pointer equality on the domain's
+            // metrics handle, so a domain deleted and recreated under the
+            // collector reads as unknown rather than as zero loss.
+            None => {
+                let armed = self
+                    .collectors
+                    .get(session_id, name)
+                    .ok_or_else(|| format!("no collector named `{name}` in this session"))?;
+                let ingest = match self.ingest_basis(&armed) {
+                    crate::collector::project::IngestBasis::Same { baseline, current } => {
+                        Some(current.since(baseline))
+                    }
+                    _ => None,
+                };
+                Ok(Arm::from_live(
+                    spec.to_string(),
+                    &armed.collector.snapshot(),
+                    ingest,
+                    Utc::now(),
+                ))
+            }
+            Some("*") => {
+                let (snapshots, _evicted) = self
+                    .collectors
+                    .history(session_id, name)
+                    .map_err(|e| e.to_string())?;
+                if snapshots.is_empty() {
+                    return Err(format!(
+                        "collector `{name}` has no recorded runs to merge. Take one with \
+                         collectors.snapshot, or name the live window as `{name}`"
+                    ));
+                }
+                Arm::merged(spec.to_string(), &snapshots).map_err(|e| e.to_string())
+            }
+            Some(label) => {
+                let s = self
+                    .collectors
+                    .get_snapshot(session_id, name, label)
+                    .map_err(|e| e.to_string())?;
+                Ok(Arm::from_snapshot(spec.to_string(), &s))
+            }
+        }
     }
 
     fn handle_collectors_reset(

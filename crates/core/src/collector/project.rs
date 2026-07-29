@@ -230,6 +230,31 @@ pub fn profile(
     }
 }
 
+/// Everything a snapshot must project at the moment it is taken.
+///
+/// One bundle rather than several arguments, because they share one reason for
+/// existing: the per-span records these are derived from are not retained
+/// (§6.3), so a projection not taken here can never be taken later. Adding a
+/// projection to the snapshot means adding a field here, which is the point —
+/// the alternative is discovering months later that the number you want was
+/// computable exactly once and nobody computed it.
+#[derive(Debug, Clone, Default)]
+pub struct Projected {
+    pub sampled: Option<ProfileSampled>,
+    pub paths: Vec<logmon_broker_protocol::PathRow>,
+    pub paths_truncated: bool,
+}
+
+/// Project everything a snapshot records, outside the collector lock.
+pub fn project_for_snapshot(snap: &CollectorSnapshot) -> Projected {
+    let (paths, paths_truncated) = project_paths(snap);
+    Projected {
+        sampled: project_samples(snap),
+        paths,
+        paths_truncated,
+    }
+}
+
 /// Just the sample-derived figures, for a snapshot to record at the moment it
 /// is taken.
 ///
@@ -773,13 +798,28 @@ fn trace_rows(samples: &SampleSnapshot, cut_ns: Option<i64>, top_n: usize) -> Ve
     v
 }
 
-/// Call paths (§5.4): self time aggregated by the chain of matched ancestors.
+/// One call path's aggregate — the shared product of the path walk.
+///
+/// Rendered two ways: as a `ProfileGroup` row for a live read, and as a
+/// `PathRow` stored in a snapshot so a flame graph can be produced from a
+/// recorded run (§9.8). One walk with two renderings rather than two walks:
+/// the second implementation is where they would drift, and a flame graph that
+/// disagreed with the profile it came from would be worse than no flame graph.
+pub struct PathAggregate {
+    pub path: String,
+    pub self_ns: i128,
+    pub count: u64,
+    pub incomplete: bool,
+}
+
+/// Call paths (§5.4): self time aggregated by the chain of matched ancestors,
+/// ranked by self time descending then by path so equal rows are stable.
 ///
 /// Paths resolve only where ancestors are matched, so the idiom is a broad
 /// filter plus read-time narrowing. A walk that stops at a parent which is not
 /// retained yields a suffix, marked `[?]` and `path_incomplete`, rather than a
 /// path silently rooted at the wrong place.
-fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec<ProfileGroup> {
+pub fn path_aggregates(snap: &CollectorSnapshot, cut_ns: Option<i64>) -> Vec<PathAggregate> {
     let samples = &snap.samples;
     let mut durations: Vec<i64> = Vec::new();
     let mut intervals: Vec<(i64, i64)> = Vec::new();
@@ -849,16 +889,32 @@ fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec
         row.incomplete |= incomplete;
     }
 
-    let mut v: Vec<ProfileGroup> = rows
+    let mut v: Vec<PathAggregate> = rows
         .into_iter()
-        .map(|(key, r)| ProfileGroup {
-            key,
+        .map(|(path, r)| PathAggregate {
+            path,
+            self_ns: r.self_ns,
+            count: r.count,
+            incomplete: r.incomplete,
+        })
+        .collect();
+    v.sort_by(|a, b| b.self_ns.cmp(&a.self_ns).then_with(|| a.path.cmp(&b.path)));
+    v
+}
+
+fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec<ProfileGroup> {
+    let complete = snap.samples.complete;
+    path_aggregates(snap, cut_ns)
+        .into_iter()
+        .take(top_n)
+        .map(|p| ProfileGroup {
+            key: p.path,
             exact: None,
             estimated: None,
             sampled: Some(ProfileSampled {
-                complete: samples.complete,
-                sample_count: r.count,
-                self_ms: Some(ns_to_ms(r.self_ns)),
+                complete,
+                sample_count: p.count,
+                self_ms: Some(ns_to_ms(p.self_ns)),
                 nested_matches: 0,
                 overlapping_child_ms: 0.0,
                 overlapping_child_spans: 0,
@@ -869,16 +925,48 @@ fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec
                 p95_ms: None,
                 p99_ms: None,
             }),
-            path_incomplete: r.incomplete,
+            path_incomplete: p.incomplete,
         })
-        .collect();
-    v.sort_by(|a, b| {
-        let sa = a.sampled.as_ref().and_then(|s| s.self_ms).unwrap_or(0.0);
-        let sb = b.sampled.as_ref().and_then(|s| s.self_ms).unwrap_or(0.0);
-        sb.total_cmp(&sa).then_with(|| a.key.cmp(&b.key))
-    });
-    v.truncate(top_n);
-    v
+        .collect()
+}
+
+/// Rows retained in a snapshot's stored path list (§9.8's `folded` format).
+///
+/// Two caps, because either alone leaks: a row count bounds a pathological
+/// fan-out, and a byte budget bounds pathologically *long* paths — a `tree`
+/// collector can walk 64 ancestors deep, so 200 rows of that shape is a
+/// different order of cost from 200 rows of `handler > db`.
+pub const SNAPSHOT_PATH_ROWS: usize = 200;
+pub const SNAPSHOT_PATH_BYTES: usize = 64 * 1024;
+
+/// The path list a snapshot stores, plus whether it was cut short.
+///
+/// Computed at snapshot time or never: the samples it walks are not retained,
+/// so a flame graph not taken here cannot be taken later. Truncation is
+/// returned rather than inferred from the row count — a flame graph rendered
+/// from a partial list is missing mass, and that is not something a reader can
+/// see by looking at it.
+pub fn project_paths(snap: &CollectorSnapshot) -> (Vec<logmon_broker_protocol::PathRow>, bool) {
+    if !snap.def.level.has_tree() {
+        return (Vec::new(), false);
+    }
+    let all = path_aggregates(snap, None);
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for p in all.iter().take(SNAPSHOT_PATH_ROWS) {
+        bytes += p.path.len();
+        if bytes > SNAPSHOT_PATH_BYTES && !out.is_empty() {
+            break;
+        }
+        out.push(logmon_broker_protocol::PathRow {
+            path: p.path.clone(),
+            self_ms: ns_to_ms(p.self_ns),
+            count: p.count,
+            incomplete: p.incomplete,
+        });
+    }
+    let truncated = out.len() < all.len();
+    (out, truncated)
 }
 
 /// Walk matched ancestors, root first. Returns the rendered path and whether

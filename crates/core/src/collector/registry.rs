@@ -10,6 +10,7 @@
 //! keeps them apart.
 
 use crate::collector::history::{History, HistoryError, SnapshotPolicy, StoredSnapshot};
+use crate::collector::project::Projected;
 use crate::collector::state::{Collector, CollectorDef, CollectorSnapshot};
 use crate::daemon::domain::DomainId;
 use crate::daemon::session::SessionId;
@@ -17,7 +18,6 @@ use crate::filter::matcher::matches_span;
 use crate::receiver::{ReceiverMetrics, TraceIngestLoss};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
-use logmon_broker_protocol::ProfileSampled;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -618,7 +618,7 @@ impl CollectorRegistry {
         project: F,
     ) -> Result<SnapshotOutcome, RegistryError>
     where
-        F: FnOnce(&CollectorSnapshot) -> Option<ProfileSampled>,
+        F: FnOnce(&CollectorSnapshot) -> Projected,
     {
         let SnapshotRequest {
             name,
@@ -662,7 +662,11 @@ impl CollectorRegistry {
         };
 
         // Step 2, outside every lock: the expensive part.
-        let projections = policy.projections.then(|| project(&view)).flatten();
+        let projected = if policy.projections {
+            project(&view)
+        } else {
+            Projected::default()
+        };
 
         // Step 3: file it.
         let snap = StoredSnapshot::from_view(
@@ -673,7 +677,7 @@ impl CollectorRegistry {
             policy,
             view,
             ingest,
-            projections,
+            projected,
         );
         // The window was already taken in step 1, so a collector removed under
         // us must NOT turn into an error: that would discard a run the caller

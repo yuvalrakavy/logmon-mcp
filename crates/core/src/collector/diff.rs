@@ -24,11 +24,12 @@
 
 use crate::collector::exact::{ns_to_ms, ExactStats};
 use crate::collector::history::RunToRunFloor;
+use crate::collector::history::StoredSnapshot;
 use crate::collector::intern::{Interner, OVERFLOW_LABEL};
 use crate::collector::project::PERCENTILES;
 use crate::collector::sample::Level;
 use crate::collector::sketch::{SketchLayout, ALPHA};
-use crate::collector::state::CollectorDef;
+use crate::collector::state::{CollectorDef, CollectorSnapshot};
 use crate::filter::parser::{DurationOp, ParsedFilter, Pattern, Qualifier, Selector};
 use crate::receiver::TraceIngestLoss;
 use chrono::{DateTime, Utc};
@@ -132,11 +133,30 @@ pub struct Arm {
     pub aggregation: Aggregation,
     pub def: Arc<CollectorDef>,
     pub total: ExactStats,
-    pub per_name: Option<HashMap<u32, ExactStats>>,
-    pub per_group: Option<HashMap<Vec<u32>, ExactStats>>,
-    pub names: Interner,
-    pub group_values: Vec<Interner>,
+    /// Breakdowns keyed by their **resolved label**, not by interner id.
+    ///
+    /// Resolved at construction because a merged arm spans several snapshots and
+    /// each carries its own interner — the same id means different names in two
+    /// of them. Keeping ids here would make the merge silently graft one run's
+    /// `db.query` onto another's, which is the kind of defect that produces a
+    /// plausible number and no error.
+    ///
+    /// `None` means the breakdown was not recorded, which is distinct from an
+    /// empty map: a restored snapshot drops per-axis maps on the way to disk, and
+    /// an empty map would read as "this run matched nothing under any name".
+    pub per_name: Option<HashMap<String, ExactStats>>,
+    pub per_group: Option<HashMap<String, ExactStats>>,
     pub projections: Option<ProfileSampled>,
+    /// `detected`, `undetected`, or `unknown` — whether any matched span sat
+    /// under another matched span, which decides whether `total_ms` counts the
+    /// inner time twice.
+    ///
+    /// **Carried explicitly rather than derived from `projections`, because a
+    /// merged arm has none.** Deriving it meant every multi-run arm read
+    /// `unknown` and every merged diff advised "re-run at `tree`" — to someone
+    /// whose runs were already at `tree`. A remedy that cannot be acted on
+    /// teaches the reader to ignore the remedies that can.
+    pub nesting: &'static str,
     /// Span loss across the window. `None` is **unknown**, not zero.
     pub ingest: Option<TraceIngestLoss>,
     pub sample_complete: bool,
@@ -146,8 +166,40 @@ pub struct Arm {
     pub taken_at: Option<DateTime<Utc>>,
     pub meta: serde_json::Value,
     pub description: Option<String>,
+    /// Top call paths by self time, for a flame graph (§9.8). Empty for a live
+    /// arm — a live read projects them fresh — and for a merged one.
+    pub paths: Vec<logmon_broker_protocol::PathRow>,
+    pub paths_truncated: bool,
     /// Spread across the runs this arm merges. `None` for a single run.
     pub floor: Option<RunToRunFloor>,
+}
+
+/// Merge one axis across snapshots, keyed by resolved label.
+///
+/// Sketches refuse a layout mismatch on merge, and a key whose merge fails is
+/// dropped rather than silently reported with one run's numbers — the caller
+/// already knows the merge succeeded overall, so a per-key failure here can only
+/// be a layout mismatch that `merge` would have caught for the total.
+fn merge_by_label<'a, F>(snapshots: &'a [StoredSnapshot], extract: F) -> HashMap<String, ExactStats>
+where
+    F: Fn(&'a StoredSnapshot) -> Option<Vec<(String, &'a ExactStats)>>,
+{
+    let mut out: HashMap<String, ExactStats> = HashMap::new();
+    for s in snapshots {
+        for (key, stats) in extract(s).into_iter().flatten() {
+            match out.get_mut(&key) {
+                None => {
+                    out.insert(key, stats.clone());
+                }
+                Some(acc) => {
+                    if acc.merge(stats).is_err() {
+                        out.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Shallow, like `StoredSnapshot`'s and for the same reason: an arm holds
@@ -179,22 +231,209 @@ impl std::fmt::Debug for DiffResult {
     }
 }
 
+/// `detected` / `undetected` / `unknown`, on the same terms a profile uses.
+///
+/// `unknown` and `undetected` are not synonyms, and the difference decides
+/// whether `total_ms` can be trusted: `undetected` means we looked and found no
+/// nesting, `unknown` means the retention level could not look.
+fn nesting_of(p: Option<&ProfileSampled>, level: Level) -> &'static str {
+    match (p, level.has_tree()) {
+        (Some(p), true) if p.nested_matches > 0 => "detected",
+        (Some(_), true) => "undetected",
+        _ => "unknown",
+    }
+}
+
 impl Arm {
-    pub fn layout(&self) -> SketchLayout {
-        self.total.sketch().layout()
+    /// An arm over a collector's still-open window.
+    pub fn from_live(
+        spec: String,
+        view: &CollectorSnapshot,
+        ingest: Option<TraceIngestLoss>,
+        read_at: DateTime<Utc>,
+    ) -> Self {
+        let window_start = view.window_start();
+        let wall_ms = (read_at - window_start).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+        // Projected once: it walks every retained record, which at the sample
+        // cap is millions of them.
+        let projections = crate::collector::project::project_samples(view);
+        let nesting = nesting_of(projections.as_ref(), view.def.level);
+        Self {
+            spec,
+            collector: view.def.name.clone(),
+            aggregation: Aggregation::Live,
+            def: view.def.clone(),
+            total: view.total.clone(),
+            per_name: Some(
+                view.per_name
+                    .iter()
+                    .map(|(id, e)| (view.names.resolve(*id).to_string(), e.clone()))
+                    .collect(),
+            ),
+            per_group: Some(
+                view.per_group
+                    .iter()
+                    .map(|(ids, e)| (group_label(&view.group_values, ids), e.clone()))
+                    .collect(),
+            ),
+            projections,
+            nesting,
+            ingest,
+            sample_complete: view.samples.complete,
+            cardinality_capped: view.cardinality_capped(),
+            wall_ms: wall_ms.max(0.0),
+            window_start: Some(window_start),
+            taken_at: Some(read_at),
+            meta: serde_json::Value::Null,
+            description: view.def.description.clone(),
+            paths: Vec::new(),
+            paths_truncated: false,
+            floor: None,
+        }
     }
 
-    /// `detected` / `undetected` / `unknown`, on the same terms a profile uses.
-    ///
-    /// `unknown` and `undetected` are not synonyms and the difference decides
-    /// whether `total_ms` can be trusted: `undetected` means we looked and
-    /// found no nesting, `unknown` means the retention level cannot look.
-    pub fn nesting(&self) -> &'static str {
-        match (&self.projections, self.def.level.has_tree()) {
-            (Some(p), true) if p.nested_matches > 0 => "detected",
-            (Some(_), true) => "undetected",
-            _ => "unknown",
+    /// An arm over one recorded run.
+    pub fn from_snapshot(spec: String, s: &StoredSnapshot) -> Self {
+        Self {
+            spec,
+            collector: s.def.name.clone(),
+            aggregation: Aggregation::SingleRun(s.label.clone()),
+            def: s.def.clone(),
+            total: s.total.clone(),
+            per_name: s.per_name.as_ref().map(|m| {
+                m.iter()
+                    .map(|(id, e)| (s.names.resolve(*id).to_string(), e.clone()))
+                    .collect()
+            }),
+            per_group: s.per_group.as_ref().map(|m| {
+                m.iter()
+                    .map(|(ids, e)| (group_label(&s.group_values, ids), e.clone()))
+                    .collect()
+            }),
+            projections: s.projections.clone(),
+            nesting: nesting_of(s.projections.as_ref(), s.def.level),
+            ingest: s.ingest,
+            sample_complete: s.sample_complete,
+            cardinality_capped: s.cardinality_capped,
+            wall_ms: s.wall_ms,
+            window_start: Some(s.window_start),
+            taken_at: Some(s.taken_at),
+            meta: s.meta.clone(),
+            description: s.description.clone(),
+            paths: s.paths.clone(),
+            paths_truncated: s.paths_truncated,
+            floor: None,
         }
+    }
+
+    /// An arm over several recorded runs, combined (§6.5).
+    ///
+    /// This is the only arm shape that yields a run-to-run floor, and therefore
+    /// the only one whose deltas can be told apart from scheduling noise. Which
+    /// is why it exists: with single-run arms on both sides, every threshold in
+    /// the result reads "unknown".
+    ///
+    /// Three things are *not* combined, each for its own reason:
+    ///
+    /// - **Sample-derived projections.** Self time across two runs is not a self
+    ///   time and a wall union across them is not a union. Omitted, not summed.
+    /// - **Per-axis breakdowns, unless every run recorded them.** Merging only
+    ///   the runs that have them would produce per-name rows that do not sum to
+    ///   the merged total — breaking the one reconciliation rule the design has
+    ///   (A11) in a way no reader could detect.
+    /// - **Ingest loss**, which is added rather than merged: two windows that
+    ///   each lost spans lost them both, so the sum is the honest figure.
+    pub fn merged(
+        spec: String,
+        snapshots: &[StoredSnapshot],
+    ) -> Result<Self, crate::collector::history::MergeError> {
+        use crate::collector::history::{merge, MergeError};
+        let last = snapshots.last().ok_or(MergeError::Empty)?;
+        let total = merge(snapshots)?;
+        let labels: Vec<String> = snapshots.iter().map(|s| s.label.clone()).collect();
+
+        // Every run or none: a partial breakdown cannot reconcile to the total.
+        let all_named = snapshots.iter().all(|s| s.per_name.is_some());
+        let all_grouped = snapshots.iter().all(|s| s.per_group.is_some());
+        let per_name = all_named.then(|| {
+            merge_by_label(snapshots, |s| {
+                s.per_name.as_ref().map(|m| {
+                    m.iter()
+                        .map(|(id, e)| (s.names.resolve(*id).to_string(), e))
+                        .collect::<Vec<_>>()
+                })
+            })
+        });
+        let per_group = all_grouped.then(|| {
+            merge_by_label(snapshots, |s| {
+                s.per_group.as_ref().map(|m| {
+                    m.iter()
+                        .map(|(ids, e)| (group_label(&s.group_values, ids), e))
+                        .collect::<Vec<_>>()
+                })
+            })
+        });
+
+        // Loss is unknown for the merged arm if it was unknown for any run: one
+        // window whose attribution failed is enough to make the total a floor
+        // rather than a figure, and a floor presented as a figure is worse than
+        // no number.
+        let ingest = snapshots
+            .iter()
+            .try_fold(TraceIngestLoss::default(), |acc, s| {
+                s.ingest.map(|i| TraceIngestLoss {
+                    dropped: acc.dropped.saturating_add(i.dropped),
+                    shed_batches: acc.shed_batches.saturating_add(i.shed_batches),
+                    malformed: acc.malformed.saturating_add(i.malformed),
+                })
+            });
+
+        Ok(Self {
+            spec,
+            collector: last.def.name.clone(),
+            aggregation: Aggregation::Merged(labels),
+            // The most recent run's definition. Any difference across the runs
+            // is caught by the diff's own filter, level and group_keys checks
+            // when this arm is compared against the other.
+            def: last.def.clone(),
+            total,
+            per_name,
+            per_group,
+            // Not merged: see above.
+            projections: None,
+            // The verdict survives even though the projections do not, and the
+            // fold is by severity: `detected` anywhere means the merged
+            // `total_ms` double-counts, and one run that could not tell makes
+            // the answer unknown rather than clean.
+            nesting: snapshots
+                .iter()
+                .map(|s| nesting_of(s.projections.as_ref(), s.def.level))
+                .fold("undetected", |acc, n| match (acc, n) {
+                    ("detected", _) | (_, "detected") => "detected",
+                    ("unknown", _) | (_, "unknown") => "unknown",
+                    _ => "undetected",
+                }),
+            ingest,
+            // Truncation anywhere truncates the merged arm: the combined sample
+            // is then a set of prefixes, which is not a sample of the whole.
+            sample_complete: snapshots.iter().all(|s| s.sample_complete),
+            cardinality_capped: snapshots.iter().any(|s| s.cardinality_capped),
+            wall_ms: snapshots.iter().map(|s| s.wall_ms).sum(),
+            window_start: snapshots.first().map(|s| s.window_start),
+            taken_at: Some(last.taken_at),
+            meta: last.meta.clone(),
+            description: last.description.clone(),
+            // Path lists do not merge: a path's self time in run 1 and run 2 are
+            // two measurements, not one longer one, and summing them would make
+            // a flame graph whose total matches no run that happened.
+            paths: Vec::new(),
+            paths_truncated: false,
+            floor: RunToRunFloor::over_total_ms(snapshots),
+        })
+    }
+
+    pub fn layout(&self) -> SketchLayout {
+        self.total.sketch().layout()
     }
 
     /// Whether this arm is a truncated prefix of its run.
@@ -256,10 +495,19 @@ pub enum DiffError {
     /// Percentiles from sketches built with different parameters. No override:
     /// the subtraction is wrong, and the mismatch is proven by a recorded fact
     /// rather than guessed at.
-    LayoutMismatch { a: String, b: String },
-    FilterMismatch { a: String, b: String },
+    LayoutMismatch {
+        a: String,
+        b: String,
+    },
+    FilterMismatch {
+        a: String,
+        b: String,
+    },
     /// One arm lost spans and the other did not.
-    AsymmetricLoss { a: String, b: String },
+    AsymmetricLoss {
+        a: String,
+        b: String,
+    },
     BothTruncated,
 }
 
@@ -471,7 +719,10 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
     }
 
     // --- Block: a genuine filter difference. -------------------------------
-    let (fa, fb) = (canonical_filter(&a.def.filter), canonical_filter(&b.def.filter));
+    let (fa, fb) = (
+        canonical_filter(&a.def.filter),
+        canonical_filter(&b.def.filter),
+    );
     if fa != fb {
         if !opts.allow.mismatch {
             return Err(DiffError::FilterMismatch {
@@ -631,11 +882,8 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
     // defect: `total_ms` double-counts when a matched span sits under another
     // matched span, and comparing at `timing` does not make that stop being
     // true of the recorded numbers.
-    let nested_either = [&a, &b]
-        .iter()
-        .filter_map(|arm| arm.projections.as_ref())
-        .any(|p| p.nested_matches > 0);
-    let nesting_unknown = a.nesting() == "unknown" || b.nesting() == "unknown";
+    let nested_either = a.nesting == "detected" || b.nesting == "detected";
+    let nesting_unknown = a.nesting == "unknown" || b.nesting == "unknown";
     if nested_either {
         marks.push(Mark {
             kind: "nesting".into(),
@@ -667,8 +915,7 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
     };
 
     let rows = overall_rows(&a, &b, &ctx, &mut suppressed);
-    let (groups, overflow_rows_suppressed) =
-        group_rows(&a, &b, &ctx, opts, &mut suppressed);
+    let (groups, overflow_rows_suppressed) = group_rows(&a, &b, &ctx, opts, &mut suppressed);
 
     // Untrustworthy if anything substantive differs — or if either arm is a
     // single run, which is on its own enough to make a confident-looking delta
@@ -691,6 +938,106 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
     })
 }
 
+// ---------------------------------------------------------------------------
+// Wire form
+// ---------------------------------------------------------------------------
+
+impl Row {
+    fn to_wire(&self) -> logmon_broker_protocol::DiffRow {
+        logmon_broker_protocol::DiffRow {
+            metric: self.metric.to_string(),
+            tier: self.tier.as_str().to_string(),
+            a: self.a,
+            b: self.b,
+            delta: self.delta,
+            delta_pct: self.delta_pct,
+            threshold_abs: self.threshold_abs,
+            threshold_pct: self.threshold_pct,
+            threshold_basis: self.threshold_basis.as_str().to_string(),
+            error_bound_pct: self.error_bound_pct,
+            suppressed: self.suppressed,
+            trustworthy: self.trustworthy,
+            notes: self.notes.clone(),
+        }
+    }
+}
+
+impl Arm {
+    fn to_wire(&self) -> logmon_broker_protocol::DiffArm {
+        logmon_broker_protocol::DiffArm {
+            spec: self.spec.clone(),
+            collector: self.collector.clone(),
+            aggregation: self.aggregation.as_str(),
+            filter: self.def.filter_string.clone(),
+            level: self.def.level.as_str().to_string(),
+            group_keys: self.def.group_keys.clone(),
+            description: self.description.clone(),
+            meta: (!self.meta.is_null()).then(|| self.meta.clone()),
+            matched: self.total.count,
+            wall_ms: self.wall_ms,
+            window_start: self.window_start,
+            taken_at: self.taken_at,
+            nesting: self.nesting.to_string(),
+            sample_complete: self.sample_complete,
+            cardinality_capped: self.cardinality_capped,
+            ingest: self.ingest.map(|i| logmon_broker_protocol::ProfileIngest {
+                drops_in_window: i.dropped,
+                shed_batches: i.shed_batches,
+                malformed_dropped: i.malformed,
+                malformed_timestamps: self.total.malformed_timestamps,
+                negative_duration_spans: self.total.negative_duration_spans,
+                attribution: "domain".into(),
+            }),
+            floor: self
+                .floor
+                .as_ref()
+                .map(|f| logmon_broker_protocol::RunToRunFloor {
+                    metric: f.metric.to_string(),
+                    runs: f.runs,
+                    min: f.min,
+                    max: f.max,
+                    mean: f.mean,
+                    cv_pct: f.cv_pct,
+                    caveat: RunToRunFloor::CAVEAT.to_string(),
+                }),
+        }
+    }
+}
+
+impl DiffResult {
+    pub fn to_wire(&self) -> logmon_broker_protocol::CollectorsDiffResult {
+        logmon_broker_protocol::CollectorsDiffResult {
+            a: self.a.to_wire(),
+            b: self.b.to_wire(),
+            level: self.level.as_str().to_string(),
+            trustworthy: self.trustworthy,
+            rows: self.rows.iter().map(Row::to_wire).collect(),
+            grouped_by: (self.grouped_by != DiffGroupBy::None)
+                .then(|| self.grouped_by.as_str().to_string()),
+            groups: self
+                .groups
+                .iter()
+                .map(|g| logmon_broker_protocol::DiffGroup {
+                    key: g.key.clone(),
+                    presence: g.presence.to_string(),
+                    rows: g.rows.iter().map(Row::to_wire).collect(),
+                })
+                .collect(),
+            marks: self
+                .marks
+                .iter()
+                .map(|m| logmon_broker_protocol::DiffMark {
+                    kind: m.kind.clone(),
+                    detail: m.detail.clone(),
+                    overridden_by: m.overridden_by.clone(),
+                })
+                .collect(),
+            overflow_rows_suppressed: self.overflow_rows_suppressed,
+            suppressed: self.suppressed.clone(),
+        }
+    }
+}
+
 /// Everything the row builders need that is not one of the two values.
 struct Ctx {
     /// Run-to-run floor binding both arms, as a percentage. `None` when either
@@ -710,9 +1057,19 @@ fn overall_rows(
 ) -> Vec<Row> {
     let mut rows = Vec::new();
 
-    rows.push(exact_row("count", a.total.count as f64, b.total.count as f64, ctx));
+    rows.push(exact_row(
+        "count",
+        a.total.count as f64,
+        b.total.count as f64,
+        ctx,
+    ));
 
-    let mut total = exact_row("total_ms", ns_to_ms(a.total.total_ns), ns_to_ms(b.total.total_ns), ctx);
+    let mut total = exact_row(
+        "total_ms",
+        ns_to_ms(a.total.total_ns),
+        ns_to_ms(b.total.total_ns),
+        ctx,
+    );
     if ctx.total_ms_untrustworthy {
         total.trustworthy = false;
         total.notes.push(
@@ -741,10 +1098,11 @@ fn overall_rows(
             );
             r.a = a.total.avg_ns().map(|v| v / 1e6);
             r.b = b.total.avg_ns().map(|v| v / 1e6);
-            r.notes
-                .push("compare `total_ms` for the aggregate and the percentiles for the \
+            r.notes.push(
+                "compare `total_ms` for the aggregate and the percentiles for the \
                        per-span shape"
-                    .into());
+                    .into(),
+            );
             rows.push(r);
         }
         _ => {}
@@ -770,8 +1128,7 @@ fn overall_rows(
             _ => rows.push(Row::absent(
                 name,
                 Tier::Estimated,
-                "at least one arm's sketch is empty, so it has no percentile to compare"
-                    .into(),
+                "at least one arm's sketch is empty, so it has no percentile to compare".into(),
             )),
         }
     }
@@ -866,14 +1223,16 @@ fn group_rows(
                  one arm's tuple names a different thing in the other",
                 a.def.group_keys, b.def.group_keys
             ),
-            remedy: Some("compare by `name`, or re-record both arms with the same group_keys".into()),
+            remedy: Some(
+                "compare by `name`, or re-record both arms with the same group_keys".into(),
+            ),
         });
         return (Vec::new(), 0);
     }
 
     let (ra, rb) = match opts.group_by {
-        DiffGroupBy::Name => (resolved_names(a), resolved_names(b)),
-        DiffGroupBy::Group => (resolved_groups(a), resolved_groups(b)),
+        DiffGroupBy::Name => (a.per_name.as_ref(), b.per_name.as_ref()),
+        DiffGroupBy::Group => (a.per_group.as_ref(), b.per_group.as_ref()),
         DiffGroupBy::None => unreachable!("returned above"),
     };
     let (ra, rb) = match (ra, rb) {
@@ -992,7 +1351,12 @@ fn group_rows(
 fn group_metric_rows(ea: &ExactStats, eb: &ExactStats, ctx: &Ctx) -> Vec<Row> {
     let mut rows = vec![
         exact_row("count", ea.count as f64, eb.count as f64, ctx),
-        exact_row("total_ms", ns_to_ms(ea.total_ns), ns_to_ms(eb.total_ns), ctx),
+        exact_row(
+            "total_ms",
+            ns_to_ms(ea.total_ns),
+            ns_to_ms(eb.total_ns),
+            ctx,
+        ),
     ];
     // Per-row `count_moved`: the overall counts can be flat while one group's
     // population moves entirely, which is exactly the case where its `avg_ms`
@@ -1024,27 +1388,9 @@ fn group_metric_rows(ea: &ExactStats, eb: &ExactStats, ctx: &Ctx) -> Vec<Row> {
     rows
 }
 
-fn resolved_names(arm: &Arm) -> Option<HashMap<String, ExactStats>> {
-    let per = arm.per_name.as_ref()?;
-    Some(
-        per.iter()
-            .map(|(id, e)| (arm.names.resolve(*id).to_string(), e.clone()))
-            .collect(),
-    )
-}
-
-fn resolved_groups(arm: &Arm) -> Option<HashMap<String, ExactStats>> {
-    let per = arm.per_group.as_ref()?;
-    Some(
-        per.iter()
-            .map(|(ids, e)| (group_label(&arm.group_values, ids), e.clone()))
-            .collect(),
-    )
-}
-
 /// The same rendering `traces.profile` uses, so a key quoted from a profile can
 /// be found in a diff.
-fn group_label(interners: &[Interner], ids: &[u32]) -> String {
+pub fn group_label(interners: &[Interner], ids: &[u32]) -> String {
     if ids.len() == 1 {
         return interners
             .first()
@@ -1080,7 +1426,15 @@ fn exact_row(metric: &'static str, a: f64, b: f64, ctx: &Ctx) -> Row {
     // run-to-run variance, and for single-run arms there is none to apply —
     // which is reported as unknown rather than as zero, because a floor of zero
     // would license calling a one-nanosecond difference a result.
-    finish(metric, Tier::Exact, a, b, ctx.floor_pct, ThresholdBasis::RunToRun, None)
+    finish(
+        metric,
+        Tier::Exact,
+        a,
+        b,
+        ctx.floor_pct,
+        ThresholdBasis::RunToRun,
+        None,
+    )
 }
 
 fn estimated_row(metric: &'static str, a: f64, b: f64, ctx: &Ctx) -> Row {
@@ -1124,7 +1478,15 @@ fn sampled_row(metric: &'static str, a: f64, b: f64, ctx: &Ctx) -> Row {
     // the honesty here is `complete`, which travels as a mark rather than as a
     // widened error bar. Widening the bar would suggest the number is fuzzy
     // when the real problem is that it describes a different population.
-    finish(metric, Tier::Sampled, a, b, ctx.floor_pct, ThresholdBasis::RunToRun, None)
+    finish(
+        metric,
+        Tier::Sampled,
+        a,
+        b,
+        ctx.floor_pct,
+        ThresholdBasis::RunToRun,
+        None,
+    )
 }
 
 fn finish(

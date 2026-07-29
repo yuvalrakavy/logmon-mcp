@@ -59,7 +59,7 @@ fn taken(label: &str, n: usize, each_ms: i64, when: DateTime<Utc>) -> StoredSnap
         SnapshotPolicy::default(),
         c.swap(when),
         None,
-        None,
+        Projected::default(),
     )
 }
 
@@ -160,7 +160,7 @@ fn a_snapshot_carries_its_own_definition_not_the_live_one() {
         SnapshotPolicy::default(),
         c.swap(at(60)),
         None,
-        None,
+        Projected::default(),
     );
 
     assert_eq!(snap.def.filter_string, "sv=svc");
@@ -184,7 +184,7 @@ fn v10_a_snapshots_wall_ms_covers_its_own_window_not_the_collectors_life() {
         SnapshotPolicy::default(),
         c.swap(at(60)),
         None,
-        None,
+        Projected::default(),
     );
     assert_eq!(first.wall_ms, 60_000.0);
 
@@ -198,7 +198,7 @@ fn v10_a_snapshots_wall_ms_covers_its_own_window_not_the_collectors_life() {
         SnapshotPolicy::default(),
         c.swap(at(90)),
         None,
-        None,
+        Projected::default(),
     );
     assert_eq!(second.wall_ms, 30_000.0);
 }
@@ -223,7 +223,7 @@ fn a10_truncation_travels_with_the_snapshot() {
         SnapshotPolicy::default(),
         c.swap(at(60)),
         None,
-        None,
+        Projected::default(),
     );
     assert!(!snap.sample_complete, "the record says the sample was cut");
     assert_eq!(
@@ -249,7 +249,7 @@ fn a_policy_can_drop_the_per_axis_breakdowns_but_never_the_core() {
         },
         c.swap(at(60)),
         None,
-        None,
+        Projected::default(),
     );
     assert!(snap.per_name.is_none());
     assert!(snap.per_group.is_none());

@@ -5496,6 +5496,945 @@
         "caveat"
       ]
     },
+    "CollectorsDiff": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsDiff",
+      "description": "`collectors.diff` — compare two arms (§5.6).\n\nAn arm is `<collector>` for the live window, `<collector>@<label>` for one\nrecorded run, or `<collector>@*` for every recorded run merged. The merged\nform is the only one that yields a run-to-run floor, which is what decides\nwhether a delta is a result or scheduling noise.",
+      "type": "object",
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "group_by": {
+          "description": "`name` or `group`. Not `trace` or `path`: both are projected from\nper-span records, and a recorded run does not retain those.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "top_n": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "allow_mismatch": {
+          "description": "Compare arms whose filters matched different populations.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_lossy": {
+          "description": "Compare when one arm lost spans and the other did not.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_truncated": {
+          "description": "Compare when both arms hit the sample budget.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "a",
+        "b"
+      ]
+    },
+    "CollectorsDiffResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsDiffResult",
+      "type": "object",
+      "properties": {
+        "a": {
+          "$ref": "#/$defs/DiffArm"
+        },
+        "b": {
+          "$ref": "#/$defs/DiffArm"
+        },
+        "level": {
+          "description": "The level both arms can answer at — `min(level)`.",
+          "type": "string"
+        },
+        "trustworthy": {
+          "description": "False when any mark makes a number unsafe to act on, **or** when either\narm is a single run. A reader who reads nothing else should still not be\nmisled.",
+          "type": "boolean"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffRow"
+          }
+        },
+        "grouped_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffGroup"
+          }
+        },
+        "marks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffMark"
+          }
+        },
+        "overflow_rows_suppressed": {
+          "description": "How many group rows were dropped because a cardinality cap folded them\ninto `__overflow__` on at least one arm. A count rather than a flag: one\nfolded row and two hundred of them mean different things about whether\nthe breakdown below is worth reading.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "suppressed": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppressed"
+          }
+        }
+      },
+      "required": [
+        "a",
+        "b",
+        "level",
+        "trustworthy",
+        "rows"
+      ],
+      "$defs": {
+        "DiffArm": {
+          "description": "One side of a comparison, as the result describes it.",
+          "type": "object",
+          "properties": {
+            "spec": {
+              "description": "How the caller named it.",
+              "type": "string"
+            },
+            "collector": {
+              "type": "string"
+            },
+            "aggregation": {
+              "description": "Which runs this figure came from, and how they were combined. **Always\npresent**: a reader looking at a single number cannot otherwise tell one\nrun from the mean of five, and the floor depends on which it is.",
+              "type": "string"
+            },
+            "filter": {
+              "description": "The definition **as of the measurement**, never the live collector's.",
+              "type": "string"
+            },
+            "level": {
+              "type": "string"
+            },
+            "group_keys": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "meta": {
+              "description": "Provenance logmon cannot infer — commit, build profile, configuration."
+            },
+            "matched": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "wall_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "window_start": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "taken_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "nesting": {
+              "description": "`detected`, `undetected`, or `unknown`.",
+              "type": "string"
+            },
+            "sample_complete": {
+              "type": "boolean"
+            },
+            "cardinality_capped": {
+              "type": "boolean"
+            },
+            "ingest": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProfileIngest"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "floor": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RunToRunFloor"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "spec",
+            "collector",
+            "aggregation",
+            "filter",
+            "level",
+            "matched",
+            "wall_ms",
+            "nesting",
+            "sample_complete"
+          ]
+        },
+        "ProfileIngest": {
+          "description": "Span loss during the window, and the collector's own view of unusable input.\n\n`attribution` is `\"domain\"`, always: the transport counters are per-domain\nand unfiltered, so most of what they count may be spans this collector's\nfilter would never have matched. That makes this sound as a trigger for\nmarking a result untrustworthy, and wrong as a statement about how many\nmatches went missing.",
+          "type": "object",
+          "properties": {
+            "drops_in_window": {
+              "description": "Per-span channel-full drops on the two OTLP trace transports.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shed_batches": {
+              "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_dropped": {
+              "description": "Spans discarded at parse time for unusable identity.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_timestamps": {
+              "description": "Matched spans whose timestamps this collector could not use.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "negative_duration_spans": {
+              "description": "Matched spans that ended before they started.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "attribution": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "drops_in_window",
+            "shed_batches",
+            "malformed_dropped",
+            "malformed_timestamps",
+            "negative_duration_spans",
+            "attribution"
+          ]
+        },
+        "RunToRunFloor": {
+          "description": "Spread across repeats of one configuration.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "runs": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "mean": {
+              "type": "number",
+              "format": "double"
+            },
+            "cv_pct": {
+              "description": "Coefficient of variation, as a percentage. **Absent for a single run —\nunknown, not zero.** A floor of zero would license calling any\ndifference significant.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "caveat": {
+              "description": "What this figure does *not* cover. Carried with it because a bare\nspread invites being read as a total error bar.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric",
+            "runs",
+            "min",
+            "max",
+            "mean",
+            "caveat"
+          ]
+        },
+        "DiffRow": {
+          "description": "One metric's delta, with everything needed to decide whether to believe it.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "tier": {
+              "description": "`exact`, `estimated`, or `sampled` — never mixed within a row. The two\ncan differ by 40 % under truncation, so a row taking one value from each\nwould be uninterpretable.",
+              "type": "string"
+            },
+            "a": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "b": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "delta": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "delta_pct": {
+              "description": "Change from `a` to `b`, as a percentage of `a`.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "threshold_abs": {
+              "description": "**The threshold, in the metric's own units.** A delta at or below this is\nsuppressed — and this is the number displayed beside it, because striking\na delta through using a bound other than the one shown is how a reader\nends up unable to check the tool's own reasoning.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "threshold_pct": {
+              "description": "The same threshold as a percentage of the two values' mean.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "threshold_basis": {
+              "description": "`run-to-run`, `measurement-resolution`, both, or `unknown`.",
+              "type": "string"
+            },
+            "error_bound_pct": {
+              "description": "§5.6's `α(a+b)/|a−b|`: the worst-case error on this delta as a\npercentage **of the delta**, on `estimated` rows only. At or above 100 %\nthe error bar is wider than the delta it qualifies.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "suppressed": {
+              "type": "boolean"
+            },
+            "trustworthy": {
+              "type": "boolean"
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "metric",
+            "tier",
+            "threshold_basis",
+            "trustworthy"
+          ]
+        },
+        "DiffGroup": {
+          "description": "One breakdown key's rows.",
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "presence": {
+              "description": "`both`, `a_only`, or `b_only`. A key on one arm only gets no delta: it\nmay be missing because nothing matched it, or because a cardinality cap\nfolded it into `__overflow__`, and those want opposite readings.",
+              "type": "string"
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/DiffRow"
+              }
+            }
+          },
+          "required": [
+            "key",
+            "presence",
+            "rows"
+          ]
+        },
+        "DiffMark": {
+          "description": "Something that differs between the arms, or that makes a number unsafe to\nact on. Never silently absorbed.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "description": "`level`, `filter`, `group_keys`, `ingest_loss`, `truncated`, `nesting`,\n`cardinality`, or `collector`.",
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "overridden_by": {
+              "description": "The flag the caller passed to permit this. Absent for conditions that\nonly ever mark.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "detail"
+          ]
+        },
+        "Suppressed": {
+          "description": "Why a field that normally carries a number is `null`.\n\nA profile has several ways to be legitimately unable to answer — the\nretention level is too low, a warm-up cut makes an unwindowed tier\nmeaningless, nothing nested so self time carries no information. Returning\n`null` alone would leave the reader to guess which, and the guesses differ\nin what they imply about the run. Every suppression names its field and its\nreason so a consumer can distinguish \"not measured\" from \"measured as zero\".",
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Dotted path of the suppressed field, e.g. `sampled.self_ms`.",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "remedy": {
+              "description": "What the caller could change to get a number instead. Absent when\nnothing would help.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "field",
+            "reason"
+          ]
+        }
+      }
+    },
+    "DiffArm": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DiffArm",
+      "description": "One side of a comparison, as the result describes it.",
+      "type": "object",
+      "properties": {
+        "spec": {
+          "description": "How the caller named it.",
+          "type": "string"
+        },
+        "collector": {
+          "type": "string"
+        },
+        "aggregation": {
+          "description": "Which runs this figure came from, and how they were combined. **Always\npresent**: a reader looking at a single number cannot otherwise tell one\nrun from the mean of five, and the floor depends on which it is.",
+          "type": "string"
+        },
+        "filter": {
+          "description": "The definition **as of the measurement**, never the live collector's.",
+          "type": "string"
+        },
+        "level": {
+          "type": "string"
+        },
+        "group_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "meta": {
+          "description": "Provenance logmon cannot infer — commit, build profile, configuration."
+        },
+        "matched": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "wall_ms": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_start": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "taken_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "nesting": {
+          "description": "`detected`, `undetected`, or `unknown`.",
+          "type": "string"
+        },
+        "sample_complete": {
+          "type": "boolean"
+        },
+        "cardinality_capped": {
+          "type": "boolean"
+        },
+        "ingest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProfileIngest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "floor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunToRunFloor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "spec",
+        "collector",
+        "aggregation",
+        "filter",
+        "level",
+        "matched",
+        "wall_ms",
+        "nesting",
+        "sample_complete"
+      ],
+      "$defs": {
+        "ProfileIngest": {
+          "description": "Span loss during the window, and the collector's own view of unusable input.\n\n`attribution` is `\"domain\"`, always: the transport counters are per-domain\nand unfiltered, so most of what they count may be spans this collector's\nfilter would never have matched. That makes this sound as a trigger for\nmarking a result untrustworthy, and wrong as a statement about how many\nmatches went missing.",
+          "type": "object",
+          "properties": {
+            "drops_in_window": {
+              "description": "Per-span channel-full drops on the two OTLP trace transports.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shed_batches": {
+              "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_dropped": {
+              "description": "Spans discarded at parse time for unusable identity.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_timestamps": {
+              "description": "Matched spans whose timestamps this collector could not use.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "negative_duration_spans": {
+              "description": "Matched spans that ended before they started.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "attribution": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "drops_in_window",
+            "shed_batches",
+            "malformed_dropped",
+            "malformed_timestamps",
+            "negative_duration_spans",
+            "attribution"
+          ]
+        },
+        "RunToRunFloor": {
+          "description": "Spread across repeats of one configuration.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "runs": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "min": {
+              "type": "number",
+              "format": "double"
+            },
+            "max": {
+              "type": "number",
+              "format": "double"
+            },
+            "mean": {
+              "type": "number",
+              "format": "double"
+            },
+            "cv_pct": {
+              "description": "Coefficient of variation, as a percentage. **Absent for a single run —\nunknown, not zero.** A floor of zero would license calling any\ndifference significant.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "caveat": {
+              "description": "What this figure does *not* cover. Carried with it because a bare\nspread invites being read as a total error bar.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric",
+            "runs",
+            "min",
+            "max",
+            "mean",
+            "caveat"
+          ]
+        }
+      }
+    },
+    "DiffRow": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DiffRow",
+      "description": "One metric's delta, with everything needed to decide whether to believe it.",
+      "type": "object",
+      "properties": {
+        "metric": {
+          "type": "string"
+        },
+        "tier": {
+          "description": "`exact`, `estimated`, or `sampled` — never mixed within a row. The two\ncan differ by 40 % under truncation, so a row taking one value from each\nwould be uninterpretable.",
+          "type": "string"
+        },
+        "a": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "b": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "delta": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "delta_pct": {
+          "description": "Change from `a` to `b`, as a percentage of `a`.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "threshold_abs": {
+          "description": "**The threshold, in the metric's own units.** A delta at or below this is\nsuppressed — and this is the number displayed beside it, because striking\na delta through using a bound other than the one shown is how a reader\nends up unable to check the tool's own reasoning.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "threshold_pct": {
+          "description": "The same threshold as a percentage of the two values' mean.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "threshold_basis": {
+          "description": "`run-to-run`, `measurement-resolution`, both, or `unknown`.",
+          "type": "string"
+        },
+        "error_bound_pct": {
+          "description": "§5.6's `α(a+b)/|a−b|`: the worst-case error on this delta as a\npercentage **of the delta**, on `estimated` rows only. At or above 100 %\nthe error bar is wider than the delta it qualifies.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "suppressed": {
+          "type": "boolean"
+        },
+        "trustworthy": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "metric",
+        "tier",
+        "threshold_basis",
+        "trustworthy"
+      ]
+    },
+    "DiffGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DiffGroup",
+      "description": "One breakdown key's rows.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "presence": {
+          "description": "`both`, `a_only`, or `b_only`. A key on one arm only gets no delta: it\nmay be missing because nothing matched it, or because a cardinality cap\nfolded it into `__overflow__`, and those want opposite readings.",
+          "type": "string"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiffRow"
+          }
+        }
+      },
+      "required": [
+        "key",
+        "presence",
+        "rows"
+      ],
+      "$defs": {
+        "DiffRow": {
+          "description": "One metric's delta, with everything needed to decide whether to believe it.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "tier": {
+              "description": "`exact`, `estimated`, or `sampled` — never mixed within a row. The two\ncan differ by 40 % under truncation, so a row taking one value from each\nwould be uninterpretable.",
+              "type": "string"
+            },
+            "a": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "b": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "delta": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "delta_pct": {
+              "description": "Change from `a` to `b`, as a percentage of `a`.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "threshold_abs": {
+              "description": "**The threshold, in the metric's own units.** A delta at or below this is\nsuppressed — and this is the number displayed beside it, because striking\na delta through using a bound other than the one shown is how a reader\nends up unable to check the tool's own reasoning.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "threshold_pct": {
+              "description": "The same threshold as a percentage of the two values' mean.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "threshold_basis": {
+              "description": "`run-to-run`, `measurement-resolution`, both, or `unknown`.",
+              "type": "string"
+            },
+            "error_bound_pct": {
+              "description": "§5.6's `α(a+b)/|a−b|`: the worst-case error on this delta as a\npercentage **of the delta**, on `estimated` rows only. At or above 100 %\nthe error bar is wider than the delta it qualifies.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "suppressed": {
+              "type": "boolean"
+            },
+            "trustworthy": {
+              "type": "boolean"
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "metric",
+            "tier",
+            "threshold_basis",
+            "trustworthy"
+          ]
+        }
+      }
+    },
+    "DiffMark": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DiffMark",
+      "description": "Something that differs between the arms, or that makes a number unsafe to\nact on. Never silently absorbed.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "`level`, `filter`, `group_keys`, `ingest_loss`, `truncated`, `nesting`,\n`cardinality`, or `collector`.",
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "overridden_by": {
+          "description": "The flag the caller passed to permit this. Absent for conditions that\nonly ever mark.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "detail"
+      ]
+    },
+    "PathRow": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "PathRow",
+      "description": "One call path's self time, as a snapshot retains it (§9.8).\n\nRecorded at snapshot time because the per-span records it is walked from are\nnot retained — a flame graph not taken then cannot be taken later. The list\nis capped, and a snapshot says when it was cut short: a flame graph rendered\nfrom a partial list is missing mass, and nothing about looking at one reveals\nthat.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Matched ancestors, root first, joined with ` > `. A leading `[?]` means\nthe walk stopped at a parent that was not retained, so this is a suffix\nrather than a root-to-here chain.",
+          "type": "string"
+        },
+        "self_ms": {
+          "description": "Time in this path and nothing matched below it.",
+          "type": "number",
+          "format": "double"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "incomplete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "self_ms",
+        "count"
+      ]
+    },
     "ProfileResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ProfileResult",

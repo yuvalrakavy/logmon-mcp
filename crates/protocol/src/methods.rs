@@ -759,6 +759,26 @@ pub struct ProfileGroup {
     pub path_incomplete: bool,
 }
 
+/// One call path's self time, as a snapshot retains it (§9.8).
+///
+/// Recorded at snapshot time because the per-span records it is walked from are
+/// not retained — a flame graph not taken then cannot be taken later. The list
+/// is capped, and a snapshot says when it was cut short: a flame graph rendered
+/// from a partial list is missing mass, and nothing about looking at one reveals
+/// that.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PathRow {
+    /// Matched ancestors, root first, joined with ` > `. A leading `[?]` means
+    /// the walk stopped at a parent that was not retained, so this is a suffix
+    /// rather than a root-to-here chain.
+    pub path: String,
+    /// Time in this path and nothing matched below it.
+    pub self_ms: f64,
+    pub count: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incomplete: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CollectorsAdd {
     pub name: String,
@@ -1038,6 +1058,162 @@ pub struct CollectorsHistoryResult {
     pub merged_estimated: Option<ProfileEstimated>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor: Option<RunToRunFloor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<Suppressed>,
+}
+
+/// `collectors.diff` — compare two arms (§5.6).
+///
+/// An arm is `<collector>` for the live window, `<collector>@<label>` for one
+/// recorded run, or `<collector>@*` for every recorded run merged. The merged
+/// form is the only one that yields a run-to-run floor, which is what decides
+/// whether a delta is a result or scheduling noise.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsDiff {
+    pub a: String,
+    pub b: String,
+    /// `name` or `group`. Not `trace` or `path`: both are projected from
+    /// per-span records, and a recorded run does not retain those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u64>,
+    /// Compare arms whose filters matched different populations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_mismatch: Option<bool>,
+    /// Compare when one arm lost spans and the other did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_lossy: Option<bool>,
+    /// Compare when both arms hit the sample budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_truncated: Option<bool>,
+}
+
+/// One side of a comparison, as the result describes it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiffArm {
+    /// How the caller named it.
+    pub spec: String,
+    pub collector: String,
+    /// Which runs this figure came from, and how they were combined. **Always
+    /// present**: a reader looking at a single number cannot otherwise tell one
+    /// run from the mean of five, and the floor depends on which it is.
+    pub aggregation: String,
+    /// The definition **as of the measurement**, never the live collector's.
+    pub filter: String,
+    pub level: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Provenance logmon cannot infer — commit, build profile, configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+    pub matched: u64,
+    pub wall_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_at: Option<DateTime<Utc>>,
+    /// `detected`, `undetected`, or `unknown`.
+    pub nesting: String,
+    pub sample_complete: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cardinality_capped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest: Option<ProfileIngest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<RunToRunFloor>,
+}
+
+/// Something that differs between the arms, or that makes a number unsafe to
+/// act on. Never silently absorbed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiffMark {
+    /// `level`, `filter`, `group_keys`, `ingest_loss`, `truncated`, `nesting`,
+    /// `cardinality`, or `collector`.
+    pub kind: String,
+    pub detail: String,
+    /// The flag the caller passed to permit this. Absent for conditions that
+    /// only ever mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overridden_by: Option<String>,
+}
+
+/// One metric's delta, with everything needed to decide whether to believe it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiffRow {
+    pub metric: String,
+    /// `exact`, `estimated`, or `sampled` — never mixed within a row. The two
+    /// can differ by 40 % under truncation, so a row taking one value from each
+    /// would be uninterpretable.
+    pub tier: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub b: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<f64>,
+    /// Change from `a` to `b`, as a percentage of `a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_pct: Option<f64>,
+    /// **The threshold, in the metric's own units.** A delta at or below this is
+    /// suppressed — and this is the number displayed beside it, because striking
+    /// a delta through using a bound other than the one shown is how a reader
+    /// ends up unable to check the tool's own reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_abs: Option<f64>,
+    /// The same threshold as a percentage of the two values' mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_pct: Option<f64>,
+    /// `run-to-run`, `measurement-resolution`, both, or `unknown`.
+    pub threshold_basis: String,
+    /// §5.6's `α(a+b)/|a−b|`: the worst-case error on this delta as a
+    /// percentage **of the delta**, on `estimated` rows only. At or above 100 %
+    /// the error bar is wider than the delta it qualifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_bound_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suppressed: bool,
+    pub trustworthy: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// One breakdown key's rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiffGroup {
+    pub key: String,
+    /// `both`, `a_only`, or `b_only`. A key on one arm only gets no delta: it
+    /// may be missing because nothing matched it, or because a cardinality cap
+    /// folded it into `__overflow__`, and those want opposite readings.
+    pub presence: String,
+    pub rows: Vec<DiffRow>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsDiffResult {
+    pub a: DiffArm,
+    pub b: DiffArm,
+    /// The level both arms can answer at — `min(level)`.
+    pub level: String,
+    /// False when any mark makes a number unsafe to act on, **or** when either
+    /// arm is a single run. A reader who reads nothing else should still not be
+    /// misled.
+    pub trustworthy: bool,
+    pub rows: Vec<DiffRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouped_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<DiffGroup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<DiffMark>,
+    /// How many group rows were dropped because a cardinality cap folded them
+    /// into `__overflow__` on at least one arm. A count rather than a flag: one
+    /// folded row and two hundred of them mean different things about whether
+    /// the breakdown below is worth reading.
+    #[serde(default)]
+    pub overflow_rows_suppressed: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppressed: Vec<Suppressed>,
 }

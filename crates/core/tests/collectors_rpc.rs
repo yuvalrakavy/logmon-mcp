@@ -1921,3 +1921,404 @@ fn the_ungrouped_arm_still_returns_the_slowest_n_above_the_floor() {
     assert_eq!(got["count"], 5);
     assert_eq!(got["spans"][0]["duration_ms"], 500.0);
 }
+
+// ---------------------------------------------------------------------------
+// collectors.diff (spec §5.6)
+// ---------------------------------------------------------------------------
+
+/// Arm a collector, feed `n` spans of `each_ms`, snapshot under `label`.
+fn run_and_snapshot(h: &Harness, sid: &SessionId, name: &str, label: &str, n: usize, each_ms: f64) {
+    for i in 0..n {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", each_ms, i as i64 * 50_000_000),
+        );
+    }
+    h.call(
+        sid,
+        "collectors.snapshot",
+        json!({ "name": name, "label": label }),
+    )
+    .expect("snapshot taken");
+}
+
+fn armed(h: &Harness, sid: &SessionId, name: &str) {
+    h.call(
+        sid,
+        "collectors.add",
+        json!({ "name": name, "filter": "sv=store_server", "level": "tree" }),
+    )
+    .expect("armed");
+}
+
+fn diff_row<'a>(got: &'a Value, metric: &str, tier: &str) -> &'a Value {
+    got["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["metric"] == metric && r["tier"] == tier)
+        .unwrap_or_else(|| panic!("no {tier} row for {metric} in {got:#}"))
+}
+
+#[test]
+fn two_recorded_runs_diff_by_label() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 20, 10.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 20, 5.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache@before", "b": "cache@after" }),
+        )
+        .expect("diffed");
+
+    assert_eq!(got["a"]["spec"], "cache@before");
+    assert_eq!(got["b"]["spec"], "cache@after");
+    assert_eq!(got["level"], "tree");
+
+    let total = diff_row(&got, "total_ms", "exact");
+    assert_eq!(total["a"], 200.0);
+    assert_eq!(total["b"], 100.0);
+    assert_eq!(total["delta"], -100.0);
+    assert_eq!(total["delta_pct"], -50.0);
+
+    // Both arms are single runs, so the floor is unknown — stated, never zero.
+    assert_eq!(total["threshold_basis"], "unknown");
+    assert!(total.get("threshold_abs").is_none());
+    assert_eq!(
+        got["trustworthy"], false,
+        "a two-single-run comparison cannot separate a change from noise"
+    );
+
+    // And the definition each arm reports is the one recorded with it.
+    assert_eq!(got["a"]["filter"], "sv=store_server");
+    assert_eq!(got["a"]["aggregation"], "single run: before");
+}
+
+#[test]
+fn an_estimated_row_carries_the_error_bound_over_the_wire() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 40, 100.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 40, 50.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache@before", "b": "cache@after" }),
+        )
+        .unwrap();
+    let p95 = diff_row(&got, "p95_ms", "estimated");
+    let bound = p95["error_bound_pct"].as_f64().expect("bound present");
+    // A 50 % change is far outside the resolution floor, so the bound is small
+    // and the delta stands.
+    assert!(bound < 10.0, "a halving is comfortably resolvable: {bound}");
+    assert!(p95.get("suppressed").is_none() || p95["suppressed"] == false);
+    assert_eq!(p95["threshold_basis"], "measurement-resolution");
+    assert_eq!(p95["threshold_pct"], 2.0, "2α at α=1%");
+}
+
+#[test]
+fn an_unresolvable_estimated_delta_is_suppressed_over_the_wire() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 40, 100.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 40, 100.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache@before", "b": "cache@after" }),
+        )
+        .unwrap();
+    let p95 = diff_row(&got, "p95_ms", "estimated");
+    assert_eq!(p95["suppressed"], true, "no change is not a small change");
+    // The printed threshold is the applied one, in the metric's own units.
+    let t = p95["threshold_abs"].as_f64().expect("printed");
+    assert!(p95["delta"].as_f64().unwrap().abs() <= t);
+}
+
+#[test]
+fn the_wildcard_arm_merges_every_recorded_run_and_produces_a_real_floor() {
+    // The only arm shape that yields a run-to-run floor, which is what makes a
+    // delta distinguishable from scheduling noise (§6.5).
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "base");
+    for (i, ms) in [10.0, 11.0, 12.0].iter().enumerate() {
+        run_and_snapshot(&h, &sid, "base", &format!("r{i}"), 20, *ms);
+    }
+    armed(&h, &sid, "cand");
+    for (i, ms) in [5.0, 5.5, 6.0].iter().enumerate() {
+        run_and_snapshot(&h, &sid, "cand", &format!("s{i}"), 20, *ms);
+    }
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "base@*", "b": "cand@*", "allow_mismatch": false }),
+        )
+        .expect("diffed");
+
+    assert!(got["a"]["aggregation"]
+        .as_str()
+        .unwrap()
+        .contains("merged across 3 runs"));
+    let floor = &got["a"]["floor"];
+    assert_eq!(floor["runs"], 3);
+    assert!(floor["cv_pct"].as_f64().is_some(), "three runs have a CV");
+    assert!(
+        floor["caveat"].as_str().unwrap().contains("scheduling"),
+        "and the caveat travels with it"
+    );
+
+    let total = diff_row(&got, "total_ms", "exact");
+    assert_eq!(total["a"], 660.0, "20 spans x (10+11+12) ms");
+    assert_eq!(total["b"], 330.0, "20 spans x (5+5.5+6) ms");
+    assert_eq!(
+        total["threshold_basis"], "run-to-run",
+        "with a real floor the exact rows finally have a threshold"
+    );
+    assert!(total["threshold_abs"].as_f64().unwrap() > 0.0);
+
+    // Two different collectors is permitted and labelled, not refused.
+    assert!(got["marks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["kind"] == "collector"));
+    // Nothing substantive differs and both arms are multi-run.
+    assert_eq!(got["trustworthy"], true);
+}
+
+#[test]
+fn a_wildcard_arm_with_no_recorded_runs_says_what_to_do() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    let err = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache@*", "b": "cache" }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("no recorded runs"), "{err}");
+    assert!(err.contains("collectors.snapshot"), "and the remedy: {err}");
+}
+
+#[test]
+fn the_live_window_is_a_valid_arm() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 10, 20.0);
+    // Post-snapshot spans land in the fresh live window.
+    for i in 0..10 {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", 8.0, i * 50_000_000),
+        );
+    }
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache@before", "b": "cache" }),
+        )
+        .expect("diffed");
+    assert_eq!(
+        got["b"]["aggregation"],
+        "live window (single run, still open)"
+    );
+    let total = diff_row(&got, "total_ms", "exact");
+    assert_eq!(total["a"], 200.0);
+    assert_eq!(total["b"], 80.0);
+}
+
+#[test]
+fn a_genuine_filter_difference_is_refused_until_allow_mismatch() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "reads", "filter": "sn=reconcile" }),
+    )
+    .unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "writes", "filter": "sn=commit" }),
+    )
+    .unwrap();
+    for i in 0..5 {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", 10.0, i * 50_000_000),
+        );
+        h.feed(
+            "default",
+            &span_at("store_server", "commit", 20.0, i * 50_000_000),
+        );
+    }
+
+    let err = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "reads", "b": "writes" }),
+        )
+        .expect_err("blocked");
+    assert!(err.contains("different span populations"), "{err}");
+    assert!(err.contains("allow_mismatch"), "names the flag: {err}");
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "reads", "b": "writes", "allow_mismatch": true }),
+        )
+        .expect("permitted");
+    let mark = got["marks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["kind"] == "filter")
+        .expect("marked");
+    assert_eq!(mark["overridden_by"], "allow_mismatch");
+    assert_eq!(got["trustworthy"], false);
+}
+
+#[test]
+fn a_diff_breakdown_by_name_pairs_rows_and_ranks_by_movement() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    for i in 0..5 {
+        h.feed(
+            "default",
+            &span_at("store_server", "hot", 100.0, i * 50_000_000),
+        );
+        h.feed(
+            "default",
+            &span_at("store_server", "cold", 10.0, i * 50_000_000),
+        );
+    }
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "cache", "label": "before" }),
+    )
+    .unwrap();
+    for i in 0..5 {
+        h.feed(
+            "default",
+            &span_at("store_server", "hot", 20.0, i * 50_000_000),
+        );
+        h.feed(
+            "default",
+            &span_at("store_server", "cold", 10.0, i * 50_000_000),
+        );
+    }
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "cache", "label": "after" }),
+    )
+    .unwrap();
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache@before", "b": "cache@after", "group_by": "name" }),
+        )
+        .expect("diffed");
+    assert_eq!(got["grouped_by"], "name");
+    let groups = got["groups"].as_array().unwrap();
+    assert_eq!(groups[0]["key"], "hot", "ranked by how much it moved");
+    assert_eq!(groups[0]["presence"], "both");
+
+    let hot_total = groups[0]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["metric"] == "total_ms")
+        .unwrap();
+    assert_eq!(hot_total["delta"], -400.0, "500ms became 100ms");
+}
+
+#[test]
+fn trace_and_path_are_refused_as_diff_axes_with_the_reason() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "a", 5, 10.0);
+    run_and_snapshot(&h, &sid, "cache", "b", 5, 10.0);
+
+    for axis in ["trace", "path"] {
+        let err = h
+            .call(
+                &sid,
+                "collectors.diff",
+                json!({ "a": "cache@a", "b": "cache@b", "group_by": axis }),
+            )
+            .expect_err("refused");
+        assert!(err.contains("does not retain"), "{axis}: {err}");
+    }
+}
+
+#[test]
+fn an_unknown_arm_names_the_collector_that_is_missing() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    let err = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache", "b": "nope" }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("nope"), "{err}");
+
+    let err = h
+        .call(
+            &sid,
+            "collectors.diff",
+            json!({ "a": "cache", "b": "cache@absent" }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("absent"), "{err}");
+}
+
+#[test]
+fn a_diff_arm_belongs_to_the_calling_session_only() {
+    // Collectors are per-session; a diff must not become a way to read another
+    // session's runs by naming them.
+    let h = harness();
+    let a = h.sessions.create_named("A").unwrap();
+    let b = h.sessions.create_named("B").unwrap();
+    armed(&h, &a, "cache");
+    run_and_snapshot(&h, &a, "cache", "r1", 5, 10.0);
+
+    let err = h
+        .call(
+            &b,
+            "collectors.diff",
+            json!({ "a": "cache@r1", "b": "cache" }),
+        )
+        .expect_err("not visible to B");
+    assert!(err.contains("cache"), "{err}");
+}

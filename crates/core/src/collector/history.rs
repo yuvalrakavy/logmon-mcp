@@ -14,12 +14,13 @@
 
 use crate::collector::exact::{ns_to_ms, ExactStats};
 use crate::collector::intern::Interner;
+use crate::collector::project::Projected;
 use crate::collector::sample::Level;
 use crate::collector::sketch::SketchLayout;
 use crate::collector::state::{CollectorDef, CollectorSnapshot};
 use crate::receiver::TraceIngestLoss;
 use chrono::{DateTime, Utc};
-use logmon_broker_protocol::ProfileSampled;
+use logmon_broker_protocol::{PathRow, ProfileSampled};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -92,6 +93,13 @@ pub struct StoredSnapshot {
     /// Span loss across this window. `None` when it could not be attributed.
     pub ingest: Option<TraceIngestLoss>,
     pub projections: Option<ProfileSampled>,
+    /// Top call paths by self time, for rendering a flame graph from a recorded
+    /// run (§9.8). Empty below level `tree`, or when the policy declined
+    /// projections.
+    pub paths: Vec<PathRow>,
+    /// The path list was cut short by its row or byte cap, so a flame graph
+    /// built from it is missing mass.
+    pub paths_truncated: bool,
     /// `false` if the sample budget truncated during this window. Travels with
     /// the data so a snapshot cannot launder a truncated run into a clean-
     /// looking record (A10).
@@ -126,7 +134,7 @@ impl StoredSnapshot {
         policy: SnapshotPolicy,
         view: CollectorSnapshot,
         ingest: Option<TraceIngestLoss>,
-        projections: Option<ProfileSampled>,
+        projected: Projected,
     ) -> Self {
         let window_start = view.window_start();
         let wall_ms = (taken_at - window_start).num_microseconds().unwrap_or(0) as f64 / 1000.0;
@@ -147,7 +155,9 @@ impl StoredSnapshot {
             cardinality_capped: view.cardinality_capped(),
             total: view.total,
             ingest,
-            projections,
+            projections: projected.sampled,
+            paths: projected.paths,
+            paths_truncated: projected.paths_truncated,
         }
     }
 

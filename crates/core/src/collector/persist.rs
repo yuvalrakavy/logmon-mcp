@@ -22,7 +22,7 @@ use crate::daemon::persistence::atomic_write;
 use crate::filter::parser::parse_filter;
 use crate::receiver::TraceIngestLoss;
 use chrono::{DateTime, Utc};
-use logmon_broker_protocol::ProfileSampled;
+use logmon_broker_protocol::{PathRow, ProfileSampled};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -176,6 +176,20 @@ pub struct PersistedSnapshot {
     /// those is tens of megabytes per collector. The headline tier, the
     /// projections and the definition are what a comparison actually reads.
     pub projections: Option<ProfileSampled>,
+    /// Top call paths by self time, so `collectors.document --format folded`
+    /// works on a recorded run (§9.8).
+    ///
+    /// **Additive and optional, and `FORMAT_VERSION` deliberately does not
+    /// move for it.** The only version gate in `load_all` refuses a file
+    /// *newer* than this build, so a defaulted field reads correctly in both
+    /// directions: a file written before paths existed loads with an empty
+    /// list, and a file written with them loads in a build that ignores the
+    /// key. Bumping the version would instead make every existing snapshot
+    /// unreadable in exchange for nothing.
+    #[serde(default)]
+    pub paths: Vec<PathRow>,
+    #[serde(default)]
+    pub paths_truncated: bool,
     pub ingest_dropped: Option<u64>,
     pub ingest_shed_batches: Option<u64>,
     pub ingest_malformed: Option<u64>,
@@ -231,6 +245,8 @@ impl PersistedSnapshot {
             policy_projections: s.policy.projections,
             total: PersistedExact::of(&s.total),
             projections: s.projections.clone(),
+            paths: s.paths.clone(),
+            paths_truncated: s.paths_truncated,
             ingest_dropped: s.ingest.map(|i| i.dropped),
             ingest_shed_batches: s.ingest.map(|i| i.shed_batches),
             ingest_malformed: s.ingest.map(|i| i.malformed),
@@ -286,6 +302,8 @@ impl PersistedSnapshot {
             group_values: Vec::new(),
             ingest,
             projections: self.projections.clone(),
+            paths: self.paths.clone(),
+            paths_truncated: self.paths_truncated,
             sample_complete: self.sample_complete,
             cardinality_capped: self.cardinality_capped,
         })

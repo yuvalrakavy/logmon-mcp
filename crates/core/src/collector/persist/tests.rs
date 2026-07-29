@@ -58,7 +58,7 @@ fn one_run(label: &str, n: usize, each_ms: i64) -> StoredSnapshot {
         c.ingest(&span(i as u64 + 1, each_ms * MS));
     }
     let view = c.swap(at(60));
-    let projections = crate::collector::project::project_samples(&view);
+    let projected = crate::collector::project::project_for_snapshot(&view);
     StoredSnapshot::from_view(
         label.into(),
         Some("baseline".into()),
@@ -71,7 +71,7 @@ fn one_run(label: &str, n: usize, each_ms: i64) -> StoredSnapshot {
             shed_batches: 2,
             malformed: 3,
         }),
-        projections,
+        projected,
     )
 }
 
@@ -152,7 +152,7 @@ fn a_restored_sketch_still_answers_percentiles() {
         SnapshotPolicy::default(),
         view,
         None,
-        None,
+        crate::collector::project::Projected::default(),
     )]);
     save(d.path(), &file).expect("saved");
 

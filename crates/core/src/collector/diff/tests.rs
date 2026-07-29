@@ -2,8 +2,8 @@
 //! threshold, A7 diff level/filter/layout/overflow handling, A8 incomplete side.
 
 use super::*;
-use crate::collector::history::{StoredSnapshot, SnapshotPolicy};
-use crate::collector::project::project_samples;
+use crate::collector::history::{SnapshotPolicy, StoredSnapshot};
+use crate::collector::project::Projected;
 use crate::collector::sketch::DurationSketch;
 use crate::collector::state::{Collector, DEFAULT_MAX_SAMPLE_BYTES};
 use crate::filter::parser::parse_filter;
@@ -56,33 +56,22 @@ fn arm(spec: &str, n: usize, each_ms: i64) -> Arm {
     })
 }
 
+/// Built through `Arm::from_live` rather than by hand, so these tests exercise
+/// the constructor the RPC layer uses. A hand-built `Arm` would pass even if
+/// that constructor resolved the wrong interner.
 fn arm_with(spec: &str, def: CollectorDef, feed: impl FnOnce(&Collector)) -> Arm {
-    let collector = def.name.clone();
     let c = Collector::new(def, at(0));
     feed(&c);
-    let view = c.snapshot();
-    let projections = project_samples(&view);
-    Arm {
-        spec: spec.into(),
-        collector,
-        aggregation: Aggregation::SingleRun(spec.into()),
-        def: view.def.clone(),
-        total: view.total.clone(),
-        per_name: Some(view.per_name.clone()),
-        per_group: Some(view.per_group.clone()),
-        names: view.names.clone(),
-        group_values: view.group_values.clone(),
-        projections,
-        ingest: Some(TraceIngestLoss::default()),
-        sample_complete: view.samples.complete,
-        cardinality_capped: view.cardinality_capped(),
-        wall_ms: 1000.0,
-        window_start: Some(at(0)),
-        taken_at: Some(at(1)),
-        meta: serde_json::Value::Null,
-        description: None,
-        floor: None,
-    }
+    let mut arm = Arm::from_live(
+        spec.into(),
+        &c.snapshot(),
+        Some(TraceIngestLoss::default()),
+        at(1),
+    );
+    // The live shape is `Aggregation::Live`; most tests here care about the
+    // single-run *property*, not which flavour of single run it is.
+    arm.aggregation = Aggregation::SingleRun(spec.into());
+    arm
 }
 
 fn row<'a>(rows: &'a [Row], metric: &str, tier: Tier) -> &'a Row {
@@ -97,7 +86,12 @@ fn row<'a>(rows: &'a [Row], metric: &str, tier: Tier) -> &'a Row {
 
 #[test]
 fn exact_deltas_are_exact_and_carry_no_measurement_floor() {
-    let d = diff(arm("a", 100, 10), arm("b", 100, 20), &DiffOptions::default()).unwrap();
+    let d = diff(
+        arm("a", 100, 10),
+        arm("b", 100, 20),
+        &DiffOptions::default(),
+    )
+    .unwrap();
 
     let count = row(&d.rows, "count", Tier::Exact);
     assert_eq!(count.a, Some(100.0));
@@ -126,7 +120,12 @@ fn exact_deltas_are_exact_and_carry_no_measurement_floor() {
 fn an_estimated_delta_carries_alpha_a_plus_b_over_a_minus_b_and_not_root_two_alpha() {
     // V9. The bound is deterministic worst-case on a quantised value, so the
     // two arms' errors do NOT combine in quadrature: √2·α is wrong in kind.
-    let d = diff(arm("a", 200, 100), arm("b", 200, 105), &DiffOptions::default()).unwrap();
+    let d = diff(
+        arm("a", 200, 100),
+        arm("b", 200, 105),
+        &DiffOptions::default(),
+    )
+    .unwrap();
     let p50 = row(&d.rows, "p50_ms", Tier::Estimated);
     let (a, b) = (p50.a.unwrap(), p50.b.unwrap());
 
@@ -180,11 +179,18 @@ fn an_estimated_delta_below_the_resolution_floor_is_suppressed_by_the_printed_th
     // V19's "one printed threshold". The suppression rule and the printed
     // number must be the same thing — an earlier revision struck deltas
     // through using a bound other than the one it displayed.
-    let d = diff(arm("a", 200, 100), arm("b", 200, 100), &DiffOptions::default()).unwrap();
+    let d = diff(
+        arm("a", 200, 100),
+        arm("b", 200, 100),
+        &DiffOptions::default(),
+    )
+    .unwrap();
     let p50 = row(&d.rows, "p50_ms", Tier::Estimated);
     assert!(p50.suppressed, "a zero delta is below any floor");
 
-    let t = p50.threshold_pct.expect("a measurement floor always exists");
+    let t = p50
+        .threshold_pct
+        .expect("a measurement floor always exists");
     assert!(
         (t - 2.0 * ALPHA * 100.0).abs() < 1e-9,
         "threshold is 2α as a percentage of the mean: {t}"
@@ -196,7 +202,10 @@ fn an_estimated_delta_below_the_resolution_floor_is_suppressed_by_the_printed_th
     let abs = p50.threshold_abs.unwrap();
     let mean = (p50.a.unwrap() + p50.b.unwrap()) / 2.0;
     assert!((abs - t / 100.0 * mean).abs() < 1e-9);
-    assert!(p50.delta.unwrap().abs() <= abs, "suppressed because |Δ| ≤ threshold");
+    assert!(
+        p50.delta.unwrap().abs() <= abs,
+        "suppressed because |Δ| ≤ threshold"
+    );
 }
 
 #[test]
@@ -265,7 +274,12 @@ fn an_avg_ms_delta_is_suppressed_when_the_count_moved_materially() {
     // §9.5: an exact-tier number that is invalid as an effect size, because the
     // denominator moved. Reported as a pair of values with no delta rather than
     // omitted, so a reader can still see both.
-    let d = diff(arm("a", 100, 10), arm("b", 200, 10), &DiffOptions::default()).unwrap();
+    let d = diff(
+        arm("a", 100, 10),
+        arm("b", 200, 10),
+        &DiffOptions::default(),
+    )
+    .unwrap();
     let avg = row(&d.rows, "avg_ms", Tier::Exact);
     assert!(avg.delta.is_none(), "no delta");
     assert_eq!(avg.a, Some(10.0), "but both values are still shown");
@@ -278,7 +292,12 @@ fn an_avg_ms_delta_is_suppressed_when_the_count_moved_materially() {
 
     // Immaterial movement still gets a delta: suppressing on one span in a
     // thousand would train the reader to ignore the suppression.
-    let d = diff(arm("a", 1000, 10), arm("b", 1005, 10), &DiffOptions::default()).unwrap();
+    let d = diff(
+        arm("a", 1000, 10),
+        arm("b", 1005, 10),
+        &DiffOptions::default(),
+    )
+    .unwrap();
     assert!(row(&d.rows, "avg_ms", Tier::Exact).delta.is_some());
 }
 
@@ -551,7 +570,11 @@ fn below_tree_on_both_arms_marks_that_double_counting_is_unknowable() {
         c.ingest(&span(1, None, S, 20 * MS, "op"));
     });
     let d = diff(a, b, &DiffOptions::default()).unwrap();
-    let m = d.marks.iter().find(|m| m.kind == "nesting").expect("marked");
+    let m = d
+        .marks
+        .iter()
+        .find(|m| m.kind == "nesting")
+        .expect("marked");
     assert!(m.detail.contains("not knowable"), "{}", m.detail);
     assert!(!row(&d.rows, "total_ms", Tier::Exact).trustworthy);
 }
@@ -596,7 +619,10 @@ fn per_name_rows_pair_up_and_one_sided_keys_get_no_invented_zero() {
 
     let shared = g("shared");
     assert_eq!(shared.presence, "both");
-    assert_eq!(row(&shared.rows, "total_ms", Tier::Exact).delta, Some(-60.0));
+    assert_eq!(
+        row(&shared.rows, "total_ms", Tier::Exact).delta,
+        Some(-60.0)
+    );
 
     // A key on one side only is NOT a delta against zero: it may be missing
     // because nothing matched it, or because a cardinality cap folded it.
@@ -655,7 +681,10 @@ fn per_group_rows_are_suppressed_when_the_arms_declare_different_group_keys() {
         },
     );
     let d = diff(a, b, &grouped(DiffGroupBy::Group)).unwrap();
-    assert!(d.groups.is_empty(), "a tuple means a different thing on each");
+    assert!(
+        d.groups.is_empty(),
+        "a tuple means a different thing on each"
+    );
     assert!(d
         .suppressed
         .iter()
@@ -698,7 +727,12 @@ fn a_per_group_avg_delta_is_suppressed_on_its_own_count_not_the_overall_one() {
         })
     };
     // 100 total on both arms, but the split moved wholesale.
-    let d = diff(mk("a", 20, 80), mk("b", 80, 20), &grouped(DiffGroupBy::Name)).unwrap();
+    let d = diff(
+        mk("a", 20, 80),
+        mk("b", 80, 20),
+        &grouped(DiffGroupBy::Name),
+    )
+    .unwrap();
     assert!(
         row(&d.rows, "count", Tier::Exact).delta == Some(0.0),
         "overall count is flat"
@@ -717,7 +751,12 @@ fn a_single_run_arm_makes_the_result_untrustworthy_on_its_own() {
     // §9.4: `trustworthy: false` whenever any arm is single-run. Nothing else
     // has to be wrong for a two-single-run comparison to be unable to tell a
     // real change from noise.
-    let d = diff(arm("a", 100, 10), arm("b", 100, 20), &DiffOptions::default()).unwrap();
+    let d = diff(
+        arm("a", 100, 10),
+        arm("b", 100, 20),
+        &DiffOptions::default(),
+    )
+    .unwrap();
     assert!(d.marks.is_empty(), "nothing differs: {:?}", d.marks);
     assert!(!d.trustworthy, "and it is still not trustworthy");
 
@@ -735,7 +774,10 @@ fn a_single_run_arm_makes_the_result_untrustworthy_on_its_own() {
 fn aggregation_says_which_runs_a_figure_came_from() {
     assert!(Aggregation::Live.is_single_run());
     assert!(Aggregation::SingleRun("x".into()).is_single_run());
-    assert!(Aggregation::Merged(vec!["a".into()]).is_single_run(), "one is one");
+    assert!(
+        Aggregation::Merged(vec!["a".into()]).is_single_run(),
+        "one is one"
+    );
     assert!(!Aggregation::Merged(vec!["a".into(), "b".into()]).is_single_run());
 
     let s = Aggregation::Merged(vec!["a".into(), "b".into()]).as_str();
@@ -747,16 +789,24 @@ fn comparing_two_different_collectors_is_permitted_and_labelled() {
     let a = arm_with("a", def_named("left", "sv=svc", Level::Tree, vec![]), |c| {
         c.ingest(&span(1, None, S, 10 * MS, "op"));
     });
-    let b = arm_with("b", def_named("right", "sv=svc", Level::Tree, vec![]), |c| {
-        c.ingest(&span(1, None, S, 20 * MS, "op"));
-    });
+    let b = arm_with(
+        "b",
+        def_named("right", "sv=svc", Level::Tree, vec![]),
+        |c| {
+            c.ingest(&span(1, None, S, 20 * MS, "op"));
+        },
+    );
     let d = diff(a, b, &DiffOptions::default()).expect("permitted");
     let m = d
         .marks
         .iter()
         .find(|m| m.kind == "collector")
         .expect("labelled");
-    assert!(m.detail.contains("two different collectors"), "{}", m.detail);
+    assert!(
+        m.detail.contains("two different collectors"),
+        "{}",
+        m.detail
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +831,12 @@ fn duration_thresholds_canonicalize_by_bit_pattern_which_is_total_cmp_equality()
 
     // The claim the comment rests on: bit equality is exactly total_cmp
     // equality, so canonicalizing on bits IS "thresholds by total_cmp".
-    for (x, y) in [(1.0f64, 1.0f64), (0.0, -0.0), (f64::NAN, f64::NAN), (1.0, 2.0)] {
+    for (x, y) in [
+        (1.0f64, 1.0f64),
+        (0.0, -0.0),
+        (f64::NAN, f64::NAN),
+        (1.0, 2.0),
+    ] {
         assert_eq!(
             x.to_bits() == y.to_bits(),
             x.total_cmp(&y) == std::cmp::Ordering::Equal,
@@ -803,6 +858,315 @@ fn a_regex_spelled_differently_marks_rather_than_being_normalised() {
 // The stored-snapshot path
 // ---------------------------------------------------------------------------
 
+/// A recorded run of `n` spans of `each_ms`, with `ingest` loss attributed.
+fn stored(label: &str, n: usize, each_ms: i64, ingest: Option<TraceIngestLoss>) -> StoredSnapshot {
+    let c = Collector::new(def_named("c", "sv=svc", Level::Tree, vec![]), at(0));
+    for i in 0..n {
+        c.ingest(&span(i as u64 + 1, None, S, each_ms * MS, "op"));
+    }
+    let view = c.swap(at(60));
+    let projected = crate::collector::project::project_for_snapshot(&view);
+    StoredSnapshot::from_view(
+        label.into(),
+        None,
+        serde_json::Value::Null,
+        at(60),
+        SnapshotPolicy::default(),
+        view,
+        ingest,
+        projected,
+    )
+}
+
+#[test]
+fn a_merged_arm_is_the_only_shape_that_yields_a_run_to_run_floor() {
+    // The reason `@*` exists. With single-run arms on both sides every threshold
+    // in the result reads "unknown", so nothing can be called a result.
+    let runs = vec![
+        stored("r1", 100, 10, Some(TraceIngestLoss::default())),
+        stored("r2", 100, 11, Some(TraceIngestLoss::default())),
+        stored("r3", 100, 12, Some(TraceIngestLoss::default())),
+    ];
+    let merged = Arm::merged("c@*".into(), &runs).expect("merged");
+
+    assert_eq!(merged.total.count, 300, "exact scalars are additive");
+    let floor = merged.floor.as_ref().expect("three runs have a spread");
+    assert_eq!(floor.runs, 3);
+    assert!(floor.cv_pct.is_some(), "and a CV");
+    assert!(!merged.aggregation.is_single_run());
+    assert!(merged.aggregation.as_str().contains("r1, r2, r3"));
+}
+
+#[test]
+fn a_merged_arm_omits_sample_derived_figures_rather_than_summing_them() {
+    // Self time across two runs is not a self time, and a wall union across
+    // them is not a union (§6.5).
+    let runs = vec![
+        stored("r1", 50, 10, Some(TraceIngestLoss::default())),
+        stored("r2", 50, 10, Some(TraceIngestLoss::default())),
+    ];
+    assert!(runs[0].projections.is_some(), "the runs have projections");
+    let merged = Arm::merged("c@*".into(), &runs).unwrap();
+    assert!(merged.projections.is_none(), "omitted, not summed");
+    assert!(merged.paths.is_empty(), "and neither do path lists merge");
+
+    // Which the diff then reports as a suppression rather than a silent gap.
+    let d = diff(merged, arm("b", 50, 10), &DiffOptions::default()).unwrap();
+    assert!(d
+        .suppressed
+        .iter()
+        .any(|s| s.field == "sampled" && s.reason.contains("projections")));
+}
+
+#[test]
+fn a_merged_arms_per_axis_rows_are_all_or_nothing() {
+    // Merging only the runs that recorded a breakdown would give per-name rows
+    // that do not sum to the merged total — breaking A11's reconciliation rule
+    // in a way no reader could detect.
+    let mut runs = vec![
+        stored("r1", 50, 10, Some(TraceIngestLoss::default())),
+        stored("r2", 50, 10, Some(TraceIngestLoss::default())),
+    ];
+    let merged = Arm::merged("c@*".into(), &runs).unwrap();
+    let per_name = merged.per_name.as_ref().expect("both runs recorded it");
+    assert_eq!(
+        per_name.get("op").map(|e| e.count),
+        Some(100),
+        "and the rows sum to the merged total"
+    );
+
+    // One run without it — as a restored-from-disk snapshot is — and the whole
+    // breakdown is absent rather than partial.
+    runs[1].per_name = None;
+    let merged = Arm::merged("c@*".into(), &runs).unwrap();
+    assert!(merged.per_name.is_none(), "all or nothing");
+}
+
+#[test]
+fn merged_ingest_loss_is_summed_and_unknown_on_any_run_makes_it_unknown() {
+    let loss = TraceIngestLoss {
+        dropped: 5,
+        shed_batches: 1,
+        malformed: 2,
+    };
+    let runs = vec![
+        stored("r1", 10, 10, Some(loss)),
+        stored("r2", 10, 10, Some(loss)),
+    ];
+    let merged = Arm::merged("c@*".into(), &runs).unwrap();
+    let i = merged.ingest.expect("known on both");
+    assert_eq!(
+        (i.dropped, i.shed_batches, i.malformed),
+        (10, 2, 4),
+        "summed"
+    );
+
+    // One window whose attribution failed makes the total a floor rather than a
+    // figure, and a floor presented as a figure is worse than no number.
+    let runs = vec![stored("r1", 10, 10, Some(loss)), stored("r2", 10, 10, None)];
+    let merged = Arm::merged("c@*".into(), &runs).unwrap();
+    assert!(merged.ingest.is_none(), "unknown, not 5");
+}
+
+#[test]
+fn truncation_anywhere_truncates_the_merged_arm() {
+    let mut runs = vec![
+        stored("r1", 10, 10, Some(TraceIngestLoss::default())),
+        stored("r2", 10, 10, Some(TraceIngestLoss::default())),
+    ];
+    assert!(!Arm::merged("x".into(), &runs).unwrap().truncated());
+    runs[0].sample_complete = false;
+    assert!(
+        Arm::merged("x".into(), &runs).unwrap().truncated(),
+        "a set of prefixes is not a sample of the whole"
+    );
+}
+
+#[test]
+fn merging_no_runs_is_an_error_rather_than_an_empty_arm() {
+    assert!(Arm::merged("c@*".into(), &[]).is_err());
+}
+
+#[test]
+fn the_nesting_verdict_survives_a_merge_even_though_the_projections_do_not() {
+    // Found by a test, not by inspection: deriving `nesting` from `projections`
+    // made every merged arm read `unknown`, so every multi-run diff advised
+    // "re-run at `tree`" to someone whose runs were already at `tree`. A remedy
+    // that cannot be acted on teaches the reader to ignore the ones that can.
+    let tree_no_nesting = vec![
+        stored("r1", 10, 10, Some(TraceIngestLoss::default())),
+        stored("r2", 10, 10, Some(TraceIngestLoss::default())),
+    ];
+    let merged = Arm::merged("c@*".into(), &tree_no_nesting).unwrap();
+    assert!(merged.projections.is_none(), "projections do not merge");
+    assert_eq!(merged.nesting, "undetected", "but the verdict survives");
+
+    // And a merged diff of two clean tree-level arms carries no nesting mark.
+    let other = Arm::merged("d@*".into(), &tree_no_nesting).unwrap();
+    let d = diff(merged, other, &DiffOptions::default()).unwrap();
+    assert!(
+        !d.marks.iter().any(|m| m.kind == "nesting"),
+        "marks: {:?}",
+        d.marks
+    );
+}
+
+#[test]
+fn the_merged_nesting_verdict_folds_by_severity() {
+    // `detected` anywhere means the merged `total_ms` double-counts; one run
+    // that could not tell makes the answer unknown rather than clean. Built by
+    // hand because the fold is the thing under test, not the ingest path.
+    let nested = {
+        let c = Collector::new(def_named("c", "sv=svc", Level::Tree, vec![]), at(0));
+        c.ingest(&span(1, None, S, 100 * MS, "outer"));
+        c.ingest(&span(2, Some(1), S + 10 * MS, 50 * MS, "inner"));
+        let view = c.swap(at(60));
+        let projected = crate::collector::project::project_for_snapshot(&view);
+        StoredSnapshot::from_view(
+            "nested".into(),
+            None,
+            serde_json::Value::Null,
+            at(60),
+            SnapshotPolicy::default(),
+            view,
+            Some(TraceIngestLoss::default()),
+            projected,
+        )
+    };
+    let flat = stored("flat", 10, 10, Some(TraceIngestLoss::default()));
+    let blind = {
+        let mut s = stored("blind", 10, 10, Some(TraceIngestLoss::default()));
+        // A run recorded below `tree`: it cannot answer the question at all.
+        s.def = Arc::new(def_named("c", "sv=svc", Level::Timing, vec![]));
+        s
+    };
+
+    let v = |runs: Vec<StoredSnapshot>| Arm::merged("c@*".into(), &runs).unwrap().nesting;
+    assert_eq!(v(vec![flat.clone(), flat.clone()]), "undetected");
+    assert_eq!(v(vec![flat.clone(), blind.clone()]), "unknown");
+    assert_eq!(
+        v(vec![flat.clone(), nested.clone()]),
+        "detected",
+        "one nested run is enough"
+    );
+    assert_eq!(
+        v(vec![blind, nested]),
+        "detected",
+        "detected outranks unknown: the double-count is a fact, not a gap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stored path rows (§9.8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_snapshot_records_call_paths_because_they_cannot_be_computed_later() {
+    // The samples a path is walked from are not retained, so a flame graph not
+    // taken at snapshot time can never be taken.
+    let c = Collector::new(def_named("c", "sv=svc", Level::Tree, vec![]), at(0));
+    c.ingest(&span(1, None, S, 100 * MS, "handler"));
+    c.ingest(&span(2, Some(1), S + 10 * MS, 60 * MS, "db"));
+    let view = c.swap(at(60));
+    let projected = crate::collector::project::project_for_snapshot(&view);
+
+    let paths: Vec<&str> = projected.paths.iter().map(|p| p.path.as_str()).collect();
+    assert!(
+        paths.contains(&"handler > db"),
+        "the chain is rendered root first: {paths:?}"
+    );
+    assert!(paths.contains(&"handler"));
+    assert!(!projected.paths_truncated);
+
+    // Self time, not total: `handler` keeps 40 ms of its 100 once `db`'s
+    // clipped interval is removed.
+    let handler = projected
+        .paths
+        .iter()
+        .find(|p| p.path == "handler")
+        .unwrap();
+    assert!(
+        (handler.self_ms - 40.0).abs() < 0.001,
+        "{}",
+        handler.self_ms
+    );
+}
+
+#[test]
+fn a_scalar_or_timing_snapshot_records_no_paths_because_it_has_no_parent_identity() {
+    for level in [Level::Scalar, Level::Timing] {
+        let c = Collector::new(def_named("c", "sv=svc", level, vec![]), at(0));
+        c.ingest(&span(1, None, S, 10 * MS, "op"));
+        let projected = crate::collector::project::project_for_snapshot(&c.swap(at(60)));
+        assert!(projected.paths.is_empty(), "{level:?} retains no identity");
+        assert!(!projected.paths_truncated, "absent is not truncated");
+    }
+}
+
+#[test]
+fn a_capped_path_list_says_so_because_a_partial_flame_graph_looks_complete() {
+    use crate::collector::project::SNAPSHOT_PATH_ROWS;
+    let c = Collector::new(def_named("c", "sv=svc", Level::Tree, vec![]), at(0));
+    // Distinct names, so each span is its own path.
+    for i in 0..(SNAPSHOT_PATH_ROWS as u64 + 50) {
+        c.ingest(&span(i + 1, None, S, 10 * MS, &format!("op{i}")));
+    }
+    let projected = crate::collector::project::project_for_snapshot(&c.swap(at(60)));
+    assert!(projected.paths.len() <= SNAPSHOT_PATH_ROWS);
+    assert!(
+        projected.paths_truncated,
+        "nothing about looking at a flame graph reveals that mass is missing"
+    );
+}
+
+#[test]
+fn path_rows_survive_a_persistence_round_trip() {
+    use crate::collector::persist::PersistedSnapshot;
+    let s = {
+        let c = Collector::new(def_named("c", "sv=svc", Level::Tree, vec![]), at(0));
+        c.ingest(&span(1, None, S, 100 * MS, "handler"));
+        c.ingest(&span(2, Some(1), S + 10 * MS, 60 * MS, "db"));
+        let view = c.swap(at(60));
+        let projected = crate::collector::project::project_for_snapshot(&view);
+        StoredSnapshot::from_view(
+            "r".into(),
+            None,
+            serde_json::Value::Null,
+            at(60),
+            SnapshotPolicy::default(),
+            view,
+            None,
+            projected,
+        )
+    };
+    assert_eq!(s.paths.len(), 2);
+
+    let json = serde_json::to_string(&PersistedSnapshot::of(&s)).expect("encode");
+    let back: PersistedSnapshot = serde_json::from_str(&json).expect("decode");
+    let restored = back.restore("c").expect("restore");
+    assert_eq!(restored.paths.len(), 2);
+    assert_eq!(restored.paths[0].path, s.paths[0].path);
+    assert_eq!(restored.paths_truncated, s.paths_truncated);
+}
+
+#[test]
+fn a_snapshot_file_written_before_paths_existed_still_loads() {
+    // The reason FORMAT_VERSION does not move for this field: the only version
+    // gate refuses a file NEWER than this build, so an additive optional field
+    // has to read correctly from an older one or the choice was wrong.
+    use crate::collector::persist::PersistedSnapshot;
+    let s = stored("r", 5, 10, None);
+    let mut v = serde_json::to_value(PersistedSnapshot::of(&s)).expect("encode");
+    v.as_object_mut().unwrap().remove("paths");
+    v.as_object_mut().unwrap().remove("paths_truncated");
+
+    let back: PersistedSnapshot = serde_json::from_value(v).expect("an older file still parses");
+    let restored = back.restore("c").expect("restore");
+    assert!(restored.paths.is_empty());
+    assert!(!restored.paths_truncated);
+    assert_eq!(restored.total.count, 5, "and the rest of the run survives");
+}
+
 #[test]
 fn an_arm_built_from_a_stored_snapshot_reports_the_recorded_definition() {
     // §6.3's whole reason for existing: a diff must not read the LIVE
@@ -818,7 +1182,7 @@ fn an_arm_built_from_a_stored_snapshot_reports_the_recorded_definition() {
         SnapshotPolicy::default(),
         c.swap(at(1)),
         None,
-        None,
+        Projected::default(),
     );
     assert_eq!(stored.def.filter_string, "sn=old");
 
