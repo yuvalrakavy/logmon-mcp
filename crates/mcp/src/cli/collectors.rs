@@ -6,8 +6,9 @@
 
 use clap::{Args, Subcommand};
 use logmon_broker_protocol::{
-    CollectorsAdd, CollectorsEdit, CollectorsGet, CollectorsHistory, CollectorsList,
-    CollectorsName, CollectorsSnapshot, ProfileResult, TracesProfile,
+    CollectorsAdd, CollectorsDiff, CollectorsDiffResult, CollectorsEdit, CollectorsGet,
+    CollectorsHistory, CollectorsList, CollectorsName, CollectorsSnapshot, DiffRow, ProfileResult,
+    TracesProfile,
 };
 use logmon_broker_sdk::Broker;
 
@@ -100,6 +101,32 @@ enum ColVerb {
         /// Also combine them and report the run-to-run spread.
         #[arg(long)]
         merge: bool,
+    },
+    /// Compare two arms and report what moved.
+    ///
+    /// An arm is `<collector>` (live window), `<collector>@<label>` (one
+    /// recorded run), or `<collector>@*` (every recorded run merged). Prefer
+    /// `@*` on both sides: single-run arms have no spread, so every threshold
+    /// comes back unknown and nothing can be called a result.
+    Diff {
+        /// Baseline arm.
+        a: String,
+        /// The arm to compare against it.
+        b: String,
+        /// Break the deltas down by `name` or `group`.
+        #[arg(long)]
+        group_by: Option<String>,
+        #[arg(long)]
+        top_n: Option<u64>,
+        /// Compare arms whose filters matched different populations.
+        #[arg(long)]
+        allow_mismatch: bool,
+        /// Compare when one arm lost spans and the other did not.
+        #[arg(long)]
+        allow_lossy: bool,
+        /// Compare when both arms hit the sample budget.
+        #[arg(long)]
+        allow_truncated: bool,
     },
     /// Zero a collector and start a fresh window, keeping it armed.
     Reset {
@@ -437,6 +464,43 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
             0
         }
 
+        ColVerb::Diff {
+            a,
+            b,
+            group_by,
+            top_n,
+            allow_mismatch,
+            allow_lossy,
+            allow_truncated,
+        } => {
+            let result = match broker
+                .collectors_diff(CollectorsDiff {
+                    a,
+                    b,
+                    group_by,
+                    top_n,
+                    allow_mismatch: Some(allow_mismatch),
+                    allow_lossy: Some(allow_lossy),
+                    allow_truncated: Some(allow_truncated),
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // The refusals carry their own remedy and the flag that
+                    // permits them, so the error text is the whole answer.
+                    format::error(&format!("collectors.diff failed: {e}"), json);
+                    return 1;
+                }
+            };
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            print_diff(&result);
+            0
+        }
+
         ColVerb::Reset { name } => {
             let result = match broker.collectors_reset(CollectorsName { name }).await {
                 Ok(r) => r,
@@ -621,5 +685,144 @@ fn print_profile(r: &ProfileResult) {
     }
     if r.cardinality_capped {
         println!("  note: a cardinality cap folded values into __overflow__");
+    }
+}
+
+/// A comparison, rendered for a human.
+///
+/// Leads with what makes the numbers untrustworthy rather than burying it: a
+/// reader who stops after the first screen must not come away with a delta they
+/// should not have believed. Suppressed rows are shown struck through with the
+/// threshold that struck them, never hidden — a row that vanished would read as
+/// a row that did not exist.
+fn print_diff(r: &CollectorsDiffResult) {
+    println!("{}  ->  {}", r.a.spec, r.b.spec);
+    println!("  a: {} | {} | {}", r.a.aggregation, r.a.level, r.a.filter);
+    println!("  b: {} | {} | {}", r.b.aggregation, r.b.level, r.b.filter);
+    if r.a.level != r.b.level {
+        println!("  compared at: {}", r.level);
+    }
+
+    if !r.trustworthy {
+        println!("\nNOT TRUSTWORTHY — read the notes before acting on any number below.");
+    }
+    for m in &r.marks {
+        match &m.overridden_by {
+            Some(flag) => println!("  [{}] {} (permitted by --{})", m.kind, m.detail, flag),
+            None => println!("  [{}] {}", m.kind, m.detail),
+        }
+    }
+
+    println!();
+    print_diff_rows(&r.rows);
+
+    for g in &r.groups {
+        let label = match g.presence.as_str() {
+            "both" => String::new(),
+            other => format!("  ({other})"),
+        };
+        println!("\n{}{}", g.key, label);
+        print_diff_rows(&g.rows);
+    }
+    if r.overflow_rows_suppressed > 0 {
+        println!(
+            "\n{} group row(s) not compared: a cardinality cap folded them into \
+             __overflow__, which aggregates a different arbitrary set on each arm",
+            r.overflow_rows_suppressed
+        );
+    }
+
+    for s in &r.suppressed {
+        match &s.remedy {
+            Some(rem) => println!("\n{}: {} — {rem}", s.field, s.reason),
+            None => println!("\n{}: {}", s.field, s.reason),
+        }
+    }
+
+    // The floors last, because they qualify everything above and a reader who
+    // has already seen a delta needs to know what would have had to be true for
+    // it to mean something.
+    for (which, arm) in [("a", &r.a), ("b", &r.b)] {
+        match &arm.floor {
+            Some(f) => match f.cv_pct {
+                Some(cv) => println!(
+                    "\nfloor {which}: {} runs, {:.1}-{:.1}ms (mean {:.1}), CV {cv:.1}%\n  {}",
+                    f.runs, f.min, f.max, f.mean, f.caveat
+                ),
+                None => println!("\nfloor {which}: UNKNOWN (one run)"),
+            },
+            None => println!(
+                "\nfloor {which}: UNKNOWN — {} is a single run. Take several and compare \
+                 `<collector>@*` to find out whether a difference is real.",
+                arm.spec
+            ),
+        }
+    }
+}
+
+fn print_diff_rows(rows: &[DiffRow]) {
+    let cell = |v: Option<f64>| v.map_or("-".to_string(), |x| format!("{x:.3}"));
+    let table: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            let delta = match r.delta {
+                None => "-".to_string(),
+                Some(d) => {
+                    let pct = r
+                        .delta_pct
+                        .map_or(String::new(), |p| format!(" ({p:+.1}%)"));
+                    // The strike-through is the suppression made visible, and
+                    // the threshold that caused it prints beside it — 6.5
+                    // forbids striking a delta through with a bound other than
+                    // the one displayed.
+                    if r.suppressed {
+                        format!("[{d:+.3}{pct}]")
+                    } else {
+                        format!("{d:+.3}{pct}")
+                    }
+                }
+            };
+            let threshold = match (r.threshold_abs, r.threshold_pct) {
+                (Some(abs), Some(pct)) => format!("{abs:.3} ({pct:.1}% of mean)"),
+                _ => "unknown".to_string(),
+            };
+            vec![
+                r.metric.clone(),
+                r.tier.clone(),
+                cell(r.a),
+                cell(r.b),
+                delta,
+                threshold,
+                r.error_bound_pct
+                    .map_or("-".to_string(), |e| format!("{e:.0}%")),
+                if r.trustworthy { "" } else { "!" }.to_string(),
+            ]
+        })
+        .collect();
+    format::print_table(
+        &[
+            "metric",
+            "tier",
+            "a",
+            "b",
+            "delta",
+            "threshold",
+            "err/delta",
+            "",
+        ],
+        table,
+    );
+    // Suppression and doubt both print their reason: a bracketed delta with no
+    // explanation is indistinguishable from a formatting artifact.
+    for r in rows {
+        if r.suppressed {
+            println!(
+                "  [{}] below the {} floor — present, but not evidence of a change",
+                r.metric, r.threshold_basis
+            );
+        }
+        for n in &r.notes {
+            println!("  {}: {n}", r.metric);
+        }
     }
 }

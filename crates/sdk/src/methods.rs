@@ -12,19 +12,20 @@ use crate::{Broker, BrokerError};
 use logmon_broker_protocol::{
     BookmarksAdd, BookmarksAddResult, BookmarksClear, BookmarksClearResult, BookmarksList,
     BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, CollectorsAdd,
-    CollectorsAddResult, CollectorsEdit, CollectorsEditResult, CollectorsGet, CollectorsHistory,
-    CollectorsHistoryResult, CollectorsList, CollectorsListResult, CollectorsName,
-    CollectorsRemoveResult, CollectorsResetResult, CollectorsSnapshot, DomainsClear,
-    DomainsClearResult, DomainsCreate, DomainsCreateResult, DomainsDelete, DomainsDeleteResult,
-    DomainsList, DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult,
-    FiltersEdit, FiltersEditResult, FiltersList, FiltersListResult, FiltersRemove,
-    FiltersRemoveResult, LogsClear, LogsClearResult, LogsContext, LogsContextResult, LogsExport,
-    LogsExportResult, LogsRecent, LogsRecentResult, ProfileResult, SessionDrop, SessionDropResult,
-    SessionList, SessionListResult, SnapshotSummary, SpansContext, SpansContextResult, StatusGet,
-    StatusGetResult, TracesGet, TracesGetResult, TracesLogs, TracesLogsResult, TracesProfile,
-    TracesRecent, TracesRecentResult, TracesSlow, TracesSlowResult, TracesSummary,
-    TracesSummaryResult, TriggersAdd, TriggersAddResult, TriggersEdit, TriggersEditResult,
-    TriggersList, TriggersListResult, TriggersRemove, TriggersRemoveResult,
+    CollectorsAddResult, CollectorsDiff, CollectorsDiffResult, CollectorsEdit,
+    CollectorsEditResult, CollectorsGet, CollectorsHistory, CollectorsHistoryResult,
+    CollectorsList, CollectorsListResult, CollectorsName, CollectorsRemoveResult,
+    CollectorsResetResult, CollectorsSnapshot, DomainsClear, DomainsClearResult, DomainsCreate,
+    DomainsCreateResult, DomainsDelete, DomainsDeleteResult, DomainsList, DomainsListResult,
+    DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult, FiltersEdit, FiltersEditResult,
+    FiltersList, FiltersListResult, FiltersRemove, FiltersRemoveResult, LogsClear, LogsClearResult,
+    LogsContext, LogsContextResult, LogsExport, LogsExportResult, LogsRecent, LogsRecentResult,
+    ProfileResult, SessionDrop, SessionDropResult, SessionList, SessionListResult, SnapshotSummary,
+    SpansContext, SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult,
+    TracesLogs, TracesLogsResult, TracesProfile, TracesRecent, TracesRecentResult, TracesSlow,
+    TracesSlowResult, TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult,
+    TriggersEdit, TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove,
+    TriggersRemoveResult,
 };
 
 impl Broker {
@@ -147,6 +148,15 @@ impl Broker {
         p: CollectorsHistory,
     ) -> Result<CollectorsHistoryResult, BrokerError> {
         self.call_typed("collectors.history", p).await
+    }
+    /// Compare two arms. An arm is `<collector>` (the live window),
+    /// `<collector>@<label>` (one recorded run), or `<collector>@*` (every
+    /// recorded run merged — the only shape with a run-to-run floor).
+    pub async fn collectors_diff(
+        &self,
+        p: CollectorsDiff,
+    ) -> Result<CollectorsDiffResult, BrokerError> {
+        self.call_typed("collectors.diff", p).await
     }
 
     // ---- bookmarks.* ----

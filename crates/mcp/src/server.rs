@@ -326,6 +326,26 @@ struct CollectorHistoryParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct CollectorDiffParams {
+    /// Baseline arm: "<collector>" for the live window, "<collector>@<label>"
+    /// for one recorded run, or "<collector>@*" for every recorded run merged.
+    a: String,
+    /// The arm to compare against the baseline, same syntax.
+    b: String,
+    /// Break the deltas down by "name" or "group". Not "trace" or "path" — a
+    /// recorded run does not retain the per-span records those need.
+    group_by: Option<String>,
+    /// Rows returned in the breakdown (default 20).
+    top_n: Option<u32>,
+    /// Compare even though the arms matched different span populations.
+    allow_mismatch: Option<bool>,
+    /// Compare even though one arm lost spans and the other did not.
+    allow_lossy: Option<bool>,
+    /// Compare even though both arms hit the sample budget.
+    allow_truncated: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ProfileTracesParams {
     /// Span filter DSL. Default "ALL".
     filter: Option<String>,
@@ -892,6 +912,43 @@ impl GelfMcpServer {
                     "name": p.name,
                     "limit": p.limit,
                     "merge": p.merge,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Compare two runs and get what moved. Arms are \"<collector>\" (live \
+                       window), \"<collector>@<label>\" (one recorded run), or \
+                       \"<collector>@*\" (every recorded run merged). Prefer @* on both \
+                       sides: with single runs there is no run-to-run spread, so nothing \
+                       can separate a real change from scheduling noise, and every \
+                       threshold comes back \"unknown\". Each row carries the threshold used \
+                       to suppress it, and estimated percentile rows carry the error on the \
+                       delta — at or above 100% the error bar is wider than the delta. \
+                       REFUSES rather than guessing when the arms are not comparable, and \
+                       names the flag that would permit it."
+    )]
+    async fn diff_collectors(
+        &self,
+        Parameters(p): Parameters<CollectorDiffParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.diff",
+                serde_json::json!({
+                    "a": p.a,
+                    "b": p.b,
+                    "group_by": p.group_by,
+                    "top_n": p.top_n,
+                    "allow_mismatch": p.allow_mismatch,
+                    "allow_lossy": p.allow_lossy,
+                    "allow_truncated": p.allow_truncated,
                 }),
             )
             .await
