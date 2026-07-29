@@ -9,6 +9,7 @@
 pub mod exact;
 pub mod history;
 pub mod intern;
+pub mod persist;
 pub mod project;
 pub mod registry;
 pub mod sample;

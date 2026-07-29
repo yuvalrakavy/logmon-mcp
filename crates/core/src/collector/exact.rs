@@ -139,6 +139,35 @@ impl ExactStats {
         &self.sketch
     }
 
+    /// Rebuild from persisted parts. Every field is passed explicitly rather
+    /// than replayed through `record`, because replaying would need the
+    /// original durations — which is exactly what the sketch exists to avoid
+    /// keeping.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        count: u64,
+        total_ns: i128,
+        min_ns: Option<i64>,
+        max_ns: Option<i64>,
+        error_count: u64,
+        negative_duration_spans: u64,
+        malformed_timestamps: u64,
+        out_of_range_spans: u64,
+        sketch: DurationSketch,
+    ) -> Self {
+        Self {
+            count,
+            total_ns,
+            min_ns,
+            max_ns,
+            error_count,
+            negative_duration_spans,
+            malformed_timestamps,
+            out_of_range_spans,
+            sketch,
+        }
+    }
+
     /// Additive merge — the property `collectors.history(merge:)` and the
     /// read-path fold both rest on.
     pub fn merge(&mut self, other: &ExactStats) -> Result<(), SketchMergeError> {

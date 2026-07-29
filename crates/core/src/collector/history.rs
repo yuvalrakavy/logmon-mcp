@@ -293,6 +293,21 @@ impl History {
         self.snapshots.is_empty()
     }
 
+    /// Restore the counters a persisted file recorded.
+    ///
+    /// The auto-label counter has to come back, or a restarted daemon would
+    /// re-issue `snapshot-1` for a run that is not the first — the ambiguity
+    /// the never-reuse rule exists to prevent, reintroduced by a restart.
+    pub fn restore_counters(&mut self, next_auto: u64, evicted: u64) {
+        self.next_auto = next_auto.max(1);
+        self.evicted = evicted;
+    }
+
+    /// The next auto-label number, for persistence.
+    pub fn next_auto(&self) -> u64 {
+        self.next_auto
+    }
+
     /// How many were dropped to the cap. Reported rather than inferred: a
     /// caller comparing "the first run" against the latest needs to know the
     /// first run is gone.

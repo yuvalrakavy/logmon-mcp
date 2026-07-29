@@ -92,6 +92,20 @@ impl DurationSketch {
         self.layout
     }
 
+    /// Rebuild from `to_bytes` output, restoring the layout it was recorded
+    /// under rather than assuming the current one.
+    ///
+    /// The recorded layout is the whole point: a sketch decoded from a file
+    /// written by an older build may have been constructed with different
+    /// parameters, and merging it with a current one would produce percentiles
+    /// with no stated accuracy at all. Carrying the layout forward is what lets
+    /// §6.5 refuse that from a recorded fact instead of guessing.
+    pub fn from_bytes(bytes: &[u8], layout: SketchLayout) -> Result<Self, String> {
+        let inner = DDSketch::from_java_bytes(bytes)
+            .map_err(|e| format!("could not decode duration sketch: {e:?}"))?;
+        Ok(Self { inner, layout })
+    }
+
     /// Offer one span's duration, in nanoseconds.
     ///
     /// Clamping to the declared range before `add` is what makes the range a
