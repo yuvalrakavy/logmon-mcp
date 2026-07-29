@@ -18,6 +18,8 @@ Reach for it when any of these are true:
 - A test just failed and the failure isn't obviously in the test code.
 - A user-reported bug describes a behavior, not a code path.
 - You're about to insert `println!` / `console.log` / `print` to understand control flow — query logmon first.
+- **The user wants to know whether a change made things faster** — "did the cache help," "is this slower than before," "where is the time going." Arm a collector *before* the run, not after. See [Time profiling](#time-profiling).
+- You're about to time something by hand — wrapping a block in `Instant::now()`, or eyeballing durations across a few traces. A collector aggregates over the whole run instead.
 
 ## When NOT to reach for logmon
 
@@ -60,6 +62,8 @@ If the host is Claude Code, the user can type `/logmon <args>`. Execute the matc
 - `/logmon sessions` — `get_sessions`, summarize.
 - `/logmon traces` — `get_recent_traces`, summarize.
 - `/logmon slow` — `get_slow_spans` with default threshold, summarize bottlenecks.
+- `/logmon profile [filter]` — `profile_traces(filter=…, group_by="name")` over what's buffered, summarize where the time went.
+- `/logmon collectors` — `list_collectors`, summarize what's armed and what each has matched.
 - `/logmon trace <trace_id>` — `get_trace(trace_id=…)`.
 - `/logmon <DSL expr>` — if the argument contains `=`, `>=`, `/regex/`, or a known selector (`fa=`, `l>=`, `h=`, `m=`, `sn=`, `sv=`, `d>=`), call `get_recent_logs` (log selectors) or `get_slow_spans` (span selectors) with that filter.
 - `/logmon help` — print this list. Do **not** call any tools.
@@ -128,7 +132,9 @@ Measuring the effect of a change means comparing two runs. A collector accumulat
 
 - **`add_collector(name, filter, level?, group_keys?, description?)`** — arm it. `level`: `scalar` (counts and totals), `timing` (adds percentiles, wall union, warm-up exclusion), `tree` (adds self time, nesting and call paths — the default). `group_keys` splits the numbers by span attribute, which is how you run both arms of an A/B in one pass: `group_keys=["cache.enabled"]`. Always give a `description` — it comes back with every read.
 - **`get_collector(name, group_by?, skip_warmup_ms?, top_n?)`** — read it. `group_by`: `name`, `group`, `trace`, `path`.
+- **`list_collectors()`** — what this session has armed, and how much each has matched. Check this before arming: only about four default-sized collectors fit in the daemon-wide budget.
 - **`reset_collector(name)`** — zero it and start a fresh window, staying armed. Returns what it discarded.
+- **`remove_collector(name)`** — unarm it and hand the budget back. Do this when you're done; a collector left armed keeps costing ingest time and reserved memory.
 - **`profile_traces(filter?, …)`** — same numbers over what is already in the buffer. A collector must be armed *before* the run it measures; this looks back at one that already happened.
 
 **Reading the result.** `exact`, `estimated` and `sampled` are not three views of one number:

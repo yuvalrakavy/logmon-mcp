@@ -208,6 +208,12 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `traces_slow` | `TracesSlow` | `TracesSlowResult` |
 | `traces_logs` | `TracesLogs` | `TracesLogsResult` |
 | `spans_context` | `SpansContext` | `SpansContextResult` |
+| `collectors_add` | `CollectorsAdd` | `CollectorsAddResult` |
+| `collectors_list` | `CollectorsList` | `CollectorsListResult` |
+| `collectors_get` | `CollectorsGet` | `ProfileResult` |
+| `collectors_reset` | `CollectorsName` | `CollectorsResetResult` |
+| `collectors_remove` | `CollectorsName` | `CollectorsRemoveResult` |
+| `traces_profile` | `TracesProfile` | `ProfileResult` |
 | `bookmarks_add` | `BookmarksAdd` | `BookmarksAddResult` |
 | `bookmarks_list` | `BookmarksList` | `BookmarksListResult` |
 | `bookmarks_remove` | `BookmarksRemove` | `BookmarksRemoveResult` |
@@ -222,6 +228,13 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `domains_clear` | `DomainsClear` | `DomainsClearResult` |
 
 All methods return `Result<R, BrokerError>`.
+
+`collectors_get` and `traces_profile` share one result type on purpose — the same
+projection runs over an armed collector and over an ad-hoc query, so two clients
+comparing them are comparing like with like. Read `ProfileResult` carefully: `exact`,
+`estimated` and `sampled` are **not** three views of one number (see "Profiles" below),
+and a `None` field is explained by a matching entry in `suppressed` rather than being
+indistinguishable from zero.
 
 The `logs_recent` / `logs_export` / `traces_recent` result types carry query **diagnostics**: `matched` (the returned `count`) alongside `scanned` (records examined), `buffer_total`, and `buffer_oldest_seq` / `buffer_newest_seq` — so `scanned == 0` (empty buffer / dead pipeline) is distinguishable from `matched == 0, scanned > 0` (filter matched nothing while data flows). `logs_recent` / `logs_export` additionally set `truncated` / `evicted_before_window` when a `b>=` / `c>=` window predates the retained buffer. All are `#[serde(default)]`, so older servers that omit them deserialize cleanly.
 
@@ -333,11 +346,77 @@ pub struct TraceSummaryBreakdownEntry {
 
 pub struct TracesSlowGroup {
     pub name: String,                        // Span name (the grouping key).
-    pub avg_ms: f64,
-    pub p95_ms: f64,
+    pub avg_ms: f64,                         // Over EVERY matching span of this name...
+    pub p50_ms: f64,                         // ...not only those above min_duration_ms,
+    pub p95_ms: f64,                         // which is a display floor selecting which
+    pub max_ms: f64,                         // NAMES appear. That is what max_ms tests.
     pub count: usize,
 }
 ```
+
+### Profiles
+
+```rust
+pub struct ProfileResult {
+    pub collector: Option<String>,           // None for an ad-hoc traces_profile.
+    pub description: Option<String>,
+    pub filter: String,
+    pub level: String,                       // "scalar" | "timing" | "tree".
+    pub matched: u64,                        // Raw count. Never windowed, never suppressed.
+    pub nesting: String,                     // "detected" | "undetected" | "unknown".
+        // "unknown" means the level cannot answer, NOT that nothing nested. Below `tree`
+        // there is no parent identity to look at, so reading "undetected" there would let
+        // you infer a flat call structure from a retention setting.
+    pub window: ProfileWindow,               // wall_ms runs from the later of arming and
+                                             // the last reset, not from arming.
+    pub ingest: Option<ProfileIngest>,       // None when the pinned domain is gone or was
+                                             // recreated, which makes a counter delta
+                                             // meaningless. Its figures are per-DOMAIN and
+                                             // unfiltered: sound as a reason to distrust
+                                             // `matched`, wrong as a count of lost matches.
+    pub exact: Option<ProfileExact>,         // Every matched span, for the collector's life.
+    pub estimated: Option<ProfileEstimated>, // Same population, percentiles to +/-1%.
+    pub sampled: Option<ProfileSampled>,     // EXACT over retained records — which is the
+                                             // whole population only while `complete`.
+    pub grouped_by: Option<String>,
+    pub groups: Vec<ProfileGroup>,
+    pub cardinality_capped: bool,            // A cap folded values into __overflow__.
+    pub suppressed: Vec<Suppressed>,         // { field, reason, remedy } per null above.
+    pub warnings: Vec<String>,               // traces_profile only; collectors_add returns
+                                             // the same list at arm time.
+}
+```
+
+**The three categories are not interchangeable.** They cover different populations
+and disagree exactly when it matters: under sample truncation `exact` still covers
+the whole run while `sampled` covers a prefix. Pick by what you need — a headline
+total from `exact`, a distribution over an unbounded run from `estimated`, anything
+structural (self time, wall union, call paths) from `sampled` after checking
+`complete`.
+
+**Every `None` has a reason.** `suppressed` names the field, why it could not be
+computed, and usually what to change. `self_ms: None` with `nested_matches: 0` means
+the filter matched no nested spans — not that no time was spent. Treating `None` as
+zero is the one way to read this type wrongly.
+
+```rust
+pub struct ProfileSampled {
+    pub complete: bool,                      // false => the retained set is a PREFIX.
+    pub sample_count: u64,
+    pub self_ms: Option<f64>,                // duration - union(children clipped to parent).
+    pub nested_matches: u64,                 // 0 => self_ms is suppressed, by construction.
+    pub overlapping_child_ms: f64,           // Child time that lay OUTSIDE its parent and
+    pub overlapping_child_spans: u64,        // was clipped: clock skew, not concurrency.
+    pub wall_union_ms: Option<f64>,          // Elapsed time with >=1 matched span in flight.
+    pub achieved_concurrency: Option<f64>,   // Sampled total / that union. 1.0 = serial.
+    pub p50_ms: Option<f64>, pub p80_ms: Option<f64>,
+    pub p95_ms: Option<f64>, pub p99_ms: Option<f64>,
+}
+```
+
+Percentiles everywhere — sketch, sample, and `traces_slow` — use the lower quantile,
+rank `floor(1 + q(n-1))` 1-indexed. That is the convention the sketch's accuracy bound
+is stated against, so `estimated` and `sampled` are comparable on the same data.
 
 ### Bookmarks (post-cursor design)
 
