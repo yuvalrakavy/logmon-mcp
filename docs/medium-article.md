@@ -63,6 +63,22 @@ Two triggers auto-create per session: `l>=ERROR` and `mfm=panic`. Add your own w
 
 OTLP ingests both. They sit in separate ring buffers but share a global `seq` counter, so the same bookmark works across both. Logs carrying `trace_id`/`span_id` are linked to their spans — `get_trace(trace_id=...)` returns the full span tree *and* the logs emitted under it. The assistant can pivot from "this trace was slow" to "which log lines were emitted during the slow span" without correlating by hand.
 
+### Span time collectors: making "did that make it faster?" answerable
+
+Traces tell you what one request did. They're bad at telling you whether a *change* helped, because answering that means aggregating many runs and knowing whether the difference you're looking at is bigger than the noise. Assistants do this badly by default: they eyeball three numbers and declare victory.
+
+So logmon has a measuring instrument. You arm a **collector** over a span filter *before* the run — `add_collector(name="lookup", filter="sn=Lookup", level="tree")` — and it accumulates while the workload executes. Then you read exact totals, percentiles, self time (duration minus the union of matched children, so concurrent children don't double-count), and call paths.
+
+Three design choices that only matter because an LLM reads the output:
+
+**It declines to report figures it can't compute.** Every suppressed field comes back `null` with a reason and a remedy: *"no matched span has a matched parent, so self time would equal total time by construction — broaden the filter so nested spans are matched too."* An instrument that quietly returns a plausible-but-meaningless number is worse than one that refuses, because the assistant will use it. This turned out to be the feature users cite as the reason they trust the rest of the output.
+
+**It reports what it did to the data, not just the result.** `skip_warmup_ms` says how many spans it excluded. A grouped read says how many groups existed before `top_n` truncated the list. "Skipped nothing" and "skipped half the data" are indistinguishable downstream otherwise.
+
+**It knows the difference between a small sample and a real one.** At three runs, percentiles are order statistics of three numbers and say nothing — so the sampled block also returns the raw durations in arrival order, plus a Bessel-corrected standard deviation. That turns "are these two arms actually separated?" from a judgement by eye into arithmetic. And it's honest about the limit: separating two three-run means properly takes a difference of roughly 2.3 standard deviations, not one.
+
+Runs are kept, not just read. `snapshot_collector(label="before")` records a window and starts the next; `diff_collectors("lookup@before", "lookup@after")` subtracts them and reports what moved — **and refuses when the arms aren't comparable**, naming the flag that would permit it anyway. Merge several runs of the same configuration and it reports the run-to-run spread, so a 5% difference can be called noise or signal instead of guessed at. A single run reports that spread as *unknown*, which is the honest answer and not zero.
+
 ### Backpressure resilience
 
 A noisy producer should slow itself down, not take the broker down. Concretely:
