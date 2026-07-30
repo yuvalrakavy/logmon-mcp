@@ -293,7 +293,7 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `add_bookmark` / `list_bookmarks` / `remove_bookmark` / `clear_bookmarks` | Bookmarks (also act as cursors via `c>=`). |
 | `get_sessions` / `drop_session` | Multi-session inspection. |
 | `rename_session` | Rename this session in place — all state (domain binding, triggers, filters, bookmarks) survives. A name held by a *connected* session errors (deliberate: two live clients must not share an identity); a *disconnected* holder is displaced (reported via `displaced_stale_holder`). |
-| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, current domain + active filters, and per-listener `receiver_liveness`. |
+| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. |
 | `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale) and `bound_sessions` — which sessions are bound to each domain (derived from the session registry; disconnected holders are suffixed). |
 | `use_domain` | Bind this session to a domain for subsequent queries + notifications. |
 | `clear_domain` | Dispose the bound domain's logs + spans (keeps the domain alive). |
@@ -490,15 +490,32 @@ Ports are optional (omitted → auto-allocated; `0` → that receiver disabled) 
 Environment variable overrides:
 
 - `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (skips PATH lookup).
-- `LOGMON_BROKER_SOCKET` — explicit broker socket path. Defaults to `~/.config/logmon/logmon.sock`.
-- `LOGMON_CONFIG_DIR` — relocate the whole state directory (`state.json`, `daemon.pid`,
-  `logmon.sock`, `daemon.log`, `collectors/`). Read by the **daemon and its clients**, so
-  one variable stands up a second broker beside your live one:
+- `LOGMON_BROKER_SOCKET` — explicit broker socket path. Falls back to
+  `$LOGMON_CONFIG_DIR/logmon.sock` if that is set, else `~/.config/logmon/logmon.sock`.
+- `LOGMON_CONFIG_DIR` — relocate the whole config **and** state directory: `config.json`,
+  `state.json`, `daemon.pid`, `daemon.lock`, `logmon.sock`, `daemon.log`, `collectors/`.
+  Read by the **daemon and its clients**, so one variable stands up a second broker beside
+  your live one:
   `LOGMON_CONFIG_DIR=/tmp/probe logmon-broker --gelf-port 0 --otlp-grpc-port 0 --otlp-http-port 0`
-  and any `logmon-mcp` invocation in the same environment finds it. Intended for tests and
-  throwaway instances — the managed service is unaffected, because launchd/systemd do not
-  inherit your shell's environment. An empty value is ignored (the `VAR= cmd` idiom means
-  "unset for this invocation"). `LOGMON_BROKER_SOCKET` still wins for clients.
+  and any `logmon-mcp` invocation in the same environment finds it.
+
+  Three things worth knowing before you use it:
+  - **It moves state, not ports.** A broker in the new directory reads *that* directory's
+    `config.json` — so with no file there it runs on stock defaults (10 000-entry buffers,
+    no declared domains, GELF 12201), which will collide with your live daemon. Pass
+    explicit ports as above, or put a `config.json` with non-conflicting ports in the new
+    directory.
+  - **It must be an absolute path.** A relative one is ignored (with a warning in the
+    daemon log), because processes share an environment but not a working directory — a
+    relative value would point the daemon and its clients at different places.
+  - **Auto-start refuses** in a relocated directory that has no `config.json`, rather than
+    spawning a broker that would bind the default ports; the error tells you the command
+    to run. An empty value is ignored throughout (`VAR= cmd` means "unset for this
+    invocation").
+
+  Intended for tests and throwaway instances — the managed service is unaffected, because
+  launchd/systemd do not inherit your shell's environment. `LOGMON_BROKER_SOCKET` still
+  wins for clients.
 
 ## Backpressure
 
@@ -508,9 +525,13 @@ A noisy producer should slow itself down, not take the broker down. Concretely:
 - GELF UDP sets `SO_RCVBUF` to **8 MB** so a slow consumer has a sizeable OS-side cushion before datagrams start falling on the floor.
 - OTLP gRPC and OTLP HTTP both check channel fill before consuming a payload. At **≥ 80% full**, gRPC returns `UNAVAILABLE` and HTTP returns `429`. The producer is expected to retry with backoff. The protocol-level rejection *is* the backpressure signal — per-source drop counters aren't bumped, because nothing was silently dropped.
 - Per-source drop counts surface in `status.get` under `receiver_drops` (`gelf_udp`, `gelf_tcp`, `otlp_http_logs`, `otlp_http_traces`, `otlp_grpc_logs`, `otlp_grpc_traces`). Healthy operation keeps all six at zero.
-- `status.get` also carries `trace_ingest` (`dropped`, `shed_batches`, `malformed_dropped`) — span loss on the OTLP trace transports specifically. It's a sibling of `receiver_drops`, deliberately not merged into it: `receiver_drops` counts silent channel-full loss, while `shed_batches` is a loud 429/UNAVAILABLE the client saw, and `malformed_dropped` is a parse-time refusal. Healthy operation keeps all three at zero.
+- Trace-transport loss surfaces separately under `trace_ingest` (`dropped`, `shed_batches`, `malformed_dropped`) — spans lost before any collector saw them, so non-zero means every span-derived figure is a lower bound. `shed_batches` counts request **bodies** refused with 429/UNAVAILABLE, not spans: the bodies were never parsed, so how many spans they held is unknowable. **`dropped` is not a separate quantity** — it is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, reported again so the three trace figures read as one block, so **adding it to those two double-counts**.
 
-If you're seeing nonzero drops, the broker is the bottleneck — bump `buffer_size` / `span_buffer_size`, or check whether a runaway producer is genuinely outpacing the consumer.
+If you're seeing nonzero **drops**, the broker is the bottleneck — bump `buffer_size` /
+`span_buffer_size`, or check whether a runaway producer is genuinely outpacing the consumer.
+That remedy is for channel-full drops only: a `shed_batches` count means the producer was
+told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
+unusable trace id) — no buffer size changes either.
 
 ## SDK and cross-language clients
 

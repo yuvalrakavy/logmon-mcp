@@ -2950,3 +2950,87 @@ fn a_threshold_survives_a_restart_with_the_collector() {
     assert_eq!(c["threshold"]["evaluated"], false);
     assert_eq!(c["threshold"]["fires"], 0);
 }
+
+#[test]
+fn the_auto_label_counter_survives_a_restart_at_eviction_scale() {
+    // Found by the mutation lens, which broke `restore_counters` to always reset
+    // `next_auto = 1` and watched every test stay green — including the
+    // out-of-process kill -9 harness.
+    //
+    // WHY the obvious test could not catch it: `reserve_label` skips any
+    // candidate that collides with a snapshot still in the list. Below the
+    // retention cap nothing is evicted, so a corrupted counter of 1 tries
+    // `snapshot-1`, collides with the retained one, and walks up to the same
+    // answer a correct restore would give. The collision loop LAUNDERS the
+    // corruption for as long as no eviction has happened.
+    //
+    // The real failure needs the label's original to be GONE: past
+    // MAX_SNAPSHOTS, `snapshot-1` has been evicted, so a reset counter re-issues
+    // it for a different run — exactly the ambiguity §6.2's never-reuse rule
+    // exists to prevent, and the thing `History`'s own doc comment promises.
+    let d = tempfile::TempDir::new().unwrap();
+    let cap = logmon_broker_core::collector::history::MAX_SNAPSHOTS;
+    let over = cap + 3;
+
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "sv=svc", "level": "tree" }),
+        )
+        .unwrap();
+        // All auto-labelled, so the counter is the only thing deciding names.
+        for i in 1..=over {
+            let out = h
+                .call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+                .expect("snapshot");
+            assert_eq!(out["label"], format!("snapshot-{i}"));
+        }
+        let hist = h
+            .call(&sid, "collectors.history", json!({ "name": "c" }))
+            .unwrap();
+        assert_eq!(
+            hist["count"], cap,
+            "the cap must have evicted, or this test cannot detect the defect"
+        );
+        assert_eq!(hist["evicted"], 3);
+        // The evicted labels are the ones a reset counter would re-issue.
+        assert_eq!(hist["snapshots"][0]["label"], "snapshot-4");
+    }
+
+    let h2 = restart_over(d.path());
+    let sid = h2.sessions.create_named("perf").unwrap();
+    let out = h2
+        .call(&sid, "collectors.snapshot", json!({ "name": "c" }))
+        .expect("post-restart snapshot");
+    assert_eq!(
+        out["label"],
+        format!("snapshot-{}", over + 1),
+        "a restarted daemon must continue the sequence, not re-issue an evicted label"
+    );
+
+    // Stated as the property rather than only the number: no label in the
+    // restored history, nor the new one, may be a number already used.
+    let hist = h2
+        .call(&sid, "collectors.history", json!({ "name": "c" }))
+        .unwrap();
+    let labels: Vec<String> = hist["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["label"].as_str().unwrap().to_string())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for l in &labels {
+        assert!(
+            seen.insert(l.clone()),
+            "label {l} appears twice: {labels:?}"
+        );
+    }
+    assert!(
+        !labels.contains(&"snapshot-1".to_string()),
+        "snapshot-1 was evicted before the restart and must never come back: {labels:?}"
+    );
+}

@@ -207,31 +207,99 @@ impl Broker {
 }
 
 pub(crate) fn default_socket_path() -> PathBuf {
-    // Must match the broker daemon's `core::daemon::persistence::config_dir()`
-    // resolution: `$LOGMON_CONFIG_DIR`, else `$HOME/.config/logmon/` on every
-    // Unix (including macOS, where `dirs::config_dir()` would otherwise return
-    // `~/Library/Application Support/`). Duplicated rather than imported so the
-    // SDK keeps its deliberate independence from `core` — change one, change
-    // both.
-    //
-    // Honoring the var HERE is what makes the one-variable workflow work: a
-    // second daemon started with `LOGMON_CONFIG_DIR=X logmon-broker` is
-    // reachable by any client in the same environment without also setting
-    // `LOGMON_BROKER_SOCKET`. Precedence stays: explicit `socket_path()` >
-    // `LOGMON_BROKER_SOCKET` (resolved before this function is consulted) >
-    // `LOGMON_CONFIG_DIR` > home default. An empty var is ignored — the
-    // `VAR= cmd` idiom means "unset for this invocation".
+    default_socket_path_from(std::env::var_os("LOGMON_CONFIG_DIR"))
+}
+
+/// The pure resolution behind [`default_socket_path`].
+///
+/// Split out for the same reason `core::daemon::persistence::config_dir_from`
+/// is: the impure wrapper cannot be unit-tested, because tests share one
+/// process and `std::env::set_var` races every concurrently-running test that
+/// reads the environment. The split is what makes this resolution testable at
+/// all — without it, deleting the `LOGMON_CONFIG_DIR` branch entirely left the
+/// whole workspace suite green, because every test connection passes an
+/// explicit `.socket_path()` and so never exercises this function.
+///
+/// Must match `core::daemon::persistence::config_dir`'s resolution exactly.
+/// Duplicated rather than imported so the SDK stays independent of `core` —
+/// change one, change both. The rules, and why each exists:
+///
+/// - **Blank is ignored.** `VAR= cmd` is the shell idiom for "unset for this
+///   invocation".
+/// - **Relative is ignored.** Processes in a tree share an environment but not
+///   a working directory, so a relative value would point this client at a
+///   different directory than the daemon it is trying to reach. Falling back to
+///   the shared default is the safe asymmetry: both sides then agree.
+/// - Otherwise the directory is used verbatim, and the socket is
+///   `<dir>/logmon.sock`, exactly where the daemon binds it.
+pub(crate) fn default_socket_path_from(override_dir: Option<std::ffi::OsString>) -> PathBuf {
     #[cfg(unix)]
     {
-        if let Some(dir) = std::env::var_os("LOGMON_CONFIG_DIR").filter(|d| !d.is_empty()) {
-            return PathBuf::from(dir).join("logmon.sock");
+        let relocated = override_dir
+            .filter(|d| !d.as_encoded_bytes().trim_ascii().is_empty())
+            .map(PathBuf::from)
+            .filter(|d| d.is_absolute());
+        if let Some(dir) = relocated {
+            return dir.join("logmon.sock");
         }
+        // `$HOME/.config/logmon/` on every Unix including macOS, where
+        // `dirs::config_dir()` would otherwise return
+        // `~/Library/Application Support/`.
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         home.join(".config").join("logmon").join("logmon.sock")
     }
     #[cfg(windows)]
     {
+        let _ = override_dir;
         // TCP path — socket_path unused on Windows; left for symmetry
         PathBuf::from("127.0.0.1:12200")
+    }
+}
+
+#[cfg(all(test, unix))]
+mod socket_path_tests {
+    use super::default_socket_path_from;
+    use std::path::PathBuf;
+
+    fn home_default() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".config")
+            .join("logmon")
+            .join("logmon.sock")
+    }
+
+    #[test]
+    fn an_absolute_override_relocates_the_socket() {
+        assert_eq!(
+            default_socket_path_from(Some("/tmp/probe".into())),
+            PathBuf::from("/tmp/probe/logmon.sock"),
+        );
+    }
+
+    #[test]
+    fn no_override_uses_the_home_default() {
+        assert_eq!(default_socket_path_from(None), home_default());
+    }
+
+    #[test]
+    fn a_blank_override_is_ignored() {
+        // `VAR= cmd` means "unset for this invocation".
+        assert_eq!(default_socket_path_from(Some("".into())), home_default());
+        assert_eq!(default_socket_path_from(Some("   ".into())), home_default());
+    }
+
+    #[test]
+    fn a_relative_override_is_ignored_so_client_and_daemon_cannot_disagree() {
+        // The daemon ignores it too (`config_dir_from`), so both fall back to
+        // the SAME default. Honoring it would resolve against this process's
+        // cwd, which is not the daemon's.
+        for rel in ["probe", "./probe", "../probe"] {
+            assert_eq!(
+                default_socket_path_from(Some(rel.into())),
+                home_default(),
+                "{rel} must not be honored"
+            );
+        }
     }
 }

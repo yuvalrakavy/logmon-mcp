@@ -95,7 +95,7 @@ async fn try_start_or_verify(dir: &Path) -> anyhow::Result<()> {
     }
 
     // No running daemon -- start one.
-    start_broker()?;
+    start_broker(dir)?;
 
     // Poll for the socket to appear.
     wait_for_socket(dir).await
@@ -138,14 +138,48 @@ fn cleanup_stale_files(dir: &Path) {
 /// The broker binary is invoked with no subcommand — `logmon-broker` runs
 /// the daemon by default. (Status / install-service modes use explicit
 /// subcommands.)
-fn start_broker() -> anyhow::Result<()> {
+///
+/// Refuses when `LOGMON_CONFIG_DIR` relocated the state directory and that
+/// directory carries no `config.json`. The variable moves **state, not ports**,
+/// and this is the one path that starts a broker on the user's behalf — with no
+/// way to pass port flags. Auto-spawning there binds the *default* ports, so it
+/// collides with whatever already holds them (typically the user's live
+/// service), exits 1, and leaves the caller polling a socket that will never
+/// appear. A directory with its own `config.json` has taken responsibility for
+/// its ports and is allowed through.
+fn start_broker(dir: &Path) -> anyhow::Result<()> {
+    if std::env::var_os("LOGMON_CONFIG_DIR").is_some_and(|v| !v.is_empty())
+        && !dir.join("config.json").exists()
+    {
+        anyhow::bail!(
+            "refusing to auto-start a broker in {}: LOGMON_CONFIG_DIR relocated the state \
+             directory, but that variable moves state and NOT ports — a broker started here \
+             would bind the default ports and collide with whatever already holds them. \
+             Either start it yourself with explicit ports:\n\
+             \n    LOGMON_CONFIG_DIR={} logmon-broker --gelf-port 0 --otlp-grpc-port 0 \
+             --otlp-http-port 0\n\n\
+             or put a config.json with non-conflicting ports in that directory, which also \
+             lets this auto-start work.",
+            dir.display(),
+            dir.display()
+        );
+    }
     let bin = locate_broker_binary()?;
-    std::process::Command::new(bin)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn broker process")?;
+    // stderr to a file, never to /dev/null: this child can fail for reasons
+    // only it can see (a port clash, a too-long socket path), and discarding
+    // them turns every such failure into an unexplained ten-second timeout.
+    let log = std::fs::File::create(dir.join("autostart.log")).ok();
+    let mut cmd = std::process::Command::new(bin);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    match log {
+        Some(f) => {
+            cmd.stderr(f);
+        }
+        None => {
+            cmd.stderr(Stdio::null());
+        }
+    }
+    cmd.spawn().context("failed to spawn broker process")?;
     Ok(())
 }
 
@@ -157,7 +191,12 @@ async fn wait_for_socket(dir: &Path) -> anyhow::Result<()> {
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for daemon socket to become available");
+            bail!(
+                "timed out waiting for daemon socket to become available in {}; the broker's \
+             own stderr is in {}",
+                dir.display(),
+                dir.join("autostart.log").display()
+            );
         }
 
         if probe_socket(dir).await.is_ok() {

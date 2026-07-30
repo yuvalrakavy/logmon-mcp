@@ -338,19 +338,54 @@ pub fn load_config(path: &Path) -> anyhow::Result<DaemonConfig> {
 ///
 /// The env var exists for **cross-process** redirection — a real `kill -9`
 /// harness spawning the actual binary, or a second daemon run beside a
-/// developer's live one. In-process tests keep using `DaemonOverrides`, which
-/// wins over everything: overrides > env > default. The live launchd service
-/// is unaffected by a stray shell var, because launchd does not inherit the
-/// shell's environment.
+/// developer's live one. Precedence is `DaemonOverrides.config_dir` > env >
+/// default; note it is that ONE field that isolates, not `DaemonOverrides` as a
+/// whole — `socket_path` alone moves the socket while state still lands here.
+/// The live launchd/systemd service is unaffected by a stray shell var, because
+/// neither inherits the shell's environment.
 ///
-/// The SDK's `default_socket_path()` reads the same variable (duplicated
-/// there rather than imported, keeping the SDK's deliberate independence from
-/// this crate) — change one, change both.
+/// **It must be absolute.** A relative value is ignored, for the reason the
+/// variable exists: processes in a tree share an environment but not a working
+/// directory, so `LOGMON_CONFIG_DIR=probe` would put the daemon's state in one
+/// place and its clients' socket lookup in another. Ignoring is the safe
+/// asymmetry — daemon and client fall back to the *same* default and so cannot
+/// disagree — and `warn_if_ignored` exists so it is not silent.
+///
+/// Three other readers follow this resolution and must stay in step:
+/// the SDK's `default_socket_path()` (duplicated rather than imported, keeping
+/// the SDK independent of this crate), `logmon-mcp`'s `auto_start`, and the
+/// broker's own `status` subcommand.
 pub fn config_dir() -> std::path::PathBuf {
     config_dir_from(
         std::env::var_os("LOGMON_CONFIG_DIR"),
         std::env::var_os("HOME"),
     )
+}
+
+/// The override, if it is usable at all.
+///
+/// Blank is ignored — `LOGMON_CONFIG_DIR= cmd` is the shell idiom for "unset
+/// for this invocation" — and so is anything relative, per `config_dir`'s
+/// contract. Whitespace-only counts as blank, matching how the shim already
+/// treats `LOGMON_DOMAIN`.
+fn usable_override(v: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let v = v?;
+    if v.as_encoded_bytes().trim_ascii().is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(v);
+    p.is_absolute().then_some(p)
+}
+
+/// Whether `LOGMON_CONFIG_DIR` was set to something this build will not use, so
+/// a caller with a log can say so instead of silently using the default. `Some`
+/// carries the offending value.
+pub fn ignored_config_dir_override() -> Option<std::ffi::OsString> {
+    let raw = std::env::var_os("LOGMON_CONFIG_DIR")?;
+    if raw.as_encoded_bytes().trim_ascii().is_empty() {
+        return None; // deliberately unset for this invocation; not a mistake
+    }
+    usable_override(Some(raw.clone())).is_none().then_some(raw)
 }
 
 /// The pure resolution, split from the wrapper because the wrapper cannot be
@@ -360,13 +395,12 @@ fn config_dir_from(
     override_dir: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
 ) -> std::path::PathBuf {
-    // An empty var is ignored rather than honored: `LOGMON_CONFIG_DIR= cmd`
-    // is a shell idiom for "unset for this invocation", and a config dir of
-    // `""` would resolve against an accidental cwd.
-    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
-        return std::path::PathBuf::from(dir);
+    if let Some(dir) = usable_override(override_dir) {
+        return dir;
     }
-    let home = home.filter(|h| !h.is_empty()).unwrap_or_else(|| ".".into());
+    let home = home
+        .filter(|h| !h.as_encoded_bytes().trim_ascii().is_empty())
+        .unwrap_or_else(|| ".".into());
     std::path::PathBuf::from(home)
         .join(".config")
         .join("logmon")
@@ -553,6 +587,30 @@ mod tests {
         // invocation"; honoring the empty string would make the config dir
         // whatever directory the daemon happened to start in.
         let got = config_dir_from(Some("".into()), Some("/home/u".into()));
+        assert_eq!(got, std::path::PathBuf::from("/home/u/.config/logmon"));
+    }
+
+    #[test]
+    fn a_relative_override_is_ignored_because_processes_share_no_cwd() {
+        // The variable's whole purpose is cross-process redirection, and a
+        // relative path would resolve differently in the daemon and in a client
+        // started from another directory — the one failure it must not cause.
+        for rel in ["probe", "./probe", "../probe"] {
+            let got = config_dir_from(Some(rel.into()), Some("/home/u".into()));
+            assert_eq!(
+                got,
+                std::path::PathBuf::from("/home/u/.config/logmon"),
+                "{rel} must fall back to the default, not resolve against a cwd"
+            );
+        }
+        // And absolute still works, or the check above would be vacuous.
+        let got = config_dir_from(Some("/tmp/probe".into()), Some("/home/u".into()));
+        assert_eq!(got, std::path::PathBuf::from("/tmp/probe"));
+    }
+
+    #[test]
+    fn a_whitespace_only_override_counts_as_blank() {
+        let got = config_dir_from(Some("   ".into()), Some("/home/u".into()));
         assert_eq!(got, std::path::PathBuf::from("/home/u/.config/logmon"));
     }
 

@@ -58,8 +58,72 @@ impl Daemon {
         d
     }
 
+    /// A daemon spawned WITHOUT waiting for readiness, logging to `log_name`.
+    ///
+    /// For the case where refusing to start is the expected outcome — waiting
+    /// for readiness there would just burn the deadline. Still a `Daemon`, so
+    /// `Drop` cannot leak it if an assertion fires first.
+    fn spawn_unchecked(dir: &Path, log_name: &str) -> Self {
+        let log = std::fs::File::create(dir.join(log_name)).expect("create log");
+        let child = Command::new(env!("CARGO_BIN_EXE_logmon-broker"))
+            .env("LOGMON_CONFIG_DIR", dir)
+            .args([
+                "--gelf-port",
+                "0",
+                "--otlp-grpc-port",
+                "0",
+                "--otlp-http-port",
+                "0",
+            ])
+            .stdout(log.try_clone().expect("dup"))
+            .stderr(log)
+            .spawn()
+            .expect("spawn logmon-broker");
+        Daemon {
+            child,
+            dir: dir.to_path_buf(),
+        }
+    }
+
     fn spawn_log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("spawn.log")).unwrap_or_default()
+        self.diagnostics("spawn.log")
+    }
+
+    fn log_named(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+
+    /// Everything the child could have told us, labelled.
+    ///
+    /// The captured stream is EMPTY on a healthy start: the daemon installs a
+    /// rolling file appender and logs to `daemon.log.<date>`, so stderr carries
+    /// only what escapes before that — a panic, or a `main` that returns Err.
+    /// Reporting the stream alone therefore says nothing on the timeout path,
+    /// which is exactly where the diagnostic is needed.
+    fn diagnostics(&self, stream_name: &str) -> String {
+        let stream = self.log_named(stream_name);
+        let daemon_logs: Vec<String> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("daemon.log"))
+            .collect();
+        let daemon = daemon_logs
+            .iter()
+            .map(|n| format!("--- {n} ---\n{}", self.log_named(n)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let listing: Vec<String> = std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        format!(
+            "--- {stream_name} (child stderr; empty is NORMAL, the daemon logs to a file) ---\n\
+             {stream}\n{daemon}\n--- dir contents: {listing:?} ---"
+        )
     }
 
     fn socket(&self) -> PathBuf {
@@ -77,8 +141,23 @@ impl Daemon {
     ///
     /// Also polls the child: a daemon that exited is reported as that, with its
     /// log, instead of timing out with no explanation.
+    ///
+    /// **The deadline is generous because the FIRST exec of a freshly linked
+    /// binary is slow, and that is measured, not guessed.** Instrumented on this
+    /// machine: first spawn 6.2 s / 117 polls, second spawn of the same image
+    /// 52 ms / 2 polls, and 753 ms / 15 polls on a later run with the binary
+    /// warm. The daemon's own log shows it reaching "listening" 13 ms after
+    /// start, so none of that is startup work — it is macOS validating and
+    /// caching a newly written ~100 MB debug binary, and it lands on whichever
+    /// test happens to exec it first. Under `cargo test --workspace
+    /// --all-features` the binary is rebuilt AND the machine is running dozens
+    /// of test binaries, which is how a 20 s deadline failed both tests here
+    /// while each passed alone.
+    ///
+    /// A slow pass costs seconds; a false failure costs a debugging session.
+    /// The check is a poll, so a warm start still returns in ~50 ms.
     fn await_ready(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait") {
                 panic!(
@@ -100,17 +179,30 @@ impl Daemon {
     }
 
     /// SIGKILL — the point of the whole file. No shutdown path runs.
-    fn kill_dash_nine(mut self) {
+    ///
+    /// Takes `&mut self` and lets `Drop` run normally. An earlier version
+    /// `mem::forget`'d to avoid "double-killing a reaped child", which std
+    /// forecloses: `Child::kill` returns `Ok(())` once a status is cached
+    /// (`if self.status.is_some() { return Ok(()) }`), precisely so a pid that
+    /// may have been recycled is never signalled. `Child` has no `Drop` of its
+    /// own, so nothing went unreaped — the `forget` leaked the `PathBuf`, and
+    /// would have leaked anything owning that `Daemon` later gained.
+    fn kill_dash_nine(&mut self) {
         self.child.kill().expect("SIGKILL");
         self.child.wait().expect("reap");
         // The socket file survives a kill -9 (nothing unlinked it). The next
-        // daemon must cope with that, which is part of what restarting into
-        // the same directory exercises.
-        std::mem::forget(self); // Drop would double-kill a reaped child.
+        // daemon must cope with that, which is part of what restarting into the
+        // same directory exercises.
     }
 }
 
 impl Drop for Daemon {
+    /// **The SIGKILL here is load-bearing, not merely expedient.** A graceful
+    /// shutdown reaches `send_otel_beacon("OTEL:OFFLINE")`, which multicasts to
+    /// 239.255.77.1:4399 unconditionally — no check that this daemon ever
+    /// started an OTLP receiver. Switching this to SIGTERM would make
+    /// `cargo test` broadcast "collector offline" to every app on the
+    /// developer's machine that uses the tracing-init circuit breaker.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -141,7 +233,7 @@ async fn a_collector_and_its_history_survive_a_real_kill_dash_nine() {
     let dir = tmp.path().to_path_buf();
 
     // ---- first incarnation: arm, record two runs, die cold ----------------
-    let first = Daemon::spawn(&dir);
+    let mut first = Daemon::spawn(&dir);
     {
         let b = client(first.socket(), "kill9").await;
         b.call(
@@ -176,6 +268,7 @@ async fn a_collector_and_its_history_survive_a_real_kill_dash_nine() {
         .expect("auto-labelled snapshot");
     }
     first.kill_dash_nine();
+    drop(first);
 
     // ---- second incarnation: same directory, cold socket file -------------
     let second_d = Daemon::spawn(&dir);
@@ -230,42 +323,48 @@ async fn a_collector_and_its_history_survive_a_real_kill_dash_nine() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_second_daemon_on_the_same_directory_is_refused_by_the_lock() {
-    // Free cross-process coverage the in-process suite cannot have: the
-    // daemon.lock actually excludes a second process, rather than merely
-    // existing as a file.
+async fn a_second_daemon_on_the_same_directory_is_refused_while_the_first_lives() {
+    // Cross-process coverage the in-process suite cannot have. Named for the
+    // mechanism that actually excludes: the daemon's stale-pid sweep reads
+    // `daemon.pid` and asks whether that process is alive. `daemon.lock` is
+    // flocked only by the MCP shim's auto-start, never by the daemon — an
+    // earlier name pointed a maintainer at the wrong file.
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let first = Daemon::spawn(tmp.path());
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_logmon-broker"))
-        .env("LOGMON_CONFIG_DIR", tmp.path())
-        .args([
-            "--gelf-port",
-            "0",
-            "--otlp-grpc-port",
-            "0",
-            "--otlp-http-port",
-            "0",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn second");
+    // Wrapped in `Daemon` so the timeout path below cannot leak a live broker
+    // holding ephemeral ports and rooted at a directory `TempDir` then deletes.
+    let mut second = Daemon::spawn_unchecked(tmp.path(), "second.log");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
-        if let Some(s) = second.try_wait().expect("try_wait") {
+        if let Some(s) = second.child.try_wait().expect("try_wait") {
             break s;
         }
         assert!(
             Instant::now() < deadline,
-            "second daemon neither exited nor was refused within 15s"
+            "a second daemon neither exited nor was refused within 15s; its log:\n{}",
+            second.diagnostics("second.log")
         );
         std::thread::sleep(Duration::from_millis(50));
     };
+
     assert!(
         !status.success(),
-        "a second daemon on a locked directory must refuse to start"
+        "a second daemon on a live directory must refuse to start; its log:\n{}",
+        second.diagnostics("second.log")
     );
+    // The REASON, not just the failure. `!status.success()` alone would read
+    // green if the second daemon died for any unrelated cause — a future
+    // startup step failing in a tempdir, a sandbox blocking the ephemeral bind,
+    // `kill` missing from PATH — and that green would be recorded as "the
+    // exclusion invariant holds" when it holds for no reason at all.
+    let log = second.diagnostics("second.log");
+    assert!(
+        log.contains("another broker is already running"),
+        "expected the refusal to name the running broker; got:\n{log}"
+    );
+
+    drop(second);
     drop(first);
 }

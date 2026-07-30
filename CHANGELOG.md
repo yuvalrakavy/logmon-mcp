@@ -3,6 +3,108 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## 0.7.0 — 2026-07-30
+
+Two deferred items from the span-collector design, and the twelve defects a
+pre-merge gate found in them.
+
+### Added
+
+- **`LOGMON_CONFIG_DIR`** relocates the whole config and state directory —
+  `config.json`, `state.json`, `daemon.pid`, `daemon.lock`, `logmon.sock`,
+  `daemon.log`, `collectors/`. Read by the **daemon and its clients**, so one
+  variable stands up a second broker beside a live one and any client in the same
+  environment finds it.
+
+  Three properties worth knowing, each of which exists because the alternative
+  bit: it moves **state, not ports** (a broker in the new directory reads *that*
+  directory's `config.json`, so with no file there it runs on stock defaults and
+  collides — pass explicit ports, or put a `config.json` there); it must be
+  **absolute**, because processes share an environment but not a working
+  directory, and a relative value is ignored with a warning rather than pointing
+  daemon and client at different places; and **auto-start refuses** in a
+  relocated directory with no `config.json` instead of spawning a broker that
+  would bind the default ports, naming the command to run instead. The managed
+  service is unaffected — launchd and systemd do not inherit a shell's
+  environment.
+
+- **A real `kill -9` restart test**, out-of-process against the actual binary
+  (`crates/broker/tests/kill_dash_nine.rs`). §12 objected to testing restart
+  survival with a graceful `restart()`, because a graceful path writes on the way
+  down and so passes whether or not the files were already complete. This kills
+  the process cold and restarts on the same directory, asserting the definition,
+  every recorded run, `zeroed_by: "daemon_restart"`, the threshold surviving with
+  its rolling window cleared, and the auto-label counter continuing rather than
+  re-issuing an evicted label. A second test proves the pid-liveness check
+  excludes a second *process*, asserting the refusal's reason rather than merely
+  that it failed.
+
+- **`status.get` reports `trace_ingest`** — `dropped`, `shed_batches`,
+  `malformed_dropped` — a **sibling** of `receiver_drops` rather than a member,
+  because that field documents itself as counting *silent* loss and a shed batch
+  is a 429 the caller saw. Scoped to the session's bound domain.
+
+  **`dropped` is not new information**: it is exactly
+  `receiver_drops.otlp_http_traces + otlp_grpc_traces`, the same two atomics,
+  repeated so the three trace figures read as one block — so summing it with
+  those fields double-counts. `shed_batches` and `malformed_dropped` are the
+  numbers nothing else in the payload reports, and `shed_batches` counts request
+  *bodies*, not spans: they were refused before being parsed, so how many spans
+  they held is unknowable.
+
+- `ThresholdInfo.effective_window_ms` — the window as evaluated, i.e. the
+  declared width rounded up to a whole number of ring buckets, so a guard is
+  never narrower than asked for.
+
+### Fixed
+
+- **Auto-start in a relocated directory silently broke every logmon tool.** The
+  MCP shim's auto-start follows `LOGMON_CONFIG_DIR` but cannot pass port flags,
+  so it spawned a broker that bound the *default* ports, collided with the live
+  daemon, exited 1 with its stderr discarded, and left the caller polling a
+  socket that would never appear — surfacing after ten seconds as "timed out
+  waiting for daemon socket", naming neither the collision nor the variable. It
+  now refuses with the command to run, and the child's stderr goes to
+  `autostart.log`.
+- A set-but-empty `LOGMON_BROKER_SOCKET` resolved to `""` and shadowed every
+  later step in the socket chain, including the new fallback.
+- A relative `LOGMON_CONFIG_DIR` was accepted by both daemon and client, which
+  would have resolved to different directories. Both now ignore it, and the
+  daemon logs why.
+- An unrepresentable threshold recorded in a *snapshot* destroyed the whole
+  recorded run on restore, where the same thing on a live collector only dropped
+  the guard. A snapshot's threshold is inert metadata nothing evaluates.
+- `path_aggregates` lost `incomplete` from its sort tiebreak, so a complete chain
+  and a same-named suffix tied at equal self time and hash order decided — two
+  snapshots of identical data could store different flame graphs.
+- A ranked table grew a spurious "unattributed residual" row on large,
+  fully-reconciling tables: the tolerance was absolute against f64 millisecond
+  sums that each carry their own rounding.
+- A `window_ms` that was not a multiple of the bucket count evaluated a window
+  *narrower* than declared — up to 48% narrower at `window_ms: 31`, against a
+  documented "at most 1/16". It rounds up now.
+- `threshold.group` matched only the collector's first declared group key, so a
+  value belonging to any other key silently never matched — indistinguishable
+  from no traffic. Documented, and warned at arm time.
+- `collectors.diff --group-by group` on collectors declaring no group keys
+  returned an empty breakdown with no reason.
+- Two SDK/daemon precedence claims in doc comments were wrong, and one asserted
+  a check that did not exist.
+
+### Testing
+
+Two coverage gaps found by a mutation lens rather than by reading, both closed:
+the SDK's socket resolution had **no** test (every connection in the suite passes
+an explicit path, so deleting the env branch left the whole workspace green), and
+the auto-label counter's restore was laundered by `reserve_label`'s
+collision-avoidance loop below the retention cap — the real defect only appears
+past eviction, where a reset counter re-issues a label whose original is gone.
+Both now have tests that fail under the exact mutation that survived.
+
+`verify.sh` runs the suite with `--all-features`, because a dozen integration
+files are gated behind `test-support` and a plain `cargo test --workspace`
+compiles them empty and reports them ok.
+
 ## 0.6.0 — 2026-07-30
 
 Comparison and guards — phases 4 and 5 of the span time collector design. The

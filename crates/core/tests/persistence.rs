@@ -131,7 +131,25 @@ fn test_config_partial_json() {
 #[test]
 fn test_config_dir() {
     let dir = config_dir();
-    assert!(dir.to_string_lossy().contains("logmon"));
+    // Branches on the ambient environment rather than assuming it. A developer
+    // who followed the README and exported `LOGMON_CONFIG_DIR` in their shell
+    // profile would otherwise get a red suite for no reason — and asserting
+    // only the default shape would ALSO stop testing the case they are in.
+    match std::env::var_os("LOGMON_CONFIG_DIR")
+        .filter(|v| !v.as_encoded_bytes().trim_ascii().is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        Some(expected) => assert_eq!(
+            dir, expected,
+            "an absolute LOGMON_CONFIG_DIR must be used verbatim"
+        ),
+        None => assert!(
+            dir.to_string_lossy().contains("logmon"),
+            "the default lands under a logmon directory: {}",
+            dir.display()
+        ),
+    }
 }
 
 #[test]

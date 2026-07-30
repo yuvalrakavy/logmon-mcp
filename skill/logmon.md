@@ -195,7 +195,13 @@ Two ways to run an A/B:
 
 ### Status
 
-- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`** (spans lost on the OTLP trace transports before any collector saw them — a sibling of `receiver_drops`, not folded into it; non-zero means every span-derived number you get elsewhere is a lower bound), plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
+
+**`trace_ingest` — loss on the OTLP trace transports, before any collector saw a span.** Non-zero on any of the three means every span-derived number you report from elsewhere is a **lower bound**, `matched` included.
+
+**Do not add `trace_ingest.dropped` to the `receiver_drops` trace fields — it IS those fields.** `dropped` is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, the same counters read a second time so the three trace figures read as one block. Summing them double-counts. `shed_batches` and `malformed_dropped` are the genuinely new numbers.
+
+Also: `shed_batches` counts **request bodies**, not spans — the bodies were refused with 429/UNAVAILABLE before being parsed, so how many spans were in them is unknowable. And the standing "bump `buffer_size`" remedy applies only to channel-full drops: a `malformed_dropped` span was refused for cause (an unusable trace id), and no buffer size changes that.
 
 ### Domains
 
