@@ -242,3 +242,81 @@ its first run exposed that every plain workspace run had compiled the `test-supp
 EMPTY and reported them ok), `docs/process/gate-briefs.md` (the four lens briefs with slots, incl.
 the six harness-lie modes), and a fmt-only commit ending the four-file drift tax. Version-bump
 chaining already guarded by memory; classifier-outage friction has no available guard — logged only.
+
+## 2026-07-30/31 acting on first production use: 0.8.0, then 0.9.0 (T1, T2-withdrawn, T1)
+
+**What shipped.** 0.8.0 — the Store project's report on first real use of the collectors:
+`durations_ms`/`stddev_ms` (small-n evidence), `excluded_by_warmup`, `groups_total`, plus two
+*already-shipped* silent lies it led me to (a snapshot read accepted `skip_warmup_ms` and
+`group_by` and discarded both; `group_by: name|group` under a cut served unwindowed rows beside
+windowed headline figures). 0.9.0 — capability skew made visible. Then the deferred docs.
+
+**The report's own headline finding was that three of its seven suggestions already existed.**
+Not a rebuttal — the strongest possible confirmation of its §3 thesis that documentation, not
+capability, was the binding constraint. Their shim was several versions behind.
+
+**Two designs withdrawn at their own gates**, both recorded rather than deleted. Daemon-taught
+tool registration: ~35 findings; it deleted argument validation across 42 tools (`new_dyn` takes
+raw `JsonObject`, rmcp validates nothing against `inputSchema`) and could not deliver its own
+bootstrap explanation (`main.rs` `?`-exits before `serve()`). Then a handshake variant: it aborted
+shim startup against an un-upgraded broker — in exactly the upgrade its own notice recommends.
+What survived is one shared `(tool, method)` const, two fields on `status.get`, one injected key.
+
+**Gate rounds: 3 on the design (13 → 11 → 8), 2 lenses on the code (8 + 15 mutations).**
+
+### The pattern behind nearly every expensive defect
+
+**I verified claims by finding evidence *consistent* with them instead of hunting a falsifier.**
+Four instances, same shape, all one command from being right:
+- A remedy naming `collectors.diff`; one grep confirmed diff reads `per_name`. It did not show
+  `persist.rs` deliberately dropping those on the way to disk, so the advice is false after any
+  restart — plus diff has no `trace`/`path` axis at all.
+- "41 of 42 tools are passthrough", from `grep -c to_string_pretty`. `export_logs` writes a file.
+- A `group_keys` worked example using `attribute=value`. It is the value alone; a test asserts it.
+- "Respawned as pid 6392" — my check matched a pre-existing process from another session.
+
+**And the two-surface variant:** one commit shipped `annotate_skew` comparing *tool sets* while
+the CLI compared *version strings*. This repo has two commits stamped `0.5.1` with different tool
+sets, so on the exact case the feature exists to catch they gave opposite answers. Fixed by one
+shared composer rather than a corrected comparison — a version check is wrong by construction here.
+
+### User-directed process corrections (two, both acted on immediately)
+
+1. **"The lenses are a safety net, not the designer."** Finding counts were too high. Self-gating
+   before dispatch measurably worked: the last design round's HIGH finding was already fixed
+   before the lens reported, and I caught 4 gaps in my own spec pre-dispatch (drift mechanism,
+   the missing tool→method map, a needed timeout, a false-positive rule).
+2. **"Stop asking questions with obvious answers."** Said twice. Both times I ended a turn asking
+   permission for a step already in an approved plan.
+
+### The omission that recurred three times, in the docs of the fix for it
+
+0.9.0 shipped believing itself done. Its user-facing story existed only in the CHANGELOG: the
+README's `get_status` row, the skill file, and `docs/medium-article.md` were all silent. Three
+one-line user questions ("did you update the readme / skill / guide?") each found a real gap. The
+article had **zero** mentions of collectors — five phases invisible in the document whose job is
+to say what exists. My completeness checks covered the code surface and stopped at "files I
+edited".
+
+**Proposal (for the next consolidation):** a *docs surface list* per repo, enumerated once and
+checked before any feature is called done — here: README, crates/mcp/README, crates/sdk/README,
+skill, article, CHANGELOG. Ladder rung: workflow habit, or a `verify.sh` step that greps each
+surface for the release's new public identifiers and fails on a miss.
+
+### Gate cost (answering "why do gates take forever")
+
+Per-lens wall clock was 5–22 min; **round count dominates**, not lens duration. Two speedups
+applied in the last round: hand the lenses the pre-verified seam table ("attack, do not re-check")
+and name the exact files, instead of "read the codebase freely" — they had been burning 40–126
+tool calls each, much of it re-deriving what I had already verified. The larger lever is fewer
+rounds, i.e. the self-gating in correction 1.
+
+### Two-way evidence
+
+The mutation lens earned its cost again: 14/15 caught, and its two misses were both real
+(`tool_names()` losing `.sort()` survived because every consumer re-derived its expectation from
+the same mutated function; deleting a `StatusGetResult` field was caught only as a *compile*
+error, and with one test line removed the whole workspace passed green). The second is now closed
+as a **class** — any unmirrored `status.get` key fails a test, not just that field. A 7th
+harness-lie mode was found and recorded in `gate-briefs.md`: the file-watcher reminder that
+misattributes an agent's own `git checkout --` and instructs it not to revert.
