@@ -228,3 +228,17 @@ calls each.
      "did not change at all" regression, and the merged-arm suppression reason that
      was a false statement about why). Candidate: extend the false-negative-pairing
      line to cover any user-visible CLAIM, not only blocking checks.
+
+## Consolidated through 2026-07-30
+
+Two entries mined (phases 1–3, phases 4–5). Five ways-of-working edits: source-text-through-Write
+promoted from a failed memory rung; two-sided pairing extended to user-visible claims and messages;
+the grounding rule applied at code-comment scale (three named 30-second greps); independent modules
+default to a parallel worktree subagent, named at phase open; endgame ordering fixed as
+gate → fix → docs/CHANGELOG → tag → deploy, with deploy-before-gate a named decision plus rollback.
+Convergent gate findings promoted to a verification shortcut (fix, don't triage — 8/8 real).
+Tooling: `scripts/verify.sh` (each expensive step exactly once, `--all-features` load-bearing —
+its first run exposed that every plain workspace run had compiled the `test-support`-gated suites
+EMPTY and reported them ok), `docs/process/gate-briefs.md` (the four lens briefs with slots, incl.
+the six harness-lie modes), and a fmt-only commit ending the four-file drift tax. Version-bump
+chaining already guarded by memory; classifier-outage friction has no available guard — logged only.

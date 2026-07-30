@@ -62,6 +62,10 @@ snapshot, then ask what moved.
   Percentiles are refused, because a rolling percentile needs a duration sketch
   per bucket and per-collector memory is bounded on purpose.
 
+- `ThresholdInfo.effective_window_ms` — the window as **evaluated**: the
+  declared width rounded up to a whole number of ring buckets, so the guard is
+  never narrower than asked for and the difference is never something a caller
+  has to infer.
 - **Snapshots record their top call paths**, so `folded` output works on a
   recorded run and not only on a live one. Two caps, because either alone leaks:
   200 rows bounds a pathological fan-out and 64 KiB bounds pathologically long
@@ -87,6 +91,25 @@ snapshot, then ask what moved.
 - A threshold verdict was rendered as a JSON literal, emitting
   `"last_value": null` where the schema promises the key is absent. Absent
   versus null is the whole distinction that field carries.
+- **Thirteen defects found by the pre-merge adversarial gate**, fixed before
+  this release was tagged. The three worst would each have produced a confident
+  wrong answer rather than an error: `<collector>@*` merged runs recorded under
+  **different definitions** (now refused, naming both runs — §7.1 keeps history
+  across a structural edit, so a history legitimately spans configurations and
+  summing them reported the spread across configurations as scheduling
+  variance); `reset` left the threshold's rolling ring loaded, so a re-pinned
+  collector carried a verdict from the old domain's traffic; and the
+  threshold's `avg_ms` divided by all matched spans instead of the spans that
+  contributed to the sum, silently understating the average on dirty input.
+  Also: `folded` could never succeed on a live arm; YAML front-matter broke on
+  a multi-line `finding`; a flame-graph line broke on a control character in a
+  span name; path ordering was nondeterministic at equal self time; a spurious
+  residual row appeared on large reconciling tables; small `window_ms` values
+  evaluated up to 48% narrow; `threshold.group` silently matched only the first
+  group key (now documented and warned); an unrepresentable snapshot threshold
+  destroyed the whole recorded run; and `group_by: "group"` with no group keys
+  returned an empty breakdown with no reason. Full detail in commit
+  `fix: thirteen defects from the pre-merge adversarial gate`.
 
 ## 0.5.1 — 2026-07-30
 

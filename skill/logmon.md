@@ -171,7 +171,7 @@ Two ways to run an A/B:
 
 - **Marked** — it proceeds and says what differs. Arms at different levels (compared at the lower one, with nesting evidence carried across anyway), filters that differ only in spelling, one truncated arm.
 - **Blocked, with a flag that permits it** — the arms matched different populations (`allow_mismatch`), one lost spans and the other did not (`allow_lossy`), both hit the sample budget (`allow_truncated`). The error names the flag.
-- **Refused outright** — mismatched sketch layouts. The subtraction would be arithmetic on two different scales, so there is nothing to permit.
+- **Refused outright** — mismatched sketch layouts (the subtraction would be arithmetic on two different scales, so there is nothing to permit), and a `@*` arm whose recorded runs carry **different definitions**: a structural edit keeps history, so a collector's history can legitimately span configurations, and summing them would report the spread across configurations as scheduling variance. The refusal names both runs; compare them individually by label, or re-record under one definition.
 
 **Every row carries the threshold used to suppress it, and that is the threshold that was applied** — there is no second, stricter bound doing the striking. A bracketed `[Δ]` is below its printed floor: the number is real, what is missing is any basis for calling it a change.
 
@@ -187,7 +187,7 @@ Two ways to run an A/B:
 
 **Percentiles cannot be thresholds.** A rolling percentile needs a duration sketch per bucket, and per-collector memory is bounded on purpose. Use `avg_ms` for the guard and `get_collector` for the real percentiles.
 
-`fires` counts clear-to-breached transitions, not evaluations — a threshold breached for a whole run has fired once. `last_value` is **absent** until something has been evaluated: zero is a value `count` legitimately holds, and an `lt` guard would read it as a breach. Changing a threshold zeroes the live window, like any other structural edit; pass `threshold: null` to remove one.
+`fires` counts clear-to-breached transitions, not evaluations — a threshold breached for a whole run has fired once. `last_value` is **absent** until something has been evaluated: zero is a value `count` legitimately holds, and an `lt` guard would read it as a breach. Changing a threshold zeroes the live window, like any other structural edit; pass `threshold: null` to remove one. `effective_window_ms` in the report is the window as evaluated — the declared width rounded up to a whole number of ring buckets, never narrower than asked for. A reset or kept snapshot clears the guard's window and verdict along with the data.
 
 **Renaming a session keeps its collectors** — they move with it. If the rename displaces a disconnected session that held the same name, that session's collectors are cleared rather than inherited, so you never read another conversation's measurements.
 
