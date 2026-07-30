@@ -937,3 +937,353 @@ fn group_by_parses_only_the_names_it_documents() {
     assert_eq!(GroupBy::parse("service"), None);
     assert_eq!(GroupBy::parse("NAME"), None);
 }
+
+// ---------------------------------------------------------------------------
+// What the instrument did to the data (§2.5)
+// ---------------------------------------------------------------------------
+
+/// Three spans, cut at 100 ms: one excluded, two kept. The exclusion count and
+/// the surviving population must add back up to what was retained, or a reader
+/// cannot reconstruct the denominator the numbers were computed over.
+#[test]
+fn warmup_reports_how_many_spans_it_excluded() {
+    let spans = [
+        span("cold", 1, None, 0, 500 * MS),
+        span("warm", 2, None, 200 * MS, 210 * MS),
+        span("warm", 3, None, 300 * MS, 310 * MS),
+    ];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.excluded_by_warmup, Some(1));
+    assert_eq!(r.sampled.as_ref().unwrap().sample_count, 2);
+    assert_eq!(
+        r.excluded_by_warmup.unwrap() + r.sampled.unwrap().sample_count,
+        3,
+        "excluded plus surviving must account for every retained span"
+    );
+}
+
+/// The trap this field exists to close. `absent` means the filter never ran;
+/// `0` means it ran and removed nothing. Asserted at the JSON layer too,
+/// because a `#[serde(default)]` on the read side would turn one into the
+/// other with nothing in the Rust type to show for it.
+#[test]
+fn no_warmup_leaves_the_exclusion_count_absent_not_zero() {
+    let spans = [span("a", 1, None, 0, 10 * MS)];
+    let r = run(Level::Timing, &spans, ProfileOptions::default());
+    assert_eq!(r.excluded_by_warmup, None);
+
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(
+        v.get("excluded_by_warmup").is_none(),
+        "the key must be absent from the wire, not present as 0: {v}"
+    );
+    // The mirror of `an_empty_window_says_the_zero_means_there_was_nothing_to_cut`:
+    // that suppression is gated on a cut having been *asked for*, and without
+    // this a read that requested nothing would carry an explanation for it.
+    assert!(
+        suppression(&r, "excluded_by_warmup").is_none(),
+        "nothing was suppressed, because nothing was requested"
+    );
+}
+
+#[test]
+fn an_empty_window_says_the_zero_means_there_was_nothing_to_cut() {
+    // `warmup_cutoff_ns` measures from the earliest retained start, so with
+    // nothing retained there is no cut to position. Reporting a bare 0 would
+    // read as "the warm-up period was empty", which is a different claim.
+    let r = run(
+        Level::Timing,
+        &[],
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.excluded_by_warmup, Some(0));
+    let s = suppression(&r, "excluded_by_warmup").expect("the zero must be explained");
+    assert!(s.reason.contains("nothing to cut"), "reason: {}", s.reason);
+}
+
+#[test]
+fn a_warmup_that_excludes_everything_reports_the_whole_count() {
+    let spans = [
+        span("a", 1, None, 0, 10 * MS),
+        span("b", 2, None, 5 * MS, 15 * MS),
+    ];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(10_000.0),
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.excluded_by_warmup, Some(2));
+    assert_eq!(
+        r.sampled.unwrap().sample_count,
+        0,
+        "an empty surviving population must not panic on the percentile path"
+    );
+}
+
+/// Adversarial (H2): the count is taken once, off the record set every view
+/// filters over. Group by trace and by path both re-walk those same records,
+/// so a per-view count could drift — this pins all three to one number.
+#[test]
+fn every_view_reports_the_same_exclusion_count() {
+    let spans = [
+        span("cold", 1, None, 0, 500 * MS),
+        span("warm", 2, None, 200 * MS, 210 * MS),
+        span("warm", 3, None, 300 * MS, 310 * MS),
+    ];
+    let opts = |g| ProfileOptions {
+        skip_warmup_ms: Some(100.0),
+        group_by: g,
+        ..Default::default()
+    };
+    let ungrouped = run(Level::Tree, &spans, opts(GroupBy::None));
+    let by_trace = run(Level::Tree, &spans, opts(GroupBy::Trace));
+    let by_path = run(Level::Tree, &spans, opts(GroupBy::Path));
+
+    assert_eq!(ungrouped.excluded_by_warmup, Some(1));
+    assert_eq!(by_trace.excluded_by_warmup, ungrouped.excluded_by_warmup);
+    assert_eq!(by_path.excluded_by_warmup, ungrouped.excluded_by_warmup);
+}
+
+#[test]
+fn groups_total_counts_rows_before_top_n_truncation() {
+    let spans = [
+        span("a", 1, None, 0, 40 * MS),
+        span("b", 2, None, 0, 30 * MS),
+        span("c", 3, None, 0, 20 * MS),
+        span("d", 4, None, 0, 10 * MS),
+    ];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            group_by: GroupBy::Name,
+            top_n: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.groups.len(), 2, "top_n bounds what is returned");
+    assert_eq!(
+        r.groups_total, 4,
+        "but the reader still has to be able to tell the top 2 of 4 from the top 2 of 2"
+    );
+}
+
+/// Two-way: the count must not be a constant that only looks right when
+/// something was dropped.
+#[test]
+fn groups_total_equals_the_row_count_when_nothing_was_truncated() {
+    let spans = [
+        span("a", 1, None, 0, 40 * MS),
+        span("b", 2, None, 0, 30 * MS),
+    ];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            group_by: GroupBy::Name,
+            top_n: 20,
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.groups.len(), 2);
+    assert_eq!(r.groups_total, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Small-n evidence: durations and spread (§2.1)
+// ---------------------------------------------------------------------------
+
+/// The load-bearing property. `sampled_view` keeps a sorted copy for the
+/// percentiles right beside the arrival-order one, so returning the wrong
+/// vector is a one-character mistake that every other assertion here would
+/// still pass. A reader can sort these; they cannot unsort them.
+#[test]
+fn durations_come_back_in_arrival_order_not_sorted() {
+    let spans = [
+        span("op", 1, None, 0, 30 * MS),
+        span("op", 2, None, 100 * MS, 110 * MS),
+        span("op", 3, None, 200 * MS, 220 * MS),
+    ];
+    let r = run(Level::Timing, &spans, ProfileOptions::default());
+    assert_eq!(
+        r.sampled.unwrap().durations_ms,
+        Some(vec![30.0, 10.0, 20.0]),
+        "arrival order, not ascending"
+    );
+}
+
+/// Pure arithmetic, checkable by hand: 10, 20, 30 ms has mean 20, squared
+/// deviations 100 + 0 + 100, and n-1 = 2 — so exactly 10.0 ms. Pinned as an
+/// exact figure rather than a range so that swapping in the population form
+/// (which gives 8.165) fails rather than merely shifts.
+#[test]
+fn stddev_matches_a_hand_computed_reference() {
+    let spans = [
+        span("op", 1, None, 0, 10 * MS),
+        span("op", 2, None, 100 * MS, 120 * MS),
+        span("op", 3, None, 200 * MS, 230 * MS),
+    ];
+    let r = run(Level::Timing, &spans, ProfileOptions::default());
+    let s = r
+        .sampled
+        .unwrap()
+        .stddev_ms
+        .expect("three records have spread");
+    assert!(
+        (s - 10.0).abs() < 1e-9,
+        "sample stddev of 10/20/30 ms is exactly 10.0, got {s}"
+    );
+}
+
+#[test]
+fn a_single_record_has_no_spread_rather_than_a_zero_one() {
+    // 0.0 would say the measurement was perfectly repeatable. One observation
+    // says nothing about repeatability at all.
+    let spans = [span("op", 1, None, 0, 10 * MS)];
+    let r = run(Level::Timing, &spans, ProfileOptions::default());
+    let s = r.sampled.unwrap();
+    assert_eq!(s.sample_count, 1);
+    assert_eq!(s.stddev_ms, None);
+    assert_eq!(
+        s.durations_ms,
+        Some(vec![10.0]),
+        "the one duration is still worth listing — it is the spread that is undefined"
+    );
+}
+
+#[test]
+fn stddev_is_computed_over_the_post_warmup_population() {
+    // Without the cut the 500 ms cold span dominates; with it, the spread is
+    // that of 10 and 30 ms — sqrt(200) ms. A stddev computed before the filter
+    // would report a number describing a population the percentiles beside it
+    // do not share.
+    let spans = [
+        span("cold", 1, None, 0, 500 * MS),
+        span("warm", 2, None, 200 * MS, 210 * MS),
+        span("warm", 3, None, 300 * MS, 330 * MS),
+    ];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            ..Default::default()
+        },
+    );
+    let s = r
+        .sampled
+        .unwrap()
+        .stddev_ms
+        .expect("two records have spread");
+    assert!(
+        (s - 10.0 * 2f64.sqrt()).abs() < 1e-9,
+        "spread of the surviving 10/30 ms pair is sqrt(200) = 14.142, got {s}"
+    );
+}
+
+#[test]
+fn the_duration_list_stops_at_the_inline_cap() {
+    let build = |n: u64| {
+        let spans: Vec<_> = (0..n)
+            .map(|i| span("op", i + 1, None, i as i64 * MS, i as i64 * MS + MS))
+            .collect();
+        run(Level::Timing, &spans, ProfileOptions::default())
+    };
+
+    let at_cap = build(MAX_INLINE_DURATIONS);
+    let s = at_cap.sampled.as_ref().unwrap();
+    assert_eq!(
+        s.durations_ms.as_ref().map(|d| d.len()),
+        Some(MAX_INLINE_DURATIONS as usize),
+        "exactly at the cap is still listed"
+    );
+    assert!(suppression(&at_cap, "sampled.durations_ms").is_none());
+
+    let over_cap = build(MAX_INLINE_DURATIONS + 1);
+    let s = over_cap.sampled.as_ref().unwrap();
+    assert_eq!(s.durations_ms, None, "one over the cap is withheld");
+    assert!(
+        suppression(&over_cap, "sampled.durations_ms").is_some(),
+        "and withholding is explained, not silent"
+    );
+    assert!(
+        s.stddev_ms.is_some(),
+        "the spread still describes the whole retained set, so it survives the cap"
+    );
+}
+
+#[test]
+fn a_truncated_sample_withholds_its_durations_and_says_why() {
+    use crate::collector::sample::CHUNK_RECORDS;
+    // A budget for one chunk, then twice that many spans: the retained set is a
+    // contiguous prefix of the run. Listing it would invite exactly the
+    // per-value reasoning a biased subset cannot support.
+    let mut d = def(Level::Timing, &[]);
+    d.max_sample_bytes = CHUNK_RECORDS * Level::Timing.bytes_per_record();
+    let c = Collector::new(d, now());
+    for i in 0..(CHUNK_RECORDS * 2) {
+        c.ingest(&span(
+            "op",
+            i as u64 + 1,
+            None,
+            i as i64 * MS,
+            (i as i64 + 1) * MS,
+        ));
+    }
+    let r = profile(
+        &c.snapshot(),
+        IngestBasis::Unavailable,
+        &ProfileOptions::default(),
+        read_at(),
+    );
+
+    let s = r.sampled.as_ref().unwrap();
+    assert!(!s.complete, "the fixture must actually truncate");
+    assert_eq!(s.durations_ms, None);
+    let sup = suppression(&r, "sampled.durations_ms").expect("withholding must be explained");
+    assert!(sup.reason.contains("prefix"), "reason: {}", sup.reason);
+}
+
+/// H7: a `sampled` block recorded before these fields existed — every snapshot
+/// on disk today — must read as *not recorded*, never as an empty list or a
+/// zero spread.
+#[test]
+fn a_sampled_block_from_an_older_build_reads_as_absent_not_empty() {
+    let legacy = serde_json::json!({
+        "complete": true,
+        "sample_count": 3,
+        "nested_matches": 0,
+        "overlapping_child_ms": 0.0,
+        "overlapping_child_spans": 0,
+        "p50_ms": 10.0,
+    });
+    let s: ProfileSampled = serde_json::from_value(legacy).expect("older shape still loads");
+    assert_eq!(s.sample_count, 3);
+    assert_eq!(s.durations_ms, None, "absent, not Some(vec![])");
+    assert_eq!(s.stddev_ms, None, "absent, not Some(0.0)");
+}
+
+#[test]
+fn an_ungrouped_read_reports_no_group_total() {
+    let spans = [span("a", 1, None, 0, 10 * MS)];
+    let r = run(Level::Timing, &spans, ProfileOptions::default());
+    assert!(r.grouped_by.is_none());
+    assert!(r.groups.is_empty());
+    assert_eq!(
+        r.groups_total, 0,
+        "no grouping was asked for, so none exists"
+    );
+}

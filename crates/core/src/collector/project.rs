@@ -29,6 +29,15 @@ use std::collections::HashMap;
 /// The percentiles every profile reports, as fractions.
 pub const PERCENTILES: [f64; 4] = [0.50, 0.80, 0.95, 0.99];
 
+/// How many retained durations a `sampled` block will list inline.
+///
+/// The cap exists because the list is unbounded otherwise — a busy collector
+/// retains tens of thousands of records, and a reader who wants those wants an
+/// export, not a profile response. Below it, at the sizes where percentiles of
+/// three values say nothing useful, the raw durations are the only thing that
+/// answers "are these two arms actually separated?".
+pub const MAX_INLINE_DURATIONS: u64 = 50;
+
 /// Ancestor-walk depth cap for call paths (§5.4). Beyond this the path is
 /// reported truncated rather than walked further — a cap plus the visited set
 /// is what makes a malformed parent cycle terminate.
@@ -143,6 +152,29 @@ pub fn profile(
     let warmup = opts.skip_warmup_ms.filter(|ms| *ms > 0.0);
     let cut_ns = warmup.and_then(|ms| warmup_cutoff_ns(&snap.samples, ms));
 
+    // Counted ONCE, here, off the same `samples.records()` that every filtering
+    // view walks (`sampled`, `groups: trace`, `groups: path`). Counting inside
+    // each view would let three numbers describing one filter disagree, and a
+    // reader has no way to tell which of them the headline figures used.
+    //
+    // `None` when no cut was requested — never `Some(0)`. Absent says the
+    // filter did not run; zero says it ran and removed nothing. Reporting the
+    // second for the first is the failure this field exists to prevent.
+    let excluded_by_warmup = warmup.map(|_| match cut_ns {
+        Some(c) => snap.samples.records().filter(|r| r.start_ns < c).count() as u64,
+        None => 0,
+    });
+    if warmup.is_some() && cut_ns.is_none() {
+        suppressed.push(Suppressed {
+            field: "excluded_by_warmup".into(),
+            reason: "the cut is measured from the earliest retained span, and this \
+                     window retains none — so the zero means there was nothing to \
+                     cut, not that the warm-up period was empty"
+                .into(),
+            remedy: Some("read a window that retained samples, at level `timing` or `tree`".into()),
+        });
+    }
+
     let exact = if warmup.is_some() {
         suppressed.push(Suppressed {
             field: "exact".into(),
@@ -195,13 +227,11 @@ pub fn profile(
         "undetected"
     };
 
-    let (grouped_by, groups) = if opts.group_by == GroupBy::None {
-        (None, Vec::new())
+    let (grouped_by, groups, groups_total) = if opts.group_by == GroupBy::None {
+        (None, Vec::new(), 0)
     } else {
-        (
-            Some(opts.group_by.as_str().to_string()),
-            group_rows(snap, opts, cut_ns, &mut suppressed),
-        )
+        let (rows, total) = group_rows(snap, opts, cut_ns, &mut suppressed);
+        (Some(opts.group_by.as_str().to_string()), rows, total)
     };
 
     ProfileResult {
@@ -220,6 +250,8 @@ pub fn profile(
         sampled,
         grouped_by,
         groups,
+        groups_total,
+        excluded_by_warmup,
         cardinality_capped: snap.cardinality_capped(),
         suppressed,
         // Filled by the RPC layer for `traces.profile`, whose filter has no
@@ -446,9 +478,42 @@ fn sampled_view(
     sorted.sort_unstable();
     let pct = |q: f64| quantile_sorted(&sorted, q).map(|ns| ns as f64 / 1_000_000.0);
 
+    // Small-n evidence (§2.1). At three records the percentiles are order
+    // statistics of three numbers and carry nothing; the durations themselves
+    // are what turn "do these arms overlap?" from a judgement by eye into a
+    // computation.
+    let durations_ms = if !samples.complete {
+        suppressed.push(Suppressed {
+            field: "sampled.durations_ms".into(),
+            reason: "the sample budget stopped retention, so these records are a \
+                     contiguous prefix of the run rather than all of it — listing \
+                     them would invite per-value reasoning a biased subset cannot \
+                     support"
+                .into(),
+            remedy: Some("raise max_sample_bytes, or narrow the filter".into()),
+        });
+        None
+    } else if sample_count > MAX_INLINE_DURATIONS {
+        suppressed.push(Suppressed {
+            field: "sampled.durations_ms".into(),
+            reason: format!(
+                "{sample_count} retained records is above the {MAX_INLINE_DURATIONS}-record \
+                 inline cap"
+            ),
+            remedy: Some(
+                "read the percentiles and stddev_ms, which describe the whole retained set".into(),
+            ),
+        });
+        None
+    } else {
+        Some(durations.iter().map(|d| ns_to_ms(*d as i128)).collect())
+    };
+
     let mut out = ProfileSampled {
         complete: samples.complete,
         sample_count,
+        stddev_ms: sample_stddev_ms(&durations),
+        durations_ms,
         self_ms: None,
         nested_matches: 0,
         overlapping_child_ms: 0.0,
@@ -499,6 +564,33 @@ fn sampled_view(
         out.self_ms = Some(ns_to_ms(self_time.self_ns));
     }
     out
+}
+
+/// Sample standard deviation in milliseconds, Bessel-corrected.
+///
+/// `None` below two records: with one observation the spread is undefined, and
+/// reporting 0.0 would say the opposite — that the measurement was perfectly
+/// repeatable.
+///
+/// Two-pass on purpose. The single-pass `E[x²] - E[x]²` form catastrophically
+/// cancels exactly where this field is used: a 86 ms mean with a 0.5 ms spread
+/// squares to two nearly equal terms around 7.4e15, and the difference that
+/// survives is mostly rounding error.
+fn sample_stddev_ms(durations: &[i64]) -> Option<f64> {
+    if durations.len() < 2 {
+        return None;
+    }
+    let n = durations.len() as f64;
+    let mean = durations.iter().map(|d| *d as f64).sum::<f64>() / n;
+    let variance = durations
+        .iter()
+        .map(|d| {
+            let dev = *d as f64 - mean;
+            dev * dev
+        })
+        .sum::<f64>()
+        / (n - 1.0);
+    Some(variance.sqrt() / 1_000_000.0)
 }
 
 struct SelfTime {
@@ -658,7 +750,7 @@ fn group_rows(
     opts: &ProfileOptions,
     cut_ns: Option<i64>,
     suppressed: &mut Vec<Suppressed>,
-) -> Vec<ProfileGroup> {
+) -> (Vec<ProfileGroup>, usize) {
     let level = snap.def.level;
     if opts.group_by.is_sample_derived() && !level.has_tree() {
         suppressed.push(Suppressed {
@@ -670,11 +762,11 @@ fn group_rows(
             ),
             remedy: Some("define the collector at level `tree`".into()),
         });
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     match opts.group_by {
-        GroupBy::None => Vec::new(),
+        GroupBy::None => (Vec::new(), 0),
         GroupBy::Name => exact_rows(
             snap.per_name
                 .iter()
@@ -691,7 +783,7 @@ fn group_rows(
                         "define a collector with group_keys, e.g. [\"cache.enabled\"]".into(),
                     ),
                 });
-                return Vec::new();
+                return (Vec::new(), 0);
             }
             exact_rows(
                 snap.per_group
@@ -712,7 +804,7 @@ fn exact_rows<'a>(
     rows: impl Iterator<Item = (String, &'a ExactStats)>,
     axis: &str,
     top_n: usize,
-) -> Vec<ProfileGroup> {
+) -> (Vec<ProfileGroup>, usize) {
     let mut v: Vec<ProfileGroup> = rows
         .map(|(key, e)| ProfileGroup {
             key,
@@ -722,8 +814,8 @@ fn exact_rows<'a>(
             path_incomplete: false,
         })
         .collect();
-    rank_and_truncate(&mut v, top_n);
-    v
+    let total = rank_and_truncate(&mut v, top_n);
+    (v, total)
 }
 
 /// The declared group keys' values, joined. A single key renders bare so the
@@ -747,7 +839,11 @@ fn group_label(interners: &[Interner], ids: &[u32]) -> String {
         .join(" / ")
 }
 
-fn trace_rows(samples: &SampleSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec<ProfileGroup> {
+fn trace_rows(
+    samples: &SampleSnapshot,
+    cut_ns: Option<i64>,
+    top_n: usize,
+) -> (Vec<ProfileGroup>, usize) {
     let mut per_trace: HashMap<u128, Vec<i64>> = HashMap::new();
     let mut intervals: HashMap<u128, Vec<(i64, i64)>> = HashMap::new();
     for r in samples.records() {
@@ -784,6 +880,10 @@ fn trace_rows(samples: &SampleSnapshot, cut_ns: Option<i64>, top_n: usize) -> Ve
                 sampled: Some(ProfileSampled {
                     complete: samples.complete,
                     sample_count: durations.len() as u64,
+                    // One number per row is worth carrying; the duration list
+                    // is not, because per-row it multiplies by `top_n`.
+                    stddev_ms: sample_stddev_ms(&durations),
+                    durations_ms: None,
                     self_ms: None,
                     nested_matches: 0,
                     overlapping_child_ms: 0.0,
@@ -799,8 +899,8 @@ fn trace_rows(samples: &SampleSnapshot, cut_ns: Option<i64>, top_n: usize) -> Ve
             }
         })
         .collect();
-    rank_and_truncate(&mut v, top_n);
-    v
+    let total = rank_and_truncate(&mut v, top_n);
+    (v, total)
 }
 
 /// One call path's aggregate — the shared product of the path walk.
@@ -935,9 +1035,18 @@ pub fn path_aggregates(snap: &CollectorSnapshot, cut_ns: Option<i64>) -> Vec<Pat
     v
 }
 
-fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec<ProfileGroup> {
+fn path_rows(
+    snap: &CollectorSnapshot,
+    cut_ns: Option<i64>,
+    top_n: usize,
+) -> (Vec<ProfileGroup>, usize) {
     let complete = snap.samples.complete;
-    path_aggregates(snap, cut_ns)
+    // Materialised before `take` for the same reason `rank_and_truncate` hands
+    // its count back: the denominator has to be the pre-truncation one, and
+    // this path truncates with `take` rather than going through that helper.
+    let aggregates = path_aggregates(snap, cut_ns);
+    let total = aggregates.len();
+    let rows = aggregates
         .into_iter()
         .take(top_n)
         .map(|p| ProfileGroup {
@@ -947,6 +1056,10 @@ fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec
             sampled: Some(ProfileSampled {
                 complete,
                 sample_count: p.count,
+                // A path aggregate carries a count and a self-time sum, not the
+                // per-span durations either figure would need.
+                stddev_ms: None,
+                durations_ms: None,
                 self_ms: Some(ns_to_ms(p.self_ns)),
                 nested_matches: 0,
                 overlapping_child_ms: 0.0,
@@ -960,7 +1073,8 @@ fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec
             }),
             path_incomplete: p.incomplete,
         })
-        .collect()
+        .collect();
+    (rows, total)
 }
 
 /// Rows retained in a snapshot's stored path list (§9.8's `folded` format).
@@ -1048,13 +1162,19 @@ fn walk_path(
 /// Rank by total time descending, then by key so equal rows are stable across
 /// reads. Truncation is silent in the row list, so `top_n` belongs beside a
 /// count the caller can compare against `matched`.
-fn rank_and_truncate(v: &mut Vec<ProfileGroup>, top_n: usize) {
+/// Returns the row count **before** truncation — the denominator a reader needs
+/// to tell "the top 20 of 20" from "the top 20 of 900". Taken here rather than
+/// recomputed by the caller so the count and the cut can never describe
+/// different collections.
+fn rank_and_truncate(v: &mut Vec<ProfileGroup>, top_n: usize) -> usize {
     v.sort_by(|a, b| {
         let ta = a.exact.as_ref().map(|e| e.total_ms).unwrap_or(0.0);
         let tb = b.exact.as_ref().map(|e| e.total_ms).unwrap_or(0.0);
         tb.total_cmp(&ta).then_with(|| a.key.cmp(&b.key))
     });
+    let total = v.len();
     v.truncate(top_n);
+    total
 }
 
 #[cfg(test)]

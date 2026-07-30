@@ -740,6 +740,30 @@ pub struct ProfileSampled {
     pub p95_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_ms: Option<f64>,
+    /// Sample standard deviation (Bessel-corrected, `n-1`) of the durations the
+    /// percentiles were computed over. Absent below two records, where it is
+    /// undefined rather than zero.
+    ///
+    /// The n-1 form because at the sizes this matters for — a three-run A/B —
+    /// the population form understates the spread by about 18%, and the whole
+    /// question being asked is whether a difference exceeds the spread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stddev_ms: Option<f64>,
+    /// Every retained duration, in **arrival order**, when the sample is
+    /// complete and small enough to send (see `MAX_INLINE_DURATIONS`).
+    ///
+    /// Arrival order rather than sorted: a reader can sort these, but could not
+    /// unsort them, and the ordering carries drift and warm-up trends that the
+    /// percentiles have already thrown away.
+    ///
+    /// Absent when the sample was truncated — a prefix of a run presented as
+    /// its durations would invite exactly the per-value reasoning that a biased
+    /// subset cannot support — or when there are more than the cap. `suppressed`
+    /// carries the reason in both cases. Only the top-level `sampled` block
+    /// populates this: it is the population the headline figures describe, and
+    /// per-group rows would multiply it by `top_n`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durations_ms: Option<Vec<f64>>,
 }
 
 /// One row of a breakdown. `key` is the span name, the group tuple, the trace
@@ -1429,6 +1453,19 @@ pub struct ProfileResult {
     pub grouped_by: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ProfileGroup>,
+    /// Group keys **before** `top_n` truncation, so a reader can tell "the top
+    /// 20 of 20" from "the top 20 of 900". Mirrors `CollectorsDiffResult`.
+    #[serde(default)]
+    pub groups_total: usize,
+    /// How many retained spans `skip_warmup_ms` excluded from the sample tier.
+    ///
+    /// **Absent means the filter never ran** — not that it ran and excluded
+    /// nothing. A reader that cannot tell those apart cannot tell "warm-up was
+    /// negligible" from "warm-up was never cut", which are opposite facts about
+    /// the same number. `sampled.sample_count` is the population that survived,
+    /// so the two together give the whole picture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_by_warmup: Option<u64>,
     /// True when a cardinality cap folded values into `__overflow__`, so at
     /// least one row aggregates an arbitrary, arrival-ordered member set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

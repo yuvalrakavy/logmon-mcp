@@ -3,6 +3,58 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## 0.8.0 — 2026-07-30
+
+Acting on the first production use of the collectors, by a session that had no
+hand in designing them. Their report found no correctness problem — one arm
+reproduced a figure recorded days earlier, on a different broker version, to
+within 0.8% — so everything here is about what the output *says*, not what it
+computes.
+
+### Added
+
+- **`sampled.durations_ms`** — every retained duration, in **arrival order**,
+  when the sample is complete and at most 50 records. At the sizes this serves,
+  percentiles are order statistics of three numbers and carry nothing; the
+  durations are what turn "are these two arms actually separated?" from a
+  judgement by eye into a computation. Arrival order rather than sorted because
+  a reader can sort them but cannot unsort them, and the ordering carries the
+  drift and warm-up trends the percentiles have already discarded.
+
+- **`sampled.stddev_ms`** — sample standard deviation, Bessel-corrected, absent
+  below two records where it is undefined rather than zero. The `n-1` form
+  because at three runs the population form understates the spread by about 18%,
+  and the question being asked is whether a difference exceeds the spread.
+
+  Both fields live on the sampled block, so they are **recorded into snapshots**:
+  a run captured from 0.8.0 onward carries its own raw durations permanently.
+
+- **`excluded_by_warmup`** — how many retained spans `skip_warmup_ms` removed.
+  **Absent means the filter never ran**, and is never reported as zero: "warm-up
+  was negligible" and "warm-up was never cut" are opposite facts about the same
+  number. Counted once, off the same record set every filtering view walks, so
+  the four views cannot disagree about one filter.
+
+- **`groups_total`** on a profile — group keys before `top_n` truncation, so a
+  reader can tell the top 20 of 20 from the top 20 of 900. `collectors.diff`
+  has carried this since 0.6.0; the profile did not.
+
+### Fixed
+
+- **A recorded run silently ignored the options it could not honour.** Reading a
+  snapshot with `skip_warmup_ms` or `group_by` accepted the parameter and served
+  the stored numbers as though it had been applied — the projection is computed
+  when the snapshot is taken, and the per-span records it came from are gone.
+  Both now report why, and the `group_by` case names `collectors.diff`, which
+  does read the stored per-name and per-group breakdowns.
+
+### Compatibility
+
+Every change is additive. `PROTOCOL_VERSION` stays 1 and `FORMAT_VERSION` stays
+1: snapshots written by 0.8.0 load on older builds, which ignore the new fields,
+and snapshots written by older builds load here with them absent — which reads
+as *not recorded*, never as an empty list or a zero spread.
+
 ## 0.7.0 — 2026-07-30
 
 Two deferred items from the span-collector design, and the twelve defects a

@@ -3034,3 +3034,109 @@ fn the_auto_label_counter_survives_a_restart_at_eviction_scale() {
         "snapshot-1 was evicted before the restart and must never come back: {labels:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A recorded run says which read-shaping options it could not honour (§2.5)
+// ---------------------------------------------------------------------------
+
+/// Arms `c`, feeds four spans, and records them as `baseline`.
+fn harness_with_a_recorded_run() -> (Harness, SessionId) {
+    let h = harness();
+    let sid = h.sessions.create_named("A").expect("session");
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sv=svc", "level": "tree" }),
+    )
+    .expect("armed");
+    for i in 0..4 {
+        h.feed("default", &span_at("svc", "op", 25.0, i * 100_000_000));
+    }
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "c", "label": "baseline" }),
+    )
+    .expect("recorded");
+    (h, sid)
+}
+
+fn suppressed_field<'a>(r: &'a Value, field: &str) -> Option<&'a Value> {
+    r["suppressed"]
+        .as_array()?
+        .iter()
+        .find(|s| s["field"] == field)
+}
+
+#[test]
+fn a_snapshot_read_says_skip_warmup_ms_could_not_apply() {
+    // The projection was computed when the snapshot was taken, from records
+    // that are no longer retained. Serving the stored numbers as though the cut
+    // had been applied is the exact silent transformation this reports.
+    let (h, sid) = harness_with_a_recorded_run();
+    let r = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "c", "snapshot": "baseline", "skip_warmup_ms": 100.0 }),
+        )
+        .expect("read");
+
+    let s = suppressed_field(&r, "excluded_by_warmup")
+        .expect("an ignored warm-up cut must be reported, not silently dropped");
+    assert!(
+        s["reason"].as_str().unwrap().contains("recorded run"),
+        "reason: {}",
+        s["reason"]
+    );
+    assert!(
+        r.get("excluded_by_warmup").is_none(),
+        "and no exclusion count may be invented for it: {r}"
+    );
+}
+
+#[test]
+fn a_snapshot_read_says_group_by_could_not_apply_and_points_at_diff() {
+    let (h, sid) = harness_with_a_recorded_run();
+    let r = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "c", "snapshot": "baseline", "group_by": "name" }),
+        )
+        .expect("read");
+
+    let s = suppressed_field(&r, "groups")
+        .expect("an ignored group_by must be reported: an empty groups list reads as `no groups`");
+    assert!(
+        s["remedy"].as_str().unwrap().contains("collectors.diff"),
+        "the remedy must name the surface that DOES read stored per-name rows: {}",
+        s["remedy"]
+    );
+}
+
+/// The false-positive mirror. `group_by: ""` parses to `GroupBy::None` — it is
+/// a valid way to ask for no grouping, not an ignored request. Reporting a
+/// suppression for something nobody asked for is the same class of lie as
+/// staying silent about something that was ignored, so both sides get a test.
+#[test]
+fn a_snapshot_read_invents_no_suppression_for_options_that_were_not_asked_for() {
+    let (h, sid) = harness_with_a_recorded_run();
+    for params in [
+        json!({ "name": "c", "snapshot": "baseline" }),
+        json!({ "name": "c", "snapshot": "baseline", "group_by": "" }),
+        json!({ "name": "c", "snapshot": "baseline", "skip_warmup_ms": 0.0 }),
+    ] {
+        let r = h
+            .call(&sid, "collectors.get", params.clone())
+            .expect("read");
+        assert!(
+            suppressed_field(&r, "groups").is_none(),
+            "no grouping was requested by {params}, so nothing was ignored: {r}"
+        );
+        assert!(
+            suppressed_field(&r, "excluded_by_warmup").is_none(),
+            "no warm-up cut was requested by {params}: {r}"
+        );
+    }
+}

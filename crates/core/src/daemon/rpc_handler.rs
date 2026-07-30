@@ -1666,7 +1666,7 @@ impl RpcHandler {
                 .collectors
                 .get_snapshot(session_id, name, label)
                 .map_err(|e| e.to_string())?;
-            return Ok(snapshot_as_profile(&snap));
+            return Ok(snapshot_as_profile(&snap, params));
         }
         let armed = self
             .collectors
@@ -2353,7 +2353,12 @@ fn snapshot_summary(s: &StoredSnapshot) -> Value {
 /// a snapshot — a recorded run *is* a profile, of a window that has closed.
 /// Two shapes would mean every client branches on a parameter it passed, and
 /// the typed SDK could not name a return type at all.
-fn snapshot_as_profile(s: &StoredSnapshot) -> Value {
+/// `params` is read only to report what a recorded run could not honour. A
+/// snapshot is served from what it stored, so every read-shaping option arrives
+/// after the shaping moment has passed — and handing back numbers that ignored
+/// one, with nothing in the shape to say so, is the failure the suppression
+/// channel exists to prevent.
+fn snapshot_as_profile(s: &StoredSnapshot, params: &Value) -> Value {
     let nesting = match (&s.projections, s.def.level.has_tree()) {
         (Some(p), true) if p.nested_matches > 0 => "detected",
         (Some(_), true) => "undetected",
@@ -2369,6 +2374,38 @@ fn snapshot_as_profile(s: &StoredSnapshot) -> Value {
             "reason": "this snapshot was recorded with projections disabled, and the \
                        samples it would have been projected from are not retained",
             "remedy": "take the next snapshot with projections: true",
+        }));
+    }
+    if params
+        .get("skip_warmup_ms")
+        .and_then(|v| v.as_f64())
+        .is_some_and(|ms| ms > 0.0)
+    {
+        suppressed.push(json!({
+            "field": "excluded_by_warmup",
+            "reason": "skip_warmup_ms cannot apply to a recorded run: the projection \
+                       was computed when the snapshot was taken, and the per-span \
+                       records it was computed from are not retained. These numbers \
+                       cover the whole recorded window, warm-up included",
+            "remedy": "pass skip_warmup_ms on a live read, or reset the collector \
+                       after warm-up so the next snapshot records a clean window",
+        }));
+    }
+    // Parsed, not merely present: `group_by: ""` is a valid way to ask for no
+    // grouping, and reporting a suppression for a request nobody made is the
+    // same class of lie as staying silent about one that was ignored.
+    if params
+        .get("group_by")
+        .and_then(|v| v.as_str())
+        .and_then(GroupBy::parse)
+        .is_some_and(|g| g != GroupBy::None)
+    {
+        suppressed.push(json!({
+            "field": "groups",
+            "reason": "a recorded run is served from what it stored, and per-group \
+                       rows are not projected into a snapshot",
+            "remedy": "compare recorded runs with collectors.diff, which reads the \
+                       stored per-name and per-group breakdowns",
         }));
     }
     json!({
