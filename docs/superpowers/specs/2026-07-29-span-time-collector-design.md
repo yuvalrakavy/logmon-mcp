@@ -142,8 +142,10 @@ Plus 4 B/match per `group_keys` entry at `timing`+. The exact tier's key is wide
 `parent_span_id == 0` means root (`bytes_to_span_id(&[0;8]) → None`, so 0 is never a real id).
 **This is why a level raise may not zero-fill** (§7.1).
 
-Below `tree`, nesting is undetectable: results carry `nesting: "undetected"` and never print a
-bare total that could be mistaken for work done.
+Below `tree`, the nesting question cannot be asked: results carry `nesting: "unknown"` and
+never print a bare total that could be mistaken for work done. (`"undetected"` is reserved
+for a `tree`-level run that looked and found none — the two are different claims, and only
+the first is a reason to re-run.)
 
 ### 3.3 `group_keys`
 
@@ -806,7 +808,7 @@ reader could not reconstruct the floor — making the floor simultaneously load-
 unverifiable.
 
 `trustworthy: false` whenever any arm is single-run, truncated, has ingest loss, or reports
-`nesting: "undetected"`.
+`nesting: "unknown"` — an arm that looked and found none (`"undetected"`) is clean.
 
 ### 9.5 Body order
 
@@ -841,7 +843,7 @@ the remedy list:
 |---|---|
 | Ingest loss (`drops_in_window`, `shed_batches`, `malformed_dropped`) | Spans lost **before the collector**; `matched` may under-count and every tier is affected. Reduce load, raise the channel, re-run. |
 | Arm truncated | Self time and paths are a **mixture**. Raise `max_sample_bytes`, re-run. |
-| `nesting: "undetected"` | Below `tree`, `total_ms` may double-count and nothing can tell you. Re-run at `tree`. |
+| `nesting: "unknown"` | Below `tree`, `total_ms` may double-count and nothing can tell you. Re-run at `tree`. |
 | `nested_matches > 0` | `total_ms` double-counts; quote `self_ms`. |
 | Unmatched descendants | Attributed to the nearest matched ancestor — reads as that ancestor's work. |
 | `overlapping_child_spans > 0` | Tree not properly nested; `Σ(unclamped) = self_ms − overlapping_child_ms`. |
@@ -1259,11 +1261,12 @@ and the handler built the report as a `json!` literal, emitting `"last_value": n
 the schema promises the key is absent — and absent-versus-null is the whole distinction
 that field carries.
 
-**One spec/implementation discrepancy, resolved toward the substance.** §9.6's limitation
-row is labelled `nesting: "undetected"` but its body describes the *below-`tree`* case,
-which the code calls `"unknown"` and whose remedy ("re-run at `tree`") only makes sense
-there. The code reserves `"undetected"` for "we looked and found none". Implemented per
-the body; the label in §9.6 is the thing that is wrong.
+**One spec/implementation discrepancy, resolved toward the substance — and since
+corrected in the spec.** §3.2, §9.4 and §9.6 all wrote `nesting: "undetected"` where they
+described the *below-`tree`* case, which the code calls `"unknown"` and whose remedy
+("re-run at `tree`") only makes sense there. `"undetected"` is reserved for a `tree`-level
+run that looked and found none. Implemented per the bodies; the three labels were fixed
+2026-07-30.
 
 `FORMAT_VERSION` and `PROTOCOL_VERSION` both stay at **1**. Every addition is optional and
 defaulted, and the only version gate refuses a file *newer* than the running build — so a
