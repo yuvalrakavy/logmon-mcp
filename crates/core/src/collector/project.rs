@@ -174,13 +174,24 @@ pub fn profile(
     if warmup.is_some() && cut_ns.is_none() {
         suppressed.push(Suppressed {
             field: "excluded_by_warmup".into(),
-            reason: format!(
-                "the cut is measured from the earliest retained span, and level `{}` \
-                 retained none here — so how many spans it would have excluded is \
-                 unknown, not zero",
-                level.as_str()
+            reason: "the cut is measured from the earliest retained span, and this \
+                     read retained none — so how many spans it would have excluded \
+                     is unknown, not zero"
+                .into(),
+            // Two different causes reach here, and naming the wrong one gives
+            // circular advice. A `scalar` collector CANNOT retain records however
+            // much it matched; a `timing` or `tree` one simply has not yet —
+            // telling the second to "read at level `timing` or `tree`" tells it to
+            // adopt the level it already has.
+            remedy: Some(
+                if level.has_samples() {
+                    "read a window that has retained spans — this one holds none yet"
+                } else {
+                    "define the collector at level `timing` or `tree`; `scalar` keeps \
+                     no per-span records for a cut to be measured from"
+                }
+                .into(),
             ),
-            remedy: Some("read a window that retained samples, at level `timing` or `tree`".into()),
         });
     }
 
@@ -239,7 +250,7 @@ pub fn profile(
     let (grouped_by, groups, groups_total) = if opts.group_by == GroupBy::None {
         (None, Vec::new(), None)
     } else {
-        let (rows, total) = group_rows(snap, opts, cut_ns, warmup.is_some(), &mut suppressed);
+        let (rows, total) = group_rows(snap, opts, cut_ns, &mut suppressed);
         (Some(opts.group_by.as_str().to_string()), rows, total)
     };
 
@@ -758,7 +769,6 @@ fn group_rows(
     snap: &CollectorSnapshot,
     opts: &ProfileOptions,
     cut_ns: Option<i64>,
-    warmup_requested: bool,
     suppressed: &mut Vec<Suppressed>,
 ) -> (Vec<ProfileGroup>, Option<usize>) {
     let level = snap.def.level;
@@ -771,33 +781,6 @@ fn group_rows(
                 level.as_str()
             ),
             remedy: Some("define the collector at level `tree`".into()),
-        });
-        return (Vec::new(), None);
-    }
-
-    // Name and group rows come off the per-axis accumulators, which are written
-    // at ingest and have no window — the same property that makes the top-level
-    // `exact` and `estimated` tiers unreportable under a warm-up cut. Left in,
-    // they would hand back at full weight exactly the spans this read excluded,
-    // and `excluded_by_warmup` beside them invites a reader to reconstruct a
-    // denominator these rows do not share. Withheld for the same reason, and
-    // said out loud rather than served with a caveat somewhere else.
-    if warmup_requested && matches!(opts.group_by, GroupBy::Name | GroupBy::Group) {
-        suppressed.push(Suppressed {
-            field: "groups".into(),
-            reason: format!(
-                "`group_by: {}` reads the per-{} accumulators, which are unwindowed \
-                 for the same reason `exact` is — every row would carry the warm-up \
-                 spans this read excluded",
-                opts.group_by.as_str(),
-                opts.group_by.as_str()
-            ),
-            remedy: Some(
-                "group by `trace` or `path`, which are projected from the retained \
-                 records and honour the cut; or read without skip_warmup_ms and reset \
-                 the collector after warm-up instead"
-                    .into(),
-            ),
         });
         return (Vec::new(), None);
     }
@@ -837,6 +820,49 @@ fn group_rows(
         GroupBy::Trace => trace_rows(&snap.samples, cut_ns, opts.top_n),
         GroupBy::Path => path_rows(snap, cut_ns, opts.top_n),
     };
+
+    // Name and group rows come off the per-axis accumulators, which are written
+    // at ingest and have no window — the same property that makes the top-level
+    // `exact` and `estimated` tiers unreportable under a warm-up cut. Left in,
+    // they hand back at full weight exactly the spans this read excluded, and
+    // `excluded_by_warmup` beside them invites a reader to reconstruct a
+    // denominator these rows do not share.
+    //
+    // Keyed on the cut having RUN, not on it having been asked for. A cut that
+    // could not be positioned — `scalar`, or any window that retained nothing —
+    // excluded nothing, so these rows are the same ones a read without
+    // `skip_warmup_ms` would return, and withholding them would blank a correct
+    // breakdown while claiming it carried excluded spans.
+    //
+    // Placed after the match so each axis has already had its own say: a
+    // collector with no `group_keys` must hear that, not a warm-up explanation
+    // for an axis it never had.
+    if cut_ns.is_some() && matches!(opts.group_by, GroupBy::Name | GroupBy::Group) {
+        // The sample-derived axes honour the cut, but only `tree` retains the
+        // span identity they need — offering them at `timing` would send a
+        // reader to a grouping their level refuses.
+        let remedy = if level.has_tree() {
+            "group by `trace` or `path`, which are projected from the retained \
+             records and honour the cut; or reset the collector after warm-up so \
+             the window needs no cut"
+        } else {
+            "reset the collector after warm-up and read without skip_warmup_ms, so \
+             the whole window is already warm — the axes that do honour a cut \
+             (`trace`, `path`) need level `tree`"
+        };
+        suppressed.push(Suppressed {
+            field: "groups".into(),
+            reason: format!(
+                "`group_by: {axis}` reads the per-{axis} accumulators, which are \
+                 unwindowed for the same reason `exact` is — every row would carry \
+                 the warm-up spans this read excluded",
+                axis = opts.group_by.as_str()
+            ),
+            remedy: Some(remedy.into()),
+        });
+        return (Vec::new(), None);
+    }
+
     (rows, Some(total))
 }
 

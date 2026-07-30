@@ -2409,16 +2409,30 @@ fn snapshot_as_profile(s: &StoredSnapshot, opts: &ProfileOptions) -> Value {
     if opts.group_by != GroupBy::None {
         suppressed.push(json!({
             "field": "groups",
-            "reason": "a recorded run is served from what it stored, and no grouping \
-                       is projected into a snapshot",
-            // Deliberately NOT "use collectors.diff": that is true only for
-            // `name` and `group`, only between two runs, and only while their
-            // per-axis breakdowns are still in memory -- persistence drops those
-            // on the way to disk, so a restart makes the advice false. Grouping
-            // before the snapshot is the one remedy that always holds.
-            "remedy": "group on a live read, before snapshotting -- a recorded run \
-                       keeps its headline tiers and projections, not its per-axis \
-                       breakdowns",
+            "reason": "a recorded run is served from what it stored, and this read \
+                       path projects no grouping from it",
+            // Every shorter remedy here has been wrong. "Use collectors.diff"
+            // holds only for `name`/`group`, only between two runs, and only
+            // until a restart drops the per-axis breakdowns from disk. "Group on
+            // a live read" is the general answer but collides with the warm-up
+            // rule if the caller also passes skip_warmup_ms. And a snapshot DOES
+            // retain top call paths, which `collectors.document` renders -- so
+            // claiming nothing is stored was false for `path`. Each axis gets
+            // the answer that is true for it.
+            "remedy": match opts.group_by {
+                GroupBy::Path => "this run's top call paths ARE stored: read them with \
+                                  collectors.document, or group a live window by `path`",
+                // Not "use collectors.diff", even qualified: it reads the stored
+                // per-name rows only until a restart drops them from disk, and
+                // advice whose validity turns on invisible daemon state is worse
+                // than advice that is merely incomplete.
+                GroupBy::Name | GroupBy::Group => "group a live window before \
+                                  snapshotting -- a recorded run keeps its headline \
+                                  tiers and projections, not a grouping this path \
+                                  can project",
+                _ => "group a live window before snapshotting -- per-trace rows are \
+                      projected from per-span records, which a snapshot does not keep",
+            },
         }));
     }
     json!({

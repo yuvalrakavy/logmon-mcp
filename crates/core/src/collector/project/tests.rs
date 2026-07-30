@@ -1210,6 +1210,158 @@ fn a_warmup_cut_withholds_the_unwindowed_group_axes() {
     );
 }
 
+/// The regression guard for that withholding. A `scalar` collector retains no
+/// per-span records, so a warm-up cut can never be positioned and NOTHING is
+/// ever excluded — the per-name rows are identical to a read without the option.
+/// Keying the withholding on "a cut was requested" rather than "a cut ran"
+/// blanked every figure in the response and claimed the rows carried excluded
+/// spans, which was false.
+#[test]
+fn a_cut_that_never_ran_withholds_nothing() {
+    let spans = [
+        span("a", 1, None, 0, 40 * MS),
+        span("b", 2, None, 0, 30 * MS),
+    ];
+    let r = run(
+        Level::Scalar,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            group_by: GroupBy::Name,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        r.groups.len(),
+        2,
+        "the breakdown is correct and must be served"
+    );
+    assert_eq!(r.groups_total, Some(2));
+    assert!(
+        suppression(&r, "groups").is_none(),
+        "nothing was excluded, so nothing may claim these rows carry excluded spans"
+    );
+}
+
+/// `skip_warmup_ms: 0.0` asks for no cut at all — `warmup` filters out anything
+/// at or below zero. A mutation keying the withholding off the raw parameter
+/// instead survived the whole suite, so the edge gets its own test.
+#[test]
+fn a_zero_warmup_is_no_cut_and_withholds_nothing() {
+    let spans = [span("a", 1, None, 0, 40 * MS)];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(0.0),
+            group_by: GroupBy::Name,
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.groups.len(), 1);
+    assert!(suppression(&r, "groups").is_none());
+    assert_eq!(r.excluded_by_warmup, None, "no cut was asked for");
+}
+
+/// A collector with no `group_keys` must hear about that, not receive a warm-up
+/// explanation for an axis it never had. The withholding check runs after each
+/// axis has had its own say for exactly this reason.
+#[test]
+fn a_missing_group_axis_is_diagnosed_ahead_of_the_warmup_rule() {
+    let spans = [span("a", 1, None, 0, 40 * MS)];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(10.0),
+            group_by: GroupBy::Group,
+            ..Default::default()
+        },
+    );
+    let s = suppression(&r, "groups").expect("the missing axis must be reported");
+    assert!(
+        s.reason.contains("no group_keys"),
+        "the real problem is the absent axis, not the warm-up: {}",
+        s.reason
+    );
+    assert_eq!(
+        r.groups_total, None,
+        "a refused grouping has no denominator"
+    );
+}
+
+/// The remedy must be reachable from the level the reader is on. `trace` and
+/// `path` honour a cut but need `tree`, so offering them at `timing` sends a
+/// reader to a grouping their level refuses.
+#[test]
+fn the_withholding_remedy_only_offers_axes_the_level_supports() {
+    let spans = [
+        span("cold", 1, None, 0, 500 * MS),
+        span("warm", 2, None, 200 * MS, 210 * MS),
+    ];
+    let opts = ProfileOptions {
+        skip_warmup_ms: Some(100.0),
+        group_by: GroupBy::Name,
+        ..Default::default()
+    };
+
+    let timing = run(Level::Timing, &spans, opts.clone());
+    let r = suppression(&timing, "groups")
+        .and_then(|s| s.remedy.clone())
+        .expect("withheld with a remedy");
+    assert!(
+        !r.contains("`trace`, `path`") || r.contains("need level `tree`"),
+        "timing cannot group by trace or path, so it must not be told to: {r}"
+    );
+
+    let tree = run(Level::Tree, &spans, opts);
+    let r = suppression(&tree, "groups")
+        .and_then(|s| s.remedy.clone())
+        .expect("withheld with a remedy");
+    assert!(
+        r.contains("`trace`"),
+        "at tree those axes DO work and are the better answer: {r}"
+    );
+}
+
+/// The mirror of the level-aware remedy above, on the exclusion count: a
+/// `timing` collector whose window is simply empty must not be told to "read at
+/// level `timing` or `tree`" — advice to adopt the level it already has.
+#[test]
+fn an_empty_window_is_not_told_to_change_to_the_level_it_already_has() {
+    let r = run(
+        Level::Timing,
+        &[],
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            ..Default::default()
+        },
+    );
+    let remedy = suppression(&r, "excluded_by_warmup")
+        .and_then(|s| s.remedy.clone())
+        .expect("the absence is explained");
+    assert!(
+        !remedy.contains("level `timing`"),
+        "circular: it is already at timing: {remedy}"
+    );
+
+    let scalar = run(
+        Level::Scalar,
+        &[span("a", 1, None, 0, 10 * MS)],
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            ..Default::default()
+        },
+    );
+    let remedy = suppression(&scalar, "excluded_by_warmup")
+        .and_then(|s| s.remedy.clone())
+        .expect("the absence is explained");
+    assert!(
+        remedy.contains("`timing`"),
+        "but scalar genuinely cannot retain records, so there the level IS the fix: {remedy}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Small-n evidence: durations and spread (§2.1)
 // ---------------------------------------------------------------------------

@@ -78,16 +78,25 @@ recorded.
 
 ### Changed
 
-- **`group_by: name` and `group_by: group` are now withheld under a warm-up
-  cut**, with a `suppressed` entry saying why, and `group_by: trace` / `path`
-  are not. The name and group rows are built from accumulators written at
-  ingest, which have no window — so they were handing back at full weight
-  exactly the spans the read had excluded, next to headline figures that
-  excluded them. The two sample-derived axes are projected from the retained
-  records and honour the cut, so they are unaffected.
+- **`group_by: name` and `group_by: group` are now withheld when a warm-up cut
+  actually runs**, with a `suppressed` entry saying why. Those rows are built
+  from accumulators written at ingest, which have no window — so they were
+  handing back at full weight exactly the spans the read had excluded, next to
+  headline figures that excluded them, which is the same reason `exact` and
+  `estimated` are already withheld under a cut.
+
+  Withheld on the cut *running*, not on `skip_warmup_ms` being passed: where no
+  cut could be positioned — `scalar`, or a window that retained nothing — the
+  rows are identical to a read without the option and are served unchanged.
+  `group_by: trace` and `path` are projected from the retained records, honour
+  the cut, and are unaffected; they need level `tree`.
 
 - **An unparseable `group_by` on a snapshot read is now an error**, as it always
   was on a live read. It was previously discarded in silence.
+
+- **`collectors.history` no longer carries `durations_ms`.** The 50-record cap
+  budgets one `sampled` block; a listing embeds one per run for up to 50 runs.
+  Read a single run — `get_collector(name, snapshot=label)` — for its durations.
 
 ### Fixed
 

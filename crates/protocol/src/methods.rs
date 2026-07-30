@@ -769,9 +769,15 @@ pub struct ProfileSampled {
     /// Absent when the sample was truncated (a prefix of a run presented as its
     /// durations would invite exactly the per-value reasoning a biased subset
     /// cannot support), and absent above 50 records. On a live read `suppressed`
-    /// names which of the two applies; a recorded run carries the projection as
-    /// it stood when the snapshot was taken, without that entry, so compare
-    /// `sample_count` against the cap to tell them apart.
+    /// names which of the two applies.
+    ///
+    /// Two further absences carry no `suppressed` entry at all, because their
+    /// responses have no such channel. A recorded run read by label serves the
+    /// projection as it stood when the snapshot was taken; and any response that
+    /// LISTS runs — `collectors.history`, and the `collectors.snapshot` reply —
+    /// drops the durations whatever their size, because a bound written for one
+    /// block would otherwise multiply by the number of runs returned. Read a
+    /// single run by label to get them.
     ///
     /// Only the top-level `sampled` block populates this. Group rows leave it
     /// absent regardless of their size: it is the population the headline
@@ -1475,10 +1481,11 @@ pub struct ProfileResult {
     /// no denominator, and `0` there would read as "this run touched nothing"
     /// rather than "we did not look".
     ///
-    /// Counts every key the axis holds, `__overflow__` included when a
-    /// cardinality cap folded values into it. `CollectorsDiffResult` carries a
-    /// field of the same name that counts only *comparable* keys and so
-    /// excludes `__overflow__`; the two can differ by one on a capped axis.
+    /// Counts every key this one arm's axis holds, `__overflow__` included when
+    /// a cardinality cap folded values into it. `CollectorsDiffResult` carries a
+    /// field of the same name that counts something else — the *comparable* keys
+    /// across the union of two arms, `__overflow__` excluded — so the two are
+    /// not expected to reconcile and can differ by any amount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups_total: Option<usize>,
     /// How many retained spans `skip_warmup_ms` excluded from the sample tier.

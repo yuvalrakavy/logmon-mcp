@@ -3124,6 +3124,42 @@ fn a_snapshot_read_says_group_by_could_not_apply() {
     );
 }
 
+/// A runs LISTING must not carry the duration lists. The 50-record cap is a
+/// budget for one `sampled` block, and `collectors.history` embeds one per run
+/// for up to 50 runs — so leaving them in multiplies a bounded list into 2500
+/// floats straight into a reader's context. Deleting the blanking left the whole
+/// suite green, so the bound was real but unverified.
+#[test]
+fn a_runs_listing_drops_the_duration_lists_but_a_single_run_read_keeps_them() {
+    let (h, sid) = harness_with_a_recorded_run();
+
+    let hist = h
+        .call(&sid, "collectors.history", json!({ "name": "c" }))
+        .expect("history");
+    let listed = &hist["snapshots"][0]["sampled"];
+    assert_eq!(
+        listed["sample_count"], 4,
+        "the run is there in full, so this is a bound and not data loss"
+    );
+    assert!(
+        listed.get("durations_ms").is_none() || listed["durations_ms"].is_null(),
+        "a list view must not carry per-run duration lists: {listed}"
+    );
+
+    // The single-run read is where they live, and it is one call away.
+    let one = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "c", "snapshot": "baseline" }),
+        )
+        .expect("single run");
+    let durations = one["sampled"]["durations_ms"]
+        .as_array()
+        .expect("the recorded run keeps its own durations");
+    assert_eq!(durations.len(), 4);
+}
+
 /// The mirror of the parse fix: a typo'd `group_by` errors on a LIVE read, so it
 /// must error on a recorded one too. It previously reached the snapshot branch
 /// before parsing and was discarded in silence -- the same parameter, the same
