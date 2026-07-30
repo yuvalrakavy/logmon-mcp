@@ -414,6 +414,18 @@ impl RunToRunFloor {
         Self::over(values, "total_ms")
     }
 
+    /// The spread of the matched **count** across runs.
+    ///
+    /// Kept apart from the duration spread because they are different
+    /// quantities: a suite that runs a fixed number of iterations has near-zero
+    /// count variance while its timings vary by percent, and using one as a
+    /// threshold for the other over-suppresses in one direction and
+    /// under-suppresses in the other.
+    pub fn over_count(snapshots: &[StoredSnapshot]) -> Option<Self> {
+        let values: Vec<f64> = snapshots.iter().map(|s| s.total.count as f64).collect();
+        Self::over(values, "count")
+    }
+
     fn over(values: Vec<f64>, metric: &'static str) -> Option<Self> {
         let n = values.len();
         if n == 0 {

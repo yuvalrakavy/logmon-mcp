@@ -346,6 +346,34 @@ struct CollectorDiffParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct CollectorDocumentParams {
+    /// The arms to document. The FIRST is the baseline; every other is compared
+    /// against it. Same syntax as diff_collectors: "<collector>",
+    /// "<collector>@<label>", or "<collector>@*" for every recorded run merged.
+    names: Vec<String>,
+    /// "md" (default), "json", or "folded" for a flame graph.
+    format: Option<String>,
+    /// What you were trying to find out. Supply it — months later this is what
+    /// makes the document triageable.
+    question: Option<String>,
+    /// What you concluded. Normally supplied on a SECOND call, after reading the
+    /// first; regeneration is free and lossless.
+    finding: Option<String>,
+    /// What the filter was meant to capture. Defaults to the description.
+    filter_intent: Option<String>,
+    /// Evidence the faster arm is still correct. logmon cannot know this, and
+    /// "we asked and nobody said" is a different statement from silence.
+    correctness_evidence: Option<String>,
+    /// Break the ranked table down by "name" (default) or "group".
+    group_by: Option<String>,
+    /// Rows in the ranked table (default 15).
+    top_n: Option<u32>,
+    allow_mismatch: Option<bool>,
+    allow_lossy: Option<bool>,
+    allow_truncated: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ProfileTracesParams {
     /// Span filter DSL. Default "ALL".
     filter: Option<String>,
@@ -975,6 +1003,60 @@ impl GelfMcpServer {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap(),
         )]))
+    }
+
+    #[rmcp::tool(
+        description = "Write up a measurement: what moved, what to do next, and every caveat \
+                       attached to the number it qualifies. Returns the document as text \
+                       (markdown by default) plus a sidecar with the full percentile table -- \
+                       write them yourself if you want them on disk. Pass `question` when you \
+                       generate it and `finding` on a second call once you have read it; \
+                       regeneration is free and lossless. `format: folded` gives collapsed \
+                       stacks for a flame graph, one arm at a time, level tree only."
+    )]
+    async fn document_collectors(
+        &self,
+        Parameters(p): Parameters<CollectorDocumentParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "collectors.document",
+                serde_json::json!({
+                    "names": p.names,
+                    "format": p.format,
+                    "question": p.question,
+                    "finding": p.finding,
+                    "filter_intent": p.filter_intent,
+                    "correctness_evidence": p.correctness_evidence,
+                    "group_by": p.group_by,
+                    "top_n": p.top_n,
+                    "allow_mismatch": p.allow_mismatch,
+                    "allow_lossy": p.allow_lossy,
+                    "allow_truncated": p.allow_truncated,
+                }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        // The document itself, not a JSON envelope around it: a reader that has
+        // to unwrap a string field before it can read the markdown will spend a
+        // turn doing that, and the warnings are what it would skip.
+        let mut out = result
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if let Some(ws) = result.get("warnings").and_then(|v| v.as_array()) {
+            for w in ws.iter().filter_map(|w| w.as_str()) {
+                out.push_str(&format!("\n\n> NOTE: {w}"));
+            }
+        }
+        if let Some(name) = result.get("sidecar_name").and_then(|v| v.as_str()) {
+            out.push_str(&format!(
+                "\n\n> A sidecar `{name}` is available in this result's `sidecar_content`."
+            ));
+        }
+        Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
     #[rmcp::tool(description = "Remove a collector and release its sample budget")]

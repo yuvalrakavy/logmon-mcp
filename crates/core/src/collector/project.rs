@@ -806,10 +806,26 @@ fn trace_rows(samples: &SampleSnapshot, cut_ns: Option<i64>, top_n: usize) -> Ve
 /// the second implementation is where they would drift, and a flame graph that
 /// disagreed with the profile it came from would be worse than no flame graph.
 pub struct PathAggregate {
-    pub path: String,
+    /// Matched ancestors, root first, one frame per element. Kept unjoined
+    /// because a span named `parse > eval` is indistinguishable from two frames
+    /// once ` > ` is a separator, and a flame-graph renderer that splits the
+    /// joined form back apart would emit a stack that never ran.
+    pub frames: Vec<String>,
     pub self_ns: i128,
     pub count: u64,
     pub incomplete: bool,
+}
+
+impl PathAggregate {
+    /// The display form, `[?] > a > b` when the chain is a suffix.
+    pub fn path(&self) -> String {
+        let joined = self.frames.join(" > ");
+        if self.incomplete {
+            format!("[?] > {joined}")
+        } else {
+            joined
+        }
+    }
 }
 
 /// Call paths (§5.4): self time aggregated by the chain of matched ancestors,
@@ -871,34 +887,38 @@ pub fn path_aggregates(snap: &CollectorSnapshot, cut_ns: Option<i64>) -> Vec<Pat
     struct Row {
         self_ns: i128,
         count: u64,
-        incomplete: bool,
     }
-    let mut rows: HashMap<String, Row> = HashMap::new();
+    // Keyed by (frames, incomplete): a complete chain `a > b` and a suffix of
+    // some deeper chain that also ends `a > b` are different paths, and folding
+    // them together would attribute an unknown prefix's time to a known root.
+    let mut rows: HashMap<(Vec<String>, bool), Row> = HashMap::new();
 
     for (i, d) in durations.iter().enumerate() {
         let covered = children.get_mut(&i).map(|v| union_len(v)).unwrap_or(0);
         let self_ns = (*d as i128 - covered).max(0);
-        let (path, incomplete) = walk_path(i, &parents, &traces, &names, &by_id, &snap.names);
-        let row = rows.entry(path).or_insert(Row {
+        let (frames, incomplete) = walk_path(i, &parents, &traces, &names, &by_id, &snap.names);
+        let row = rows.entry((frames, incomplete)).or_insert(Row {
             self_ns: 0,
             count: 0,
-            incomplete: false,
         });
         row.self_ns += self_ns;
         row.count += 1;
-        row.incomplete |= incomplete;
     }
 
     let mut v: Vec<PathAggregate> = rows
         .into_iter()
-        .map(|(path, r)| PathAggregate {
-            path,
+        .map(|((frames, incomplete), r)| PathAggregate {
+            frames,
             self_ns: r.self_ns,
             count: r.count,
-            incomplete: r.incomplete,
+            incomplete,
         })
         .collect();
-    v.sort_by(|a, b| b.self_ns.cmp(&a.self_ns).then_with(|| a.path.cmp(&b.path)));
+    v.sort_by(|a, b| {
+        b.self_ns
+            .cmp(&a.self_ns)
+            .then_with(|| a.frames.cmp(&b.frames))
+    });
     v
 }
 
@@ -908,7 +928,7 @@ fn path_rows(snap: &CollectorSnapshot, cut_ns: Option<i64>, top_n: usize) -> Vec
         .into_iter()
         .take(top_n)
         .map(|p| ProfileGroup {
-            key: p.path,
+            key: p.path(),
             exact: None,
             estimated: None,
             sampled: Some(ProfileSampled {
@@ -954,12 +974,12 @@ pub fn project_paths(snap: &CollectorSnapshot) -> (Vec<logmon_broker_protocol::P
     let mut out = Vec::new();
     let mut bytes = 0usize;
     for p in all.iter().take(SNAPSHOT_PATH_ROWS) {
-        bytes += p.path.len();
+        bytes += p.frames.iter().map(String::len).sum::<usize>();
         if bytes > SNAPSHOT_PATH_BYTES && !out.is_empty() {
             break;
         }
         out.push(logmon_broker_protocol::PathRow {
-            path: p.path.clone(),
+            frames: p.frames.clone(),
             self_ms: ns_to_ms(p.self_ns),
             count: p.count,
             incomplete: p.incomplete,
@@ -969,8 +989,8 @@ pub fn project_paths(snap: &CollectorSnapshot) -> (Vec<logmon_broker_protocol::P
     (out, truncated)
 }
 
-/// Walk matched ancestors, root first. Returns the rendered path and whether
-/// it is a suffix rather than a complete chain.
+/// Walk matched ancestors, root first. Returns the frames and whether the chain
+/// is a suffix rather than complete.
 fn walk_path(
     start: usize,
     parents: &[u64],
@@ -978,8 +998,8 @@ fn walk_path(
     names: &[u32],
     by_id: &HashMap<(u128, u64), usize>,
     interner: &Interner,
-) -> (String, bool) {
-    let mut chain: Vec<&str> = vec![interner.resolve(names[start])];
+) -> (Vec<String>, bool) {
+    let mut chain: Vec<String> = vec![interner.resolve(names[start]).to_string()];
     let mut visited: Vec<usize> = vec![start];
     let mut cur = start;
     let mut incomplete = false;
@@ -1003,17 +1023,13 @@ fn walk_path(
             incomplete = true;
             break;
         }
-        chain.push(interner.resolve(names[p]));
+        chain.push(interner.resolve(names[p]).to_string());
         visited.push(p);
         cur = p;
     }
 
     chain.reverse();
-    let mut path = chain.join(" > ");
-    if incomplete {
-        path = format!("[?] > {path}");
-    }
-    (path, incomplete)
+    (chain, incomplete)
 }
 
 /// Rank by total time descending, then by key so equal rows are stable across

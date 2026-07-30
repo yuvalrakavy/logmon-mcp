@@ -2322,3 +2322,257 @@ fn a_diff_arm_belongs_to_the_calling_session_only() {
         .expect_err("not visible to B");
     assert!(err.contains("cache"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// collectors.document (spec §9)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_document_renders_end_to_end_with_both_arms_and_a_sidecar() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 20, 10.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 20, 5.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({
+                "names": ["cache@before", "cache@after"],
+                "question": "did the cache help",
+            }),
+        )
+        .expect("rendered");
+
+    assert_eq!(got["format"], "md");
+    let content = got["content"].as_str().expect("content");
+    assert!(content.starts_with("---\n"), "front matter first");
+    assert!(content.contains("question: \"did the cache help\""));
+    assert!(content.contains("## 1. What moved"));
+    assert!(content.contains("## 5. Definitions and how to read the numbers"));
+    assert_eq!(got["bytes"], content.len() as u64);
+
+    // §9.9: the daemon returns bytes; the client writes them. So there is no
+    // `path` parameter here and nothing was written.
+    let name = got["sidecar_name"].as_str().expect("sidecar named");
+    assert!(content.contains(name), "the front matter names the sidecar");
+    assert!(got["sidecar_content"]
+        .as_str()
+        .expect("sidecar body")
+        .contains("percentiles_ms"));
+}
+
+#[test]
+fn a_document_of_merged_arms_is_trustworthy_and_a_single_run_one_is_not() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "base");
+    for (i, ms) in [10.0, 11.0, 12.0].iter().enumerate() {
+        run_and_snapshot(&h, &sid, "base", &format!("r{i}"), 20, *ms);
+    }
+    armed(&h, &sid, "cand");
+    for (i, ms) in [5.0, 5.5, 6.0].iter().enumerate() {
+        run_and_snapshot(&h, &sid, "cand", &format!("s{i}"), 20, *ms);
+    }
+
+    let merged = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["base@*", "cand@*"] }),
+        )
+        .expect("rendered");
+    let c = merged["content"].as_str().unwrap();
+    assert!(c.contains("trustworthy: true"), "{c}");
+    assert!(c.contains("every arm merges several runs"));
+    assert!(!c.contains("**Single-run arm.**"));
+
+    let single = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["base@r0", "cand@s0"] }),
+        )
+        .expect("rendered");
+    let c = single["content"].as_str().unwrap();
+    assert!(c.contains("trustworthy: false"));
+    assert!(c.contains("**Single-run arm.**"), "with its remedy");
+}
+
+#[test]
+fn a_single_arm_document_is_permitted() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "only", 10, 10.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["cache@only"] }),
+        )
+        .expect("rendered");
+    let c = got["content"].as_str().unwrap();
+    assert!(c.contains("describes **one** arm"));
+    assert!(c.contains("## 3. Per-run detail"));
+}
+
+#[test]
+fn the_json_format_is_machine_readable_and_carries_the_comparisons() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 20, 10.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 20, 5.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["cache@before", "cache@after"], "format": "json" }),
+        )
+        .expect("rendered");
+    assert_eq!(got["format"], "json");
+    let v: Value = serde_json::from_str(got["content"].as_str().unwrap()).expect("valid json");
+    assert_eq!(v["trustworthy"], false);
+    assert_eq!(v["correctness_evidence"], "unknown");
+    assert!(v["comparisons"][0]["rows"].as_array().unwrap().len() > 4);
+}
+
+#[test]
+fn folded_output_matches_the_importer_regex_and_uses_integer_microseconds() {
+    // §9.8: speedscope matches ^(.*) (\d+)$ and drops a non-matching line
+    // SILENTLY, while flamegraph.pl accepts decimals — so a decimal would
+    // render in one tool and vanish without warning in the other.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "r", 10, 10.0);
+
+    let got = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["cache@r"], "format": "folded" }),
+        )
+        .expect("rendered");
+    assert_eq!(got["format"], "folded");
+    let content = got["content"].as_str().unwrap();
+    assert!(!content.is_empty(), "the snapshot recorded paths");
+    for line in content.lines() {
+        assert!(!line.contains('.'), "no decimals: {line:?}");
+        let (frames, count) = line.rsplit_once(' ').expect("one ASCII space: {line:?}");
+        assert!(!frames.is_empty());
+        assert!(count.parse::<u64>().is_ok(), "{line:?}");
+    }
+    // The sidecar carries the invocation, because collapsed-stack format has no
+    // unit concept of its own.
+    assert!(got["sidecar_content"]
+        .as_str()
+        .unwrap()
+        .contains("flamegraph.pl --countname us --nametype Span"));
+}
+
+#[test]
+fn folded_is_refused_below_tree_with_the_level_and_the_remedy() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({ "name": "flat", "filter": "sv=store_server", "level": "timing" }),
+    )
+    .unwrap();
+    run_and_snapshot(&h, &sid, "flat", "r", 5, 10.0);
+
+    let err = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["flat@r"], "format": "folded" }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("level `timing`"), "{err}");
+    assert!(err.contains("Re-run at level `tree`"), "{err}");
+}
+
+#[test]
+fn a_document_with_no_arms_says_what_an_arm_looks_like() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let err = h
+        .call(&sid, "collectors.document", json!({ "names": [] }))
+        .expect_err("refused");
+    assert!(err.contains("names"), "{err}");
+    assert!(err.contains("baseline"), "{err}");
+    assert!(err.contains("@*"), "and the merged form: {err}");
+}
+
+#[test]
+fn too_many_arms_is_refused_with_the_number_rather_than_truncated() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "r", 5, 10.0);
+    let names: Vec<String> = (0..9).map(|_| "cache@r".to_string()).collect();
+
+    let err = h
+        .call(&sid, "collectors.document", json!({ "names": names }))
+        .expect_err("refused");
+    assert!(err.contains("too many arms (9 > 8)"), "{err}");
+    assert!(err.contains("in groups"), "and what to do: {err}");
+}
+
+#[test]
+fn an_unknown_format_names_the_three_that_exist() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    let err = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": ["cache"], "format": "pdf" }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("`md`, `json` or `folded`"), "{err}");
+}
+
+#[test]
+fn regenerating_with_a_finding_changes_only_the_finding() {
+    // V22, and the reason `path` is optional: `finding` arrives after the first
+    // read, so regeneration has to be free and lossless.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 20, 10.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 20, 5.0);
+
+    let names = json!(["cache@before", "cache@after"]);
+    let first = h
+        .call(&sid, "collectors.document", json!({ "names": names }))
+        .unwrap();
+    let second = h
+        .call(
+            &sid,
+            "collectors.document",
+            json!({ "names": names, "finding": "halved" }),
+        )
+        .unwrap();
+
+    let (a, b) = (
+        first["content"].as_str().unwrap(),
+        second["content"].as_str().unwrap(),
+    );
+    assert!(a.contains("finding: null"));
+    assert!(b.contains("finding: \"halved\""));
+    assert!(b.contains("**Finding.** halved"));
+    // Every section survives regeneration; the annotation is not traded for
+    // anything.
+    for section in ["## 1.", "## 2.", "## 3.", "## 4.", "## 5."] {
+        assert!(a.contains(section) && b.contains(section), "{section}");
+    }
+}

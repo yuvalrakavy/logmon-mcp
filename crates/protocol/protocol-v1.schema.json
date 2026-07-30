@@ -5587,6 +5587,13 @@
             "$ref": "#/$defs/DiffGroup"
           }
         },
+        "groups_total": {
+          "description": "Comparable keys **before** `top_n` truncation, so a reader can tell \"the\ntop 15 of 15\" from \"the top 15 of 200\".",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
         "marks": {
           "type": "array",
           "items": {
@@ -6411,9 +6418,12 @@
       "description": "One call path's self time, as a snapshot retains it (§9.8).\n\nRecorded at snapshot time because the per-span records it is walked from are\nnot retained — a flame graph not taken then cannot be taken later. The list\nis capped, and a snapshot says when it was cut short: a flame graph rendered\nfrom a partial list is missing mass, and nothing about looking at one reveals\nthat.",
       "type": "object",
       "properties": {
-        "path": {
-          "description": "Matched ancestors, root first, joined with ` > `. A leading `[?]` means\nthe walk stopped at a parent that was not retained, so this is a suffix\nrather than a root-to-here chain.",
-          "type": "string"
+        "frames": {
+          "description": "Matched ancestors, root first, **one frame per element**.\n\nA list rather than a joined string, because the joined form is\nambiguous: a span named `parse > eval` is indistinguishable from two\nframes once ` > ` is the separator, and the flame-graph renderer that\nsplits it back apart would silently produce a stack that never ran. The\ndisplay form is derived; this is the form that survives.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "self_ms": {
           "description": "Time in this path and nothing matched below it.",
@@ -6426,13 +6436,143 @@
           "minimum": 0
         },
         "incomplete": {
+          "description": "The walk stopped at a parent that was not retained, so this is a suffix\nrather than a root-to-here chain. Rendered with a leading `[?]` frame.",
           "type": "boolean"
         }
       },
       "required": [
-        "path",
+        "frames",
         "self_ms",
         "count"
+      ]
+    },
+    "CollectorsDocument": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsDocument",
+      "description": "`collectors.document` — render a measurement for a reader (§9).\n\n**The daemon returns bytes; the client writes them** (§9.9). The broker runs\nas a service, so a relative path would resolve against its working directory\nrather than the caller's — and `logs.export` already puts the write in the\nclient for the same reason. Regeneration is free and lossless, so nothing is\nstored: the normal shape is to read the document, learn something, and\nregenerate it with `finding` filled in.",
+      "type": "object",
+      "properties": {
+        "names": {
+          "description": "The arms to document. The **first is the baseline**; every other one is\ncompared against it. Same syntax as `collectors.diff`.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "format": {
+          "description": "`md` (default), `json`, or `folded`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "question": {
+          "description": "What you were trying to find out. Carries most of the triage weight when\nthis is read months later, which is why it is asked for.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finding": {
+          "description": "What you concluded. Normally supplied on a **second** call, after the\nfirst read — which is why regeneration is free.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filter_intent": {
+          "description": "What the filter was meant to capture. Defaults to the collector's\ndescription.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "correctness_evidence": {
+          "description": "Evidence that the faster arm is still correct. logmon cannot know this,\nand \"we asked and nobody supplied it\" is a different statement from\nsilence — so the field is always present and defaults to `unknown`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_by": {
+          "description": "`name` (default) or `group`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "top_n": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "allow_mismatch": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_lossy": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_truncated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "names"
+      ]
+    },
+    "CollectorsDocumentResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsDocumentResult",
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        },
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sidecar_name": {
+          "description": "The bulk companion (§9.7) — a percentile table plus layout identity,\nwhich is what decides whether two documents are comparable. Named in the\ndocument's own front-matter so the two can be reunited after being moved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sidecar_content": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "description": "Things to know about the *document*, as distinct from the measurement it\ndescribes — a path list that was capped, detail moved to the sidecar.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "content",
+        "format",
+        "bytes"
       ]
     },
     "ProfileResult": {

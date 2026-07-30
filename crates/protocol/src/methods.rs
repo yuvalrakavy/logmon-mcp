@@ -768,15 +768,35 @@ pub struct ProfileGroup {
 /// that.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct PathRow {
-    /// Matched ancestors, root first, joined with ` > `. A leading `[?]` means
-    /// the walk stopped at a parent that was not retained, so this is a suffix
-    /// rather than a root-to-here chain.
-    pub path: String,
+    /// Matched ancestors, root first, **one frame per element**.
+    ///
+    /// A list rather than a joined string, because the joined form is
+    /// ambiguous: a span named `parse > eval` is indistinguishable from two
+    /// frames once ` > ` is the separator, and the flame-graph renderer that
+    /// splits it back apart would silently produce a stack that never ran. The
+    /// display form is derived; this is the form that survives.
+    pub frames: Vec<String>,
     /// Time in this path and nothing matched below it.
     pub self_ms: f64,
     pub count: u64,
+    /// The walk stopped at a parent that was not retained, so this is a suffix
+    /// rather than a root-to-here chain. Rendered with a leading `[?]` frame.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incomplete: bool,
+}
+
+impl PathRow {
+    /// The display form `a > b > c`, with `[?]` prefixed when the chain is a
+    /// suffix. Matches the key `traces.profile` uses for a `path` row, so a path
+    /// quoted from a profile can be found in a document.
+    pub fn path(&self) -> String {
+        let joined = self.frames.join(" > ");
+        if self.incomplete {
+            format!("[?] > {joined}")
+        } else {
+            joined
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1206,6 +1226,10 @@ pub struct CollectorsDiffResult {
     pub grouped_by: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<DiffGroup>,
+    /// Comparable keys **before** `top_n` truncation, so a reader can tell "the
+    /// top 15 of 15" from "the top 15 of 200".
+    #[serde(default)]
+    pub groups_total: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<DiffMark>,
     /// How many group rows were dropped because a cardinality cap folded them
@@ -1216,6 +1240,70 @@ pub struct CollectorsDiffResult {
     pub overflow_rows_suppressed: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppressed: Vec<Suppressed>,
+}
+
+/// `collectors.document` — render a measurement for a reader (§9).
+///
+/// **The daemon returns bytes; the client writes them** (§9.9). The broker runs
+/// as a service, so a relative path would resolve against its working directory
+/// rather than the caller's — and `logs.export` already puts the write in the
+/// client for the same reason. Regeneration is free and lossless, so nothing is
+/// stored: the normal shape is to read the document, learn something, and
+/// regenerate it with `finding` filled in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsDocument {
+    /// The arms to document. The **first is the baseline**; every other one is
+    /// compared against it. Same syntax as `collectors.diff`.
+    pub names: Vec<String>,
+    /// `md` (default), `json`, or `folded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// What you were trying to find out. Carries most of the triage weight when
+    /// this is read months later, which is why it is asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// What you concluded. Normally supplied on a **second** call, after the
+    /// first read — which is why regeneration is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding: Option<String>,
+    /// What the filter was meant to capture. Defaults to the collector's
+    /// description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_intent: Option<String>,
+    /// Evidence that the faster arm is still correct. logmon cannot know this,
+    /// and "we asked and nobody supplied it" is a different statement from
+    /// silence — so the field is always present and defaults to `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness_evidence: Option<String>,
+    /// `name` (default) or `group`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_mismatch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_lossy: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_truncated: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsDocumentResult {
+    pub content: String,
+    pub format: String,
+    pub bytes: u64,
+    /// The bulk companion (§9.7) — a percentile table plus layout identity,
+    /// which is what decides whether two documents are comparable. Named in the
+    /// document's own front-matter so the two can be reunited after being moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_content: Option<String>,
+    /// Things to know about the *document*, as distinct from the measurement it
+    /// describes — a path list that was capped, detail moved to the sidecar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

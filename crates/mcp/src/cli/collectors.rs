@@ -6,9 +6,9 @@
 
 use clap::{Args, Subcommand};
 use logmon_broker_protocol::{
-    CollectorsAdd, CollectorsDiff, CollectorsDiffResult, CollectorsEdit, CollectorsGet,
-    CollectorsHistory, CollectorsList, CollectorsName, CollectorsSnapshot, DiffRow, ProfileResult,
-    TracesProfile,
+    CollectorsAdd, CollectorsDiff, CollectorsDiffResult, CollectorsDocument, CollectorsEdit,
+    CollectorsGet, CollectorsHistory, CollectorsList, CollectorsName, CollectorsSnapshot, DiffRow,
+    ProfileResult, TracesProfile,
 };
 use logmon_broker_sdk::Broker;
 
@@ -125,6 +125,46 @@ enum ColVerb {
         #[arg(long)]
         allow_lossy: bool,
         /// Compare when both arms hit the sample budget.
+        #[arg(long)]
+        allow_truncated: bool,
+    },
+    /// Write up a measurement: what moved, what to do next, every caveat beside
+    /// the number it qualifies.
+    ///
+    /// The first arm is the baseline. Pass --path to write the document (and its
+    /// sidecar) to disk; otherwise it goes to stdout. Regeneration is free and
+    /// lossless, so the normal shape is to read it, then regenerate with
+    /// --finding filled in.
+    Document {
+        /// Arms to document; the first is the baseline.
+        names: Vec<String>,
+        /// md (default) | json | folded
+        #[arg(long)]
+        format: Option<String>,
+        /// Where to write it. Omitted: stdout.
+        #[arg(long)]
+        path: Option<String>,
+        /// What you were trying to find out.
+        #[arg(long)]
+        question: Option<String>,
+        /// What you concluded. Usually supplied on a second run.
+        #[arg(long)]
+        finding: Option<String>,
+        /// What the filter was meant to capture.
+        #[arg(long)]
+        filter_intent: Option<String>,
+        /// Evidence the faster arm is still correct.
+        #[arg(long)]
+        correctness_evidence: Option<String>,
+        /// name (default) | group
+        #[arg(long)]
+        group_by: Option<String>,
+        #[arg(long)]
+        top_n: Option<u64>,
+        #[arg(long)]
+        allow_mismatch: bool,
+        #[arg(long)]
+        allow_lossy: bool,
         #[arg(long)]
         allow_truncated: bool,
     },
@@ -498,6 +538,99 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
                 return 0;
             }
             print_diff(&result);
+            0
+        }
+
+        ColVerb::Document {
+            names,
+            format,
+            path,
+            question,
+            finding,
+            filter_intent,
+            correctness_evidence,
+            group_by,
+            top_n,
+            allow_mismatch,
+            allow_lossy,
+            allow_truncated,
+        } => {
+            if names.is_empty() {
+                format::error(
+                    "give at least one arm: <collector>, <collector>@<label>, or \
+                     <collector>@* for every recorded run merged",
+                    json,
+                );
+                return 1;
+            }
+            let result = match broker
+                .collectors_document(CollectorsDocument {
+                    names,
+                    format,
+                    question,
+                    finding,
+                    filter_intent,
+                    correctness_evidence,
+                    group_by,
+                    top_n,
+                    allow_mismatch: Some(allow_mismatch),
+                    allow_lossy: Some(allow_lossy),
+                    allow_truncated: Some(allow_truncated),
+                })
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    format::error(&format!("collectors.document failed: {e}"), json);
+                    return 1;
+                }
+            };
+            if json {
+                format::print_json(&result);
+                return 0;
+            }
+            // The daemon returns bytes and the client writes them (spec 9.9):
+            // the broker runs as a service, so a relative path would resolve
+            // against its working directory rather than the caller's.
+            match &path {
+                None => {
+                    println!("{}", result.content);
+                    for w in &result.warnings {
+                        eprintln!("note: {w}");
+                    }
+                    if result.sidecar_name.is_some() {
+                        eprintln!(
+                            "note: a sidecar was produced but not written — pass --path to \
+                             write both"
+                        );
+                    }
+                }
+                Some(p) => {
+                    if let Err(e) = std::fs::write(p, &result.content) {
+                        format::error(&format!("could not write {p}: {e}"), json);
+                        return 1;
+                    }
+                    println!("wrote {p} ({} bytes)", result.bytes);
+                    // The sidecar goes beside the document, under the name the
+                    // document's own front-matter already refers to — so the two
+                    // can be reunited after being moved or mailed on.
+                    if let (Some(name), Some(body)) =
+                        (&result.sidecar_name, &result.sidecar_content)
+                    {
+                        let dir = std::path::Path::new(p)
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."));
+                        let side = dir.join(name);
+                        match std::fs::write(&side, body) {
+                            Ok(()) => println!("wrote {} ({} bytes)", side.display(), body.len()),
+                            Err(e) => eprintln!("warning: could not write sidecar {name}: {e}"),
+                        }
+                    }
+                    for w in &result.warnings {
+                        eprintln!("note: {w}");
+                    }
+                }
+            }
             0
         }
 

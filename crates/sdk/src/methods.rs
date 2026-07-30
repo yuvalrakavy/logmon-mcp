@@ -12,17 +12,18 @@ use crate::{Broker, BrokerError};
 use logmon_broker_protocol::{
     BookmarksAdd, BookmarksAddResult, BookmarksClear, BookmarksClearResult, BookmarksList,
     BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, CollectorsAdd,
-    CollectorsAddResult, CollectorsDiff, CollectorsDiffResult, CollectorsEdit,
-    CollectorsEditResult, CollectorsGet, CollectorsHistory, CollectorsHistoryResult,
-    CollectorsList, CollectorsListResult, CollectorsName, CollectorsRemoveResult,
-    CollectorsResetResult, CollectorsSnapshot, DomainsClear, DomainsClearResult, DomainsCreate,
-    DomainsCreateResult, DomainsDelete, DomainsDeleteResult, DomainsList, DomainsListResult,
-    DomainsUse, DomainsUseResult, FiltersAdd, FiltersAddResult, FiltersEdit, FiltersEditResult,
-    FiltersList, FiltersListResult, FiltersRemove, FiltersRemoveResult, LogsClear, LogsClearResult,
-    LogsContext, LogsContextResult, LogsExport, LogsExportResult, LogsRecent, LogsRecentResult,
-    ProfileResult, SessionDrop, SessionDropResult, SessionList, SessionListResult, SnapshotSummary,
-    SpansContext, SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult,
-    TracesLogs, TracesLogsResult, TracesProfile, TracesRecent, TracesRecentResult, TracesSlow,
+    CollectorsAddResult, CollectorsDiff, CollectorsDiffResult, CollectorsDocument,
+    CollectorsDocumentResult, CollectorsEdit, CollectorsEditResult, CollectorsGet,
+    CollectorsHistory, CollectorsHistoryResult, CollectorsList, CollectorsListResult,
+    CollectorsName, CollectorsRemoveResult, CollectorsResetResult, CollectorsSnapshot,
+    DomainsClear, DomainsClearResult, DomainsCreate, DomainsCreateResult, DomainsDelete,
+    DomainsDeleteResult, DomainsList, DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd,
+    FiltersAddResult, FiltersEdit, FiltersEditResult, FiltersList, FiltersListResult,
+    FiltersRemove, FiltersRemoveResult, LogsClear, LogsClearResult, LogsContext, LogsContextResult,
+    LogsExport, LogsExportResult, LogsRecent, LogsRecentResult, ProfileResult, SessionDrop,
+    SessionDropResult, SessionList, SessionListResult, SnapshotSummary, SpansContext,
+    SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult, TracesLogs,
+    TracesLogsResult, TracesProfile, TracesRecent, TracesRecentResult, TracesSlow,
     TracesSlowResult, TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult,
     TriggersEdit, TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove,
     TriggersRemoveResult,
@@ -157,6 +158,15 @@ impl Broker {
         p: CollectorsDiff,
     ) -> Result<CollectorsDiffResult, BrokerError> {
         self.call_typed("collectors.diff", p).await
+    }
+    /// Render a measurement for a reader. The daemon returns bytes; **writing
+    /// them is the caller's job** — the broker runs as a service, so a relative
+    /// path would resolve against its working directory rather than yours.
+    pub async fn collectors_document(
+        &self,
+        p: CollectorsDocument,
+    ) -> Result<CollectorsDocumentResult, BrokerError> {
+        self.call_typed("collectors.document", p).await
     }
 
     // ---- bookmarks.* ----

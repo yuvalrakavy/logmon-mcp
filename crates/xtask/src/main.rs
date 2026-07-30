@@ -163,6 +163,8 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "DiffGroup":             schema_for!(DiffGroup),
             "DiffMark":              schema_for!(DiffMark),
             "PathRow":               schema_for!(PathRow),
+            "CollectorsDocument":    schema_for!(CollectorsDocument),
+            "CollectorsDocumentResult": schema_for!(CollectorsDocumentResult),
             "ProfileResult":         schema_for!(ProfileResult),
             "ProfileWindow":         schema_for!(ProfileWindow),
             "ProfileIngest":         schema_for!(ProfileIngest),

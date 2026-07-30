@@ -910,12 +910,30 @@ fn a_merged_arm_omits_sample_derived_figures_rather_than_summing_them() {
     assert!(merged.projections.is_none(), "omitted, not summed");
     assert!(merged.paths.is_empty(), "and neither do path lists merge");
 
-    // Which the diff then reports as a suppression rather than a silent gap.
+    // Which the diff then reports as a suppression rather than a silent gap —
+    // and names the ACTUAL reason. "Recorded with projections disabled" is a
+    // false statement about a merged arm, and a suppression channel is only
+    // worth having if a reader can trust what it says.
     let d = diff(merged, arm("b", 50, 10), &DiffOptions::default()).unwrap();
-    assert!(d
+    let sup = d
         .suppressed
         .iter()
-        .any(|s| s.field == "sampled" && s.reason.contains("projections")));
+        .find(|s| s.field == "sampled")
+        .expect("suppressed with a reason");
+    assert!(
+        sup.reason.contains("merges several runs") && sup.reason.contains("is not a self time"),
+        "{}",
+        sup.reason
+    );
+    assert!(
+        !sup.reason.contains("projections disabled"),
+        "which is not what happened: {}",
+        sup.reason
+    );
+    assert!(sup
+        .remedy
+        .as_ref()
+        .is_some_and(|r| r.contains("single run")));
 }
 
 #[test]
@@ -1070,20 +1088,29 @@ fn a_snapshot_records_call_paths_because_they_cannot_be_computed_later() {
     let view = c.swap(at(60));
     let projected = crate::collector::project::project_for_snapshot(&view);
 
-    let paths: Vec<&str> = projected.paths.iter().map(|p| p.path.as_str()).collect();
+    let paths: Vec<String> = projected.paths.iter().map(|p| p.path()).collect();
     assert!(
-        paths.contains(&"handler > db"),
+        paths.iter().any(|p| p == "handler > db"),
         "the chain is rendered root first: {paths:?}"
     );
-    assert!(paths.contains(&"handler"));
+    assert!(paths.iter().any(|p| p == "handler"));
     assert!(!projected.paths_truncated);
+
+    // Stored as frames, not a joined string: a span named `parse > eval` would
+    // otherwise be indistinguishable from two frames on the way back out.
+    let nested = projected
+        .paths
+        .iter()
+        .find(|p| p.path() == "handler > db")
+        .unwrap();
+    assert_eq!(nested.frames, vec!["handler", "db"]);
 
     // Self time, not total: `handler` keeps 40 ms of its 100 once `db`'s
     // clipped interval is removed.
     let handler = projected
         .paths
         .iter()
-        .find(|p| p.path == "handler")
+        .find(|p| p.path() == "handler")
         .unwrap();
     assert!(
         (handler.self_ms - 40.0).abs() < 0.001,
@@ -1145,7 +1172,7 @@ fn path_rows_survive_a_persistence_round_trip() {
     let back: PersistedSnapshot = serde_json::from_str(&json).expect("decode");
     let restored = back.restore("c").expect("restore");
     assert_eq!(restored.paths.len(), 2);
-    assert_eq!(restored.paths[0].path, s.paths[0].path);
+    assert_eq!(restored.paths[0].frames, s.paths[0].frames);
     assert_eq!(restored.paths_truncated, s.paths_truncated);
 }
 

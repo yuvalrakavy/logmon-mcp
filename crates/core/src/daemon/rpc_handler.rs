@@ -200,6 +200,9 @@ impl RpcHandler {
             "collectors.snapshot" => self.handle_collectors_snapshot(session_id, &request.params),
             "collectors.history" => self.handle_collectors_history(session_id, &request.params),
             "collectors.diff" => self.handle_collectors_diff(session_id, &request.params),
+            "collectors.document" => {
+                self.handle_collectors_document(session_id, &request.params)
+            }
             "collectors.reset" => self.handle_collectors_reset(session_id, &request.params),
             "collectors.remove" => self.handle_collectors_remove(session_id, &request.params),
             "traces.profile" => self.handle_traces_profile(session_id, &request.params),
@@ -1940,6 +1943,95 @@ impl RpcHandler {
 
         let result = diff(a, b, &opts).map_err(|e| e.to_string())?;
         serde_json::to_value(result.to_wire()).map_err(|e| e.to_string())
+    }
+
+    /// `collectors.document` — render a measurement for a reader (§9).
+    fn handle_collectors_document(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        use crate::collector::diff::{DiffAllowances, DiffGroupBy};
+        use crate::collector::document::{document, DocumentOptions, Format};
+
+        let names: Vec<String> = params
+            .get("names")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if names.is_empty() {
+            return Err(
+                "missing required parameter: names — the arms to document, first one the \
+                 baseline. An arm is `<collector>`, `<collector>@<label>`, or \
+                 `<collector>@*` for every recorded run merged"
+                    .to_string(),
+            );
+        }
+        // Bounded because each arm is resolved and held in memory at once, and a
+        // merged arm carries the union of its runs' per-axis maps. Refused with
+        // the number rather than silently truncated: a caller who asked for
+        // twenty arms wants to know they did not get them.
+        const MAX_ARMS: usize = 8;
+        if names.len() > MAX_ARMS {
+            return Err(format!(
+                "too many arms ({} > {MAX_ARMS}): every arm is resolved and held at once, \
+                 and a document comparing more than a handful against one baseline is not \
+                 a table anyone reads. Document them in groups",
+                names.len()
+            ));
+        }
+
+        let format = match params.get("format").and_then(|v| v.as_str()) {
+            None => Format::Md,
+            Some(s) => Format::parse(s).ok_or_else(|| {
+                format!("unknown format `{s}`: expected `md`, `json` or `folded`")
+            })?,
+        };
+        let group_by = match params.get("group_by").and_then(|v| v.as_str()) {
+            None => DiffGroupBy::Name,
+            Some(s) => DiffGroupBy::parse(s)
+                .ok_or_else(|| format!("unknown group_by `{s}`: expected `name` or `group`"))?,
+        };
+        let opt_str = |k: &str| params.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let opts = DocumentOptions {
+            format,
+            question: opt_str("question"),
+            finding: opt_str("finding"),
+            filter_intent: opt_str("filter_intent"),
+            correctness_evidence: opt_str("correctness_evidence"),
+            group_by,
+            top_n: params
+                .get("top_n")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(15),
+            allow: DiffAllowances {
+                mismatch: flag("allow_mismatch"),
+                lossy: flag("allow_lossy"),
+                truncated: flag("allow_truncated"),
+            },
+        };
+
+        let mut arms = Vec::with_capacity(names.len());
+        for spec in &names {
+            arms.push(self.resolve_arm(session_id, spec)?);
+        }
+
+        let doc = document(&arms, &opts, Utc::now()).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "content": doc.content,
+            "format": doc.format,
+            "bytes": doc.bytes,
+            "sidecar_name": doc.sidecar.as_ref().map(|s| s.name.clone()),
+            "sidecar_content": doc.sidecar.as_ref().map(|s| s.content.clone()),
+            "warnings": doc.warnings,
+        }))
     }
 
     /// Resolve `<collector>`, `<collector>@<label>`, or `<collector>@*` into an

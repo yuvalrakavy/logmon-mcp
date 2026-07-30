@@ -170,8 +170,16 @@ pub struct Arm {
     /// arm — a live read projects them fresh — and for a merged one.
     pub paths: Vec<logmon_broker_protocol::PathRow>,
     pub paths_truncated: bool,
-    /// Spread across the runs this arm merges. `None` for a single run.
+    /// Spread of `total_ms` across the runs this arm merges. `None` for a
+    /// single run.
     pub floor: Option<RunToRunFloor>,
+    /// Spread of `count`, kept separately **because variance is per-metric**.
+    ///
+    /// Transferring the duration spread onto a count row over-suppresses badly:
+    /// a suite that runs a fixed number of iterations has near-zero count
+    /// variance, so a 1.6% duration CV would strike out a real five-span
+    /// difference in three hundred and report it as noise.
+    pub count_floor: Option<RunToRunFloor>,
 }
 
 /// Merge one axis across snapshots, keyed by resolved label.
@@ -289,6 +297,7 @@ impl Arm {
             paths: Vec::new(),
             paths_truncated: false,
             floor: None,
+            count_floor: None,
         }
     }
 
@@ -323,6 +332,7 @@ impl Arm {
             paths: s.paths.clone(),
             paths_truncated: s.paths_truncated,
             floor: None,
+            count_floor: None,
         }
     }
 
@@ -429,6 +439,7 @@ impl Arm {
             paths: Vec::new(),
             paths_truncated: false,
             floor: RunToRunFloor::over_total_ms(snapshots),
+            count_floor: RunToRunFloor::over_count(snapshots),
         })
     }
 
@@ -692,6 +703,10 @@ pub struct DiffResult {
     pub rows: Vec<Row>,
     pub grouped_by: DiffGroupBy,
     pub groups: Vec<GroupDiff>,
+    /// Comparable keys **before** `top_n` truncation. Without it a renderer can
+    /// only say "top 3 of 3" when it truncated 3 out of 87, and a reader adds up
+    /// the visible rows and concludes they are the whole change.
+    pub groups_total: usize,
     pub marks: Vec<Mark>,
     /// Group rows dropped because one side folded into `__overflow__`.
     pub overflow_rows_suppressed: u64,
@@ -907,7 +922,8 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
 
     // --- The arithmetic. ---------------------------------------------------
     let ctx = Ctx {
-        floor_pct: binding_floor_pct(&a, &b),
+        floor_pct: binding_floor_pct(a.floor.as_ref(), b.floor.as_ref()),
+        count_floor_pct: binding_floor_pct(a.count_floor.as_ref(), b.count_floor.as_ref()),
         count_moved: count_moved_materially(&a.total, &b.total),
         truncated_either: a.truncated() || b.truncated(),
         total_ms_untrustworthy,
@@ -915,7 +931,8 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
     };
 
     let rows = overall_rows(&a, &b, &ctx, &mut suppressed);
-    let (groups, overflow_rows_suppressed) = group_rows(&a, &b, &ctx, opts, &mut suppressed);
+    let (groups, groups_total, overflow_rows_suppressed) =
+        group_rows(&a, &b, &ctx, opts, &mut suppressed);
 
     // Untrustworthy if anything substantive differs — or if either arm is a
     // single run, which is on its own enough to make a confident-looking delta
@@ -932,6 +949,7 @@ pub fn diff(a: Arm, b: Arm, opts: &DiffOptions) -> Result<DiffResult, DiffError>
         rows,
         grouped_by: opts.group_by,
         groups,
+        groups_total,
         marks,
         overflow_rows_suppressed,
         suppressed,
@@ -1032,6 +1050,7 @@ impl DiffResult {
                     overridden_by: m.overridden_by.clone(),
                 })
                 .collect(),
+            groups_total: self.groups_total,
             overflow_rows_suppressed: self.overflow_rows_suppressed,
             suppressed: self.suppressed.clone(),
         }
@@ -1043,6 +1062,8 @@ struct Ctx {
     /// Run-to-run floor binding both arms, as a percentage. `None` when either
     /// arm is single-run — **unknown, never zero** (§6.5).
     floor_pct: Option<f64>,
+    /// The same, for `count`. Separate because variance is per-metric.
+    count_floor_pct: Option<f64>,
     count_moved: bool,
     truncated_either: bool,
     total_ms_untrustworthy: bool,
@@ -1179,15 +1200,39 @@ fn overall_rows(
                 }
             }
         }
-        _ => suppressed.push(logmon_broker_protocol::Suppressed {
-            field: "sampled".into(),
-            reason: "at least one arm has no sample-derived figures — recorded with \
+        // Name the actual reason. "Recorded with projections disabled" is a
+        // false statement about a merged arm, and a suppression channel is only
+        // worth having if a reader can trust what it says.
+        _ => {
+            let arms: [&Arm; 2] = [a, b];
+            let merged = arms
+                .into_iter()
+                .find(|x| matches!(&x.aggregation, Aggregation::Merged(l) if l.len() > 1));
+            let (reason, remedy) = match merged {
+                Some(m) => (
+                    format!(
+                        "arm `{}` merges several runs, and sample-derived figures do not \
+                         merge: a self time across two runs is not a self time, and a wall \
+                         union across them is not a union",
+                        m.spec
+                    ),
+                    "document or diff a single run (`<collector>@<label>`) to get self time \
+                     and the sampled percentiles"
+                        .to_string(),
+                ),
+                None => (
+                    "at least one arm has no sample-derived figures — recorded with \
                      projections disabled, or defined at level `scalar`"
-                .into(),
-            remedy: Some(
-                "take snapshots with projections: true, at level `timing` or above".into(),
-            ),
-        }),
+                        .to_string(),
+                    "take snapshots with projections: true, at level `timing` or above".to_string(),
+                ),
+            };
+            suppressed.push(logmon_broker_protocol::Suppressed {
+                field: "sampled".into(),
+                reason,
+                remedy: Some(remedy),
+            })
+        }
     }
 
     rows
@@ -1211,9 +1256,9 @@ fn group_rows(
     ctx: &Ctx,
     opts: &DiffOptions,
     suppressed: &mut Vec<logmon_broker_protocol::Suppressed>,
-) -> (Vec<GroupDiff>, u64) {
+) -> (Vec<GroupDiff>, usize, u64) {
     if opts.group_by == DiffGroupBy::None {
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     }
     if opts.group_by == DiffGroupBy::Group && a.def.group_keys != b.def.group_keys {
         suppressed.push(logmon_broker_protocol::Suppressed {
@@ -1227,7 +1272,7 @@ fn group_rows(
                 "compare by `name`, or re-record both arms with the same group_keys".into(),
             ),
         });
-        return (Vec::new(), 0);
+        return (Vec::new(), 0, 0);
     }
 
     let (ra, rb) = match opts.group_by {
@@ -1249,7 +1294,7 @@ fn group_rows(
                     opts.group_by.as_str()
                 )),
             });
-            return (Vec::new(), 0);
+            return (Vec::new(), 0, 0);
         }
     };
 
@@ -1344,8 +1389,9 @@ fn group_rows(
             (None, None) => x.key.cmp(&y.key),
         }
     });
+    let total = out.len();
     out.truncate(opts.top_n);
-    (out, overflow)
+    (out, total, overflow)
 }
 
 fn group_metric_rows(ea: &ExactStats, eb: &ExactStats, ctx: &Ctx) -> Vec<Row> {
@@ -1426,12 +1472,20 @@ fn exact_row(metric: &'static str, a: f64, b: f64, ctx: &Ctx) -> Row {
     // run-to-run variance, and for single-run arms there is none to apply —
     // which is reported as unknown rather than as zero, because a floor of zero
     // would license calling a one-nanosecond difference a result.
+    //
+    // **The floor is chosen per metric.** A count's spread across runs and a
+    // duration's spread are different quantities, and a suite with a fixed
+    // iteration count has essentially none of the first.
+    let floor = match metric {
+        "count" | "error_count" => ctx.count_floor_pct,
+        _ => ctx.floor_pct,
+    };
     finish(
         metric,
         Tier::Exact,
         a,
         b,
-        ctx.floor_pct,
+        floor,
         ThresholdBasis::RunToRun,
         None,
     )
@@ -1538,9 +1592,9 @@ fn finish(
 /// resolvable as its noisier side. `None` — unknown — the moment either arm is
 /// a single run, which is the common case and the reason most diffs report no
 /// floor at all.
-fn binding_floor_pct(a: &Arm, b: &Arm) -> Option<f64> {
-    let ca = a.floor.as_ref().and_then(|f| f.cv_pct)?;
-    let cb = b.floor.as_ref().and_then(|f| f.cv_pct)?;
+fn binding_floor_pct(a: Option<&RunToRunFloor>, b: Option<&RunToRunFloor>) -> Option<f64> {
+    let ca = a.and_then(|f| f.cv_pct)?;
+    let cb = b.and_then(|f| f.cv_pct)?;
     Some(ca.max(cb))
 }
 
