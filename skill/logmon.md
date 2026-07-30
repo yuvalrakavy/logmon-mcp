@@ -144,7 +144,23 @@ Collectors need a **named** session (`--session NAME`, or `session.start` with a
 - **`remove_collector(name)`** — unarm it and hand the budget back. Do this when you're done; a collector left armed keeps costing ingest time and reserved memory.
 - **`diff_collectors(a, b, group_by?, …)`** — subtract two runs and get what moved. **This is the payoff**; everything above measures. An *arm* is `"<collector>"` (the live window), `"<collector>@<label>"` (one recorded run), or `"<collector>@*"` (every recorded run merged). **Prefer `@*` on both sides** — with single runs there is no spread, so every threshold comes back `unknown` and nothing in the result can be called a result.
 - **`document_collectors(names, format?, question?, finding?)`** — write it up: what moved, what to do next, and every caveat attached to the number it qualifies. The first name is the baseline. Pass `question` when you generate it and `finding` on a second call once you have read it — regeneration is free and lossless, which is why nothing is stored. `format: "folded"` gives collapsed stacks for a flame graph, one arm at a time, `tree` level only.
-- **`profile_traces(filter?, …)`** — same numbers over what is already in the buffer. A collector must be armed *before* the run it measures; this looks back at one that already happened.
+- **`profile_traces(filter?, …)`** — the same projection, over the span buffer instead of a collector. See below for which to reach for.
+
+**`profile_traces` or `get_collector`?** They return the same shape and answer different questions, so the choice is made *before* the run, not after:
+
+|  | `profile_traces` | a collector |
+|---|---|---|
+| Measures | spans already in the buffer | spans arriving from the moment you arm it |
+| Set up | nothing | `add_collector` before the run |
+| Bounded by | the buffer's ring (10 000 spans, oldest evicted silently) | its own retention budget, and it says when truncated |
+| Survives a restart | no | definition and snapshots do |
+| Can compare runs | no | `snapshot_collector` + `diff_collectors` |
+
+**Reach for `profile_traces` when the run already happened** and you want to know where the time went — a one-off, no session needed, nothing to clean up. It is the right tool for "something was slow just now."
+
+**Arm a collector when you are about to measure something**, especially when you will measure it more than once. It cannot be applied retroactively: a collector only sees spans that arrive after it is armed, which is the one mistake worth avoiding. If you are about to change code and want to know whether it got faster, arm first.
+
+A useful pattern: `profile_traces` to find *what* is slow, then arm a collector on that filter to track it across changes.
 
 **Reading the result.** `exact`, `estimated` and `sampled` are not three views of one number:
 
@@ -166,6 +182,47 @@ Two ways to run an A/B:
 
 1. **One pass, `group_keys`** — emit a span attribute naming the arm, run both interleaved, read `group_by="group"`. Immune to drift between runs.
 2. **Two passes, `snapshot_collector`** — arm, run A, `snapshot_collector(label="before")`, change the code, run B, `snapshot_collector(label="after")`, then `get_collector_history(merge=true)`. Use when the arm cannot be an attribute. Both runs are kept, each with its own definition and description.
+
+#### `group_keys`, end to end
+
+This is the one worth learning, and it is easy to skip because `group_keys: []` appears in every response whether or not you ever set it. **It replaces hand-rolled per-case counters**: one collector splits the numbers by any span attribute, and it needs no change to the code being measured beyond emitting that attribute.
+
+Arm it with the attribute you want to split by:
+
+```
+add_collector(name="cache-ab", filter="sn=Lookup", group_keys=["cache.enabled"],
+              description="does the read-through cache pay for itself")
+```
+
+Read it back with `group_by="group"`:
+
+```
+get_collector(name="cache-ab", group_by="group")
+```
+
+Each row is one value of the attribute, ranked by total time:
+
+```json
+"grouped_by": "group",
+"groups_total": 2,
+"groups": [
+  { "key": "false",
+    "exact": { "count": 500, "total_ms": 4210.0, "avg_ms": 8.42, "min_ms": 6.1, "max_ms": 31.7 },
+    "estimated": { "p50_ms": 8.1, "p95_ms": 14.2 } },
+  { "key": "true",
+    "exact": { "count": 500, "total_ms": 1180.0, "avg_ms": 2.36, "min_ms": 1.9, "max_ms": 9.4 },
+    "estimated": { "p50_ms": 2.2, "p95_ms": 4.0 } }
+]
+```
+
+Points worth knowing before you rely on it:
+
+- **`key` is the attribute *value* alone**, not `attribute=value` — `"false"`, not `"cache.enabled=false"`. The attribute name is the one you declared; the rows tell you which value. With several `group_keys` the values join with `" / "`, in declaration order, so `["region","cache.enabled"]` yields `"eu / true"`. Values are read as strings, so booleans and numbers work.
+- **Rows rank by total time descending**, so the arm that cost the most is first — which is usually the one you are trying to fix.
+- **`groups_total` is the count before `top_n` truncation** (default 20). `groups_total: 2` with two rows means you are seeing everything; `groups_total: 900` with 20 rows means you are seeing the top slice.
+- **Group rows come off the exact tier**, so they carry `exact` and `estimated` but no `sampled` block — no self time, no call paths, per row.
+- **A warm-up cut withholds them.** `skip_warmup_ms` windows the sample tier only, and these rows are unwindowed, so they are suppressed rather than served alongside windowed headline figures. Group by `trace` or `path` under a cut, or reset the collector after warm-up instead.
+- **Cardinality is capped.** Unbounded attributes (a user id, a request id) fold into `__overflow__` and set `cardinality_capped`. Group by something with a handful of values.
 
 **Repeat before you conclude.** Two runs differing by 5% tell you nothing until you know the run-to-run spread. Take three snapshots of the *same* configuration first, read the `floor` from `get_collector_history(merge=true)`, and treat differences below it as noise. A single run reports the spread as unknown, which is the honest answer, not zero.
 
