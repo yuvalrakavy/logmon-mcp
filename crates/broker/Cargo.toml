@@ -18,6 +18,14 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 
+[dev-dependencies]
+# The kill -9 harness: spawns the real binary (CARGO_BIN_EXE_logmon-broker),
+# SIGKILLs it, and talks to both incarnations through the SDK over a
+# LOGMON_CONFIG_DIR-redirected socket.
+logmon-broker-sdk = { path = "../sdk" }
+tempfile = { workspace = true }
+serde_json.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
 

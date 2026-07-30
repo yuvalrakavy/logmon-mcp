@@ -491,6 +491,14 @@ Environment variable overrides:
 
 - `LOGMON_BROKER_BIN` — explicit path to `logmon-broker` (skips PATH lookup).
 - `LOGMON_BROKER_SOCKET` — explicit broker socket path. Defaults to `~/.config/logmon/logmon.sock`.
+- `LOGMON_CONFIG_DIR` — relocate the whole state directory (`state.json`, `daemon.pid`,
+  `logmon.sock`, `daemon.log`, `collectors/`). Read by the **daemon and its clients**, so
+  one variable stands up a second broker beside your live one:
+  `LOGMON_CONFIG_DIR=/tmp/probe logmon-broker --gelf-port 0 --otlp-grpc-port 0 --otlp-http-port 0`
+  and any `logmon-mcp` invocation in the same environment finds it. Intended for tests and
+  throwaway instances — the managed service is unaffected, because launchd/systemd do not
+  inherit your shell's environment. An empty value is ignored (the `VAR= cmd` idiom means
+  "unset for this invocation"). `LOGMON_BROKER_SOCKET` still wins for clients.
 
 ## Backpressure
 

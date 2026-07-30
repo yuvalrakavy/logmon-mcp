@@ -1578,11 +1578,15 @@ pub struct ReceiverLiveness {
 /// *silently* — the channel was full and the sender was never told. None of
 /// these three counters describe that. A shed batch is a 429 / UNAVAILABLE
 /// the caller saw and can retry; a malformed span was refused for cause, not
-/// backpressure — and even the channel-full `dropped` count here, though
-/// sourced from the same silent-loss mechanism, is trace-scoped in a way
-/// `receiver_drops` is not. Merging any of them into `receiver_drops` would
-/// change what that field means. Keep them apart — do not "fix" this into a
-/// merge.
+/// backpressure. Merging any of them into `receiver_drops` would change what
+/// that field means. Keep them apart — do not "fix" this into a merge.
+///
+/// **`dropped` is not new information: it is exactly
+/// `receiver_drops.otlp_http_traces + receiver_drops.otlp_grpc_traces`**, read
+/// from the same two atomics. It is repeated here so the three trace-loss
+/// figures can be read as one block, and it is stated here because **adding it
+/// to those fields double-counts.** `shed_batches` and `malformed_dropped` are
+/// the genuinely new numbers — nothing else in this payload reports them.
 ///
 /// Scope: the calling session's bound domain, monotonic since that domain's
 /// counters were created (daemon start for `default`, domain creation for

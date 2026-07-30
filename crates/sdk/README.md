@@ -160,8 +160,10 @@ let broker = Broker::connect()
 If `.socket_path()` isn't set, `BrokerBuilder` resolves the socket path in this order:
 
 1. `LOGMON_BROKER_SOCKET` environment variable.
-2. `~/.config/logmon/logmon.sock` (default on macOS and Linux; pinned to `.config/logmon/` even on macOS so the SDK and broker agree on every platform).
-3. On Windows: `127.0.0.1:12200` TCP fallback.
+2. `$LOGMON_CONFIG_DIR/logmon.sock` — the same variable the daemon uses to relocate its
+   state directory, so redirecting a daemon redirects its clients with it. Empty is ignored.
+3. `~/.config/logmon/logmon.sock` (default on macOS and Linux; pinned to `.config/logmon/` even on macOS so the SDK and broker agree on every platform).
+4. On Windows: `127.0.0.1:12200` TCP fallback.
 
 ### Session names
 

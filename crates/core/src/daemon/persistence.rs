@@ -333,9 +333,40 @@ pub fn load_config(path: &Path) -> anyhow::Result<DaemonConfig> {
     Ok(serde_json::from_str(&content)?)
 }
 
-/// Returns the logmon config directory (~/.config/logmon/)
+/// Returns the logmon config directory: `$LOGMON_CONFIG_DIR`, else
+/// `~/.config/logmon/`.
+///
+/// The env var exists for **cross-process** redirection — a real `kill -9`
+/// harness spawning the actual binary, or a second daemon run beside a
+/// developer's live one. In-process tests keep using `DaemonOverrides`, which
+/// wins over everything: overrides > env > default. The live launchd service
+/// is unaffected by a stray shell var, because launchd does not inherit the
+/// shell's environment.
+///
+/// The SDK's `default_socket_path()` reads the same variable (duplicated
+/// there rather than imported, keeping the SDK's deliberate independence from
+/// this crate) — change one, change both.
 pub fn config_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    config_dir_from(
+        std::env::var_os("LOGMON_CONFIG_DIR"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// The pure resolution, split from the wrapper because the wrapper cannot be
+/// unit-tested: tests share one process, so `std::env::set_var` in a test
+/// races every concurrently-running test that reads the environment.
+fn config_dir_from(
+    override_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    // An empty var is ignored rather than honored: `LOGMON_CONFIG_DIR= cmd`
+    // is a shell idiom for "unset for this invocation", and a config dir of
+    // `""` would resolve against an accidental cwd.
+    if let Some(dir) = override_dir.filter(|d| !d.is_empty()) {
+        return std::path::PathBuf::from(dir);
+    }
+    let home = home.filter(|h| !h.is_empty()).unwrap_or_else(|| ".".into());
     std::path::PathBuf::from(home)
         .join(".config")
         .join("logmon")
@@ -500,5 +531,36 @@ mod tests {
             "and touches nothing else"
         );
         assert_eq!(sweep_temp_files(d.path()), 0, "idempotent");
+    }
+
+    // Pure-function tests, not `std::env::set_var`: tests share one process,
+    // and a global env mutation races every concurrent test that reads it.
+    #[test]
+    fn the_env_var_overrides_the_home_derived_default() {
+        let got = config_dir_from(Some("/tmp/elsewhere".into()), Some("/home/u".into()));
+        assert_eq!(got, std::path::PathBuf::from("/tmp/elsewhere"));
+    }
+
+    #[test]
+    fn without_the_var_the_default_is_dot_config_logmon_under_home() {
+        let got = config_dir_from(None, Some("/home/u".into()));
+        assert_eq!(got, std::path::PathBuf::from("/home/u/.config/logmon"));
+    }
+
+    #[test]
+    fn an_empty_var_is_ignored_rather_than_resolving_against_the_cwd() {
+        // `LOGMON_CONFIG_DIR= cmd` is the shell idiom for "unset for this
+        // invocation"; honoring the empty string would make the config dir
+        // whatever directory the daemon happened to start in.
+        let got = config_dir_from(Some("".into()), Some("/home/u".into()));
+        assert_eq!(got, std::path::PathBuf::from("/home/u/.config/logmon"));
+    }
+
+    #[test]
+    fn no_home_falls_back_to_the_current_directory_as_before() {
+        let got = config_dir_from(None, None);
+        assert_eq!(got, std::path::PathBuf::from("./.config/logmon"));
+        let got = config_dir_from(None, Some("".into()));
+        assert_eq!(got, std::path::PathBuf::from("./.config/logmon"));
     }
 }

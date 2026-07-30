@@ -208,12 +208,24 @@ impl Broker {
 
 pub(crate) fn default_socket_path() -> PathBuf {
     // Must match the broker daemon's `core::daemon::persistence::config_dir()`
-    // location, which is `$HOME/.config/logmon/` on every Unix (including macOS,
-    // where `dirs::config_dir()` would otherwise return `~/Library/Application
-    // Support/`). Hard-code `.config/logmon/` so the SDK and broker agree on
-    // every platform without the SDK depending on `core`.
+    // resolution: `$LOGMON_CONFIG_DIR`, else `$HOME/.config/logmon/` on every
+    // Unix (including macOS, where `dirs::config_dir()` would otherwise return
+    // `~/Library/Application Support/`). Duplicated rather than imported so the
+    // SDK keeps its deliberate independence from `core` — change one, change
+    // both.
+    //
+    // Honoring the var HERE is what makes the one-variable workflow work: a
+    // second daemon started with `LOGMON_CONFIG_DIR=X logmon-broker` is
+    // reachable by any client in the same environment without also setting
+    // `LOGMON_BROKER_SOCKET`. Precedence stays: explicit `socket_path()` >
+    // `LOGMON_BROKER_SOCKET` (resolved before this function is consulted) >
+    // `LOGMON_CONFIG_DIR` > home default. An empty var is ignored — the
+    // `VAR= cmd` idiom means "unset for this invocation".
     #[cfg(unix)]
     {
+        if let Some(dir) = std::env::var_os("LOGMON_CONFIG_DIR").filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir).join("logmon.sock");
+        }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         home.join(".config").join("logmon").join("logmon.sock")
     }

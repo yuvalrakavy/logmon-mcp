@@ -1277,15 +1277,38 @@ snapshot unreadable in exchange for nothing.
 
 1. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
    cost**; deliberately deprioritised now that measurement has ranked it.
-2. **A real `kill -9` harness.** V11 is covered by a stricter test instead: the
-   definition is asserted present on disk *while the daemon is still running*, so no
-   shutdown path is involved at all — which is what §12's objection to `restart()`
-   was actually about. A true out-of-process test additionally needs a config-dir
-   override; there is no env var or flag for it, only `DaemonOverrides`.
-3. **`status.get` does not surface the new counters.** Deliberate: `receiver_drops`
-   documents itself as counting entries the broker *silently* lost, and both transports
-   carry a comment explaining why a shed is not one of those. Adding a sibling field is
-   a protocol change worth making on its own terms.
+2. **~~A real `kill -9` harness.~~ BUILT 2026-07-30** —
+   `crates/broker/tests/kill_dash_nine.rs`, out-of-process against the real binary.
+   `LOGMON_CONFIG_DIR` was the missing piece: `config_dir()` now resolves
+   `DaemonOverrides` > env > `$HOME` default, and the SDK's `default_socket_path()`
+   reads the same var, so one variable redirects a daemon *and* its clients. The
+   harness spawns with GELF port 0 (kernel-assigned) and both OTLP ports 0
+   (disabled), so it can never collide with a developer's live daemon.
+
+   **The thing that cost time, worth not re-deriving: a socket FILE existing is not
+   readiness.** A Unix socket is not unlinked on process exit, so a daemon that bound
+   and then died leaves a file that answers every later `connect` with
+   `ECONNREFUSED` — which is precisely the state this test exists to distinguish, and
+   waiting on the file reported it as ready. Readiness is a `connect` that succeeds,
+   plus a `try_wait` on the child so a dead daemon is reported as dead with its log
+   rather than as a timeout. Never send a spawned daemon's output to `/dev/null`.
+
+   Mutation-verified: removing `.with_persistence(dir)` from `server.rs` turns the
+   test red with `{"collectors":[],"count":0}`.
+3. **~~`status.get` does not surface the new counters.~~ BUILT 2026-07-30** —
+   `trace_ingest { dropped, shed_batches, malformed_dropped }`, a **sibling** of
+   `receiver_drops` rather than a member: that field documents itself as counting
+   *silent* loss, and a shed batch was a 429 the caller saw. Scoped to the bound
+   domain, exactly like `receiver_drops`.
+
+   **`dropped` is a projection, not new state** — literally
+   `receiver_drops.otlp_http_traces + otlp_grpc_traces`, the same two atomics
+   (`metrics.rs:264`). Repeated so the three trace figures read as one block, and
+   documented on the wire type because **summing it with those fields
+   double-counts.** Only `shed_batches` and `malformed_dropped` are numbers nothing
+   else in the payload reports. The implementing agent found and corrected this
+   against a brief that had assumed independence; the test asserts the real
+   relationship in two stages rather than the tidier false version.
 4. **A rolling percentile threshold.** Refused rather than deferred: it needs a duration
    sketch per bucket, and the per-collector memory bound is the reason this design can
    promise anything about its own cost. The error says so and names `avg_ms`.
