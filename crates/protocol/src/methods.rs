@@ -1678,6 +1678,21 @@ pub struct StatusGetResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionInfo>,
     pub daemon_uptime_secs: u64,
+    /// This broker's version. Additive; an older daemon that omits it
+    /// deserializes as `""`.
+    #[serde(default)]
+    pub broker_version: String,
+    /// The MCP tools a shim built at this broker's version exposes
+    /// ([`crate::mcp_tools::TOOLS`]). A client holding fewer is out of date.
+    ///
+    /// Mirrored here — not left to the untyped passthrough — because this type
+    /// is deserialized and re-serialized on the typed SDK path, so a field the
+    /// daemon emits but this struct lacks is **silently dropped for every typed
+    /// caller**. That has happened before in this crate; see the note on
+    /// [`TriggersEditResult::post_remaining`]. `verify-schema` cannot catch it:
+    /// it checks schema-against-Rust, not daemon-JSON-against-Rust.
+    #[serde(default)]
+    pub broker_tools: Vec<String>,
     pub receivers: Vec<String>,
     pub store: StoreStats,
     #[serde(default)]

@@ -2538,6 +2538,19 @@
           "format": "uint64",
           "minimum": 0
         },
+        "broker_version": {
+          "description": "This broker's version. Additive; an older daemon that omits it\ndeserializes as `\"\"`.",
+          "type": "string",
+          "default": ""
+        },
+        "broker_tools": {
+          "description": "The MCP tools a shim built at this broker's version exposes\n([`crate::mcp_tools::TOOLS`]). A client holding fewer is out of date.\n\nMirrored here — not left to the untyped passthrough — because this type\nis deserialized and re-serialized on the typed SDK path, so a field the\ndaemon emits but this struct lacks is **silently dropped for every typed\ncaller**. That has happened before in this crate; see the note on\n[`TriggersEditResult::post_remaining`]. `verify-schema` cannot catch it:\nit checks schema-against-Rust, not daemon-JSON-against-Rust.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
         "receivers": {
           "type": "array",
           "items": {

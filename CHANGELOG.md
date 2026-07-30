@@ -3,6 +3,59 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## 0.9.0 — 2026-07-31
+
+Makes capability skew visible. On 2026-07-30 a project filed a report proposing
+three collector features that already shipped — their MCP shim was several
+versions behind the broker, and nothing anywhere said so. Both the tool list and
+the skill file are compiled into that binary, so a stale shim is silent by
+construction.
+
+### Added
+
+- **`status.get` now reports `broker_version` and `broker_tools`** — the MCP tool
+  names a shim built at this broker's version exposes.
+
+  This is deliberately on `status.get` rather than the handshake, because
+  `get_status` relays the broker's JSON **verbatim and always has** — every shim
+  ever built renders unknown fields untouched. So this reaches installations
+  already in the field: a stale shim shows the new facts after a broker restart
+  and nothing else. Tool names rather than RPC method names, because that is the
+  vocabulary an agent can compare against what it is holding
+  (`traces.slow` is `get_slow_spans`; `collectors.reset` is `reset_collector`
+  but `collectors.document` is `document_collectors` — no derivable mapping).
+
+- **A `shim_note` in the same response** when the shim is missing tools the
+  broker supports, naming them and the reinstall command. Silent when the sets
+  match, when the broker is too old to advertise, and when the shim is *ahead*
+  of the broker — absent is unknown, not "you are missing everything", and a
+  notice in the everyday case is what teaches a reader to ignore it.
+
+- **`logmon-mcp status` prints the broker version**, and says so when it differs
+  from the CLI's own. That is the surface a human is looking at while deciding
+  whether to reinstall.
+
+### Internal
+
+- `protocol::mcp_tools::TOOLS` — one `(tool, method)` table, read by the broker
+  to state its inventory and by the shim to diff against what it exposes. A test
+  pins it to the router `#[rmcp::tool]` actually generates, so the mirror cannot
+  drift; another asserts every method in it is one the broker dispatches.
+
+### Known limitation
+
+`status.get` resolves the caller's domain first, so if that domain has been
+deleted the call errors and these facts go with it. Pre-existing, reachable only
+via `use_domain(x)` then `delete_domain(x)`, and the error names its own remedy.
+Serving a partial status would mean letting an absent buffer read as an empty
+one, so the strict field stays. Pinned by a test rather than left to be found.
+
+### Compatibility
+
+Additive. `PROTOCOL_VERSION` stays 1, `FORMAT_VERSION` is untouched, and nothing
+is added to the session handshake. An older shim renders the new keys verbatim;
+an older broker omits them and the shim stays silent.
+
 ## 0.8.0 — 2026-07-30
 
 Acting on the first production use of the collectors, by a session that had no

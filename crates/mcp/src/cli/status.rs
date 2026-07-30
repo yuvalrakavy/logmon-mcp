@@ -20,6 +20,24 @@ pub async fn dispatch(broker: &Broker, json: bool) -> i32 {
     }
 
     // Human format: simple key=value block.
+    //
+    // The broker's version leads, and the CLI's own follows when they differ:
+    // this is the surface a human is looking at while deciding whether to
+    // reinstall, and the two numbers are the whole decision. An older broker
+    // omits the field, which deserializes to "" — say "unknown" rather than
+    // printing an empty value that reads like a bug.
+    let shim_version = env!("CARGO_PKG_VERSION");
+    if result.broker_version.is_empty() {
+        println!("broker: unknown (predates version reporting), cli {shim_version}");
+    } else if result.broker_version == shim_version {
+        println!("broker: {}", result.broker_version);
+    } else {
+        println!(
+            "broker: {} — this cli is {shim_version}; reinstall with \
+             `cargo install --path crates/mcp` to match",
+            result.broker_version
+        );
+    }
     println!("uptime: {}s", result.daemon_uptime_secs);
     print!("receivers:");
     if result.receivers.is_empty() {

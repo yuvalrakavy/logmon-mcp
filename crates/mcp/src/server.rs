@@ -416,11 +416,12 @@ impl GelfMcpServer {
         description = "Get current server status including buffer sizes, trigger counts, connection info, and message statistics"
     )]
     async fn get_status(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = self
+        let mut result = self
             .broker
             .call("status.get", serde_json::json!({}))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        annotate_skew(&mut result);
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap(),
         )]))
@@ -1406,6 +1407,63 @@ impl GelfMcpServer {
 /// time.
 const SKILL_INSTRUCTIONS: &str = include_str!("../../../skill/logmon.md");
 
+/// Tool names this build exposes, from the shared table.
+fn local_tool_names() -> Vec<&'static str> {
+    logmon_broker_protocol::mcp_tools::TOOLS
+        .iter()
+        .map(|(t, _)| *t)
+        .collect()
+}
+
+/// Name, in the status payload, any tool the broker advertises that this build
+/// cannot serve.
+///
+/// A **key**, not text appended after the JSON: `get_status` renders
+/// `to_string_pretty`, so trailing prose would quietly turn a structured result
+/// into an unparseable blob for anything that treats a tool result as JSON.
+///
+/// Silent in three cases, each for its own reason: a non-object payload (relay
+/// it untouched rather than `unwrap` on `as_object_mut`), a broker too old to
+/// send `broker_tools` (absent is unknown, not "you are missing everything"),
+/// and an empty gap (a note in the everyday case is the false positive that
+/// makes a reader stop believing the mechanism).
+fn annotate_skew(result: &mut serde_json::Value) {
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
+    let Some(broker_tools) = obj.get("broker_tools").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let broker_tools: Vec<String> = broker_tools
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    let local = local_tool_names();
+    let missing = logmon_broker_protocol::mcp_tools::missing_tools(&broker_tools, &local);
+    if missing.is_empty() {
+        return;
+    }
+
+    let version = obj
+        .get("broker_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    obj.insert(
+        "shim_note".into(),
+        serde_json::Value::String(format!(
+            "This MCP shim is {} and exposes {} of the {} tools broker {} supports. \
+             Not reachable from this shim: {}. Reinstall with \
+             `cargo install --path crates/mcp` and restart this MCP server to use them.",
+            env!("CARGO_PKG_VERSION"),
+            local.len(),
+            broker_tools.len(),
+            version,
+            missing.join(", "),
+        )),
+    );
+}
+
 #[rmcp::tool_handler]
 impl ServerHandler for GelfMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1439,5 +1497,117 @@ mod tests {
             SKILL_INSTRUCTIONS.contains("## When to reach for logmon"),
             "skill/logmon.md must contain the `When to reach for logmon` section"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The shared TOOLS table, held honest against what this shim actually built
+    // -----------------------------------------------------------------------
+
+    /// `TOOLS` is a hand-written mirror of the `#[rmcp::tool]` attributes, and a
+    /// mirror that drifts is worse than none: a tool missing from the table gets
+    /// reported to the user as unreachable when they are holding it, which is
+    /// the false positive no reinstall can clear.
+    ///
+    /// This compares against the router rmcp *generates*, not against another
+    /// list — the only comparison that cannot itself go stale. `tool_router()`
+    /// is an associated fn (no broker, no daemon, no async) and is generated
+    /// private, which is why this test lives inside `server.rs`.
+    #[test]
+    fn the_shared_tool_table_matches_the_router_this_shim_builds() {
+        let mut from_table: Vec<String> = super::local_tool_names()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        from_table.sort();
+
+        let mut from_router: Vec<String> = super::GelfMcpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        from_router.sort();
+
+        assert_eq!(
+            from_table, from_router,
+            "protocol::mcp_tools::TOOLS has drifted from the #[rmcp::tool] attributes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // annotate_skew — every case but one needs synthetic input, because in a
+    // single build the broker's list IS this build's list.
+    // -----------------------------------------------------------------------
+
+    fn status_with(broker_tools: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "daemon_uptime_secs": 1,
+            "broker_version": "9.9.9",
+            "broker_tools": broker_tools,
+        })
+    }
+
+    #[test]
+    fn a_broker_ahead_of_this_shim_names_exactly_the_missing_tools() {
+        let mut v = status_with(&["get_status", "brand_new_tool", "another_new_one"]);
+        super::annotate_skew(&mut v);
+        let note = v["shim_note"].as_str().expect("a gap must be reported");
+        assert!(note.contains("another_new_one") && note.contains("brand_new_tool"));
+        assert!(
+            note.contains("9.9.9"),
+            "the broker version names the target"
+        );
+        assert!(
+            note.contains("cargo install"),
+            "a notice without the fix command is a complaint"
+        );
+    }
+
+    #[test]
+    fn a_matched_pair_is_left_silent() {
+        // The everyday case. A note here is the false positive that teaches a
+        // reader to ignore the mechanism.
+        let names = super::local_tool_names();
+        let mut v = status_with(&names);
+        super::annotate_skew(&mut v);
+        assert!(v.get("shim_note").is_none(), "no gap, so no note: {v}");
+    }
+
+    #[test]
+    fn a_broker_too_old_to_advertise_says_nothing() {
+        // Absent is unknown, not "you are missing everything".
+        let mut v = serde_json::json!({ "daemon_uptime_secs": 1 });
+        super::annotate_skew(&mut v);
+        assert!(v.get("shim_note").is_none());
+    }
+
+    #[test]
+    fn a_shim_ahead_of_its_broker_makes_no_reversed_claim() {
+        let mut v = status_with(&["get_status"]);
+        super::annotate_skew(&mut v);
+        assert!(
+            v.get("shim_note").is_none(),
+            "holding more tools than the broker lists is not a gap in the shim"
+        );
+    }
+
+    #[test]
+    fn a_non_object_payload_is_relayed_untouched() {
+        let mut v = serde_json::json!("not an object");
+        super::annotate_skew(&mut v);
+        assert_eq!(v, serde_json::json!("not an object"));
+    }
+
+    #[test]
+    fn the_daemons_own_keys_survive_annotation() {
+        // The note is added to a passthrough. If annotation ever dropped or
+        // rewrote a key, tier A's whole premise — that the daemon's response
+        // reaches the reader verbatim — would be false for current shims.
+        let before = status_with(&["get_status", "unreachable_tool"]);
+        let mut after = before.clone();
+        super::annotate_skew(&mut after);
+        for (k, v) in before.as_object().unwrap() {
+            assert_eq!(after.get(k), Some(v), "annotation altered `{k}`");
+        }
+        assert!(after.get("shim_note").is_some());
     }
 }

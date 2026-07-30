@@ -748,6 +748,21 @@ impl RpcHandler {
     // -----------------------------------------------------------------------
 
     fn handle_status(&self, session_id: &SessionId) -> Result<Value, String> {
+        // Neither of the two broker facts below depends on a domain, so they are
+        // bound here rather than inside the payload — the placement records that
+        // they *could* be served when `resolve_domain` fails.
+        //
+        // They are not, today. This whole function returns `Err` once the
+        // caller's bound domain has been deleted, so the skew facts go with it.
+        // Accepted rather than fixed: the state needs `use_domain(x)` then
+        // `delete_domain(x)` to reach, the error names its own remedy
+        // ("use_domain to rebind"), and serving a partial status would mean
+        // giving `StatusGetResult::store` a default — letting an absent buffer
+        // read as an empty one, which is the conflation this codebase refuses
+        // everywhere else. Pinned by `capability_skew.rs`.
+        let broker_version = env!("CARGO_PKG_VERSION");
+        let broker_tools = logmon_broker_protocol::mcp_tools::tool_names();
+
         let d = self.resolve_domain(session_id)?;
         let session_info = self.sessions.get(session_id);
         let stats = d.pipeline.store_stats();
@@ -785,6 +800,13 @@ impl RpcHandler {
                 "client_info": s.client_info,
             })),
             "daemon_uptime_secs": self.start_time.elapsed().as_secs(),
+            // What a shim built at this broker's version exposes. A client
+            // holding fewer tools than this is out of date; one holding these
+            // or more is current. Tool names rather than RPC method names,
+            // because that is the vocabulary an agent can actually compare
+            // against what it is holding.
+            "broker_version": broker_version,
+            "broker_tools": broker_tools,
             "receivers": self.receivers_info,
             "store": {
                 "total_received": stats.total_received,

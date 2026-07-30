@@ -1,8 +1,12 @@
+pub mod mcp_tools;
 pub mod methods;
 pub mod notifications;
 
 pub use methods::*;
 pub use notifications::*;
+// Deliberately NOT re-exported at the crate root: `mcp_tools` describes one
+// front-end's surface, not the wire protocol, and a future second front-end
+// should have to name it rather than find it among the protocol types.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
