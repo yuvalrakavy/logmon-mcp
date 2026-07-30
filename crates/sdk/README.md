@@ -216,6 +216,8 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `collectors_history` | `CollectorsHistory` | `CollectorsHistoryResult` |
 | `collectors_reset` | `CollectorsName` | `CollectorsResetResult` |
 | `collectors_remove` | `CollectorsName` | `CollectorsRemoveResult` |
+| `collectors_diff` | `CollectorsDiff` | `CollectorsDiffResult` |
+| `collectors_document` | `CollectorsDocument` | `CollectorsDocumentResult` |
 | `traces_profile` | `TracesProfile` | `ProfileResult` |
 | `bookmarks_add` | `BookmarksAdd` | `BookmarksAddResult` |
 | `bookmarks_list` | `BookmarksList` | `BookmarksListResult` |
@@ -387,8 +389,54 @@ pub struct ProfileResult {
     pub suppressed: Vec<Suppressed>,         // { field, reason, remedy } per null above.
     pub warnings: Vec<String>,               // traces_profile only; collectors_add returns
                                              // the same list at arm time.
+    pub threshold: Option<ThresholdInfo>,    // Live reads only: a rolling window is live
+                                             // state, so a recorded run has none.
 }
 ```
+
+### `CollectorsDiffResult`
+
+```rust
+pub struct CollectorsDiffResult {
+    pub a: DiffArm,                          // Each arm carries the definition it was
+    pub b: DiffArm,                          // measured under, never the live one.
+    pub level: String,                       // min(level) — what both can answer at.
+    pub trustworthy: bool,                   // False if any mark makes a number unsafe,
+                                             // OR if either arm is a single run.
+    pub rows: Vec<DiffRow>,
+    pub grouped_by: Option<String>,
+    pub groups: Vec<DiffGroup>,
+    pub groups_total: usize,                 // BEFORE top_n truncation, so a reader can
+                                             // tell "top 15 of 15" from "of 200".
+    pub marks: Vec<DiffMark>,                // What differs, and the flag that permitted it.
+    pub overflow_rows_suppressed: u64,
+    pub suppressed: Vec<Suppressed>,
+}
+```
+
+**A `DiffRow` carries the threshold that was applied to it**, in the metric's own
+units, plus the same figure as a percentage of the two values' mean and the name
+of the rule that set it (`run-to-run`, `measurement-resolution`, or both). There
+is no second, stricter bound doing the suppressing — §6.5 forbids striking a
+delta through with a number other than the one displayed.
+
+`error_bound_pct` appears on `estimated` rows only: it is `α(a+b)/|a−b|`, the
+worst-case error **as a percentage of the delta**. At or above 100 the error bar
+is as wide as the delta and the sign of the change is not established.
+
+**Deltas are relative to `a`; thresholds are relative to the mean.** Two
+different denominators in adjacent fields, because a change is a property of the
+baseline and a floor is a property of the pair. Compare `delta.abs()` against
+`threshold_abs`, which is in the metric's units and needs no denominator at all.
+
+### `CollectorsDocumentResult`
+
+The daemon returns bytes and **the caller writes them** — the broker runs as a
+service, so a relative path would resolve against its working directory rather
+than yours, exactly as with `logs_export`. `sidecar_content` is the bulk
+companion (a full percentile table plus the sketch's layout identity, which is
+what decides whether two documents are comparable); the document's own
+front-matter names it, so write it beside the document under that name.
 
 **The three categories are not interchangeable.** They cover different populations
 and disagree exactly when it matters: under sample truncation `exact` still covers

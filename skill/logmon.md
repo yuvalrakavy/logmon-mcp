@@ -41,6 +41,8 @@ Skip it (and say so) when:
 | Get the timing breakdown of a trace | `get_trace_summary(trace_id=…)` |
 | Compare before/after a code change | `add_bookmark` → make change → query with `b>=name` |
 | Measure how long something takes, in aggregate | `add_collector(name=…, filter=…)` → run it → `get_collector` |
+| Did a change make it faster? | arm → run → `snapshot_collector` ×3 → change → ×3 → `diff_collectors(a="c@*", b="c@*")` |
+| Write up what a measurement showed | `document_collectors(names=[…], question=…)` |
 | Profile what already ran | `profile_traces(filter=…, group_by="name")` |
 | Stream "what's new since I last checked" | `c>=name` filter (cursor — see below) |
 | Get notified when X happens later | `add_trigger(filter=…, pre_window=…, post_window=…)` |
@@ -140,6 +142,8 @@ Collectors need a **named** session (`--session NAME`, or `session.start` with a
 - **`edit_collector(name, …)`** — change an armed collector. `group_keys` is capped at 8 (group by one attribute — that is the case this is built for). A structural edit is refused if it would exceed the daemon-wide sample reservation, and a refused edit changes nothing. Editing only `description` costs nothing; editing `filter`, `level`, `group_keys`, `max_sample_bytes` or `domain` **discards the live window** (snapshots are never touched). Use it to re-pin a collector orphaned by a restart, or to drop `tree` → `timing` for 2.5× the records when the sample budget runs out.
 - **`reset_collector(name)`** — zero it and **discard** the run. Prefer `snapshot_collector` unless you genuinely want it gone.
 - **`remove_collector(name)`** — unarm it and hand the budget back. Do this when you're done; a collector left armed keeps costing ingest time and reserved memory.
+- **`diff_collectors(a, b, group_by?, …)`** — subtract two runs and get what moved. **This is the payoff**; everything above measures. An *arm* is `"<collector>"` (the live window), `"<collector>@<label>"` (one recorded run), or `"<collector>@*"` (every recorded run merged). **Prefer `@*` on both sides** — with single runs there is no spread, so every threshold comes back `unknown` and nothing in the result can be called a result.
+- **`document_collectors(names, format?, question?, finding?)`** — write it up: what moved, what to do next, and every caveat attached to the number it qualifies. The first name is the baseline. Pass `question` when you generate it and `finding` on a second call once you have read it — regeneration is free and lossless, which is why nothing is stored. `format: "folded"` gives collapsed stacks for a flame graph, one arm at a time, `tree` level only.
 - **`profile_traces(filter?, …)`** — same numbers over what is already in the buffer. A collector must be armed *before* the run it measures; this looks back at one that already happened.
 
 **Reading the result.** `exact`, `estimated` and `sampled` are not three views of one number:
@@ -160,6 +164,30 @@ Two ways to run an A/B:
 2. **Two passes, `snapshot_collector`** — arm, run A, `snapshot_collector(label="before")`, change the code, run B, `snapshot_collector(label="after")`, then `get_collector_history(merge=true)`. Use when the arm cannot be an attribute. Both runs are kept, each with its own definition and description.
 
 **Repeat before you conclude.** Two runs differing by 5% tell you nothing until you know the run-to-run spread. Take three snapshots of the *same* configuration first, read the `floor` from `get_collector_history(merge=true)`, and treat differences below it as noise. A single run reports the spread as unknown, which is the honest answer, not zero.
+
+### Comparing, and what a diff refuses to do
+
+`diff_collectors` subtracts; most of its behaviour is the cases where it refuses to. Three severities:
+
+- **Marked** — it proceeds and says what differs. Arms at different levels (compared at the lower one, with nesting evidence carried across anyway), filters that differ only in spelling, one truncated arm.
+- **Blocked, with a flag that permits it** — the arms matched different populations (`allow_mismatch`), one lost spans and the other did not (`allow_lossy`), both hit the sample budget (`allow_truncated`). The error names the flag.
+- **Refused outright** — mismatched sketch layouts. The subtraction would be arithmetic on two different scales, so there is nothing to permit.
+
+**Every row carries the threshold used to suppress it, and that is the threshold that was applied** — there is no second, stricter bound doing the striking. A bracketed `[Δ]` is below its printed floor: the number is real, what is missing is any basis for calling it a change.
+
+**`err/Δ` on an estimated percentile row is the error bar as a percentage of the delta.** At 100% the bar is as wide as the delta and the *sign* of the change is not established. A 1% change carries ±199%; below roughly a 2% relative change an estimated delta is not resolvable at all. This is a property of the sketch — repeating the run will not improve it, which is what makes it a different floor from the run-to-run one.
+
+**A count row and a duration row get different floors.** A suite with a fixed iteration count has near-zero count variance while its timings vary by percent, so the two are never thresholded against each other.
+
+### Guarding a run
+
+- **`add_collector(…, threshold={metric, op, value, window_ms, group?})`** — a rolling guard. `metric`: `count`, `total_ms`, `avg_ms`, `error_count`, `error_rate_pct`. `op`: `gt`, `gte`, `lt`, `lte`. Read the verdict back from `list_collectors` or `get_collector`.
+
+**The window advances on span arrival, not on a clock.** That is what makes an idle collector free, and it has one consequence worth knowing before you rely on it: **with no traffic a breached threshold neither fires nor clears.** It is a load-time guard, not a liveness check — a `lt` threshold detects a drop *while traffic continues* and does nothing at all if traffic stops. Every report carries a note saying so, so a stuck `breached: true` on a finished run is not a bug.
+
+**Percentiles cannot be thresholds.** A rolling percentile needs a duration sketch per bucket, and per-collector memory is bounded on purpose. Use `avg_ms` for the guard and `get_collector` for the real percentiles.
+
+`fires` counts clear-to-breached transitions, not evaluations — a threshold breached for a whole run has fired once. `last_value` is **absent** until something has been evaluated: zero is a value `count` legitimately holds, and an `lt` guard would read it as a breach. Changing a threshold zeroes the live window, like any other structural edit; pass `threshold: null` to remove one.
 
 **Renaming a session keeps its collectors** — they move with it. If the rename displaces a disconnected session that held the same name, that session's collectors are cleared rather than inherited, so you never read another conversation's measurements.
 

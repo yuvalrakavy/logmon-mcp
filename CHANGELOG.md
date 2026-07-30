@@ -3,6 +3,91 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## 0.6.0 — 2026-07-30
+
+Comparison and guards — phases 4 and 5 of the span time collector design. The
+driving workflow now closes: arm, run, snapshot, change one thing, run again,
+snapshot, then ask what moved.
+
+### Added
+
+- **`collectors.diff`** — the only place logmon subtracts. An *arm* is
+  `<collector>` (the live window), `<collector>@<label>` (one recorded run), or
+  `<collector>@*` (every recorded run merged). The wildcard is not a
+  convenience: with single-run arms on both sides every threshold in the result
+  reads `unknown`, so a merged arm is the only shape whose deltas can be told
+  apart from scheduling noise.
+
+  Most of its behaviour is the cases where it *refuses*, in three severities.
+  **Marked** — a level difference (compared at the lower one, with nesting
+  evidence carried across regardless), a filter that differs only in spelling,
+  one truncated arm. **Blocked with a named flag** — arms that matched different
+  populations, one arm that lost spans while the other did not, both arms
+  truncated. **Refused outright** — mismatched sketch layouts, where the
+  subtraction would be arithmetic on two different scales and there is nothing
+  to permit.
+
+  Every row carries **the threshold that was applied to it**, in the metric's
+  own units. Estimated percentile rows also carry `α(a+b)/|a−b|`, the worst-case
+  error as a percentage of the delta — which reaches ±199% for a 1% change, and
+  crosses 100% (the error bar as wide as the delta) below roughly a 2% relative
+  change. Count rows and duration rows get **different** run-to-run floors: a
+  fixed-iteration suite has near-zero count variance while its timings vary by
+  percent, and thresholding one against the other over-suppresses badly.
+
+- **`collectors.document`** — writes a measurement up for someone who was not
+  there: what moved, what to do next, and every caveat beside the number it
+  qualifies. `md` (default), `json`, or `folded` for a flame graph. The daemon
+  returns bytes and the client writes them, as with `logs.export`. Regeneration
+  is free and lossless, so nothing is stored and `finding` normally arrives on a
+  second call after the first read.
+
+  The document went to a **cold reader** — a reviewer given the rendered
+  markdown and nothing else, no spec and no source — which found eight things
+  the author could not see, including one message that was true of an exact
+  count and false of an estimated percentile. Only the limitations that actually
+  apply are listed, each with the remedy that would clear it, and a per-metric
+  table says which numbers each one reaches. Absent numbers read `n/a` rather
+  than being given a clean bill of health.
+
+- **Threshold triggers** — `add_collector(threshold={metric, op, value,
+  window_ms, group?})`, over `count`, `total_ms`, `avg_ms`, `error_count` or
+  `error_rate_pct`. Evaluated against a rolling bucket ring **advanced by span
+  arrival, never by a clock**, which is what keeps an idle collector free.
+
+  The consequence is stated rather than left to be discovered: with no traffic a
+  breached threshold neither fires nor clears. It is a load-time guard, not a
+  liveness check — a downward threshold detects a drop *while traffic continues*
+  and does nothing if traffic stops. Every report carries a note saying so.
+  Percentiles are refused, because a rolling percentile needs a duration sketch
+  per bucket and per-collector memory is bounded on purpose.
+
+- **Snapshots record their top call paths**, so `folded` output works on a
+  recorded run and not only on a live one. Two caps, because either alone leaks:
+  200 rows bounds a pathological fan-out and 64 KiB bounds pathologically long
+  paths. Truncation is reported — nothing about looking at a flame graph reveals
+  that mass is missing from it.
+
+### Changed
+
+- Call paths are stored as **frames** rather than a joined string. A span named
+  `parse > eval` is indistinguishable from two frames once ` > ` is the
+  separator, and a flame-graph renderer that split the joined form back apart
+  would emit a stack that never ran.
+- The MCP surface grows to **42 tools**.
+- `PROTOCOL_VERSION` stays at **1** and `FORMAT_VERSION` at **1**: every change
+  here is additive, and the only version gate refuses a file newer than the
+  running build — so an optional field reads correctly in both directions, where
+  a bump would have made every existing snapshot unreadable for nothing.
+
+### Fixed
+
+- `collectors.edit` accepted a `threshold` change, reported `zeroed: true`, and
+  kept the old limit — the new definition never received it.
+- A threshold verdict was rendered as a JSON literal, emitting
+  `"last_value": null` where the schema promises the key is absent. Absent
+  versus null is the whole distinction that field carries.
+
 ## 0.5.1 — 2026-07-30
 
 Nine defects found by the pre-merge adversarial gate on 0.5.0, all in the
