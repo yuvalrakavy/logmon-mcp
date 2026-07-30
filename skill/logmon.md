@@ -195,7 +195,7 @@ Two ways to run an A/B:
 
 ### Status
 
-- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`** (spans lost on the OTLP trace transports before any collector saw them — a sibling of `receiver_drops`, not folded into it; non-zero means every span-derived number you get elsewhere is a lower bound), plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
 ### Domains
 

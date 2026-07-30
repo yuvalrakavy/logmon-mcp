@@ -2558,6 +2558,15 @@
             "otlp_grpc_traces": 0
           }
         },
+        "trace_ingest": {
+          "description": "Spans lost on the OTLP trace transports before any collector saw\nthem — a sibling of `receiver_drops`, not a member (§ doc on\n[`TraceIngestCounts`]). Non-zero means every span-derived number\nelsewhere in this payload (and in `collectors.*`) is a lower bound.",
+          "$ref": "#/$defs/TraceIngestCounts",
+          "default": {
+            "dropped": 0,
+            "shed_batches": 0,
+            "malformed_dropped": 0
+          }
+        },
         "current_domain": {
           "description": "The domain the calling session is currently bound to (§7). Additive:\nan older daemon that omits it deserializes as `\"\"`.",
           "type": "string",
@@ -2706,6 +2715,35 @@
             }
           }
         },
+        "TraceIngestCounts": {
+          "description": "Span loss on the two OTLP trace transports — surfaced as a SIBLING of\n[`ReceiverDropCounts`] on purpose, not folded into it.\n\n`receiver_drops` documents itself as counting entries the broker lost\n*silently* — the channel was full and the sender was never told. None of\nthese three counters describe that. A shed batch is a 429 / UNAVAILABLE\nthe caller saw and can retry; a malformed span was refused for cause, not\nbackpressure — and even the channel-full `dropped` count here, though\nsourced from the same silent-loss mechanism, is trace-scoped in a way\n`receiver_drops` is not. Merging any of them into `receiver_drops` would\nchange what that field means. Keep them apart — do not \"fix\" this into a\nmerge.\n\nScope: the calling session's bound domain, monotonic since that domain's\ncounters were created (daemon start for `default`, domain creation for\nany other domain).",
+          "type": "object",
+          "properties": {
+            "dropped": {
+              "description": "Per-span channel-full drops on the two OTLP trace transports.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shed_batches": {
+              "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "malformed_dropped": {
+              "description": "Spans discarded at parse time for unusable identity. Named\n`malformed_dropped` rather than `malformed`: `store.malformed_count`\n(log-side) already sits in this same payload, and the two must not\nread as one number.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "dropped",
+            "shed_batches",
+            "malformed_dropped"
+          ]
+        },
         "ReceiverLiveness": {
           "description": "Per-listener last-received wall-clock timestamps for the caller's bound\ndomain — the drill-down for \"which port is (not) receiving.\" `None` = that\nlistener has received nothing. Mirrors [`ReceiverDropCounts`]. (Consumer #2.)",
           "type": "object",
@@ -2755,6 +2793,37 @@
           }
         }
       }
+    },
+    "TraceIngestCounts": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TraceIngestCounts",
+      "description": "Span loss on the two OTLP trace transports — surfaced as a SIBLING of\n[`ReceiverDropCounts`] on purpose, not folded into it.\n\n`receiver_drops` documents itself as counting entries the broker lost\n*silently* — the channel was full and the sender was never told. None of\nthese three counters describe that. A shed batch is a 429 / UNAVAILABLE\nthe caller saw and can retry; a malformed span was refused for cause, not\nbackpressure — and even the channel-full `dropped` count here, though\nsourced from the same silent-loss mechanism, is trace-scoped in a way\n`receiver_drops` is not. Merging any of them into `receiver_drops` would\nchange what that field means. Keep them apart — do not \"fix\" this into a\nmerge.\n\nScope: the calling session's bound domain, monotonic since that domain's\ncounters were created (daemon start for `default`, domain creation for\nany other domain).",
+      "type": "object",
+      "properties": {
+        "dropped": {
+          "description": "Per-span channel-full drops on the two OTLP trace transports.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "shed_batches": {
+          "description": "Whole request bodies refused with 429 / UNAVAILABLE. The span count\nbehind these is unknowable — the bodies were never parsed.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "malformed_dropped": {
+          "description": "Spans discarded at parse time for unusable identity. Named\n`malformed_dropped` rather than `malformed`: `store.malformed_count`\n(log-side) already sits in this same payload, and the two must not\nread as one number.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "dropped",
+        "shed_batches",
+        "malformed_dropped"
+      ]
     },
     "SessionStartParams": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

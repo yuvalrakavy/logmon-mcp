@@ -1571,6 +1571,36 @@ pub struct ReceiverLiveness {
     pub otlp_grpc_traces: Option<DateTime<Utc>>,
 }
 
+/// Span loss on the two OTLP trace transports — surfaced as a SIBLING of
+/// [`ReceiverDropCounts`] on purpose, not folded into it.
+///
+/// `receiver_drops` documents itself as counting entries the broker lost
+/// *silently* — the channel was full and the sender was never told. None of
+/// these three counters describe that. A shed batch is a 429 / UNAVAILABLE
+/// the caller saw and can retry; a malformed span was refused for cause, not
+/// backpressure — and even the channel-full `dropped` count here, though
+/// sourced from the same silent-loss mechanism, is trace-scoped in a way
+/// `receiver_drops` is not. Merging any of them into `receiver_drops` would
+/// change what that field means. Keep them apart — do not "fix" this into a
+/// merge.
+///
+/// Scope: the calling session's bound domain, monotonic since that domain's
+/// counters were created (daemon start for `default`, domain creation for
+/// any other domain).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TraceIngestCounts {
+    /// Per-span channel-full drops on the two OTLP trace transports.
+    pub dropped: u64,
+    /// Whole request bodies refused with 429 / UNAVAILABLE. The span count
+    /// behind these is unknowable — the bodies were never parsed.
+    pub shed_batches: u64,
+    /// Spans discarded at parse time for unusable identity. Named
+    /// `malformed_dropped` rather than `malformed`: `store.malformed_count`
+    /// (log-side) already sits in this same payload, and the two must not
+    /// read as one number.
+    pub malformed_dropped: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct StatusGetResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1580,6 +1610,12 @@ pub struct StatusGetResult {
     pub store: StoreStats,
     #[serde(default)]
     pub receiver_drops: ReceiverDropCounts,
+    /// Spans lost on the OTLP trace transports before any collector saw
+    /// them — a sibling of `receiver_drops`, not a member (§ doc on
+    /// [`TraceIngestCounts`]). Non-zero means every span-derived number
+    /// elsewhere in this payload (and in `collectors.*`) is a lower bound.
+    #[serde(default)]
+    pub trace_ingest: TraceIngestCounts,
     /// The domain the calling session is currently bound to (§7). Additive:
     /// an older daemon that omits it deserializes as `""`.
     #[serde(default)]
