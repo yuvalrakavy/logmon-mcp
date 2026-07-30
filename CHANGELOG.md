@@ -6,38 +6,88 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 ## 0.8.0 — 2026-07-30
 
 Acting on the first production use of the collectors, by a session that had no
-hand in designing them. Their report found no correctness problem — one arm
-reproduced a figure recorded days earlier, on a different broker version, to
-within 0.8% — so everything here is about what the output *says*, not what it
-computes.
+hand in designing them. The arithmetic held up under it — one arm reproduced a
+figure recorded days earlier, on a different broker version, to within 0.8%.
+What did not hold up was the *labelling*, and two of the fixes below mean some
+numbers you have already read were not measuring what they said.
+
+**Re-check two kinds of past reading** (see Fixed for the mechanism):
+
+1. Any **snapshot** read with `skip_warmup_ms` — the cut was never applied, so
+   those figures include the warm-up period while claiming not to. They are
+   biased high, and the per-span records they came from are gone, so the run has
+   to be repeated rather than re-derived.
+2. Any **live** read combining `skip_warmup_ms` with `group_by: name` or
+   `group_by: group` — the headline figures excluded warm-up, the per-row
+   breakdown did not, and comparing the two would understate how much of the
+   total the warm-up span accounted for.
+
+Everything else here is additive and changes nothing you have already
+recorded.
 
 ### Added
 
-- **`sampled.durations_ms`** — every retained duration, in **arrival order**,
-  when the sample is complete and at most 50 records. At the sizes this serves,
-  percentiles are order statistics of three numbers and carry nothing; the
-  durations are what turn "are these two arms actually separated?" from a
-  judgement by eye into a computation. Arrival order rather than sorted because
-  a reader can sort them but cannot unsort them, and the ordering carries the
-  drift and warm-up trends the percentiles have already discarded.
+- **`sampled.durations_ms`** — every retained duration, in **arrival order**.
 
-- **`sampled.stddev_ms`** — sample standard deviation, Bessel-corrected, absent
-  below two records where it is undefined rather than zero. The `n-1` form
-  because at three runs the population form understates the spread by about 18%,
-  and the question being asked is whether a difference exceeds the spread.
+  *Present when* the collector retains per-span records (level `timing` or
+  `tree`), the sample was not truncated by `max_sample_bytes`, and it holds **at
+  most 50** of them. Above 50 the list is withheld and the percentiles and
+  spread stand in for it.
 
-  Both fields live on the sampled block, so they are **recorded into snapshots**:
-  a run captured from 0.8.0 onward carries its own raw durations permanently.
+  The 50 gates what is **stored**, not merely what is printed: a snapshot keeps
+  the projection as it stood when taken, so a run that exceeded the cap has no
+  durations to recover later. This suits a collector that matches once per run —
+  three runs is three records — and not one that matches once per iteration.
+
+  Arrival order rather than sorted because a reader can sort them but cannot
+  unsort them, and the order carries drift across a run — first-call effects, a
+  cache filling — that every other figure discards. **`durations_ms[0]` is the
+  first duration, not the smallest.** The list covers the same population as the
+  percentiles beside it, after any warm-up cut.
+
+- **`sampled.stddev_ms`** — sample standard deviation, Bessel-corrected, over
+  the same population. Absent below two records, where it is undefined rather
+  than zero, and absent on `group_by: path` rows, which keep a count and a
+  self-time sum rather than the durations it would need.
+
+  The `n-1` form because the population form is about 18% smaller at three
+  records. That is the gap between the two *formulas* — both still estimate the
+  true spread from very few samples, and at three records the estimate is itself
+  uncertain to roughly ±45%. Treat it as a description of the observed spread,
+  **not a significance test**: separating two three-run means properly takes a
+  difference of roughly 2.3 standard deviations, not one.
+
+  Both fields live on the sampled block, so they are **recorded into snapshots**.
+  A run captured from 0.8.0 onward carries its own durations permanently *when
+  it met the conditions above* — complete, and at or under the cap.
 
 - **`excluded_by_warmup`** — how many retained spans `skip_warmup_ms` removed.
-  **Absent means the filter never ran**, and is never reported as zero: "warm-up
-  was negligible" and "warm-up was never cut" are opposite facts about the same
-  number. Counted once, off the same record set every filtering view walks, so
-  the four views cannot disagree about one filter.
+  **Absent means no count could be produced**, never zero: either no cut was
+  asked for, or none could be positioned because the level retains no spans to
+  measure from. "Warm-up was negligible" and "warm-up was never cut" are
+  opposite facts about the same number. Counted once, off the same record set
+  every filtering view walks, so no two views can disagree about one filter.
 
-- **`groups_total`** on a profile — group keys before `top_n` truncation, so a
-  reader can tell the top 20 of 20 from the top 20 of 900. `collectors.diff`
-  has carried this since 0.6.0; the profile did not.
+- **`groups_total`** on a profile — group keys before `top_n` truncation (which
+  defaults to 20), so a reader can tell the top 20 of 20 from the top 20 of 900.
+  Absent when no grouping happened, including when one was asked for and
+  refused: a refused grouping has no denominator, and `0` would read as "this
+  run touched nothing". `collectors.diff` has carried a field of this name since
+  0.6.0; it counts only *comparable* keys, so on an axis at its cardinality cap
+  the two can differ by one.
+
+### Changed
+
+- **`group_by: name` and `group_by: group` are now withheld under a warm-up
+  cut**, with a `suppressed` entry saying why, and `group_by: trace` / `path`
+  are not. The name and group rows are built from accumulators written at
+  ingest, which have no window — so they were handing back at full weight
+  exactly the spans the read had excluded, next to headline figures that
+  excluded them. The two sample-derived axes are projected from the retained
+  records and honour the cut, so they are unaffected.
+
+- **An unparseable `group_by` on a snapshot read is now an error**, as it always
+  was on a live read. It was previously discarded in silence.
 
 ### Fixed
 
@@ -45,15 +95,24 @@ computes.
   snapshot with `skip_warmup_ms` or `group_by` accepted the parameter and served
   the stored numbers as though it had been applied — the projection is computed
   when the snapshot is taken, and the per-span records it came from are gone.
-  Both now report why, and the `group_by` case names `collectors.diff`, which
-  does read the stored per-name and per-group breakdowns.
+  Both now say so, as an entry in the response's `suppressed` list; **the call
+  still succeeds and nothing else about the response changes.**
 
 ### Compatibility
 
-Every change is additive. `PROTOCOL_VERSION` stays 1 and `FORMAT_VERSION` stays
-1: snapshots written by 0.8.0 load on older builds, which ignore the new fields,
-and snapshots written by older builds load here with them absent — which reads
-as *not recorded*, never as an empty list or a zero spread.
+Every wire and file change is additive. `PROTOCOL_VERSION` stays 1 and
+`FORMAT_VERSION` stays 1: snapshots written by 0.8.0 load on older builds, which
+ignore the new fields, and snapshots written by older builds load here with
+`stddev_ms` and `durations_ms` absent — which reads as *not recorded*, never as
+an empty list or a zero spread.
+
+`excluded_by_warmup` and `groups_total` are computed per read and never stored,
+so a snapshot recorded before 0.8.0 carries no stale claim about either.
+
+One asymmetry worth knowing before you downgrade: an older build that loads a
+0.8.0 snapshot **drops the two new fields on its next write**, permanently. The
+data degrades rather than corrupting — nothing misreads — but re-upgrading will
+not bring the durations back.
 
 ## 0.7.0 — 2026-07-30
 

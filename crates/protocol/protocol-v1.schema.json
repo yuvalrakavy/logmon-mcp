@@ -5302,7 +5302,7 @@
               "format": "double"
             },
             "stddev_ms": {
-              "description": "Sample standard deviation (Bessel-corrected, `n-1`) of the durations the\npercentiles were computed over. Absent below two records, where it is\nundefined rather than zero.\n\nThe n-1 form because at the sizes this matters for — a three-run A/B —\nthe population form understates the spread by about 18%, and the whole\nquestion being asked is whether a difference exceeds the spread.",
+              "description": "Sample standard deviation (Bessel-corrected, `n-1`) over exactly the\ndurations the percentiles beside it were computed from — the same\npopulation, after any warm-up cut.\n\nAbsent below two records, where it is undefined rather than zero. Also\nabsent on `group_by: path` rows, which hold a count and a self-time sum\nrather than the per-span durations either figure needs; there, absence\nsays nothing about how many records the row covers.\n\nThe `n-1` form because at the sizes this serves the population form is\nabout 18% smaller at three records (it is smaller by `sqrt((n-1)/n)`).\nNote that is the gap between the two *formulas*: both still estimate the\ntrue spread from very few samples, and at three records the estimate is\nitself uncertain to roughly ±45%. This is a description of the observed\nspread, not a significance test — comparing two three-run means properly\nneeds a difference of roughly 2.3 standard deviations, not one.",
               "type": [
                 "number",
                 "null"
@@ -5310,7 +5310,7 @@
               "format": "double"
             },
             "durations_ms": {
-              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and small enough to send (see `MAX_INLINE_DURATIONS`).\n\nArrival order rather than sorted: a reader can sort these, but could not\nunsort them, and the ordering carries drift and warm-up trends that the\npercentiles have already thrown away.\n\nAbsent when the sample was truncated — a prefix of a run presented as\nits durations would invite exactly the per-value reasoning that a biased\nsubset cannot support — or when there are more than the cap. `suppressed`\ncarries the reason in both cases. Only the top-level `sampled` block\npopulates this: it is the population the headline figures describe, and\nper-group rows would multiply it by `top_n`.",
+              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and holds at most 50 records.\n\nArrival order rather than sorted: a reader can sort these but could not\nunsort them, and the order carries drift across a run — first-call\neffects, a cache filling — which every other figure here discards.\n`durations_ms[0]` is the FIRST duration, not the smallest.\n\nAbsent when the sample was truncated (a prefix of a run presented as its\ndurations would invite exactly the per-value reasoning a biased subset\ncannot support), and absent above 50 records. On a live read `suppressed`\nnames which of the two applies; a recorded run carries the projection as\nit stood when the snapshot was taken, without that entry, so compare\n`sample_count` against the cap to tell them apart.\n\nOnly the top-level `sampled` block populates this. Group rows leave it\nabsent regardless of their size: it is the population the headline\nfigures describe, and per-row lists would multiply it by `top_n`.",
               "type": [
                 "array",
                 "null"
@@ -5741,7 +5741,7 @@
               "format": "double"
             },
             "stddev_ms": {
-              "description": "Sample standard deviation (Bessel-corrected, `n-1`) of the durations the\npercentiles were computed over. Absent below two records, where it is\nundefined rather than zero.\n\nThe n-1 form because at the sizes this matters for — a three-run A/B —\nthe population form understates the spread by about 18%, and the whole\nquestion being asked is whether a difference exceeds the spread.",
+              "description": "Sample standard deviation (Bessel-corrected, `n-1`) over exactly the\ndurations the percentiles beside it were computed from — the same\npopulation, after any warm-up cut.\n\nAbsent below two records, where it is undefined rather than zero. Also\nabsent on `group_by: path` rows, which hold a count and a self-time sum\nrather than the per-span durations either figure needs; there, absence\nsays nothing about how many records the row covers.\n\nThe `n-1` form because at the sizes this serves the population form is\nabout 18% smaller at three records (it is smaller by `sqrt((n-1)/n)`).\nNote that is the gap between the two *formulas*: both still estimate the\ntrue spread from very few samples, and at three records the estimate is\nitself uncertain to roughly ±45%. This is a description of the observed\nspread, not a significance test — comparing two three-run means properly\nneeds a difference of roughly 2.3 standard deviations, not one.",
               "type": [
                 "number",
                 "null"
@@ -5749,7 +5749,7 @@
               "format": "double"
             },
             "durations_ms": {
-              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and small enough to send (see `MAX_INLINE_DURATIONS`).\n\nArrival order rather than sorted: a reader can sort these, but could not\nunsort them, and the ordering carries drift and warm-up trends that the\npercentiles have already thrown away.\n\nAbsent when the sample was truncated — a prefix of a run presented as\nits durations would invite exactly the per-value reasoning that a biased\nsubset cannot support — or when there are more than the cap. `suppressed`\ncarries the reason in both cases. Only the top-level `sampled` block\npopulates this: it is the population the headline figures describe, and\nper-group rows would multiply it by `top_n`.",
+              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and holds at most 50 records.\n\nArrival order rather than sorted: a reader can sort these but could not\nunsort them, and the order carries drift across a run — first-call\neffects, a cache filling — which every other figure here discards.\n`durations_ms[0]` is the FIRST duration, not the smallest.\n\nAbsent when the sample was truncated (a prefix of a run presented as its\ndurations would invite exactly the per-value reasoning a biased subset\ncannot support), and absent above 50 records. On a live read `suppressed`\nnames which of the two applies; a recorded run carries the projection as\nit stood when the snapshot was taken, without that entry, so compare\n`sample_count` against the cap to tell them apart.\n\nOnly the top-level `sampled` block populates this. Group rows leave it\nabsent regardless of their size: it is the population the headline\nfigures describe, and per-row lists would multiply it by `top_n`.",
               "type": [
                 "array",
                 "null"
@@ -7153,11 +7153,13 @@
           }
         },
         "groups_total": {
-          "description": "Group keys **before** `top_n` truncation, so a reader can tell \"the top\n20 of 20\" from \"the top 20 of 900\". Mirrors `CollectorsDiffResult`.",
-          "type": "integer",
+          "description": "Group keys **before** `top_n` truncation, so a reader can tell \"the top\n20 of 20\" from \"the top 20 of 900\".\n\nAbsent when no grouping was performed — either none was asked for, or\nthe one asked for was refused (see `suppressed`). A refused grouping has\nno denominator, and `0` there would read as \"this run touched nothing\"\nrather than \"we did not look\".\n\nCounts every key the axis holds, `__overflow__` included when a\ncardinality cap folded values into it. `CollectorsDiffResult` carries a\nfield of the same name that counts only *comparable* keys and so\nexcludes `__overflow__`; the two can differ by one on a capped axis.",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint",
-          "minimum": 0,
-          "default": 0
+          "minimum": 0
         },
         "excluded_by_warmup": {
           "description": "How many retained spans `skip_warmup_ms` excluded from the sample tier.\n\n**Absent means the filter never ran** — not that it ran and excluded\nnothing. A reader that cannot tell those apart cannot tell \"warm-up was\nnegligible\" from \"warm-up was never cut\", which are opposite facts about\nthe same number. `sampled.sample_count` is the population that survived,\nso the two together give the whole picture.",
@@ -7469,7 +7471,7 @@
               "format": "double"
             },
             "stddev_ms": {
-              "description": "Sample standard deviation (Bessel-corrected, `n-1`) of the durations the\npercentiles were computed over. Absent below two records, where it is\nundefined rather than zero.\n\nThe n-1 form because at the sizes this matters for — a three-run A/B —\nthe population form understates the spread by about 18%, and the whole\nquestion being asked is whether a difference exceeds the spread.",
+              "description": "Sample standard deviation (Bessel-corrected, `n-1`) over exactly the\ndurations the percentiles beside it were computed from — the same\npopulation, after any warm-up cut.\n\nAbsent below two records, where it is undefined rather than zero. Also\nabsent on `group_by: path` rows, which hold a count and a self-time sum\nrather than the per-span durations either figure needs; there, absence\nsays nothing about how many records the row covers.\n\nThe `n-1` form because at the sizes this serves the population form is\nabout 18% smaller at three records (it is smaller by `sqrt((n-1)/n)`).\nNote that is the gap between the two *formulas*: both still estimate the\ntrue spread from very few samples, and at three records the estimate is\nitself uncertain to roughly ±45%. This is a description of the observed\nspread, not a significance test — comparing two three-run means properly\nneeds a difference of roughly 2.3 standard deviations, not one.",
               "type": [
                 "number",
                 "null"
@@ -7477,7 +7479,7 @@
               "format": "double"
             },
             "durations_ms": {
-              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and small enough to send (see `MAX_INLINE_DURATIONS`).\n\nArrival order rather than sorted: a reader can sort these, but could not\nunsort them, and the ordering carries drift and warm-up trends that the\npercentiles have already thrown away.\n\nAbsent when the sample was truncated — a prefix of a run presented as\nits durations would invite exactly the per-value reasoning that a biased\nsubset cannot support — or when there are more than the cap. `suppressed`\ncarries the reason in both cases. Only the top-level `sampled` block\npopulates this: it is the population the headline figures describe, and\nper-group rows would multiply it by `top_n`.",
+              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and holds at most 50 records.\n\nArrival order rather than sorted: a reader can sort these but could not\nunsort them, and the order carries drift across a run — first-call\neffects, a cache filling — which every other figure here discards.\n`durations_ms[0]` is the FIRST duration, not the smallest.\n\nAbsent when the sample was truncated (a prefix of a run presented as its\ndurations would invite exactly the per-value reasoning a biased subset\ncannot support), and absent above 50 records. On a live read `suppressed`\nnames which of the two applies; a recorded run carries the projection as\nit stood when the snapshot was taken, without that entry, so compare\n`sample_count` against the cap to tell them apart.\n\nOnly the top-level `sampled` block populates this. Group rows leave it\nabsent regardless of their size: it is the population the headline\nfigures describe, and per-row lists would multiply it by `top_n`.",
               "type": [
                 "array",
                 "null"
@@ -7912,7 +7914,7 @@
           "format": "double"
         },
         "stddev_ms": {
-          "description": "Sample standard deviation (Bessel-corrected, `n-1`) of the durations the\npercentiles were computed over. Absent below two records, where it is\nundefined rather than zero.\n\nThe n-1 form because at the sizes this matters for — a three-run A/B —\nthe population form understates the spread by about 18%, and the whole\nquestion being asked is whether a difference exceeds the spread.",
+          "description": "Sample standard deviation (Bessel-corrected, `n-1`) over exactly the\ndurations the percentiles beside it were computed from — the same\npopulation, after any warm-up cut.\n\nAbsent below two records, where it is undefined rather than zero. Also\nabsent on `group_by: path` rows, which hold a count and a self-time sum\nrather than the per-span durations either figure needs; there, absence\nsays nothing about how many records the row covers.\n\nThe `n-1` form because at the sizes this serves the population form is\nabout 18% smaller at three records (it is smaller by `sqrt((n-1)/n)`).\nNote that is the gap between the two *formulas*: both still estimate the\ntrue spread from very few samples, and at three records the estimate is\nitself uncertain to roughly ±45%. This is a description of the observed\nspread, not a significance test — comparing two three-run means properly\nneeds a difference of roughly 2.3 standard deviations, not one.",
           "type": [
             "number",
             "null"
@@ -7920,7 +7922,7 @@
           "format": "double"
         },
         "durations_ms": {
-          "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and small enough to send (see `MAX_INLINE_DURATIONS`).\n\nArrival order rather than sorted: a reader can sort these, but could not\nunsort them, and the ordering carries drift and warm-up trends that the\npercentiles have already thrown away.\n\nAbsent when the sample was truncated — a prefix of a run presented as\nits durations would invite exactly the per-value reasoning that a biased\nsubset cannot support — or when there are more than the cap. `suppressed`\ncarries the reason in both cases. Only the top-level `sampled` block\npopulates this: it is the population the headline figures describe, and\nper-group rows would multiply it by `top_n`.",
+          "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and holds at most 50 records.\n\nArrival order rather than sorted: a reader can sort these but could not\nunsort them, and the order carries drift across a run — first-call\neffects, a cache filling — which every other figure here discards.\n`durations_ms[0]` is the FIRST duration, not the smallest.\n\nAbsent when the sample was truncated (a prefix of a run presented as its\ndurations would invite exactly the per-value reasoning a biased subset\ncannot support), and absent above 50 records. On a live read `suppressed`\nnames which of the two applies; a recorded run carries the projection as\nit stood when the snapshot was taken, without that entry, so compare\n`sample_count` against the cap to tell them apart.\n\nOnly the top-level `sampled` block populates this. Group rows leave it\nabsent regardless of their size: it is the population the headline\nfigures describe, and per-row lists would multiply it by `top_n`.",
           "type": [
             "array",
             "null"
@@ -8170,7 +8172,7 @@
               "format": "double"
             },
             "stddev_ms": {
-              "description": "Sample standard deviation (Bessel-corrected, `n-1`) of the durations the\npercentiles were computed over. Absent below two records, where it is\nundefined rather than zero.\n\nThe n-1 form because at the sizes this matters for — a three-run A/B —\nthe population form understates the spread by about 18%, and the whole\nquestion being asked is whether a difference exceeds the spread.",
+              "description": "Sample standard deviation (Bessel-corrected, `n-1`) over exactly the\ndurations the percentiles beside it were computed from — the same\npopulation, after any warm-up cut.\n\nAbsent below two records, where it is undefined rather than zero. Also\nabsent on `group_by: path` rows, which hold a count and a self-time sum\nrather than the per-span durations either figure needs; there, absence\nsays nothing about how many records the row covers.\n\nThe `n-1` form because at the sizes this serves the population form is\nabout 18% smaller at three records (it is smaller by `sqrt((n-1)/n)`).\nNote that is the gap between the two *formulas*: both still estimate the\ntrue spread from very few samples, and at three records the estimate is\nitself uncertain to roughly ±45%. This is a description of the observed\nspread, not a significance test — comparing two three-run means properly\nneeds a difference of roughly 2.3 standard deviations, not one.",
               "type": [
                 "number",
                 "null"
@@ -8178,7 +8180,7 @@
               "format": "double"
             },
             "durations_ms": {
-              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and small enough to send (see `MAX_INLINE_DURATIONS`).\n\nArrival order rather than sorted: a reader can sort these, but could not\nunsort them, and the ordering carries drift and warm-up trends that the\npercentiles have already thrown away.\n\nAbsent when the sample was truncated — a prefix of a run presented as\nits durations would invite exactly the per-value reasoning that a biased\nsubset cannot support — or when there are more than the cap. `suppressed`\ncarries the reason in both cases. Only the top-level `sampled` block\npopulates this: it is the population the headline figures describe, and\nper-group rows would multiply it by `top_n`.",
+              "description": "Every retained duration, in **arrival order**, when the sample is\ncomplete and holds at most 50 records.\n\nArrival order rather than sorted: a reader can sort these but could not\nunsort them, and the order carries drift across a run — first-call\neffects, a cache filling — which every other figure here discards.\n`durations_ms[0]` is the FIRST duration, not the smallest.\n\nAbsent when the sample was truncated (a prefix of a run presented as its\ndurations would invite exactly the per-value reasoning a biased subset\ncannot support), and absent above 50 records. On a live read `suppressed`\nnames which of the two applies; a recorded run carries the projection as\nit stood when the snapshot was taken, without that entry, so compare\n`sample_count` against the cap to tell them apart.\n\nOnly the top-level `sampled` block populates this. Group rows leave it\nabsent regardless of their size: it is the population the headline\nfigures describe, and per-row lists would multiply it by `top_n`.",
               "type": [
                 "array",
                 "null"

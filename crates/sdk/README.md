@@ -387,6 +387,17 @@ pub struct ProfileResult {
                                              // whole population only while `complete`.
     pub grouped_by: Option<String>,
     pub groups: Vec<ProfileGroup>,
+    pub groups_total: Option<usize>,         // Keys before top_n truncation (default 20).
+                                             // None when no grouping happened, INCLUDING
+                                             // when one was asked for and refused — a
+                                             // refused grouping has no denominator, and 0
+                                             // would read as "this run touched nothing".
+    pub excluded_by_warmup: Option<u64>,     // Spans skip_warmup_ms removed. None means no
+                                             // count could be produced — no cut asked for,
+                                             // or none positionable because the level
+                                             // retains nothing to measure from. Never 0
+                                             // for those: "warm-up was negligible" and
+                                             // "warm-up was never cut" are opposite facts.
     pub cardinality_capped: bool,            // A cap folded values into __overflow__.
     pub suppressed: Vec<Suppressed>,         // { field, reason, remedy } per null above.
     pub warnings: Vec<String>,               // traces_profile only; collectors_add returns
@@ -464,6 +475,16 @@ pub struct ProfileSampled {
     pub achieved_concurrency: Option<f64>,   // Sampled total / that union. 1.0 = serial.
     pub p50_ms: Option<f64>, pub p80_ms: Option<f64>,
     pub p95_ms: Option<f64>, pub p99_ms: Option<f64>,
+    pub stddev_ms: Option<f64>,              // Sample (n-1) stddev over the same population
+                                             // as the percentiles. None below 2 records,
+                                             // and on group_by=path rows, which hold no
+                                             // per-span durations. A description of the
+                                             // observed spread, NOT a significance test.
+    pub durations_ms: Option<Vec<f64>>,      // ARRIVAL ORDER, not sorted — [0] is the first
+                                             // duration, not the smallest. Present only on
+                                             // the top-level block, only when `complete`,
+                                             // and only at <=50 records. The cap gates what
+                                             // a snapshot STORES, not just what prints.
 }
 ```
 

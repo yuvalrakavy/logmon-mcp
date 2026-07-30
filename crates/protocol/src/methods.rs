@@ -740,28 +740,42 @@ pub struct ProfileSampled {
     pub p95_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub p99_ms: Option<f64>,
-    /// Sample standard deviation (Bessel-corrected, `n-1`) of the durations the
-    /// percentiles were computed over. Absent below two records, where it is
-    /// undefined rather than zero.
+    /// Sample standard deviation (Bessel-corrected, `n-1`) over exactly the
+    /// durations the percentiles beside it were computed from — the same
+    /// population, after any warm-up cut.
     ///
-    /// The n-1 form because at the sizes this matters for — a three-run A/B —
-    /// the population form understates the spread by about 18%, and the whole
-    /// question being asked is whether a difference exceeds the spread.
+    /// Absent below two records, where it is undefined rather than zero. Also
+    /// absent on `group_by: path` rows, which hold a count and a self-time sum
+    /// rather than the per-span durations either figure needs; there, absence
+    /// says nothing about how many records the row covers.
+    ///
+    /// The `n-1` form because at the sizes this serves the population form is
+    /// about 18% smaller at three records (it is smaller by `sqrt((n-1)/n)`).
+    /// Note that is the gap between the two *formulas*: both still estimate the
+    /// true spread from very few samples, and at three records the estimate is
+    /// itself uncertain to roughly ±45%. This is a description of the observed
+    /// spread, not a significance test — comparing two three-run means properly
+    /// needs a difference of roughly 2.3 standard deviations, not one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stddev_ms: Option<f64>,
     /// Every retained duration, in **arrival order**, when the sample is
-    /// complete and small enough to send (see `MAX_INLINE_DURATIONS`).
+    /// complete and holds at most 50 records.
     ///
-    /// Arrival order rather than sorted: a reader can sort these, but could not
-    /// unsort them, and the ordering carries drift and warm-up trends that the
-    /// percentiles have already thrown away.
+    /// Arrival order rather than sorted: a reader can sort these but could not
+    /// unsort them, and the order carries drift across a run — first-call
+    /// effects, a cache filling — which every other figure here discards.
+    /// `durations_ms[0]` is the FIRST duration, not the smallest.
     ///
-    /// Absent when the sample was truncated — a prefix of a run presented as
-    /// its durations would invite exactly the per-value reasoning that a biased
-    /// subset cannot support — or when there are more than the cap. `suppressed`
-    /// carries the reason in both cases. Only the top-level `sampled` block
-    /// populates this: it is the population the headline figures describe, and
-    /// per-group rows would multiply it by `top_n`.
+    /// Absent when the sample was truncated (a prefix of a run presented as its
+    /// durations would invite exactly the per-value reasoning a biased subset
+    /// cannot support), and absent above 50 records. On a live read `suppressed`
+    /// names which of the two applies; a recorded run carries the projection as
+    /// it stood when the snapshot was taken, without that entry, so compare
+    /// `sample_count` against the cap to tell them apart.
+    ///
+    /// Only the top-level `sampled` block populates this. Group rows leave it
+    /// absent regardless of their size: it is the population the headline
+    /// figures describe, and per-row lists would multiply it by `top_n`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durations_ms: Option<Vec<f64>>,
 }
@@ -1454,9 +1468,19 @@ pub struct ProfileResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<ProfileGroup>,
     /// Group keys **before** `top_n` truncation, so a reader can tell "the top
-    /// 20 of 20" from "the top 20 of 900". Mirrors `CollectorsDiffResult`.
-    #[serde(default)]
-    pub groups_total: usize,
+    /// 20 of 20" from "the top 20 of 900".
+    ///
+    /// Absent when no grouping was performed — either none was asked for, or
+    /// the one asked for was refused (see `suppressed`). A refused grouping has
+    /// no denominator, and `0` there would read as "this run touched nothing"
+    /// rather than "we did not look".
+    ///
+    /// Counts every key the axis holds, `__overflow__` included when a
+    /// cardinality cap folded values into it. `CollectorsDiffResult` carries a
+    /// field of the same name that counts only *comparable* keys and so
+    /// excludes `__overflow__`; the two can differ by one on a capped axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_total: Option<usize>,
     /// How many retained spans `skip_warmup_ms` excluded from the sample tier.
     ///
     /// **Absent means the filter never ran** — not that it ran and excluded

@@ -1661,18 +1661,23 @@ impl RpcHandler {
         // rather than re-projected, because the samples it was projected from
         // are gone — and re-deriving from the live collector would answer a
         // different question with the right-looking shape.
+        // Parsed BEFORE the snapshot branch on purpose. Reading the raw params
+        // there instead would let a typo like `group_by: "NAME"` hard-error on a
+        // live read and pass silently on a recorded one — the same parameter,
+        // the same mistake, two different outcomes, and the quiet one is the
+        // failure this whole surface exists to close.
+        let opts = self.profile_options(params)?;
         if let Some(label) = params.get("snapshot").and_then(|v| v.as_str()) {
             let snap = self
                 .collectors
                 .get_snapshot(session_id, name, label)
                 .map_err(|e| e.to_string())?;
-            return Ok(snapshot_as_profile(&snap, params));
+            return Ok(snapshot_as_profile(&snap, &opts));
         }
         let armed = self
             .collectors
             .get(session_id, name)
             .ok_or_else(|| format!("no collector named `{name}` in this session"))?;
-        let opts = self.profile_options(params)?;
         let result = crate::collector::project::profile(
             &armed.collector.snapshot(),
             self.ingest_basis(&armed),
@@ -2321,6 +2326,15 @@ fn estimated_json(e: &crate::collector::exact::ExactStats, axis: &str) -> Value 
 /// Reports the definition **from the snapshot**, never from the live
 /// collector — that is the whole reason §6.3 makes a snapshot carry its own.
 fn snapshot_summary(s: &StoredSnapshot) -> Value {
+    // The 50-duration cap was budgeted for ONE `sampled` block. This is a list
+    // view -- `collectors.history` returns every retained run, up to 50 of them,
+    // so carrying the durations here would multiply one bounded list into 2500
+    // floats nobody asked for, straight into a reader's context. The single-run
+    // read (`collectors.get` with a `snapshot` label) still serves them.
+    let sampled = s.projections.as_ref().map(|p| ProfileSampled {
+        durations_ms: None,
+        ..p.clone()
+    });
     json!({
         "label": s.label,
         "description": s.description,
@@ -2333,7 +2347,7 @@ fn snapshot_summary(s: &StoredSnapshot) -> Value {
         "group_keys": s.def.group_keys,
         "exact": exact_json(&s.total),
         "estimated": estimated_json(&s.total, "collector"),
-        "sampled": s.projections,
+        "sampled": sampled,
         "ingest": s.ingest.map(|i| json!({
             "drops_in_window": i.dropped,
             "shed_batches": i.shed_batches,
@@ -2353,12 +2367,14 @@ fn snapshot_summary(s: &StoredSnapshot) -> Value {
 /// a snapshot — a recorded run *is* a profile, of a window that has closed.
 /// Two shapes would mean every client branches on a parameter it passed, and
 /// the typed SDK could not name a return type at all.
-/// `params` is read only to report what a recorded run could not honour. A
+/// `opts` is read only to report what a recorded run could not honour. A
 /// snapshot is served from what it stored, so every read-shaping option arrives
 /// after the shaping moment has passed — and handing back numbers that ignored
 /// one, with nothing in the shape to say so, is the failure the suppression
-/// channel exists to prevent.
-fn snapshot_as_profile(s: &StoredSnapshot, params: &Value) -> Value {
+/// channel exists to prevent. Taking the parsed options rather than the raw
+/// params is what keeps an unparseable value an error here as it is on a live
+/// read, instead of a silent no-op.
+fn snapshot_as_profile(s: &StoredSnapshot, opts: &ProfileOptions) -> Value {
     let nesting = match (&s.projections, s.def.level.has_tree()) {
         (Some(p), true) if p.nested_matches > 0 => "detected",
         (Some(_), true) => "undetected",
@@ -2376,11 +2392,7 @@ fn snapshot_as_profile(s: &StoredSnapshot, params: &Value) -> Value {
             "remedy": "take the next snapshot with projections: true",
         }));
     }
-    if params
-        .get("skip_warmup_ms")
-        .and_then(|v| v.as_f64())
-        .is_some_and(|ms| ms > 0.0)
-    {
+    if opts.skip_warmup_ms.is_some_and(|ms| ms > 0.0) {
         suppressed.push(json!({
             "field": "excluded_by_warmup",
             "reason": "skip_warmup_ms cannot apply to a recorded run: the projection \
@@ -2391,21 +2403,22 @@ fn snapshot_as_profile(s: &StoredSnapshot, params: &Value) -> Value {
                        after warm-up so the next snapshot records a clean window",
         }));
     }
-    // Parsed, not merely present: `group_by: ""` is a valid way to ask for no
-    // grouping, and reporting a suppression for a request nobody made is the
-    // same class of lie as staying silent about one that was ignored.
-    if params
-        .get("group_by")
-        .and_then(|v| v.as_str())
-        .and_then(GroupBy::parse)
-        .is_some_and(|g| g != GroupBy::None)
-    {
+    // `GroupBy::None` rather than mere absence: `group_by: ""` is a valid way to
+    // ask for no grouping, and reporting a suppression for a request nobody made
+    // is the same class of lie as staying silent about one that was ignored.
+    if opts.group_by != GroupBy::None {
         suppressed.push(json!({
             "field": "groups",
-            "reason": "a recorded run is served from what it stored, and per-group \
-                       rows are not projected into a snapshot",
-            "remedy": "compare recorded runs with collectors.diff, which reads the \
-                       stored per-name and per-group breakdowns",
+            "reason": "a recorded run is served from what it stored, and no grouping \
+                       is projected into a snapshot",
+            // Deliberately NOT "use collectors.diff": that is true only for
+            // `name` and `group`, only between two runs, and only while their
+            // per-axis breakdowns are still in memory -- persistence drops those
+            // on the way to disk, so a restart makes the advice false. Grouping
+            // before the snapshot is the one remedy that always holds.
+            "remedy": "group on a live read, before snapshotting -- a recorded run \
+                       keeps its headline tiers and projections, not its per-axis \
+                       breakdowns",
         }));
     }
     json!({

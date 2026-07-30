@@ -994,10 +994,14 @@ fn no_warmup_leaves_the_exclusion_count_absent_not_zero() {
 }
 
 #[test]
-fn an_empty_window_says_the_zero_means_there_was_nothing_to_cut() {
+fn a_cut_that_could_not_be_positioned_is_absent_with_a_reason_not_a_zero() {
     // `warmup_cutoff_ns` measures from the earliest retained start, so with
-    // nothing retained there is no cut to position. Reporting a bare 0 would
-    // read as "the warm-up period was empty", which is a different claim.
+    // nothing retained there is no cut to position. `Some(0)` would be a claim
+    // about the run ("warm-up excluded nothing") when the truth is a claim
+    // about retention ("we could not look") — and the documented contract for a
+    // figure that could not be computed is null plus a `suppressed` entry,
+    // because nothing directs a reader to check `suppressed` for a field that
+    // already carries a value.
     let r = run(
         Level::Timing,
         &[],
@@ -1006,9 +1010,13 @@ fn an_empty_window_says_the_zero_means_there_was_nothing_to_cut() {
             ..Default::default()
         },
     );
-    assert_eq!(r.excluded_by_warmup, Some(0));
-    let s = suppression(&r, "excluded_by_warmup").expect("the zero must be explained");
-    assert!(s.reason.contains("nothing to cut"), "reason: {}", s.reason);
+    assert_eq!(r.excluded_by_warmup, None);
+    let s = suppression(&r, "excluded_by_warmup").expect("the absence must be explained");
+    assert!(
+        s.reason.contains("unknown, not zero"),
+        "reason: {}",
+        s.reason
+    );
 }
 
 #[test]
@@ -1076,8 +1084,36 @@ fn groups_total_counts_rows_before_top_n_truncation() {
     );
     assert_eq!(r.groups.len(), 2, "top_n bounds what is returned");
     assert_eq!(
-        r.groups_total, 4,
+        r.groups_total,
+        Some(4),
         "but the reader still has to be able to tell the top 2 of 4 from the top 2 of 2"
+    );
+}
+
+/// `path_rows` is a SECOND implementation of "count before truncating" — it
+/// uses `take`, not `rank_and_truncate` — and the name-axis test above cannot
+/// reach it. A mutation moving its count to after the `take` survived the whole
+/// suite because every path fixture either never truncated or never looked.
+#[test]
+fn groups_total_counts_paths_before_truncation_too() {
+    let spans = [
+        span("handler", 1, None, 0, 100 * MS),
+        span("db", 2, Some(1), 10 * MS, 60 * MS),
+    ];
+    let r = run(
+        Level::Tree,
+        &spans,
+        ProfileOptions {
+            group_by: GroupBy::Path,
+            top_n: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(r.groups.len(), 1, "top_n bounds what is returned");
+    assert_eq!(
+        r.groups_total,
+        Some(2),
+        "two distinct paths exist; truncating to one must not change the count"
     );
 }
 
@@ -1099,7 +1135,79 @@ fn groups_total_equals_the_row_count_when_nothing_was_truncated() {
         },
     );
     assert_eq!(r.groups.len(), 2);
-    assert_eq!(r.groups_total, 2);
+    assert_eq!(r.groups_total, Some(2));
+}
+
+/// A grouping that was REFUSED has no denominator. Reporting `0` would read as
+/// "this run touched zero traces" when the truth is that trace identity is not
+/// retained at this level — the same absent-is-not-zero rule the exclusion
+/// count follows, in the same struct.
+#[test]
+fn a_refused_grouping_has_no_total_rather_than_a_zero_one() {
+    let spans = [span("a", 1, None, 0, 10 * MS)];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            group_by: GroupBy::Trace,
+            ..Default::default()
+        },
+    );
+    assert!(suppression(&r, "groups").is_some(), "the refusal is stated");
+    assert_eq!(r.groups_total, None);
+    let v = serde_json::to_value(&r).unwrap();
+    assert!(
+        v.get("groups_total").is_none(),
+        "and absent on the wire, not 0: {v}"
+    );
+}
+
+/// Convergent finding from two independent gate lenses. Name and group rows are
+/// built from the per-axis accumulators, which are written at ingest and have no
+/// window — so under a warm-up cut they hand back at full weight exactly the
+/// spans the read excluded, while the top-level `exact` tier is withheld for
+/// that very reason. `excluded_by_warmup` beside them makes the contradiction
+/// arithmetically visible: the cold span dominates the breakdown 25:1 while the
+/// headline figures exclude it.
+#[test]
+fn a_warmup_cut_withholds_the_unwindowed_group_axes() {
+    let spans = [
+        span("cold", 1, None, 0, 500 * MS),
+        span("warm", 2, None, 200 * MS, 210 * MS),
+        span("warm", 3, None, 300 * MS, 310 * MS),
+    ];
+    let r = run(
+        Level::Tree,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            group_by: GroupBy::Name,
+            ..Default::default()
+        },
+    );
+    assert!(
+        r.groups.is_empty(),
+        "the `cold` row would restore the excluded span at full weight: {:?}",
+        r.groups
+    );
+    assert_eq!(r.groups_total, None);
+    let s = suppression(&r, "groups").expect("withholding must be explained");
+    assert!(s.reason.contains("unwindowed"), "reason: {}", s.reason);
+
+    // Two-way: the sample-derived axes DO honour the cut, so they must survive.
+    let by_path = run(
+        Level::Tree,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            group_by: GroupBy::Path,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !by_path.groups.is_empty(),
+        "path rows are projected from the retained records and honour the cut"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,6 +1384,50 @@ fn a_sampled_block_from_an_older_build_reads_as_absent_not_empty() {
     assert_eq!(s.stddev_ms, None, "absent, not Some(0.0)");
 }
 
+/// The cap's tests reference it symbolically, so they hold for ANY value and a
+/// refactor that shrank it tenfold would ship green. The literal also appears in
+/// `durations_ms`'s published doc comment, which a schema consumer reads and
+/// cannot resolve a Rust constant from — so the two must not drift apart.
+#[test]
+fn the_inline_cap_is_the_fifty_the_published_docs_promise() {
+    assert_eq!(MAX_INLINE_DURATIONS, 50);
+}
+
+/// A span starting EXACTLY on the cutoff is kept — the filters use `<`, not
+/// `<=`. Every other warm-up fixture places spans strictly inside or strictly
+/// outside the cut, so flipping that one operator survived the whole suite while
+/// silently breaking the "excluded plus surviving accounts for every retained
+/// span" invariant by one.
+#[test]
+fn a_span_starting_exactly_on_the_cutoff_survives_the_cut() {
+    let spans = [
+        span("before", 1, None, 0, 10 * MS),
+        // The cut lands at the earliest start + 100 ms — precisely this start.
+        span("boundary", 2, None, 100 * MS, 110 * MS),
+        span("after", 3, None, 200 * MS, 210 * MS),
+    ];
+    let r = run(
+        Level::Timing,
+        &spans,
+        ProfileOptions {
+            skip_warmup_ms: Some(100.0),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        r.excluded_by_warmup,
+        Some(1),
+        "only the span strictly before the cut is excluded"
+    );
+    let s = r.sampled.unwrap();
+    assert_eq!(s.sample_count, 2, "the boundary span is retained");
+    assert_eq!(
+        s.durations_ms,
+        Some(vec![10.0, 10.0]),
+        "and it is the boundary and after spans that survived"
+    );
+}
+
 #[test]
 fn an_ungrouped_read_reports_no_group_total() {
     let spans = [span("a", 1, None, 0, 10 * MS)];
@@ -1283,7 +1435,7 @@ fn an_ungrouped_read_reports_no_group_total() {
     assert!(r.grouped_by.is_none());
     assert!(r.groups.is_empty());
     assert_eq!(
-        r.groups_total, 0,
-        "no grouping was asked for, so none exists"
+        r.groups_total, None,
+        "no grouping was asked for, so there is no denominator to report"
     );
 }

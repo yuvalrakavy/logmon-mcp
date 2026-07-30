@@ -157,20 +157,29 @@ pub fn profile(
     // each view would let three numbers describing one filter disagree, and a
     // reader has no way to tell which of them the headline figures used.
     //
-    // `None` when no cut was requested — never `Some(0)`. Absent says the
-    // filter did not run; zero says it ran and removed nothing. Reporting the
-    // second for the first is the failure this field exists to prevent.
-    let excluded_by_warmup = warmup.map(|_| match cut_ns {
-        Some(c) => snap.samples.records().filter(|r| r.start_ns < c).count() as u64,
-        None => 0,
+    // Absent unless the cut actually ran. Two ways it does not: no cut was
+    // asked for, and no cut could be POSITIONED — `warmup_cutoff_ns` measures
+    // from the earliest retained span, and a level with no sample tier retains
+    // none however many spans it matched.
+    //
+    // That second case is why this is not `Some(0)` with an explanation beside
+    // it. A `scalar` collector over 5000 spans would report "excluded 0",
+    // which reads as a fact about the run rather than about the retention
+    // level — and the documented contract for a figure that could not be
+    // computed is `null` plus a `suppressed` entry, because nothing tells a
+    // reader to check `suppressed` for a field that already has a value.
+    let excluded_by_warmup = warmup.and_then(|_| {
+        cut_ns.map(|c| snap.samples.records().filter(|r| r.start_ns < c).count() as u64)
     });
     if warmup.is_some() && cut_ns.is_none() {
         suppressed.push(Suppressed {
             field: "excluded_by_warmup".into(),
-            reason: "the cut is measured from the earliest retained span, and this \
-                     window retains none — so the zero means there was nothing to \
-                     cut, not that the warm-up period was empty"
-                .into(),
+            reason: format!(
+                "the cut is measured from the earliest retained span, and level `{}` \
+                 retained none here — so how many spans it would have excluded is \
+                 unknown, not zero",
+                level.as_str()
+            ),
             remedy: Some("read a window that retained samples, at level `timing` or `tree`".into()),
         });
     }
@@ -228,9 +237,9 @@ pub fn profile(
     };
 
     let (grouped_by, groups, groups_total) = if opts.group_by == GroupBy::None {
-        (None, Vec::new(), 0)
+        (None, Vec::new(), None)
     } else {
-        let (rows, total) = group_rows(snap, opts, cut_ns, &mut suppressed);
+        let (rows, total) = group_rows(snap, opts, cut_ns, warmup.is_some(), &mut suppressed);
         (Some(opts.group_by.as_str().to_string()), rows, total)
     };
 
@@ -749,8 +758,9 @@ fn group_rows(
     snap: &CollectorSnapshot,
     opts: &ProfileOptions,
     cut_ns: Option<i64>,
+    warmup_requested: bool,
     suppressed: &mut Vec<Suppressed>,
-) -> (Vec<ProfileGroup>, usize) {
+) -> (Vec<ProfileGroup>, Option<usize>) {
     let level = snap.def.level;
     if opts.group_by.is_sample_derived() && !level.has_tree() {
         suppressed.push(Suppressed {
@@ -762,11 +772,42 @@ fn group_rows(
             ),
             remedy: Some("define the collector at level `tree`".into()),
         });
-        return (Vec::new(), 0);
+        return (Vec::new(), None);
     }
 
-    match opts.group_by {
-        GroupBy::None => (Vec::new(), 0),
+    // Name and group rows come off the per-axis accumulators, which are written
+    // at ingest and have no window — the same property that makes the top-level
+    // `exact` and `estimated` tiers unreportable under a warm-up cut. Left in,
+    // they would hand back at full weight exactly the spans this read excluded,
+    // and `excluded_by_warmup` beside them invites a reader to reconstruct a
+    // denominator these rows do not share. Withheld for the same reason, and
+    // said out loud rather than served with a caveat somewhere else.
+    if warmup_requested && matches!(opts.group_by, GroupBy::Name | GroupBy::Group) {
+        suppressed.push(Suppressed {
+            field: "groups".into(),
+            reason: format!(
+                "`group_by: {}` reads the per-{} accumulators, which are unwindowed \
+                 for the same reason `exact` is — every row would carry the warm-up \
+                 spans this read excluded",
+                opts.group_by.as_str(),
+                opts.group_by.as_str()
+            ),
+            remedy: Some(
+                "group by `trace` or `path`, which are projected from the retained \
+                 records and honour the cut; or read without skip_warmup_ms and reset \
+                 the collector after warm-up instead"
+                    .into(),
+            ),
+        });
+        return (Vec::new(), None);
+    }
+
+    // `Some` only past this point: every arm below actually built a row set, so
+    // its total describes a real collection. The bail-outs above return `None`
+    // — a grouping that was refused has no denominator, and reporting `0` would
+    // read as "this run touched nothing" rather than "we did not look".
+    let (rows, total) = match opts.group_by {
+        GroupBy::None => return (Vec::new(), None),
         GroupBy::Name => exact_rows(
             snap.per_name
                 .iter()
@@ -783,7 +824,7 @@ fn group_rows(
                         "define a collector with group_keys, e.g. [\"cache.enabled\"]".into(),
                     ),
                 });
-                return (Vec::new(), 0);
+                return (Vec::new(), None);
             }
             exact_rows(
                 snap.per_group
@@ -795,7 +836,8 @@ fn group_rows(
         }
         GroupBy::Trace => trace_rows(&snap.samples, cut_ns, opts.top_n),
         GroupBy::Path => path_rows(snap, cut_ns, opts.top_n),
-    }
+    };
+    (rows, Some(total))
 }
 
 /// Rows straight off the exact tier: both `exact` and `estimated` are real,

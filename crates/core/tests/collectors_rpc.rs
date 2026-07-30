@@ -3096,7 +3096,7 @@ fn a_snapshot_read_says_skip_warmup_ms_could_not_apply() {
 }
 
 #[test]
-fn a_snapshot_read_says_group_by_could_not_apply_and_points_at_diff() {
+fn a_snapshot_read_says_group_by_could_not_apply() {
     let (h, sid) = harness_with_a_recorded_run();
     let r = h
         .call(
@@ -3108,10 +3108,44 @@ fn a_snapshot_read_says_group_by_could_not_apply_and_points_at_diff() {
 
     let s = suppressed_field(&r, "groups")
         .expect("an ignored group_by must be reported: an empty groups list reads as `no groups`");
+    let remedy = s["remedy"].as_str().unwrap();
     assert!(
-        s["remedy"].as_str().unwrap().contains("collectors.diff"),
-        "the remedy must name the surface that DOES read stored per-name rows: {}",
-        s["remedy"]
+        remedy.contains("before snapshotting"),
+        "the remedy must be one that always holds: {remedy}"
+    );
+    // It must NOT name `collectors.diff`. That advice is true only for `name`
+    // and `group`, only between two runs, and only while their per-axis
+    // breakdowns are still in memory -- persistence drops those on the way to
+    // disk, so a daemon restart turns it into a wrong answer with a confident
+    // shape. A remedy that fails in three ways is worse than no remedy.
+    assert!(
+        !remedy.contains("collectors.diff"),
+        "a remedy that a restart makes false must not be offered: {remedy}"
+    );
+}
+
+/// The mirror of the parse fix: a typo'd `group_by` errors on a LIVE read, so it
+/// must error on a recorded one too. It previously reached the snapshot branch
+/// before parsing and was discarded in silence -- the same parameter, the same
+/// mistake, two different outcomes, and the quiet one is the failure this whole
+/// surface exists to close.
+#[test]
+fn an_unparseable_group_by_is_an_error_on_a_snapshot_read_as_it_is_on_a_live_one() {
+    let (h, sid) = harness_with_a_recorded_run();
+    let live = h.call(
+        &sid,
+        "collectors.get",
+        json!({ "name": "c", "group_by": "NAME" }),
+    );
+    let recorded = h.call(
+        &sid,
+        "collectors.get",
+        json!({ "name": "c", "snapshot": "baseline", "group_by": "NAME" }),
+    );
+    assert!(live.is_err(), "live read must reject the typo");
+    assert!(
+        recorded.is_err(),
+        "and so must a recorded read, which returned a full profile before: {recorded:?}"
     );
 }
 
