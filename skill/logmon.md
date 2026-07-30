@@ -258,6 +258,24 @@ Points worth knowing before you rely on it:
 
 - **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
+  It also reports **`broker_version`** and **`broker_tools`** — see below, and read them the first time you call it.
+
+**Are you holding every tool this broker has?** The broker and the MCP shim are separate binaries: the tool list is compiled into the shim, so upgrading the broker cannot make a new tool appear. A shim several versions behind silently lacks capabilities, and this has already cost real work — a project proposed three collector features as new when all three had shipped, because nothing told them.
+
+`get_status` answers it. `broker_tools` is the tool names a shim at *this broker's* version exposes; compare it against the tools you actually have. If the shim is current enough to do that itself, it adds a **`shim_note`** naming what is missing:
+
+```
+"shim_note": "This logmon MCP shim reaches 37 of the 42 tools broker 0.9.0 supports.
+              Not reachable from this shim: diff_collectors, document_collectors,
+              edit_collector, get_collector_history, snapshot_collector. Reinstall the
+              `logmon-mcp` binary (`cargo install --path crates/mcp` from a logmon-mcp
+              checkout) and restart this MCP server to use them."
+```
+
+**If you see it, say so and stop reaching for workarounds.** The missing tools are usually the ones worth having — `snapshot_collector` and `diff_collectors` are how a before/after comparison is done at all, and their absence is exactly what leads to hand-rolled counters and hand-computed ratios. Tell the user which tools are unreachable and what to run; the reinstall needs a restart of the MCP server to take effect, which only they can trigger.
+
+No note and no mismatch means you are current — nothing is emitted in the normal case.
+
 **`trace_ingest` — loss on the OTLP trace transports, before any collector saw a span.** Non-zero on any of the three means every span-derived number you report from elsewhere is a **lower bound**, `matched` included.
 
 **Do not add `trace_ingest.dropped` to the `receiver_drops` trace fields — it IS those fields.** `dropped` is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, the same counters read a second time so the three trace figures read as one block. Summing them double-counts. `shed_batches` and `malformed_dropped` are the genuinely new numbers.

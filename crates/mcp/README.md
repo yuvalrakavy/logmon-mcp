@@ -46,7 +46,7 @@ Global flags:
 | `collectors` | `profile` | Same numbers over spans already buffered, without arming anything. |
 | `sessions` | `list` / `drop` | List or drop sessions. (Renaming the *current* session is an MCP-mode tool — `rename_session` — not a CLI verb: the CLI's per-invocation session has nothing durable to rename.) |
 | `domains` | `create` / `delete` / `list` / `clear` | Manage isolated domains (each with its own buffers, receivers, triggers). |
-| `status` | (no verb) | Print broker status (incl. `current_domain` + `active_filters`). |
+| `status` | (no verb) | Print broker status (incl. `current_domain` + `active_filters`). Reports the broker's version alongside this CLI's, and names any tool the broker supports that this build cannot reach — the two are separate binaries with separate lifetimes. |
 
 Run `logmon-mcp <group> --help` for per-group flag details.
 

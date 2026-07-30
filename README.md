@@ -280,7 +280,7 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `get_slow_spans` | Find slow spans (default `min_duration_ms=100`, `count=20`). With `group_by="name"` the aggregates cover **every** stored span of that name, and `min_duration_ms` becomes a display floor deciding which names appear — so a name can qualify on its `max_ms` while its `avg_ms` sits far below the floor. |
 | `get_span_context` | Spans surrounding a given span by `seq`. |
 | `get_trace_logs` | All logs linked to a trace. |
-| `add_collector` / `list_collectors` / `get_collector` / `remove_collector` | Span time collectors: arm a filter, run the workload, read exact totals, percentiles and self time. Needs a **named** session — an anonymous one's identity is a UUID that never returns, so anything it armed would be unreachable after a disconnect. `matched: 0` comes with `zeroed_by` (`snapshot` / `reset` / `edit` / `daemon_restart`, or absent for "no traffic yet"), so an empty window is never ambiguous. |
+| `add_collector` / `list_collectors` / `get_collector` / `remove_collector` | Span time collectors: arm a filter, run the workload, read exact totals, percentiles and self time. At small n the `sampled` block also carries **`durations_ms`** (every retained duration, in arrival order, when complete and ≤50) and **`stddev_ms`** — at three runs the percentiles are order statistics of three numbers, so the durations are what make "are these two arms actually separated?" a computation rather than a judgement. `skip_warmup_ms` reports its own effect as **`excluded_by_warmup`**, and a grouped read reports **`groups_total`** before `top_n` truncation. Needs a **named** session — an anonymous one's identity is a UUID that never returns, so anything it armed would be unreachable after a disconnect. `matched: 0` comes with `zeroed_by` (`snapshot` / `reset` / `edit` / `daemon_restart`, or absent for "no traffic yet"), so an empty window is never ambiguous. |
 | `snapshot_collector` / `get_collector_history` | Record a window as a named run and start the next — the between-runs move for a before/after comparison. History carries each run's own definition, and `merge` reports the run-to-run spread so you can tell a real difference from noise. Survives a daemon restart; a run that could not be written reports `durable: false` rather than pretending otherwise. |
 | `edit_collector` | Change an armed collector. Description is free; anything structural discards the live window (never the history). Re-pins a collector orphaned by a restart. |
 | `diff_collectors` | Subtract two runs and report what moved. Arms are `<collector>`, `<collector>@<label>`, or `<collector>@*` (every recorded run merged — the only shape with a run-to-run floor, so the only one whose deltas can be told from noise). Every row carries **the threshold that was applied**, and estimated percentile rows carry the error on the delta: `α(a+b)/|a−b|`, which reaches ±199% for a 1% change. **Refuses rather than guessing** when the arms are not comparable, and names the flag that would permit it. |
@@ -293,7 +293,7 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 | `add_bookmark` / `list_bookmarks` / `remove_bookmark` / `clear_bookmarks` | Bookmarks (also act as cursors via `c>=`). |
 | `get_sessions` / `drop_session` | Multi-session inspection. |
 | `rename_session` | Rename this session in place — all state (domain binding, triggers, filters, bookmarks) survives. A name held by a *connected* session errors (deliberate: two live clients must not share an identity); a *disconnected* holder is displaced (reported via `displaced_stale_holder`). |
-| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. |
+| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. Also **`broker_version`** and **`broker_tools`** — the MCP tools a shim of this broker's version exposes, so a client can tell it is out of date; a shim that finds itself short adds a **`shim_note`** naming the missing tools. See [Version skew](#version-skew). |
 | `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale) and `bound_sessions` — which sessions are bound to each domain (derived from the session registry; disconnected holders are suffixed). |
 | `use_domain` | Bind this session to a domain for subsequent queries + notifications. |
 | `clear_domain` | Dispose the bound domain's logs + spans (keeps the domain alive). |
@@ -532,6 +532,45 @@ If you're seeing nonzero **drops**, the broker is the bottleneck — bump `buffe
 That remedy is for channel-full drops only: a `shed_batches` count means the producer was
 told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
 unusable trace id) — no buffer size changes either.
+
+## Version skew
+
+The broker and the MCP shim are separate binaries with separate lifetimes: the broker runs
+as a long-lived service, while the shim is spawned per client session. The **tool list is
+compiled into the shim**, so upgrading the broker alone cannot make a new tool appear —
+and for a long time nothing said so. A project once filed a report proposing three
+collector features that already shipped, because their shim was several versions behind
+and there was no way to tell.
+
+`status.get` now carries two facts, and they are the fix:
+
+```json
+"broker_version": "0.9.0",
+"broker_tools": ["add_bookmark", "add_collector", …]
+```
+
+`broker_tools` is the MCP tool names a shim built at *this broker's* version exposes — tool
+names, not RPC method names, because that is the vocabulary a client holds. Compare it
+against the tools you actually have; anything listed but absent is out of reach until the
+shim is reinstalled.
+
+A shim from 0.9.0 onward does that comparison itself and adds a `shim_note` naming the
+gap and the command to fix it. Nothing is added when the sets match.
+
+**Why this lands on `status.get` rather than the handshake:** `get_status` relays the
+broker's JSON verbatim and always has, so these fields are rendered by *every shim ever
+built*, including ones that predate the feature. That is what makes it reach an
+installation already in the field — a stale shim shows the facts after a broker restart
+and nothing else, without first performing the upgrade the notice recommends.
+
+To upgrade both:
+
+```bash
+cargo install --path crates/broker && cargo install --path crates/mcp
+```
+
+then restart the broker service and your MCP client. Reinstalling the binary does not
+affect a running process — it keeps the image it started with.
 
 ## SDK and cross-language clients
 
