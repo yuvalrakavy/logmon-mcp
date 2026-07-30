@@ -1431,6 +1431,13 @@ fn annotate_skew(result: &mut serde_json::Value) {
     let Some(obj) = result.as_object_mut() else {
         return;
     };
+    // Never overwrite. `shim_note` is the obvious name for a *broker*-authored
+    // message to stale shims, and clobbering it would silence the broker exactly
+    // when it is ahead and has something to say — while the CHANGELOG promises
+    // every key the broker sends arrives untouched.
+    if obj.contains_key("shim_note") {
+        return;
+    }
     let Some(broker_tools) = obj.get("broker_tools").and_then(|v| v.as_array()) else {
         return;
     };
@@ -1438,30 +1445,17 @@ fn annotate_skew(result: &mut serde_json::Value) {
         .iter()
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
-
-    let local = local_tool_names();
-    let missing = logmon_broker_protocol::mcp_tools::missing_tools(&broker_tools, &local);
-    if missing.is_empty() {
-        return;
-    }
-
     let version = obj
         .get("broker_version")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    obj.insert(
-        "shim_note".into(),
-        serde_json::Value::String(format!(
-            "This MCP shim is {} and exposes {} of the {} tools broker {} supports. \
-             Not reachable from this shim: {}. Reinstall with \
-             `cargo install --path crates/mcp` and restart this MCP server to use them.",
-            env!("CARGO_PKG_VERSION"),
-            local.len(),
-            broker_tools.len(),
-            version,
-            missing.join(", "),
-        )),
-    );
+        .unwrap_or_default();
+
+    let Some(note) =
+        logmon_broker_protocol::mcp_tools::skew_note(version, &broker_tools, &local_tool_names())
+    else {
+        return;
+    };
+    obj.insert("shim_note".into(), serde_json::Value::String(note));
 }
 
 #[rmcp::tool_handler]
@@ -1533,6 +1527,76 @@ mod tests {
         );
     }
 
+    /// The *method* half of the table, checked against the call each tool body
+    /// actually makes.
+    ///
+    /// The router test above compares tool names, and the broker-side test
+    /// asserts each method exists — so swapping one real method for another
+    /// (`collectors.snapshot` → `collectors.reset`) passes both while the table
+    /// silently lies. Nothing reads the method half at runtime today, which is
+    /// exactly why it would rot unnoticed until something did.
+    ///
+    /// Source-level, like the skill assertions above: parse this file, pair each
+    /// `#[rmcp::tool]` fn with the first RPC literal in its body.
+    #[test]
+    fn every_tool_calls_the_method_the_shared_table_pairs_it_with() {
+        const SRC: &str = include_str!("server.rs");
+
+        // Two guards against the file scanning itself. The needle is assembled
+        // rather than written, so this test's own source does not contain it;
+        // and only the non-test half is scanned, so nothing below can add a
+        // phantom tool. Without the first, the split found 43 "tools" in 42.
+        let needle = concat!("#[rmcp::", "tool(");
+        let src = SRC
+            .split_once(concat!("#[cfg(", "test)]"))
+            .map(|(before, _)| before)
+            .unwrap_or(SRC);
+
+        let mut found: Vec<(String, String)> = Vec::new();
+        for chunk in src.split(needle).skip(1) {
+            let Some(rest) = chunk.split_once("async fn ") else {
+                continue;
+            };
+            let name: String = rest
+                .1
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+
+            // First `"group.verb"` literal in the body is the RPC it calls.
+            let method = rest.1.split('"').find(|s| {
+                s.contains('.')
+                    && !s.contains(' ')
+                    && s.split('.').count() == 2
+                    && s.split('.').all(|p| {
+                        !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    })
+            });
+            if let Some(m) = method {
+                found.push((name, m.to_string()));
+            }
+        }
+
+        found.sort();
+        let mut table: Vec<(String, String)> = logmon_broker_protocol::mcp_tools::TOOLS
+            .iter()
+            .map(|(t, m)| ((*t).to_string(), (*m).to_string()))
+            .collect();
+        table.sort();
+
+        assert_eq!(
+            found.len(),
+            table.len(),
+            "parsed {} tool bodies but the table has {} rows",
+            found.len(),
+            table.len()
+        );
+        assert_eq!(
+            found, table,
+            "a tool calls a different RPC than protocol::mcp_tools::TOOLS claims"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // annotate_skew — every case but one needs synthetic input, because in a
     // single build the broker's list IS this build's list.
@@ -1588,6 +1652,21 @@ mod tests {
             v.get("shim_note").is_none(),
             "holding more tools than the broker lists is not a gap in the shim"
         );
+    }
+
+    #[test]
+    fn a_broker_authored_note_is_never_overwritten() {
+        // `shim_note` is the obvious name for a broker-side message to stale
+        // shims. Clobbering it would silence the broker exactly when it is ahead
+        // and has something to say — and falsify the promise that every key the
+        // broker sends arrives untouched.
+        let mut v = status_with(&["get_status", "a_tool_this_shim_lacks"]);
+        v.as_object_mut().unwrap().insert(
+            "shim_note".into(),
+            serde_json::Value::String("from the broker".into()),
+        );
+        super::annotate_skew(&mut v);
+        assert_eq!(v["shim_note"], "from the broker");
     }
 
     #[test]

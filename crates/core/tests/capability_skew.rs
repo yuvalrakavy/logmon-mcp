@@ -96,6 +96,42 @@ async fn a_deleted_domain_takes_the_skew_facts_down_with_it() {
     );
 }
 
+/// **No key the daemon sends is silently dropped by the typed result struct.**
+///
+/// The class, not the instance. `crates/protocol/src/methods.rs:432` records
+/// this repo emitting `post_remaining` on the wire while the type lacked it —
+/// serde dropped it for every typed SDK caller and nothing noticed, because
+/// `verify-schema` compares schema-against-Rust rather than
+/// daemon-JSON-against-Rust.
+///
+/// A mutation proved the gap was still open: with the one test line that *names*
+/// `broker_tools` removed, deleting the field compiled clean and every suite in
+/// the workspace passed. Only the compile-time coupling of that line stood in
+/// the way — not a designed catch, and no protection at all for the next field
+/// someone adds to `handle_status`.
+///
+/// This compares key sets directly, so it guards every future field too.
+#[tokio::test]
+async fn the_typed_status_struct_drops_no_key_the_daemon_sends() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let raw: Value = client.call("status.get", json!({})).await.unwrap();
+    let typed: StatusGetResult = serde_json::from_value(raw.clone()).unwrap();
+    let round_tripped = serde_json::to_value(&typed).unwrap();
+
+    let sent: Vec<&String> = raw.as_object().unwrap().keys().collect();
+    let kept = round_tripped.as_object().unwrap();
+    let dropped: Vec<&&String> = sent.iter().filter(|k| !kept.contains_key(**k)).collect();
+
+    assert!(
+        dropped.is_empty(),
+        "the daemon sends {dropped:?}, which StatusGetResult does not carry — \
+         every typed SDK caller loses them silently. Mirror them on the struct \
+         (see the `post_remaining` note in protocol/src/methods.rs)."
+    );
+}
+
 /// Every method in the shared table is one this daemon actually dispatches.
 ///
 /// Asserts on the *message*, not the code: every handler failure maps to
@@ -109,14 +145,29 @@ async fn every_method_in_the_shared_table_is_dispatched_by_this_daemon() {
     let mut client = daemon.connect_anon().await;
 
     let mut unknown = Vec::new();
+    let mut probed = 0usize;
     for (tool, method) in mcp_tools::TOOLS {
         let res: Result<Value, _> = client.call(method, json!({})).await;
+        probed += 1;
         if let Err(e) = res {
-            if e.to_string().contains("unknown method") {
+            let msg = e.to_string();
+            if msg.contains("unknown method") {
                 unknown.push(format!("{tool} -> {method}"));
             }
+            // A transport failure means the connection died mid-loop — every
+            // probe after it would "pass" without checking anything, and this
+            // test would silently go vacuous for the tail of the table.
+            assert!(
+                !msg.contains("connection") && !msg.contains("closed"),
+                "the probe connection died at `{method}`, so nothing after it was checked: {msg}"
+            );
         }
     }
+    assert_eq!(
+        probed,
+        mcp_tools::TOOLS.len(),
+        "every row must be probed, or absence of failures proves nothing"
+    );
     assert!(
         unknown.is_empty(),
         "the table names methods this daemon does not have: {unknown:?}"

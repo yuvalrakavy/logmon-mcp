@@ -21,22 +21,28 @@ pub async fn dispatch(broker: &Broker, json: bool) -> i32 {
 
     // Human format: simple key=value block.
     //
-    // The broker's version leads, and the CLI's own follows when they differ:
-    // this is the surface a human is looking at while deciding whether to
-    // reinstall, and the two numbers are the whole decision. An older broker
-    // omits the field, which deserializes to "" — say "unknown" rather than
-    // printing an empty value that reads like a bug.
+    // The version is reported, but the *decision* is driven by the tool sets —
+    // via the same shared composer the MCP tool result uses, so the two surfaces
+    // cannot give a reader opposite answers. Comparing version strings would:
+    // this repo has two commits stamped `0.5.1` with different tool sets, so an
+    // equal-version check prints an all-clear exactly when tools are missing,
+    // and a differing-version check demands a reinstall after a PATCH release
+    // that changed nothing a caller can see.
     let shim_version = env!("CARGO_PKG_VERSION");
     if result.broker_version.is_empty() {
         println!("broker: unknown (predates version reporting), cli {shim_version}");
-    } else if result.broker_version == shim_version {
-        println!("broker: {}", result.broker_version);
     } else {
-        println!(
-            "broker: {} — this cli is {shim_version}; reinstall with \
-             `cargo install --path crates/mcp` to match",
-            result.broker_version
-        );
+        println!("broker: {}, cli {shim_version}", result.broker_version);
+    }
+    if let Some(note) = logmon_broker_protocol::mcp_tools::skew_note(
+        &result.broker_version,
+        &result.broker_tools,
+        &logmon_broker_protocol::mcp_tools::TOOLS
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<Vec<_>>(),
+    ) {
+        println!("{note}");
     }
     println!("uptime: {}s", result.daemon_uptime_secs);
     print!("receivers:");

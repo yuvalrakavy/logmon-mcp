@@ -65,11 +65,18 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("clear_domain", "domains.clear"),
 ];
 
-/// Tool names only, sorted — what the daemon puts in `broker_tools`.
-pub fn tool_names() -> Vec<String> {
-    let mut v: Vec<String> = TOOLS.iter().map(|(t, _)| (*t).to_string()).collect();
-    v.sort();
-    v
+/// Tool names, sorted — what the daemon puts in `broker_tools`.
+///
+/// Derived once. `handle_status` calls this on every status request, and the
+/// error path can discard the result, so re-sorting 42 fresh `String`s per call
+/// is pure waste.
+pub fn tool_names() -> &'static [String] {
+    static NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        let mut v: Vec<String> = TOOLS.iter().map(|(t, _)| (*t).to_string()).collect();
+        v.sort();
+        v
+    });
+    &NAMES
 }
 
 /// Tool names a broker advertises that this build has no tool for.
@@ -85,7 +92,50 @@ pub fn missing_tools(broker_tools: &[String], local: &[&str]) -> Vec<String> {
         .cloned()
         .collect();
     v.sort();
+    // A malformed broker could repeat a name; saying it twice would also
+    // inflate the count in the sentence built from this.
+    v.dedup();
     v
+}
+
+/// The one sentence both front-ends show, or `None` when there is nothing to say.
+///
+/// Shared so the MCP tool result and the CLI **cannot** disagree. They did in an
+/// earlier revision: the CLI compared version strings while the shim compared
+/// tool sets, and this repo's own history has two commits stamped `0.5.1` with
+/// different tool sets — so one surface printed an all-clear while the other
+/// correctly reported two missing tools. Versions do not track capability here;
+/// only the tool sets do.
+///
+/// `None` in three cases, each deliberate: the broker advertised nothing (an
+/// older build — unknown, not "everything is missing"), the sets match (a notice
+/// in the everyday case is what teaches a reader to ignore it), and the shim is
+/// *ahead* of the broker (not a gap in the shim).
+pub fn skew_note(broker_version: &str, broker_tools: &[String], local: &[&str]) -> Option<String> {
+    if broker_tools.is_empty() {
+        return None;
+    }
+    let missing = missing_tools(broker_tools, local);
+    if missing.is_empty() {
+        return None;
+    }
+    let version = if broker_version.is_empty() {
+        "of unknown version"
+    } else {
+        broker_version
+    };
+    // Numerator is the INTERSECTION, not the local total: a shim can hold tools
+    // the broker does not advertise (a rename, a removal, a different branch),
+    // and "42 of the 42 tools ... not reachable: x" contradicts itself.
+    let reachable = broker_tools.len() - missing.len();
+    Some(format!(
+        "This logmon MCP shim reaches {reachable} of the {} tools broker {version} supports. \
+         Not reachable from this shim: {}. Reinstall the `logmon-mcp` binary \
+         (`cargo install --path crates/mcp` from a logmon-mcp checkout) and restart \
+         this MCP server to use them.",
+        broker_tools.len(),
+        missing.join(", "),
+    ))
 }
 
 #[cfg(test)]
@@ -139,6 +189,77 @@ mod tests {
         let local = ["a", "b", "c"];
         let broker = vec!["a".to_string()];
         assert!(missing_tools(&broker, &local).is_empty());
+    }
+
+    /// Sortedness has to be checked against an independently-sorted copy, not
+    /// against another call to `tool_names()`. Every other consumer derives its
+    /// expectation by calling this function, so dropping the `.sort()` left the
+    /// entire suite green — `TOOLS` is in source order, so the output silently
+    /// became source-ordered and nothing compared it to anything else.
+    #[test]
+    fn tool_names_come_back_sorted() {
+        let names = tool_names();
+        let mut independently_sorted = names.to_vec();
+        independently_sorted.sort();
+        assert_eq!(
+            names,
+            independently_sorted.as_slice(),
+            "tool_names() must be sorted: a stable wire order is what lets a \
+             reader diff two brokers' lists by eye"
+        );
+        assert_ne!(
+            names.first().map(String::as_str),
+            TOOLS.first().map(|(t, _)| *t),
+            "if TOOLS ever happens to be in sorted order this test stops \
+             discriminating — reorder the table or pin a literal instead"
+        );
+    }
+
+    #[test]
+    fn the_note_counts_the_intersection_not_the_local_total() {
+        // A shim holding a tool the broker does not advertise (a rename, a
+        // removal, a different branch) must not be counted as reaching it.
+        // "42 of the 42 tools ... not reachable: x" contradicts itself.
+        let local = ["a", "b", "gone_from_broker"];
+        let broker = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let note = skew_note("1.0.0", &broker, &local).expect("c is missing");
+        assert!(
+            note.contains("reaches 2 of the 3"),
+            "numerator must be the intersection: {note}"
+        );
+        assert!(note.contains("Not reachable from this shim: c"));
+    }
+
+    #[test]
+    fn the_note_names_a_binary_and_a_command_that_can_be_run() {
+        let note = skew_note("1.0.0", &["x".to_string()], &[]).expect("x is missing");
+        assert!(
+            note.contains("logmon-mcp"),
+            "name the binary, since the broker is a different one: {note}"
+        );
+        assert!(note.contains("cargo install"), "and the command: {note}");
+        assert!(
+            note.contains("restart"),
+            "reinstalling without restarting the MCP server changes nothing: {note}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_broker_version_still_produces_a_usable_note() {
+        let note = skew_note("", &["x".to_string()], &[]).expect("x is missing");
+        assert!(note.contains("unknown version"), "{note}");
+        assert!(note.contains("Not reachable from this shim: x"));
+    }
+
+    #[test]
+    fn a_repeated_broker_entry_is_named_once() {
+        let broker = vec!["x".to_string(), "x".to_string()];
+        let note = skew_note("1.0.0", &broker, &[]).expect("x is missing");
+        assert_eq!(
+            note.matches("x").count(),
+            1,
+            "a malformed broker must not make the note stutter: {note}"
+        );
     }
 
     #[test]
