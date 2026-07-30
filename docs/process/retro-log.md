@@ -155,3 +155,76 @@ calls each.
      defensible reason, but the skill has no line about it. Candidate: when a gate is
      in flight and a deploy is requested, say what is unreviewed and name the rollback
      before doing it.
+
+## 2026-07-30 span time collector, phases 4–5 (T2)
+
+- time: implement ~45% / test ~20% / review ~25% / docs ~10%. No design phase: the
+  spec was already approved and §13's phase list is the standing memo, so a phase of an
+  already-approved multi-phase spec needs no new memo. That rule saved real time and
+  cost nothing — both phases were already specified in unusual detail.
+- catches: cold-reader=8 self-review=6 gate=13 test=3 user=2 post-merge=0
+  - **gate=13, and the two READING finders converged independently on eight of them.**
+    The skill calls convergence the strongest signal a gate produces; this run is the
+    cleanest evidence yet — every convergent finding was real, and the three worst were
+    all convergent. Three would have produced a confident wrong ANSWER rather than a
+    crash: `c@*` merging snapshots recorded under different definitions (summing two
+    populations and calling the spread across configurations "scheduling variance"),
+    `reset` leaving the rolling ring loaded (so a re-pin carried a breach from the old
+    domain), and a threshold average dividing by all-matched `count` instead of the
+    spans that contributed.
+  - **The load-bearing comment was again the thing that was wrong.** `Arm::merged`
+    carried a comment asserting that the diff's own filter/level checks caught
+    heterogeneous merges. They are cross-ARM; nothing looked inside an arm. Both
+    finders quoted that comment as what stopped anyone looking. That is now the
+    FOURTH instance of "the author's most assertive sentence is the false one" on
+    this project. The skill's rule says put load-bearing claims in a table with a
+    `file:line` column; this was a claim about code, in prose, in a doc comment —
+    exactly the shape the rule exists to catch, and I wrote it anyway.
+  - **cold-reader=8 on `collectors.document`, and it caught a regression I had
+    introduced 20 minutes earlier while acting on one of its own earlier findings.**
+    "Did not change at all" is provable for an exact count and forbidden for an
+    estimated percentile, because two equal sketch outputs mean only that both fell in
+    the same bucket. I fixed one side of a message and left the other unsampled — the
+    exact one-sided-finding failure the skill warns about, committed while responding
+    to a finding. The two-way pairing is not optional and I did not do it.
+  - Its two-way evidence was as useful as its criticism: it named five things that
+    looked like boilerplate and changed its conclusion (the DDSketch ±1% sentence
+    stopped a false bug report; printing the per-run RANGE and not just the CV was the
+    only way it discovered the totals were sums). Asking "what would you NOT cut" is
+    now something I would ask every cold reader.
+  - test=3: three defects found by writing the test, not by inspection —
+    `registry.edit` never applying `change.threshold` (reported `zeroed: true`, kept
+    the old limit), the threshold report emitting `"last_value": null` where the schema
+    promises absence, and a merged arm's nesting verdict reading `unknown` so every
+    multi-run diff advised "re-run at `tree`" to someone already at `tree`.
+- friction:
+  - **The `!`-in-Bash-payload trap fired three more times** despite being a memory.
+    Each cost a round trip. The memory is on too weak a rung: it is read at session
+    start and the mistake happens hundreds of tool calls later. Candidate below.
+  - `cargo fmt --all` reformats the four pre-existing-drift test files every time,
+    so every format step needs a `git checkout --` after it. Four occurrences this
+    session. GUARDED by habit, not by tooling.
+  - `cargo test --workspace` exceeded the 10-minute Bash cap twice. The version-bump
+    memory covered the bump case; it does not cover "the workspace suite is now just
+    slow". Backgrounding worked both times.
+- tier-call: **right (T2)**, and the phase-of-an-approved-spec rule earned its keep —
+  no new design ceremony, and the gate still caught 13.
+- delegation: 4 subagents. The cold reader was the highest-value per token by a wide
+  margin (8 findings, ~41k tokens, and it found a defect no code reviewer could have —
+  it had no code). The mutation finder confirmed 34/40 guards real and PROVED two of
+  the six survivors inert rather than reporting them as gaps.
+- improve: **two candidates, both from repeat offences.**
+  1. *Promote the `!`-in-payload rule from memory to a habit with a trigger.* It has
+     now fired 3+ times across two sessions with a memory in place. The trigger is
+     specific and recognisable: "I am about to put Rust/JSON source text in a Bash
+     heredoc." The rule is "route source text through Write/Edit, always" — there is no
+     case where the heredoc is better. Worth a line in the ways-of-working skill's
+     execution section rather than a project memory, because it is about the harness,
+     not this project.
+  2. *When a review finding makes me change a MESSAGE or a PREDICATE, check the other
+     side of it in the same edit.* The skill already says a check is a two-sided
+     classifier and a finding only samples one side. It does not say that this applies
+     to prose and error text, which is where it bit twice this session (the
+     "did not change at all" regression, and the merged-arm suppression reason that
+     was a false statement about why). Candidate: extend the false-negative-pairing
+     line to cover any user-visible CLAIM, not only blocking checks.
