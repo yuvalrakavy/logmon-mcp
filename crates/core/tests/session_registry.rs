@@ -245,5 +245,8 @@ fn ttl_predicate_spares_connected_and_dispose_removes() {
 
     registry.dispose(&dead);
     let expired = registry.expired_disconnected(std::time::Duration::ZERO);
-    assert!(expired.is_empty(), "disposed sessions are gone: {expired:?}");
+    assert!(
+        expired.is_empty(),
+        "disposed sessions are gone: {expired:?}"
+    );
 }

@@ -4,8 +4,8 @@
 //! explicit 0) are still honored.
 #![cfg(feature = "test-support")]
 
-use logmon_broker_core::test_support::*;
 use logmon_broker_core::gelf::message::Level;
+use logmon_broker_core::test_support::*;
 use logmon_broker_protocol::{TriggersAddResult, TriggersEditResult, TriggersListResult};
 use serde_json::json;
 

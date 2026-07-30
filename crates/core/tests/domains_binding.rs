@@ -305,8 +305,14 @@ async fn rename_preserves_binding_and_triggers() {
         .call("session.rename", json!({ "name": "Store-t3-feat-thing" }))
         .await
         .expect("rename");
-    assert_eq!(r.get("name").and_then(|v| v.as_str()), Some("Store-t3-feat-thing"));
-    assert!(r.get("displaced_stale_holder").is_none(), "nothing displaced: {r}");
+    assert_eq!(
+        r.get("name").and_then(|v| v.as_str()),
+        Some("Store-t3-feat-thing")
+    );
+    assert!(
+        r.get("displaced_stale_holder").is_none(),
+        "nothing displaced: {r}"
+    );
 
     // The binding survived: a t3-port log is visible without re-binding.
     send_gelf(t3.gelf_port, "after rename").await;
@@ -364,7 +370,10 @@ async fn rename_to_a_live_holder_errors_and_changes_nothing() {
     let result = challenger
         .call::<Value>("session.rename", json!({ "name": "Store-t1-feat-x" }))
         .await;
-    let err = format!("{:?}", result.expect_err("a live holder must refuse the rename"));
+    let err = format!(
+        "{:?}",
+        result.expect_err("a live holder must refuse the rename")
+    );
     assert!(
         err.contains("already connected"),
         "the error must say the name is actively held: {err}"

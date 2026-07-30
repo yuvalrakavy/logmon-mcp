@@ -1,6 +1,6 @@
 use chrono::Utc;
-use logmon_broker_core::daemon::log_processor::{process_entry, sync_pre_buffer_size};
 use logmon_broker_core::daemon::domain::DomainId;
+use logmon_broker_core::daemon::log_processor::{process_entry, sync_pre_buffer_size};
 use logmon_broker_core::daemon::session::{SessionId, SessionRegistry};
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::gelf::message::{Level, LogEntry, LogSource};
@@ -28,9 +28,10 @@ fn make_entry(level: Level, msg: &str) -> LogEntry {
 
 fn make_entry_with_field(level: Level, msg: &str, key: &str, value: &str) -> LogEntry {
     let mut entry = make_entry(level, msg);
-    entry
-        .additional_fields
-        .insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    entry.additional_fields.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
     entry
 }
 
@@ -64,7 +65,11 @@ fn a_busy_trigger_does_not_blind_a_quiet_one() {
     // The noisy built-in `l>=ERROR` trigger fires, opening its 200-entry window.
     let mut boom = make_entry(Level::Error, "boom");
     process_entry(&mut boom, &pipeline, &sessions);
-    assert_eq!(match_count_of(&sessions, &sid, 1), 1, "the busy trigger fired");
+    assert_eq!(
+        match_count_of(&sessions, &sid, 1),
+        1,
+        "the busy trigger fired"
+    );
 
     // The needle lands INSIDE that window.
     let mut needle = make_entry_with_field(Level::Info, "haystack", "kind", "needle");
@@ -90,7 +95,9 @@ fn a_short_window_trigger_does_not_truncate_a_longer_one() {
     let sessions = Arc::new(SessionRegistry::new());
     let sid = sessions.create_anonymous();
     // INFO is not stored normally, so anything stored below is post-window capture.
-    sessions.add_filter(&sid, "l>=ERROR", Some("errors")).unwrap();
+    sessions
+        .add_filter(&sid, "l>=ERROR", Some("errors"))
+        .unwrap();
     // A deliberately impatient trigger: one entry of aftermath.
     sessions
         .add_trigger(&sid, "kind=needle", 0, 1, 0, Some("short"), false)
