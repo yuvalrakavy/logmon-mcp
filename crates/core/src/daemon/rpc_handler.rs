@@ -1560,6 +1560,13 @@ impl RpcHandler {
             .map(|b| b as usize)
             .unwrap_or(DEFAULT_MAX_SAMPLE_BYTES);
 
+        // Validated against the group keys resolved above, so a threshold naming
+        // a group the collector does not split by is refused at arm time rather
+        // than silently never matching.
+        let (threshold, threshold_warnings) = threshold_of(params, &group_keys)?;
+        let mut warnings = warnings;
+        warnings.extend(threshold_warnings);
+
         let def = CollectorDef {
             name: name.to_string(),
             filter_string: filter_string.to_string(),
@@ -1571,6 +1578,7 @@ impl RpcHandler {
                 .get("description")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            threshold: threshold.flatten(),
         };
 
         let domain_id = self.sessions.domain_of(session_id);
@@ -1626,6 +1634,7 @@ impl RpcHandler {
                          so this is the normal outcome of a restart for a collector armed \
                          on one. Re-pin it with collectors.edit, or remove it."
                     ),
+                    "threshold": a.collector.threshold().as_ref().map(threshold_json),
                 })
             })
             .collect();
@@ -1664,7 +1673,14 @@ impl RpcHandler {
             &opts,
             Utc::now(),
         );
-        serde_json::to_value(result).map_err(|e| e.to_string())
+        let mut out = serde_json::to_value(result).map_err(|e| e.to_string())?;
+        // Only on a live read. A rolling window is live state, so a recorded run
+        // has none — and reporting the LIVE verdict beside a recorded run's
+        // numbers would attach a fact about now to a window that closed.
+        if let Some(t) = armed.collector.threshold() {
+            out["threshold"] = threshold_json(&t);
+        }
+        Ok(out)
     }
 
     fn handle_collectors_edit(
@@ -1714,6 +1730,21 @@ impl RpcHandler {
             }
         };
 
+        // Against the group keys that will be IN FORCE after this edit, not the
+        // ones currently armed: a caller adding a group key and a threshold that
+        // uses it in one call must not be refused for a state neither before nor
+        // after the edit.
+        let effective_group_keys = match params.get("group_keys") {
+            Some(_) => group_keys_of(params)?,
+            None => self
+                .collectors
+                .get(session_id, name)
+                .map(|a| a.collector.def().group_keys.clone())
+                .unwrap_or_default(),
+        };
+        let (threshold, threshold_warnings) = threshold_of(params, &effective_group_keys)?;
+        warnings.extend(threshold_warnings);
+
         let change = CollectorEdit {
             description: params
                 .get("description")
@@ -1736,11 +1767,12 @@ impl RpcHandler {
                 .and_then(|v| v.as_u64())
                 .map(|b| b as usize),
             domain,
+            threshold,
         };
         if change.is_empty() {
             return Err(
                 "nothing to edit: pass at least one of description, filter, level, \
-                        group_keys, max_sample_bytes or domain"
+                        group_keys, max_sample_bytes, domain or threshold"
                     .to_string(),
             );
         }
@@ -2192,6 +2224,9 @@ impl RpcHandler {
             group_keys,
             max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
             description: None,
+            // No threshold on an ad-hoc profile: a rolling guard needs a window
+            // it was present for, and this reads spans that already arrived.
+            threshold: None,
         };
         let scratch = Collector::new(def, Utc::now());
         let matched = d
@@ -2392,6 +2427,91 @@ fn group_keys_of(params: &Value) -> Result<Vec<String>, String> {
         ));
     }
     Ok(keys)
+}
+
+/// Parse a `threshold` parameter (§8), validating it against the collector's
+/// declared group keys.
+///
+/// Returns `Ok(None)` when the key is absent — "leave it alone" — and
+/// `Ok(Some(None))` for an explicit `null`, which removes an armed threshold.
+/// A flat `Option` cannot express both, and conflating them would make it
+/// impossible to clear a guard once set.
+#[allow(clippy::type_complexity)]
+fn threshold_of(
+    params: &Value,
+    group_keys: &[String],
+) -> Result<
+    (
+        Option<Option<crate::collector::threshold::Threshold>>,
+        Vec<String>,
+    ),
+    String,
+> {
+    use crate::collector::threshold::{Metric, Op, Threshold};
+    let Some(v) = params.get("threshold") else {
+        return Ok((None, Vec::new()));
+    };
+    if v.is_null() {
+        return Ok((Some(None), Vec::new()));
+    }
+    let obj = v.as_object().ok_or_else(|| {
+        "threshold must be an object: { metric, op, value, window_ms, group? }".to_string()
+    })?;
+    let need = |k: &str| -> Result<&Value, String> {
+        obj.get(k)
+            .ok_or_else(|| format!("threshold is missing `{k}`"))
+    };
+    let metric = Metric::parse(
+        need("metric")?
+            .as_str()
+            .ok_or("threshold.metric must be a string")?,
+    )?;
+    let op = Op::parse(
+        need("op")?
+            .as_str()
+            .ok_or("threshold.op must be a string")?,
+    )?;
+    let value = need("value")?
+        .as_f64()
+        .ok_or("threshold.value must be a number")?;
+    let window_ms = need("window_ms")?
+        .as_u64()
+        .ok_or("threshold.window_ms must be a positive integer")?;
+    let t = Threshold {
+        metric,
+        group: obj
+            .get("group")
+            .and_then(|g| g.as_str())
+            .map(str::to_string),
+        op,
+        value,
+        window_ms,
+    };
+    let warnings = t.validate(group_keys)?;
+    Ok((Some(Some(t)), warnings))
+}
+
+/// A threshold's verdict on the wire (§8).
+///
+/// Built through the protocol struct rather than as a `json!` literal, so the
+/// `skip_serializing_if` the schema declares is the one that actually applies.
+/// A hand-written literal emits `"last_value": null` where the schema promises
+/// the key is absent — and `absent` versus `null` is exactly the distinction
+/// this field exists to carry.
+fn threshold_json(r: &crate::collector::threshold::ThresholdReport) -> Value {
+    serde_json::to_value(logmon_broker_protocol::ThresholdInfo {
+        metric: r.metric.to_string(),
+        group: r.group.clone(),
+        op: r.op.to_string(),
+        value: r.value,
+        window_ms: r.window_ms,
+        breached: r.breached,
+        fires: r.fires,
+        last_value: r.last_value,
+        evaluated: r.evaluated,
+        note: r.note.to_string(),
+    })
+    .unwrap_or(Value::Null)
 }
 
 fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {

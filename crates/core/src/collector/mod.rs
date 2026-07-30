@@ -17,3 +17,4 @@ pub mod registry;
 pub mod sample;
 pub mod sketch;
 pub mod state;
+pub mod threshold;

@@ -3944,12 +3944,61 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "threshold": {
+          "description": "A rolling guard over this collector's matched spans (§8).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThresholdSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "name",
         "filter"
-      ]
+      ],
+      "$defs": {
+        "ThresholdSpec": {
+          "description": "A rolling threshold as declared (§8).\n\nEvaluated over a window **advanced by span arrival, never by a clock**, so an\nidle collector costs nothing — and so a breached threshold on a finished run\nneither fires again nor clears. That is the right behaviour for a load-time\nguard and the wrong one for a liveness check, which is why every report\ncarries the note saying so.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "description": "`count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.\n\n**Percentiles are deliberately absent.** A rolling percentile needs a\nduration sketch per bucket, and this design's per-collector memory is\nbounded precisely so a collector cannot grow without limit. Use `avg_ms`\nfor the guard and read the real percentiles with `collectors.get`.",
+              "type": "string"
+            },
+            "group": {
+              "description": "Restrict to one group value. Requires the collector to declare\n`group_keys`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "description": "`gt`, `gte`, `lt` or `lte`.",
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            },
+            "window_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "metric",
+            "op",
+            "value",
+            "window_ms"
+          ]
+        }
+      }
     },
     "CollectorsAddResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4105,6 +4154,17 @@
                 "string",
                 "null"
               ]
+            },
+            "threshold": {
+              "description": "The armed threshold and whether it is currently breached (§8).",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ThresholdInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -4114,6 +4174,68 @@
             "domain",
             "matched",
             "sample_complete"
+          ]
+        },
+        "ThresholdInfo": {
+          "description": "A threshold and its current verdict, as `collectors.list` and\n`collectors.get` report it.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "group": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            },
+            "window_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "breached": {
+              "type": "boolean"
+            },
+            "fires": {
+              "description": "Clear-to-breached **transitions**, not evaluations: a threshold breached\nfor a whole run has fired once, which is what \"did this happen\" means.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "last_value": {
+              "description": "The metric's value at the last evaluation. **Absent until one has\nhappened — unknown, not zero**, because zero is a value `count` can\nlegitimately hold and an `lt` threshold would read it as a breach.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "evaluated": {
+              "description": "Whether any span has yet been evaluated against this threshold.",
+              "type": "boolean"
+            },
+            "note": {
+              "description": "Carried with every report, because it is the one thing about this\nmechanism that surprises people.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric",
+            "op",
+            "value",
+            "window_ms",
+            "breached",
+            "fires",
+            "evaluated",
+            "note"
           ]
         }
       }
@@ -4194,6 +4316,17 @@
             "string",
             "null"
           ]
+        },
+        "threshold": {
+          "description": "The armed threshold and whether it is currently breached (§8).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThresholdInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -4203,7 +4336,71 @@
         "domain",
         "matched",
         "sample_complete"
-      ]
+      ],
+      "$defs": {
+        "ThresholdInfo": {
+          "description": "A threshold and its current verdict, as `collectors.list` and\n`collectors.get` report it.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "group": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            },
+            "window_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "breached": {
+              "type": "boolean"
+            },
+            "fires": {
+              "description": "Clear-to-breached **transitions**, not evaluations: a threshold breached\nfor a whole run has fired once, which is what \"did this happen\" means.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "last_value": {
+              "description": "The metric's value at the last evaluation. **Absent until one has\nhappened — unknown, not zero**, because zero is a value `count` can\nlegitimately hold and an `lt` threshold would read it as a breach.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "evaluated": {
+              "description": "Whether any span has yet been evaluated against this threshold.",
+              "type": "boolean"
+            },
+            "note": {
+              "description": "Carried with every report, because it is the one thing about this\nmechanism that surprises people.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric",
+            "op",
+            "value",
+            "window_ms",
+            "breached",
+            "fires",
+            "evaluated",
+            "note"
+          ]
+        }
+      }
     },
     "CollectorsGet": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4459,11 +4656,60 @@
             "string",
             "null"
           ]
+        },
+        "threshold": {
+          "description": "Set or replace the rolling guard. Pass JSON `null` to remove one — which\nis why this is doubly optional: \"leave it alone\" and \"take it away\" are\ndifferent requests and a single `Option` cannot express both.\n\nLike every other structural field, changing it **zeroes the live\nwindow**: the rolling ring is measurement state, and evaluating a new\nlimit over a window accumulated under the old one would breach for\nreasons unrelated to load.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThresholdSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "name"
-      ]
+      ],
+      "$defs": {
+        "ThresholdSpec": {
+          "description": "A rolling threshold as declared (§8).\n\nEvaluated over a window **advanced by span arrival, never by a clock**, so an\nidle collector costs nothing — and so a breached threshold on a finished run\nneither fires again nor clears. That is the right behaviour for a load-time\nguard and the wrong one for a liveness check, which is why every report\ncarries the note saying so.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "description": "`count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.\n\n**Percentiles are deliberately absent.** A rolling percentile needs a\nduration sketch per bucket, and this design's per-collector memory is\nbounded precisely so a collector cannot grow without limit. Use `avg_ms`\nfor the guard and read the real percentiles with `collectors.get`.",
+              "type": "string"
+            },
+            "group": {
+              "description": "Restrict to one group value. Requires the collector to declare\n`group_keys`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "description": "`gt`, `gte`, `lt` or `lte`.",
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            },
+            "window_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "metric",
+            "op",
+            "value",
+            "window_ms"
+          ]
+        }
+      }
     },
     "CollectorsEditResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6446,6 +6692,108 @@
         "count"
       ]
     },
+    "ThresholdSpec": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ThresholdSpec",
+      "description": "A rolling threshold as declared (§8).\n\nEvaluated over a window **advanced by span arrival, never by a clock**, so an\nidle collector costs nothing — and so a breached threshold on a finished run\nneither fires again nor clears. That is the right behaviour for a load-time\nguard and the wrong one for a liveness check, which is why every report\ncarries the note saying so.",
+      "type": "object",
+      "properties": {
+        "metric": {
+          "description": "`count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.\n\n**Percentiles are deliberately absent.** A rolling percentile needs a\nduration sketch per bucket, and this design's per-collector memory is\nbounded precisely so a collector cannot grow without limit. Use `avg_ms`\nfor the guard and read the real percentiles with `collectors.get`.",
+          "type": "string"
+        },
+        "group": {
+          "description": "Restrict to one group value. Requires the collector to declare\n`group_keys`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "op": {
+          "description": "`gt`, `gte`, `lt` or `lte`.",
+          "type": "string"
+        },
+        "value": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "metric",
+        "op",
+        "value",
+        "window_ms"
+      ]
+    },
+    "ThresholdInfo": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ThresholdInfo",
+      "description": "A threshold and its current verdict, as `collectors.list` and\n`collectors.get` report it.",
+      "type": "object",
+      "properties": {
+        "metric": {
+          "type": "string"
+        },
+        "group": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "op": {
+          "type": "string"
+        },
+        "value": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "breached": {
+          "type": "boolean"
+        },
+        "fires": {
+          "description": "Clear-to-breached **transitions**, not evaluations: a threshold breached\nfor a whole run has fired once, which is what \"did this happen\" means.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_value": {
+          "description": "The metric's value at the last evaluation. **Absent until one has\nhappened — unknown, not zero**, because zero is a value `count` can\nlegitimately hold and an `lt` threshold would read it as a breach.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "evaluated": {
+          "description": "Whether any span has yet been evaluated against this threshold.",
+          "type": "boolean"
+        },
+        "note": {
+          "description": "Carried with every report, because it is the one thing about this\nmechanism that surprises people.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "op",
+        "value",
+        "window_ms",
+        "breached",
+        "fires",
+        "evaluated",
+        "note"
+      ]
+    },
     "CollectorsDocument": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "CollectorsDocument",
@@ -6689,6 +7037,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "threshold": {
+          "description": "The armed threshold and its verdict, so one read answers both \"what are\nthe numbers\" and \"did it go over\" (§8). Absent on a recorded run: a\nrolling window is live state and a snapshot does not preserve it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThresholdInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -7039,6 +7398,68 @@
           "required": [
             "field",
             "reason"
+          ]
+        },
+        "ThresholdInfo": {
+          "description": "A threshold and its current verdict, as `collectors.list` and\n`collectors.get` report it.",
+          "type": "object",
+          "properties": {
+            "metric": {
+              "type": "string"
+            },
+            "group": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "type": "string"
+            },
+            "value": {
+              "type": "number",
+              "format": "double"
+            },
+            "window_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "breached": {
+              "type": "boolean"
+            },
+            "fires": {
+              "description": "Clear-to-breached **transitions**, not evaluations: a threshold breached\nfor a whole run has fired once, which is what \"did this happen\" means.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "last_value": {
+              "description": "The metric's value at the last evaluation. **Absent until one has\nhappened — unknown, not zero**, because zero is a value `count` can\nlegitimately hold and an `lt` threshold would read it as a breach.",
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "evaluated": {
+              "description": "Whether any span has yet been evaluated against this threshold.",
+              "type": "boolean"
+            },
+            "note": {
+              "description": "Carried with every report, because it is the one thing about this\nmechanism that surprises people.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "metric",
+            "op",
+            "value",
+            "window_ms",
+            "breached",
+            "fires",
+            "evaluated",
+            "note"
           ]
         }
       }

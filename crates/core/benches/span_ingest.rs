@@ -111,7 +111,12 @@ fn ingest_with_collectors(c: &mut Criterion, n_collectors: usize) {
                     level: Level::Tree,
                     group_keys: vec![],
                     max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
+                    // No threshold: this bench measures the observer effect of a
+                    // collector's *retention*, and adding a rolling guard to
+                    // some arms and not others would change what the numbers in
+                    // §17 are comparable against.
                     description: None,
+                    threshold: None,
                 },
                 Utc::now(),
             )

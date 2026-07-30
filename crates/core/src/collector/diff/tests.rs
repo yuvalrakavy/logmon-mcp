@@ -26,6 +26,7 @@ fn def_named(name: &str, filter: &str, level: Level, group_keys: Vec<String>) ->
         group_keys,
         max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
         description: None,
+        threshold: None,
     }
 }
 

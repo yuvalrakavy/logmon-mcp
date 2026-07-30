@@ -30,6 +30,7 @@ fn def() -> CollectorDef {
         group_keys: vec!["cache.enabled".into()],
         max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
         description: Some("the read-through cache".into()),
+        threshold: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn file_with(snapshots: Vec<StoredSnapshot>) -> PersistedCollector {
         group_keys: vec!["cache.enabled".into()],
         max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
         description: Some("the read-through cache".into()),
+        threshold: None,
         armed_at: at(0),
         next_auto_label: snapshots.len() as u64 + 1,
         snapshots_evicted: 0,

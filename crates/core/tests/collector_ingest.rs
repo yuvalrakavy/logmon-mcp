@@ -64,6 +64,7 @@ fn def(name: &str, filter: &str, level: Level, group_keys: &[&str]) -> Collector
         group_keys: group_keys.iter().map(|s| s.to_string()).collect(),
         max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
         description: None,
+        threshold: None,
     }
 }
 

@@ -158,6 +158,10 @@ impl Entry {
             group_keys: def.group_keys.clone(),
             max_sample_bytes: def.max_sample_bytes,
             description: def.description.clone(),
+            threshold: def
+                .threshold
+                .as_ref()
+                .map(crate::collector::persist::PersistedThreshold::of),
             armed_at: self.collector.armed_at(),
             snapshots: self
                 .history
@@ -182,6 +186,10 @@ pub struct CollectorEdit {
     pub group_keys: Option<Vec<String>>,
     pub max_sample_bytes: Option<usize>,
     pub domain: Option<DomainId>,
+    /// `Some(None)` clears an armed threshold; `Some(Some(t))` sets one. Nested
+    /// because "leave it alone" and "remove it" are different requests, and a
+    /// flat `Option` cannot express both.
+    pub threshold: Option<Option<crate::collector::threshold::Threshold>>,
 }
 
 impl CollectorEdit {
@@ -199,6 +207,15 @@ impl CollectorEdit {
             || self
                 .max_sample_bytes
                 .is_some_and(|b| b != current.max_sample_bytes)
+            // The rolling ring IS measurement state, so changing the limit it is
+            // evaluated against zeroes the window on the same terms as changing
+            // the filter (§7.1). Evaluating a new limit over a window
+            // accumulated under the old one would breach for reasons unrelated
+            // to load.
+            || self
+                .threshold
+                .as_ref()
+                .is_some_and(|t| *t != current.threshold)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -208,6 +225,7 @@ impl CollectorEdit {
             && self.group_keys.is_none()
             && self.max_sample_bytes.is_none()
             && self.domain.is_none()
+            && self.threshold.is_none()
     }
 }
 
@@ -326,6 +344,25 @@ impl CollectorRegistry {
             group_keys: file.group_keys.clone(),
             max_sample_bytes: file.max_sample_bytes,
             description: file.description.clone(),
+            threshold: match &file.threshold {
+                None => None,
+                Some(t) => match t.restore() {
+                    Ok(t) => Some(t),
+                    // A threshold this build cannot represent must not take the
+                    // collector down with it: the definition and its whole
+                    // history are still restorable, and a guard that stopped
+                    // existing is a smaller loss than a run that did.
+                    Err(e) => {
+                        tracing::warn!(
+                            collector = %file.name,
+                            error = %e,
+                            "dropping a recorded threshold this build cannot represent; the \
+                             collector and its history were restored without it"
+                        );
+                        None
+                    }
+                },
+            },
         };
         let (history, snapshot_errors) = crate::collector::persist::restore_history(file);
         if !snapshot_errors.is_empty() {
@@ -468,6 +505,13 @@ impl CollectorRegistry {
         }
         if let Some(k) = change.group_keys {
             def.group_keys = k;
+        }
+        // The outer `Some` is "the caller asked about this field"; the inner one
+        // is the value. `Some(None)` therefore removes an armed guard, which a
+        // flat `Option` could not express — and forgetting this arm is how the
+        // edit reported `zeroed: true` while keeping the old limit.
+        if let Some(t) = change.threshold {
+            def.threshold = t;
         }
         if let Some(b) = change.max_sample_bytes {
             def.max_sample_bytes = b;
@@ -908,6 +952,7 @@ mod tests {
             group_keys: vec![],
             max_sample_bytes: bytes,
             description: None,
+            threshold: None,
         }
     }
 

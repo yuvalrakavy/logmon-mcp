@@ -35,6 +35,7 @@ fn def(name: &str) -> CollectorDef {
         group_keys: vec![],
         max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
         description: None,
+        threshold: None,
     }
 }
 

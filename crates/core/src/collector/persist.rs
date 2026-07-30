@@ -167,6 +167,8 @@ pub struct PersistedSnapshot {
     pub group_keys: Vec<String>,
     pub max_sample_bytes: usize,
     pub collector_description: Option<String>,
+    #[serde(default)]
+    pub threshold: Option<PersistedThreshold>,
     pub policy_per_name: bool,
     pub policy_per_group: bool,
     pub policy_projections: bool,
@@ -197,6 +199,45 @@ pub struct PersistedSnapshot {
     pub cardinality_capped: bool,
 }
 
+/// A threshold as recorded on disk (§8).
+///
+/// Flat scalars rather than the in-memory enums, so a file written by a build
+/// that knew a metric this one does not can be rejected by name instead of
+/// failing to parse — the loader quarantines what it cannot understand, and
+/// "unknown metric `p95_ms`" is a better quarantine reason than a serde error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedThreshold {
+    pub metric: String,
+    #[serde(default)]
+    pub group: Option<String>,
+    pub op: String,
+    pub value: f64,
+    pub window_ms: u64,
+}
+
+impl PersistedThreshold {
+    pub fn of(t: &crate::collector::threshold::Threshold) -> Self {
+        Self {
+            metric: t.metric.as_str().to_string(),
+            group: t.group.clone(),
+            op: t.op.as_str().to_string(),
+            value: t.value,
+            window_ms: t.window_ms,
+        }
+    }
+
+    pub fn restore(&self) -> Result<crate::collector::threshold::Threshold, String> {
+        use crate::collector::threshold::{Metric, Op, Threshold};
+        Ok(Threshold {
+            metric: Metric::parse(&self.metric)?,
+            group: self.group.clone(),
+            op: Op::parse(&self.op)?,
+            value: self.value,
+            window_ms: self.window_ms,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedCollector {
     pub version: u32,
@@ -211,6 +252,11 @@ pub struct PersistedCollector {
     pub group_keys: Vec<String>,
     pub max_sample_bytes: usize,
     pub description: Option<String>,
+    /// Additive and optional, so `FORMAT_VERSION` does not move: a file written
+    /// before thresholds existed loads with none, and one written with a
+    /// threshold loads in a build that ignores the key.
+    #[serde(default)]
+    pub threshold: Option<PersistedThreshold>,
     pub armed_at: DateTime<Utc>,
     pub snapshots: Vec<PersistedSnapshot>,
     pub next_auto_label: u64,
@@ -240,6 +286,7 @@ impl PersistedSnapshot {
             group_keys: s.def.group_keys.clone(),
             max_sample_bytes: s.def.max_sample_bytes,
             collector_description: s.def.description.clone(),
+            threshold: s.def.threshold.as_ref().map(PersistedThreshold::of),
             policy_per_name: s.policy.per_name,
             policy_per_group: s.policy.per_group,
             policy_projections: s.policy.projections,
@@ -284,6 +331,10 @@ impl PersistedSnapshot {
                 group_keys: self.group_keys.clone(),
                 max_sample_bytes: self.max_sample_bytes,
                 description: self.collector_description.clone(),
+                threshold: match &self.threshold {
+                    None => None,
+                    Some(t) => Some(t.restore()?),
+                },
             }),
             policy: SnapshotPolicy {
                 per_name: self.policy_per_name,

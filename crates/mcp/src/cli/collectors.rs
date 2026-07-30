@@ -8,7 +8,7 @@ use clap::{Args, Subcommand};
 use logmon_broker_protocol::{
     CollectorsAdd, CollectorsDiff, CollectorsDiffResult, CollectorsDocument, CollectorsEdit,
     CollectorsGet, CollectorsHistory, CollectorsList, CollectorsName, CollectorsSnapshot, DiffRow,
-    ProfileResult, TracesProfile,
+    ProfileResult, ThresholdSpec, TracesProfile,
 };
 use logmon_broker_sdk::Broker;
 
@@ -38,6 +38,22 @@ enum ColVerb {
         description: Option<String>,
         #[arg(long)]
         max_sample_bytes: Option<u64>,
+        /// Rolling guard: count | total_ms | avg_ms | error_count |
+        /// error_rate_pct. Percentiles are not available - a rolling percentile
+        /// needs a sketch per bucket and per-collector memory is bounded.
+        #[arg(long, requires_all = ["threshold_op", "threshold_value", "threshold_window_ms"])]
+        threshold_metric: Option<String>,
+        /// gt | gte | lt | lte
+        #[arg(long)]
+        threshold_op: Option<String>,
+        #[arg(long)]
+        threshold_value: Option<f64>,
+        /// Rolling window in ms, 16..=600000.
+        #[arg(long)]
+        threshold_window_ms: Option<u64>,
+        /// Restrict the guard to one group value.
+        #[arg(long)]
+        threshold_group: Option<String>,
     },
     /// List this session's collectors.
     List,
@@ -202,7 +218,29 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
             group_keys,
             description,
             max_sample_bytes,
+            threshold_metric,
+            threshold_op,
+            threshold_value,
+            threshold_window_ms,
+            threshold_group,
         } => {
+            // clap's `requires_all` guarantees the other three are present once
+            // the metric is, so this cannot silently arm a half-specified guard.
+            let threshold = match (
+                threshold_metric,
+                threshold_op,
+                threshold_value,
+                threshold_window_ms,
+            ) {
+                (Some(metric), Some(op), Some(value), Some(window_ms)) => Some(ThresholdSpec {
+                    metric,
+                    group: threshold_group,
+                    op,
+                    value,
+                    window_ms,
+                }),
+                _ => None,
+            };
             let result = match broker
                 .collectors_add(CollectorsAdd {
                     name,
@@ -211,6 +249,7 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
                     group_keys: (!group_keys.is_empty()).then_some(group_keys),
                     description,
                     max_sample_bytes,
+                    threshold,
                 })
                 .await
             {
@@ -274,6 +313,28 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
                 &["name", "level", "domain", "matched", "sample", "filter"],
                 rows,
             );
+            // A breached guard is the most decision-relevant thing about a
+            // collector, so it prints under the table rather than as a column
+            // that would be empty for most rows.
+            for c in &result.collectors {
+                if let Some(t) = &c.threshold {
+                    let state = if t.breached { "BREACHED" } else { "ok" };
+                    println!(
+                        "  {} threshold {} {} {} over {}ms: {state} (last {}, {} fire(s))",
+                        c.name,
+                        t.metric,
+                        t.op,
+                        t.value,
+                        t.window_ms,
+                        t.last_value
+                            .map_or("not yet evaluated".to_string(), |v| format!("{v:.3}")),
+                        t.fires
+                    );
+                    if t.breached {
+                        println!("    note: {}", t.note);
+                    }
+                }
+            }
             println!(
                 "{} collector(s), {} bytes reserved",
                 result.count, result.reserved_bytes
@@ -299,6 +360,7 @@ pub async fn dispatch(broker: &Broker, cmd: CollectorsCmd, json: bool) -> i32 {
                     group_keys: (!group_keys.is_empty()).then_some(group_keys),
                     max_sample_bytes,
                     domain,
+                    threshold: None,
                 })
                 .await
             {

@@ -28,6 +28,7 @@ fn def(level: Level) -> CollectorDef {
         group_keys: vec![],
         max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
         description: Some("the read-through cache".into()),
+        threshold: None,
     }
 }
 

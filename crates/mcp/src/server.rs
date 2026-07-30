@@ -259,6 +259,9 @@ struct AddCollectorParams {
     description: Option<String>,
     /// Per-collector retained-sample budget in bytes (default 64 MiB).
     max_sample_bytes: Option<u64>,
+    /// A rolling guard: tell me when this metric crosses this value over this
+    /// window. Read the verdict back from list_collectors or get_collector.
+    threshold: Option<ThresholdParams>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -323,6 +326,24 @@ struct CollectorHistoryParams {
     /// Also combine them: exact totals and percentiles add across runs, and a
     /// run-to-run spread is reported. Sample-derived figures do not merge.
     merge: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ThresholdParams {
+    /// "count", "total_ms", "avg_ms", "error_count" or "error_rate_pct".
+    /// Percentiles are NOT available: a rolling percentile needs a duration
+    /// sketch per bucket, and per-collector memory is bounded on purpose. Use
+    /// "avg_ms" for the guard and get_collector for real percentiles.
+    metric: String,
+    /// Restrict to one group value. Needs the collector to declare group_keys.
+    group: Option<String>,
+    /// "gt", "gte", "lt" or "lte". A downward op detects a drop WHILE traffic
+    /// continues; it does nothing if traffic stops, because the window advances
+    /// on span arrival rather than on a clock.
+    op: String,
+    value: f64,
+    /// The rolling window, 16..=600000 ms.
+    window_ms: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -810,6 +831,13 @@ impl GelfMcpServer {
                     "group_keys": p.group_keys,
                     "description": p.description,
                     "max_sample_bytes": p.max_sample_bytes,
+                    "threshold": p.threshold.as_ref().map(|t| serde_json::json!({
+                        "metric": t.metric,
+                        "group": t.group,
+                        "op": t.op,
+                        "value": t.value,
+                        "window_ms": t.window_ms,
+                    })),
                 }),
             )
             .await

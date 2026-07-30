@@ -38,6 +38,11 @@ pub struct CollectorDef {
     pub group_keys: Vec<String>,
     pub max_sample_bytes: usize,
     pub description: Option<String>,
+    /// A load-time guard over a rolling window (§8). Part of the definition, so
+    /// it is persisted with the collector and recorded by every snapshot — and
+    /// so changing it is a structural edit that zeroes the window, on the same
+    /// terms as changing the filter. The rolling ring IS measurement state.
+    pub threshold: Option<crate::collector::threshold::Threshold>,
 }
 
 struct Inner {
@@ -108,6 +113,11 @@ impl CollectorSnapshot {
 pub struct Collector {
     def: Arc<CollectorDef>,
     inner: RwLock<Inner>,
+    /// Outside the lock on purpose: every field of it is an atomic, so ingest
+    /// updates the rolling window without needing the write lock that gates
+    /// every other domain's ingest (§3.6). An `Arc` so a description-only edit
+    /// can carry the live ring across rather than restarting the window.
+    threshold: Option<Arc<crate::collector::threshold::ThresholdState>>,
 }
 
 /// Deliberately shallow: the definition and a count, never the contents.
@@ -128,10 +138,20 @@ impl std::fmt::Debug for Collector {
 impl Collector {
     pub fn new(def: CollectorDef, now: DateTime<Utc>) -> Self {
         let inner = Inner::new(&def, now);
+        let threshold = def
+            .threshold
+            .clone()
+            .map(|t| Arc::new(crate::collector::threshold::ThresholdState::new(t)));
         Self {
             def: Arc::new(def),
             inner: RwLock::new(inner),
+            threshold,
         }
+    }
+
+    /// The rolling threshold's current verdict, if one is armed.
+    pub fn threshold(&self) -> Option<crate::collector::threshold::ThresholdReport> {
+        self.threshold.as_ref().map(|t| t.report())
     }
 
     pub fn def(&self) -> &Arc<CollectorDef> {
@@ -176,6 +196,15 @@ impl Collector {
         g.per_name.entry(name_id).or_default().record(d, err);
 
         let mut group_ids: Vec<u32> = Vec::new();
+        // The first group key's rendered value, kept only when a threshold needs
+        // it. Reuses the string the interner already built rather than rendering
+        // the attribute twice — §4.2 measured allocation on this path, and this
+        // is that path.
+        let mut group_value: Option<String> = None;
+        let want_group_value = self
+            .threshold
+            .as_ref()
+            .is_some_and(|t| t.def().group.is_some());
         if !self.def.group_keys.is_empty() {
             group_ids.reserve_exact(self.def.group_keys.len());
             for (i, key) in self.def.group_keys.iter().enumerate() {
@@ -183,7 +212,12 @@ impl Collector {
                     None => ABSENT_ID,
                     Some(v) => match render_attribute(v) {
                         None => ABSENT_ID,
-                        Some(s) => g.group_values[i].intern(&s),
+                        Some(s) => {
+                            if i == 0 && want_group_value {
+                                group_value = Some(s.clone());
+                            }
+                            g.group_values[i].intern(&s)
+                        }
                     },
                 };
                 group_ids.push(id);
@@ -220,6 +254,17 @@ impl Collector {
             };
             g.samples.push(&rec, &group_ids);
         }
+        drop(g);
+
+        // Outside the lock. All-atomic, and the only work an idle collector
+        // never does — nothing here runs on a timer.
+        if let Some(t) = &self.threshold {
+            // The producer's clock, like every other projection: a run whose
+            // spans arrive in a burst after the fact is evaluated over the
+            // window they happened in, not the window they were delivered in.
+            let start_ms = span.start_time.timestamp_millis();
+            t.record(start_ms, d, err, group_value.as_deref());
+        }
     }
 
     /// A collector with a new definition and the same live data.
@@ -242,9 +287,24 @@ impl Collector {
         inner.zeroed_at = g.zeroed_at;
         inner.group_tuples_capped = g.group_tuples_capped;
         drop(g);
+        // The rolling window comes across too, for the same reason the sample
+        // tier does: this path is only ever a rename, and restarting a window
+        // someone is watching because they edited a description would make the
+        // threshold clear itself for reasons unrelated to load.
+        //
+        // Asserted rather than assumed: a threshold change is structural (§7.1),
+        // so it goes through a fresh `Collector` and never reaches here. If that
+        // ever stops being true, carrying the old ring would evaluate the new
+        // limit against a window accumulated under the old one.
+        debug_assert_eq!(
+            def.threshold, self.def.threshold,
+            "with_def is a rename path; a threshold change must build a fresh collector"
+        );
+        let threshold = self.threshold.clone();
         Self {
             def: Arc::new(def),
             inner: RwLock::new(inner),
+            threshold,
         }
     }
 
@@ -326,6 +386,7 @@ mod tests {
             group_keys: group_keys.iter().map(|s| s.to_string()).collect(),
             max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
             description: None,
+            threshold: None,
         }
     }
 

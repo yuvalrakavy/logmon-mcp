@@ -1091,6 +1091,7 @@ fn dropping_a_session_reclaims_collectors_even_when_the_session_is_already_gone(
                 group_keys: vec![],
                 max_sample_bytes: DEFAULT_MAX_SAMPLE_BYTES,
                 description: None,
+                threshold: None,
             },
             chrono::Utc::now(),
         )
@@ -2575,4 +2576,377 @@ fn regenerating_with_a_finding_changes_only_the_finding() {
     for section in ["## 1.", "## 2.", "## 3.", "## 4.", "## 5."] {
         assert!(a.contains(section) && b.contains(section), "{section}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Threshold triggers (spec §8)
+// ---------------------------------------------------------------------------
+
+fn armed_with_threshold(h: &Harness, sid: &SessionId, name: &str, threshold: Value) -> Value {
+    h.call(
+        sid,
+        "collectors.add",
+        json!({
+            "name": name,
+            "filter": "sv=store_server",
+            "level": "tree",
+            "threshold": threshold,
+        }),
+    )
+    .expect("armed")
+}
+
+fn threshold_of(h: &Harness, sid: &SessionId, name: &str) -> Value {
+    let got = h
+        .call(sid, "collectors.get", json!({ "name": name }))
+        .expect("read");
+    got["threshold"].clone()
+}
+
+#[test]
+fn a_threshold_breaches_over_the_rolling_window_and_reports_it_on_get_and_list() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed_with_threshold(
+        &h,
+        &sid,
+        "guard",
+        json!({ "metric": "avg_ms", "op": "gt", "value": 50.0, "window_ms": 5000 }),
+    );
+
+    // Nothing yet: not breached, and no value — unknown, not zero.
+    let t = threshold_of(&h, &sid, "guard");
+    assert_eq!(t["breached"], false);
+    assert_eq!(t["evaluated"], false);
+    assert!(t.get("last_value").is_none(), "{t}");
+    assert!(t["note"].as_str().unwrap().contains("no traffic"));
+
+    // Fast spans: under the limit.
+    for i in 0..10 {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", 10.0, i * 1_000_000),
+        );
+    }
+    let t = threshold_of(&h, &sid, "guard");
+    assert_eq!(t["evaluated"], true);
+    assert_eq!(t["breached"], false);
+    assert_eq!(t["last_value"], 10.0);
+
+    // Slow ones in a fresh window: over it.
+    for i in 0..10 {
+        h.feed(
+            "default",
+            &span_at(
+                "store_server",
+                "reconcile",
+                200.0,
+                60_000_000_000 + i * 1_000_000,
+            ),
+        );
+    }
+    let t = threshold_of(&h, &sid, "guard");
+    assert_eq!(t["breached"], true, "{t}");
+    assert_eq!(t["fires"], 1);
+    assert_eq!(t["last_value"], 200.0);
+
+    // And `list` reports the same verdict, from the same renderer.
+    let listed = h.call(&sid, "collectors.list", json!({})).unwrap();
+    let c = &listed["collectors"][0];
+    assert_eq!(c["threshold"]["breached"], true);
+    assert_eq!(c["threshold"]["metric"], "avg_ms");
+    assert_eq!(c["threshold"]["window_ms"], 5000);
+}
+
+#[test]
+fn a_percentile_threshold_is_refused_at_arm_time_with_the_design_reason() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({
+                "name": "guard",
+                "filter": "sv=store_server",
+                "threshold": { "metric": "p95_ms", "op": "gt", "value": 100.0, "window_ms": 5000 },
+            }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("sketch per bucket"), "{err}");
+    assert!(err.contains("avg_ms"), "and names the alternative: {err}");
+    // And nothing was armed by the failed call.
+    let listed = h.call(&sid, "collectors.list", json!({})).unwrap();
+    assert_eq!(listed["count"], 0, "a refused add must not half-arm");
+}
+
+#[test]
+fn a_downward_threshold_arms_with_a_warning_that_it_is_not_a_liveness_check() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let added = armed_with_threshold(
+        &h,
+        &sid,
+        "guard",
+        json!({ "metric": "count", "op": "lt", "value": 100.0, "window_ms": 5000 }),
+    );
+    let warnings = added["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("not a liveness check")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_group_scoped_threshold_needs_group_keys() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let err = h
+        .call(
+            &sid,
+            "collectors.add",
+            json!({
+                "name": "guard",
+                "filter": "sv=store_server",
+                "threshold": {
+                    "metric": "count", "op": "gt", "value": 1.0,
+                    "window_ms": 5000, "group": "enabled"
+                },
+            }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("no group_keys"), "{err}");
+
+    // With a group key declared, the same threshold arms.
+    h.call(
+        &sid,
+        "collectors.add",
+        json!({
+            "name": "guard",
+            "filter": "sv=store_server",
+            "group_keys": ["cache.enabled"],
+            "threshold": {
+                "metric": "count", "op": "gt", "value": 1.0,
+                "window_ms": 5000, "group": "enabled"
+            },
+        }),
+    )
+    .expect("armed");
+}
+
+#[test]
+fn a_window_outside_the_permitted_range_is_refused_with_both_bounds() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for w in [0, 1, 700_000] {
+        let err = h
+            .call(
+                &sid,
+                "collectors.add",
+                json!({
+                    "name": "guard",
+                    "filter": "sv=store_server",
+                    "threshold": { "metric": "count", "op": "gt", "value": 1.0, "window_ms": w },
+                }),
+            )
+            .expect_err("refused");
+        assert!(err.contains("16"), "{err}");
+        assert!(err.contains("600000"), "{err}");
+    }
+}
+
+#[test]
+fn an_incomplete_threshold_names_the_missing_key() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for (missing, body) in [
+        (
+            "metric",
+            json!({ "op": "gt", "value": 1.0, "window_ms": 5000 }),
+        ),
+        (
+            "op",
+            json!({ "metric": "count", "value": 1.0, "window_ms": 5000 }),
+        ),
+        (
+            "value",
+            json!({ "metric": "count", "op": "gt", "window_ms": 5000 }),
+        ),
+        (
+            "window_ms",
+            json!({ "metric": "count", "op": "gt", "value": 1.0 }),
+        ),
+    ] {
+        let err = h
+            .call(
+                &sid,
+                "collectors.add",
+                json!({ "name": "guard", "filter": "sv=store_server", "threshold": body }),
+            )
+            .expect_err("refused");
+        assert!(
+            err.contains(missing),
+            "expected `{missing}` named in: {err}"
+        );
+    }
+}
+
+#[test]
+fn editing_a_threshold_zeroes_the_window_and_editing_a_description_does_not() {
+    // §7.1: description is free; every other edit is a reset plus a config
+    // change. The rolling ring is measurement state, so a new limit gets a new
+    // window — evaluating it over one accumulated under the old limit would
+    // breach for reasons unrelated to load.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed_with_threshold(
+        &h,
+        &sid,
+        "guard",
+        json!({ "metric": "count", "op": "gt", "value": 5.0, "window_ms": 5000 }),
+    );
+    for i in 0..10 {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", 10.0, i * 1_000_000),
+        );
+    }
+    assert_eq!(threshold_of(&h, &sid, "guard")["breached"], true);
+
+    // A description edit keeps the window AND the rolling verdict.
+    let out = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "guard", "description": "renamed" }),
+        )
+        .expect("edited");
+    assert_eq!(out["zeroed"], false);
+    let t = threshold_of(&h, &sid, "guard");
+    assert_eq!(t["breached"], true, "a rename must not clear a guard: {t}");
+
+    // A threshold edit zeroes.
+    let out = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({
+                "name": "guard",
+                "threshold": { "metric": "count", "op": "gt", "value": 500.0, "window_ms": 5000 },
+            }),
+        )
+        .expect("edited");
+    assert_eq!(out["zeroed"], true, "a new limit gets a fresh window");
+    let t = threshold_of(&h, &sid, "guard");
+    assert_eq!(t["value"], 500.0);
+    assert_eq!(t["breached"], false);
+    assert_eq!(t["evaluated"], false, "the ring restarted too");
+    assert_eq!(t["fires"], 0);
+}
+
+#[test]
+fn a_null_threshold_removes_an_armed_one() {
+    // "Leave it alone" and "take it away" are different requests, so the wire
+    // shape has to distinguish an absent key from an explicit null.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed_with_threshold(
+        &h,
+        &sid,
+        "guard",
+        json!({ "metric": "count", "op": "gt", "value": 5.0, "window_ms": 5000 }),
+    );
+    assert!(!threshold_of(&h, &sid, "guard").is_null());
+
+    let out = h
+        .call(
+            &sid,
+            "collectors.edit",
+            json!({ "name": "guard", "threshold": Value::Null }),
+        )
+        .expect("edited");
+    assert_eq!(out["zeroed"], true);
+    assert!(
+        threshold_of(&h, &sid, "guard").is_null(),
+        "the guard is gone"
+    );
+}
+
+#[test]
+fn a_recorded_run_reports_no_threshold_verdict() {
+    // A rolling window is live state. Reporting the LIVE verdict beside a
+    // recorded run's numbers would attach a fact about now to a window that
+    // closed.
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed_with_threshold(
+        &h,
+        &sid,
+        "guard",
+        json!({ "metric": "count", "op": "gt", "value": 1.0, "window_ms": 5000 }),
+    );
+    for i in 0..5 {
+        h.feed(
+            "default",
+            &span_at("store_server", "reconcile", 10.0, i * 1_000_000),
+        );
+    }
+    h.call(
+        &sid,
+        "collectors.snapshot",
+        json!({ "name": "guard", "label": "r1" }),
+    )
+    .unwrap();
+
+    let recorded = h
+        .call(
+            &sid,
+            "collectors.get",
+            json!({ "name": "guard", "snapshot": "r1" }),
+        )
+        .unwrap();
+    assert!(
+        recorded["threshold"].is_null(),
+        "a closed window has no rolling verdict: {recorded}"
+    );
+    // But the live read still has one.
+    assert!(!threshold_of(&h, &sid, "guard").is_null());
+}
+
+#[test]
+fn a_threshold_survives_a_restart_with_the_collector() {
+    let d = tempfile::TempDir::new().unwrap();
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        armed_with_threshold(
+            &h,
+            &sid,
+            "guard",
+            json!({
+                "metric": "error_rate_pct",
+                "op": "gte",
+                "value": 5.0,
+                "window_ms": 30000
+            }),
+        );
+    }
+
+    // A second daemon over the same directory, with no shutdown on the first:
+    // the point is that the file was already complete while it was running.
+    let h2 = restart_over(d.path());
+    let sid = h2.sessions.create_named("perf").unwrap();
+    let listed = h2.call(&sid, "collectors.list", json!({})).unwrap();
+    let c = &listed["collectors"][0];
+    assert_eq!(c["name"], "guard");
+    assert_eq!(c["threshold"]["metric"], "error_rate_pct");
+    assert_eq!(c["threshold"]["op"], "gte");
+    assert_eq!(c["threshold"]["value"], 5.0);
+    assert_eq!(c["threshold"]["window_ms"], 30000);
+    // The RING does not survive, and should not: a restored collector is zeroed
+    // by definition, so the window the verdict was reached over is gone too.
+    assert_eq!(c["threshold"]["evaluated"], false);
+    assert_eq!(c["threshold"]["fires"], 0);
 }

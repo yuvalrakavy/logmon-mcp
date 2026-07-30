@@ -799,6 +799,58 @@ impl PathRow {
     }
 }
 
+/// A rolling threshold as declared (§8).
+///
+/// Evaluated over a window **advanced by span arrival, never by a clock**, so an
+/// idle collector costs nothing — and so a breached threshold on a finished run
+/// neither fires again nor clears. That is the right behaviour for a load-time
+/// guard and the wrong one for a liveness check, which is why every report
+/// carries the note saying so.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ThresholdSpec {
+    /// `count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.
+    ///
+    /// **Percentiles are deliberately absent.** A rolling percentile needs a
+    /// duration sketch per bucket, and this design's per-collector memory is
+    /// bounded precisely so a collector cannot grow without limit. Use `avg_ms`
+    /// for the guard and read the real percentiles with `collectors.get`.
+    pub metric: String,
+    /// Restrict to one group value. Requires the collector to declare
+    /// `group_keys`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `gt`, `gte`, `lt` or `lte`.
+    pub op: String,
+    pub value: f64,
+    pub window_ms: u64,
+}
+
+/// A threshold and its current verdict, as `collectors.list` and
+/// `collectors.get` report it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ThresholdInfo {
+    pub metric: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub op: String,
+    pub value: f64,
+    pub window_ms: u64,
+    pub breached: bool,
+    /// Clear-to-breached **transitions**, not evaluations: a threshold breached
+    /// for a whole run has fired once, which is what "did this happen" means.
+    pub fires: u64,
+    /// The metric's value at the last evaluation. **Absent until one has
+    /// happened — unknown, not zero**, because zero is a value `count` can
+    /// legitimately hold and an `lt` threshold would read it as a breach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_value: Option<f64>,
+    /// Whether any span has yet been evaluated against this threshold.
+    pub evaluated: bool,
+    /// Carried with every report, because it is the one thing about this
+    /// mechanism that surprises people.
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CollectorsAdd {
     pub name: String,
@@ -815,6 +867,9 @@ pub struct CollectorsAdd {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sample_bytes: Option<u64>,
+    /// A rolling guard over this collector's matched spans (§8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<ThresholdSpec>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -870,6 +925,9 @@ pub struct CollectorInfo {
     pub orphaned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orphan_note: Option<String>,
+    /// The armed threshold and whether it is currently breached (§8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<ThresholdInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -948,6 +1006,16 @@ pub struct CollectorsEdit {
     /// is the remedy for a collector orphaned by a restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
+    /// Set or replace the rolling guard. Pass JSON `null` to remove one — which
+    /// is why this is doubly optional: "leave it alone" and "take it away" are
+    /// different requests and a single `Option` cannot express both.
+    ///
+    /// Like every other structural field, changing it **zeroes the live
+    /// window**: the rolling ring is measurement state, and evaluating a new
+    /// limit over a window accumulated under the old one would breach for
+    /// reasons unrelated to load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<Option<ThresholdSpec>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1365,6 +1433,11 @@ pub struct ProfileResult {
     /// returns, since an ad-hoc filter has no arm-time moment to report them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// The armed threshold and its verdict, so one read answers both "what are
+    /// the numbers" and "did it go over" (§8). Absent on a recorded run: a
+    /// rolling window is live state and a snapshot does not preserve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<ThresholdInfo>,
 }
 
 // =============================================================================

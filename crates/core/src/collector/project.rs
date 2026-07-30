@@ -227,6 +227,11 @@ pub fn profile(
         // reports them from `collectors.add` instead, which is when the caller
         // can still cheaply change their mind.
         warnings: Vec::new(),
+        // Also filled by the RPC layer, and only for a live read: the rolling
+        // window is state on the `Collector`, which this function does not see —
+        // it projects a `CollectorSnapshot`, and a snapshot has no rolling
+        // window by design.
+        threshold: None,
     }
 }
 

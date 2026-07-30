@@ -675,7 +675,7 @@ fn render_md(
         );
     }
 
-    section_what_moved(&mut s, arms, comparisons, opts);
+    section_what_moved(&mut s, arms, comparisons);
     section_what_to_do(&mut s, arms, facts);
 
     // Section 3 is the bulk. If the document has already grown past its budget,
@@ -825,12 +825,7 @@ fn front_matter(
     let _ = writeln!(s, "---");
 }
 
-fn section_what_moved(
-    s: &mut String,
-    arms: &[Arm],
-    comparisons: &[DiffResult],
-    opts: &DocumentOptions,
-) {
+fn section_what_moved(s: &mut String, arms: &[Arm], comparisons: &[DiffResult]) {
     let _ = writeln!(s, "## 1. What moved\n");
     if comparisons.is_empty() {
         let _ = writeln!(
@@ -939,7 +934,7 @@ fn section_what_moved(
         }
 
         if !c.groups.is_empty() {
-            group_table(s, c, opts);
+            group_table(s, c);
         }
         let _ = writeln!(s);
     }
@@ -950,7 +945,7 @@ fn section_what_moved(
 /// "share of total Δ" and "Δ to this row" are different numbers that readers
 /// conflate — 4.4 % and −8.4 % can be the same line. So both are printed, with
 /// distinct headings, and section 5 says what each one means.
-fn group_table(s: &mut String, c: &DiffResult, opts: &DocumentOptions) {
+fn group_table(s: &mut String, c: &DiffResult) {
     let overall = c
         .rows
         .iter()
@@ -1066,7 +1061,7 @@ fn section_what_to_do(s: &mut String, arms: &[Arm], facts: &Facts) {
     let _ = writeln!(s, "|---|{}", "---|".repeat(cols.len()));
     let mut any_absent = false;
     for (metric, cells) in rows {
-        any_absent |= cells.iter().any(|c| *c == Cell::Absent);
+        any_absent |= cells.contains(&Cell::Absent);
         let marks: Vec<&str> = cells.iter().map(|c| c.as_str()).collect();
         let _ = writeln!(s, "| `{metric}` | {} |", marks.join(" | "));
     }
