@@ -834,7 +834,13 @@ pub struct ThresholdInfo {
     pub group: Option<String>,
     pub op: String,
     pub value: f64,
+    /// The window as declared.
     pub window_ms: u64,
+    /// The window as **evaluated**: the declared width rounded up to a whole
+    /// number of ring buckets, so it is never narrower than what was asked for.
+    /// Equal to `window_ms` when that is a multiple of the bucket count.
+    #[serde(default)]
+    pub effective_window_ms: u64,
     pub breached: bool,
     /// Clear-to-breached **transitions**, not evaluations: a threshold breached
     /// for a whole run has fired once, which is what "did this happen" means.

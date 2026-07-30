@@ -331,10 +331,22 @@ impl PersistedSnapshot {
                 group_keys: self.group_keys.clone(),
                 max_sample_bytes: self.max_sample_bytes,
                 description: self.collector_description.clone(),
-                threshold: match &self.threshold {
-                    None => None,
-                    Some(t) => Some(t.restore()?),
-                },
+                // Dropped, never propagated. A snapshot's threshold is inert
+                // metadata (§6.3) that nothing evaluates, so a metric name this
+                // build does not know must not condemn a recorded run — which is
+                // what `?` did here, and the opposite of what the live
+                // collector's restore does with the same failure.
+                threshold: self.threshold.as_ref().and_then(|t| match t.restore() {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(
+                            snapshot = %self.label,
+                            error = %e,
+                            "dropping a recorded snapshot's threshold metadata this build                              cannot represent; the run itself was restored"
+                        );
+                        None
+                    }
+                }),
             }),
             policy: SnapshotPolicy {
                 per_name: self.policy_per_name,

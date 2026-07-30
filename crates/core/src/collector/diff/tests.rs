@@ -1053,26 +1053,92 @@ fn the_merged_nesting_verdict_folds_by_severity() {
         )
     };
     let flat = stored("flat", 10, 10, Some(TraceIngestLoss::default()));
-    let blind = {
-        let mut s = stored("blind", 10, 10, Some(TraceIngestLoss::default()));
-        // A run recorded below `tree`: it cannot answer the question at all.
-        s.def = Arc::new(def_named("c", "sv=svc", Level::Timing, vec![]));
-        s
-    };
 
     let v = |runs: Vec<StoredSnapshot>| Arm::merged("c@*".into(), &runs).unwrap().nesting;
     assert_eq!(v(vec![flat.clone(), flat.clone()]), "undetected");
-    assert_eq!(v(vec![flat.clone(), blind.clone()]), "unknown");
     assert_eq!(
         v(vec![flat.clone(), nested.clone()]),
         "detected",
-        "one nested run is enough"
+        "one nested run is enough — the double-count is a fact about the sum"
     );
-    assert_eq!(
-        v(vec![blind, nested]),
-        "detected",
-        "detected outranks unknown: the double-count is a fact, not a gap"
-    );
+
+    // A whole arm below `tree` cannot answer the question, and the merged verdict
+    // says so rather than reading as a clean `undetected`.
+    let blind: Vec<StoredSnapshot> = ["b1", "b2"]
+        .iter()
+        .map(|l| {
+            let mut s = stored(l, 10, 10, Some(TraceIngestLoss::default()));
+            s.def = Arc::new(def_named("c", "sv=svc", Level::Timing, vec![]));
+            s
+        })
+        .collect();
+    assert_eq!(v(blind.clone()), "unknown");
+
+    // And the `unknown` + `detected` combination is now unreachable *by
+    // construction*, because runs recorded at different levels can no longer be
+    // merged at all. The fold still handles it — losing that would make the
+    // function wrong if the definition check were ever relaxed — but the case is
+    // reached through the refusal now, not through a verdict.
+    let mixed = vec![blind[0].clone(), nested.clone()];
+    let err = Arm::merged("c@*".into(), &mixed).expect_err("refused");
+    assert!(err.to_string().contains("different definitions"), "{err}");
+}
+
+#[test]
+fn merging_runs_recorded_under_different_definitions_is_refused() {
+    // §7.1 keeps history across a structural edit, so a collector's history
+    // legitimately spans several configurations — which makes this reachable
+    // through the sanctioned workflow, not by misuse. Combining them would sum
+    // two populations, fold one filter's span names into another's, and report
+    // the spread across *configurations* as scheduling variance.
+    //
+    // Nothing else could catch it: `merge` compares sketch layouts, which are
+    // compile-time constants and so identical whatever the filter, and the diff's
+    // own filter/level/group_keys checks are cross-ARM, never intra-arm.
+    let base = stored("r1", 10, 10, Some(TraceIngestLoss::default()));
+
+    let with_def = |label: &str, def: CollectorDef| {
+        let mut s = stored(label, 10, 10, Some(TraceIngestLoss::default()));
+        s.def = Arc::new(def);
+        s
+    };
+
+    for (what, other) in [
+        (
+            "filter",
+            with_def("r2", def_named("c", "sn=other", Level::Tree, vec![])),
+        ),
+        (
+            "level",
+            with_def("r2", def_named("c", "sv=svc", Level::Timing, vec![])),
+        ),
+        (
+            "group_keys",
+            with_def(
+                "r2",
+                def_named("c", "sv=svc", Level::Tree, vec!["region".into()]),
+            ),
+        ),
+    ] {
+        let err = match Arm::merged("c@*".into(), &[base.clone(), other]) {
+            Err(e) => e,
+            Ok(arm) => panic!("a differing `{what}` must be refused, but it merged into {arm:?}"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("different definitions"), "{what}: {msg}");
+        // The message names both runs, because "they differ" without saying how
+        // leaves the caller to diff two definitions by hand.
+        assert!(msg.contains("r1") && msg.contains("r2"), "{what}: {msg}");
+        assert!(
+            msg.contains("<collector>@<label>"),
+            "{what}: and the way out: {msg}"
+        );
+    }
+
+    // Two runs under one definition still merge — otherwise the check above
+    // would be indistinguishable from refusing everything.
+    let same = stored("r2", 10, 10, Some(TraceIngestLoss::default()));
+    assert!(Arm::merged("c@*".into(), &[base, same]).is_ok());
 }
 
 // ---------------------------------------------------------------------------

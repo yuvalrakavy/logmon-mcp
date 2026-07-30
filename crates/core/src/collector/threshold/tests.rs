@@ -428,3 +428,205 @@ fn concurrent_recording_neither_panics_nor_loses_the_breach() {
     // right and nothing panicked or wrapped.
     assert!(r.last_value.unwrap() >= 100.0, "{:?}", r.last_value);
 }
+
+// ---------------------------------------------------------------------------
+// Found by the pre-merge gate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_average_divides_by_the_spans_that_contributed_not_by_every_matched_span() {
+    // The mistake `ExactStats::well_formed_count` exists to prevent, made here:
+    // dividing by `count` understates the average by exactly the proportion of
+    // unusable input — quietly, and worst on the dirtiest data. And
+    // `Duration::Negative` is routine under `tokio::spawn` instrumentation and
+    // cross-process clock skew, not exotic.
+    //
+    // Four spans of 200ms plus one with end < start. The honest average is 200;
+    // dividing by 5 gives 160 and a `> 180` guard silently does not fire.
+    let s = ThresholdState::new(th(Metric::AvgMs, Op::Gt, 180.0, 1600));
+    for i in 0..4i64 {
+        s.record(i, Duration::Ok(200 * 1_000_000), false, None);
+    }
+    s.record(4, Duration::Negative(-1_000_000), false, None);
+
+    assert_eq!(
+        s.report().last_value,
+        Some(200.0),
+        "800ms over the FOUR spans that contributed it, not over all five"
+    );
+    assert!(s.report().breached, "so the guard fires, as it should");
+
+    // And the same collector's exact tier agrees, which is the point: one
+    // `collectors.get` response must not show `exact.avg_ms: 200` beside a
+    // `> 180` guard reporting 160 and `breached: false`.
+    let mut e = crate::collector::exact::ExactStats::new();
+    for _ in 0..4 {
+        e.record(Duration::Ok(200 * 1_000_000), false);
+    }
+    e.record(Duration::Negative(-1_000_000), false);
+    assert_eq!(e.avg_ns().map(|v| v / 1e6), Some(200.0), "the two agree");
+}
+
+#[test]
+fn a_malformed_duration_still_counts_toward_count_and_the_error_rate() {
+    // The other side of the fix: excluding unusable durations from the average
+    // must not exclude the spans from the population.
+    let c = ThresholdState::new(th(Metric::Count, Op::Gte, 5.0, 1600));
+    for i in 0..5i64 {
+        c.record(i, Duration::Malformed, false, None);
+    }
+    assert!(
+        c.report().breached,
+        "five matched spans are five matched spans"
+    );
+
+    let r = ThresholdState::new(th(Metric::ErrorRatePct, Op::Gte, 40.0, 1600));
+    for i in 0..3i64 {
+        r.record(i, Duration::Malformed, i < 2, None);
+    }
+    let got = r.report().last_value.expect("evaluated");
+    // 1e-3, not 1e-9: `last_value` is stored as an integer thousandth of the
+    // metric's unit, so it is quantised to 0.001 by construction.
+    assert!(
+        (got - 200.0 / 3.0).abs() < 1e-3,
+        "two errors in three spans is 66.7%, whether or not their durations were \
+         usable: got {got}"
+    );
+    assert!(r.report().breached);
+}
+
+#[test]
+fn an_average_over_a_window_of_only_unusable_durations_is_undefined() {
+    // Not zero. With no span contributing to the sum there is no average, and
+    // reporting 0.0 would make `avg_ms < 5` fire on a window of pure clock skew.
+    let s = ThresholdState::new(th(Metric::AvgMs, Op::Lt, 5.0, 1600));
+    for i in 0..10i64 {
+        s.record(i, Duration::Negative(-1_000_000), false, None);
+    }
+    assert!(!s.report().evaluated, "nothing evaluable arrived");
+    assert!(!s.report().breached);
+    assert!(s.report().last_value.is_none());
+}
+
+#[test]
+fn clear_discards_the_window_and_the_verdict_reached_over_it() {
+    let s = ThresholdState::new(th(Metric::AvgMs, Op::Gt, 50.0, 1600));
+    feed(&s, 0, 10, 200, false);
+    let before = s.report();
+    assert!(before.breached && before.fires == 1);
+    assert_eq!(before.last_value, Some(200.0));
+
+    s.clear();
+    let after = s.report();
+    assert!(!after.breached, "the verdict went with the data");
+    assert_eq!(after.fires, 0, "and so did the transition count");
+    assert!(
+        after.last_value.is_none(),
+        "reporting a value computed from discarded data is worse than reporting none"
+    );
+    assert!(!after.evaluated);
+
+    // And the ring is genuinely empty, not merely reported so: one span in a
+    // fresh window must read as one span.
+    feed(&s, 100_000, 1, 10, false);
+    assert_eq!(s.report().last_value, Some(10.0));
+}
+
+#[test]
+fn the_evaluated_window_is_never_narrower_than_the_one_declared() {
+    // It used to be narrower by `window_ms % BUCKETS` — an ABSOLUTE error, so at
+    // `window_ms: 31` the real window was 16 ms: a 48% shortfall against a doc
+    // promising "at most 1/16". Rounding up overshoots instead, which is the
+    // conservative direction for a guard.
+    for w in [MIN_WINDOW_MS, 17, 31, 100, 1000, 5000, MAX_WINDOW_MS] {
+        let s = ThresholdState::new(th(Metric::Count, Op::Gte, 1.0, w));
+        let effective = s.effective_window_ms();
+        assert!(
+            effective >= w,
+            "window_ms {w} evaluated over only {effective}ms"
+        );
+        // And never wildly wider: at most one bucket over.
+        assert!(
+            effective < w + w.div_ceil(BUCKETS as u64) + BUCKETS as u64,
+            "window_ms {w} overshot to {effective}ms"
+        );
+    }
+}
+
+#[test]
+fn a_span_exactly_a_window_old_is_dropped_and_one_just_inside_is_kept() {
+    // The boundary of the staleness check, on the slot-COLLISION path the older
+    // test missed: an epoch a whole ring cycle back maps to the same slot as a
+    // live one, so if it were accepted it would reclaim that slot and delete
+    // real in-window data.
+    let window = 1600u64;
+    let s = ThresholdState::new(th(Metric::Count, Op::Gte, 2.0, window));
+    let bucket = (window.div_ceil(BUCKETS as u64)) as i64;
+
+    // Establish a window at a high epoch.
+    let base = 1_000_000i64;
+    s.record(base, Duration::Ok(1_000_000), false, None);
+    assert_eq!(s.report().last_value, Some(1.0));
+
+    // Exactly one ring cycle back: same slot, and outside the window.
+    s.record(
+        base - bucket * BUCKETS as i64,
+        Duration::Ok(1_000_000),
+        false,
+        None,
+    );
+    assert_eq!(
+        s.report().last_value,
+        Some(1.0),
+        "a span a full cycle old must neither count nor clear the slot it aliases"
+    );
+
+    // One bucket back is inside the window and does count.
+    s.record(base - bucket, Duration::Ok(1_000_000), false, None);
+    assert_eq!(s.report().last_value, Some(2.0));
+}
+
+#[test]
+fn the_verdict_and_the_value_it_came_from_are_read_as_one() {
+    // They were three independent atomics, so a reader could pair a `breached`
+    // from one evaluation with a `last_value` from another and print a verdict
+    // that does not follow from the number beside it.
+    let s = ThresholdState::new(th(Metric::AvgMs, Op::Gt, 50.0, 1600));
+    feed(&s, 0, 5, 100, false);
+
+    // The property, stated as an invariant a reader can check: whenever a value
+    // is reported, applying the declared op to it reproduces `breached`.
+    for _ in 0..100 {
+        let r = s.report();
+        if let Some(v) = r.last_value {
+            assert_eq!(
+                r.breached,
+                v > r.value,
+                "the verdict must follow from the value printed beside it: {r:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_group_scoped_threshold_on_several_group_keys_warns_that_only_the_first_counts() {
+    // Silent non-matching is indistinguishable from no traffic, and this is the
+    // one in-range misconfiguration that produces it.
+    let mut def = th(Metric::Count, Op::Gt, 1.0, 1000);
+    def.group = Some("us-east".into());
+    let w = def
+        .validate(&["service.name".to_string(), "region".to_string()])
+        .expect("permitted");
+    assert!(
+        w.iter().any(|x| x.contains("FIRST declared group key")),
+        "{w:?}"
+    );
+    assert!(w.iter().any(|x| x.contains("service.name")), "{w:?}");
+
+    // One key: no warning, so the warning means something.
+    assert!(def
+        .validate(&["region".to_string()])
+        .unwrap()
+        .iter()
+        .all(|x| !x.contains("FIRST declared")));
+}

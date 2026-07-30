@@ -4197,9 +4197,17 @@
               "format": "double"
             },
             "window_ms": {
+              "description": "The window as declared.",
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "effective_window_ms": {
+              "description": "The window as **evaluated**: the declared width rounded up to a whole\nnumber of ring buckets, so it is never narrower than what was asked for.\nEqual to `window_ms` when that is a multiple of the bucket count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
             },
             "breached": {
               "type": "boolean"
@@ -4359,9 +4367,17 @@
               "format": "double"
             },
             "window_ms": {
+              "description": "The window as declared.",
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "effective_window_ms": {
+              "description": "The window as **evaluated**: the declared width rounded up to a whole\nnumber of ring buckets, so it is never narrower than what was asked for.\nEqual to `window_ms` when that is a multiple of the bucket count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
             },
             "breached": {
               "type": "boolean"
@@ -6753,9 +6769,17 @@
           "format": "double"
         },
         "window_ms": {
+          "description": "The window as declared.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "effective_window_ms": {
+          "description": "The window as **evaluated**: the declared width rounded up to a whole\nnumber of ring buckets, so it is never narrower than what was asked for.\nEqual to `window_ms` when that is a multiple of the bucket count.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
         },
         "breached": {
           "type": "boolean"
@@ -7421,9 +7445,17 @@
               "format": "double"
             },
             "window_ms": {
+              "description": "The window as declared.",
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "effective_window_ms": {
+              "description": "The window as **evaluated**: the declared width rounded up to a whole\nnumber of ring buckets, so it is never narrower than what was asked for.\nEqual to `window_ms` when that is a multiple of the bucket count.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
             },
             "breached": {
               "type": "boolean"

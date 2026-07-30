@@ -266,6 +266,12 @@ impl Arm {
         // cap is millions of them.
         let projections = crate::collector::project::project_samples(view);
         let nesting = nesting_of(projections.as_ref(), view.def.level);
+        // Projected here, not left empty. A live arm was previously given no
+        // paths on the reasoning that "a live read projects them fresh" — true
+        // of `traces.profile`, false of `document --format folded`, which reads
+        // this field and never projects. So `folded` on a live collector failed
+        // with a message blaming the run for retaining nothing.
+        let (paths, paths_truncated) = crate::collector::project::project_paths(view);
         Self {
             spec,
             collector: view.def.name.clone(),
@@ -294,8 +300,8 @@ impl Arm {
             taken_at: Some(read_at),
             meta: serde_json::Value::Null,
             description: view.def.description.clone(),
-            paths: Vec::new(),
-            paths_truncated: false,
+            paths,
+            paths_truncated,
             floor: None,
             count_floor: None,
         }
@@ -353,12 +359,49 @@ impl Arm {
     ///   (A11) in a way no reader could detect.
     /// - **Ingest loss**, which is added rather than merged: two windows that
     ///   each lost spans lost them both, so the sum is the honest figure.
+    ///
+    /// **Refuses runs recorded under different definitions.** §7.1 keeps history
+    /// across a structural edit, so a collector's history legitimately spans
+    /// several configurations — and combining them would sum two populations,
+    /// fold one filter's `db.query` into another's, union two group dimensions
+    /// under one label, and report the spread across configurations as
+    /// "scheduling variance". An arm is one measurement of one population; that
+    /// is what makes `RunToRunFloor` mean anything.
     pub fn merged(
         spec: String,
         snapshots: &[StoredSnapshot],
     ) -> Result<Self, crate::collector::history::MergeError> {
         use crate::collector::history::{merge, MergeError};
         let last = snapshots.last().ok_or(MergeError::Empty)?;
+
+        // Checked here because nothing else can: `merge` compares sketch
+        // LAYOUTS, which are compile-time constants and therefore identical for
+        // every snapshot in a process whatever its filter; and `diff`'s filter,
+        // level and group_keys checks are cross-ARM, never intra-arm.
+        for s in snapshots {
+            let differs = canonical_filter(&s.def.filter) != canonical_filter(&last.def.filter)
+                || s.def.level != last.def.level
+                || s.def.group_keys != last.def.group_keys;
+            if differs {
+                return Err(MergeError::DefinitionMismatch {
+                    a: format!(
+                        "`{}`: filter `{}`, level `{}`, group_keys {:?}",
+                        s.label,
+                        s.def.filter_string,
+                        s.def.level.as_str(),
+                        s.def.group_keys
+                    ),
+                    b: format!(
+                        "`{}`: filter `{}`, level `{}`, group_keys {:?}",
+                        last.label,
+                        last.def.filter_string,
+                        last.def.level.as_str(),
+                        last.def.group_keys
+                    ),
+                });
+            }
+        }
+
         let total = merge(snapshots)?;
         let labels: Vec<String> = snapshots.iter().map(|s| s.label.clone()).collect();
 
@@ -402,9 +445,8 @@ impl Arm {
             spec,
             collector: last.def.name.clone(),
             aggregation: Aggregation::Merged(labels),
-            // The most recent run's definition. Any difference across the runs
-            // is caught by the diff's own filter, level and group_keys checks
-            // when this arm is compared against the other.
+            // Every run's definition, because the loop above proved they
+            // agree on everything that decides what was measured.
             def: last.def.clone(),
             total,
             per_name,
@@ -1205,9 +1247,13 @@ fn overall_rows(
         // worth having if a reader can trust what it says.
         _ => {
             let arms: [&Arm; 2] = [a, b];
+            // `Merged(_)`, not `len() > 1`: `Arm::merged` drops projections for
+            // every merge, including a one-run one, so keying on the length gave
+            // a one-run merge the generic reason and told the reader their
+            // `tree`-level, projections-enabled run had projections disabled.
             let merged = arms
                 .into_iter()
-                .find(|x| matches!(&x.aggregation, Aggregation::Merged(l) if l.len() > 1));
+                .find(|x| matches!(&x.aggregation, Aggregation::Merged(_)));
             let (reason, remedy) = match merged {
                 Some(m) => (
                     format!(
@@ -1270,6 +1316,24 @@ fn group_rows(
             ),
             remedy: Some(
                 "compare by `name`, or re-record both arms with the same group_keys".into(),
+            ),
+        });
+        return (Vec::new(), 0, 0);
+    }
+
+    if opts.group_by == DiffGroupBy::Group
+        && a.def.group_keys.is_empty()
+        && b.def.group_keys.is_empty()
+    {
+        // Otherwise this returns an empty breakdown with no reason, which reads
+        // as "nothing differed by group" rather than "there are no groups".
+        suppressed.push(logmon_broker_protocol::Suppressed {
+            field: "groups".into(),
+            reason: "neither arm declares any group_keys, so there is no group axis to                      break the numbers down by"
+                .into(),
+            remedy: Some(
+                "arm the collectors with group_keys, e.g. [\"cache.enabled\"], or compare                  by `name`"
+                    .into(),
             ),
         });
         return (Vec::new(), 0, 0);

@@ -2505,6 +2505,7 @@ fn threshold_json(r: &crate::collector::threshold::ThresholdReport) -> Value {
         op: r.op.to_string(),
         value: r.value,
         window_ms: r.window_ms,
+        effective_window_ms: r.effective_window_ms,
         breached: r.breached,
         fires: r.fires,
         last_value: r.last_value,

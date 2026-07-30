@@ -919,10 +919,18 @@ pub fn path_aggregates(snap: &CollectorSnapshot, cut_ns: Option<i64>) -> Vec<Pat
             incomplete,
         })
         .collect();
+    // `incomplete` is part of the tiebreak because it is part of the KEY: a
+    // complete chain `a > b` and a suffix of some deeper chain that also ends
+    // `a > b` are different rows with identical frames. Without it they compare
+    // Equal at equal self time, and since `sort_by` is stable, HashMap iteration
+    // order decides — so `top_n` and the stored path list would differ between
+    // two runs over identical data. Equal self time is not exotic: every parent
+    // fully covered by its children contributes zero.
     v.sort_by(|a, b| {
         b.self_ns
             .cmp(&a.self_ns)
             .then_with(|| a.frames.cmp(&b.frames))
+            .then_with(|| a.incomplete.cmp(&b.incomplete))
     });
     v
 }

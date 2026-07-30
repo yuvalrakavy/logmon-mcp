@@ -236,13 +236,17 @@ impl Collector {
         // The sample tier only wants well-formed timings; a malformed or
         // negative duration would poison every interval projection built on
         // it. It is still counted in the exact tier above.
-        if let Duration::Ok(_) = d {
-            let (Some(start), Some(end)) = (
-                span.start_time.timestamp_nanos_opt(),
-                span.end_time.timestamp_nanos_opt(),
-            ) else {
-                return;
-            };
+        // No early `return` from here on: the threshold update below must run for
+        // every span the exact tier counted. This block used to `return` when a
+        // timestamp failed to convert — unreachable, because `classify` already
+        // proved both convert before it can yield `Duration::Ok`, but the
+        // guarantee rested on a coincidence between two functions with nothing
+        // linking them, and what it would have skipped is the guard.
+        if let (Duration::Ok(_), Some(start), Some(end)) = (
+            d,
+            span.start_time.timestamp_nanos_opt(),
+            span.end_time.timestamp_nanos_opt(),
+        ) {
             let rec = SampleRecord {
                 start_ns: start,
                 end_ns: end,
@@ -331,6 +335,14 @@ impl Collector {
     /// returned view and the fresh state can never overlap or lose a span —
     /// the property A11 asserts field by field.
     pub fn swap(&self, now: DateTime<Utc>) -> CollectorSnapshot {
+        // The rolling window goes with the data. It IS measurement state — the
+        // same reason a threshold change is a structural edit — so leaving it
+        // loaded across a `reset` would report a verdict about spans that are no
+        // longer anywhere in the response, and would let a re-pin (permitted
+        // only while zeroed) carry a breach from the old domain's traffic.
+        if let Some(t) = &self.threshold {
+            t.clear();
+        }
         let mut g = self.inner.write().expect("collector lock poisoned");
         let armed_at = g.armed_at;
         let mut fresh = Inner::new(&self.def, armed_at);

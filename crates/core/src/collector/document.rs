@@ -278,6 +278,9 @@ impl Cell {
 struct Facts {
     /// Whether any arm carries a sampled tier at all.
     sampled_available: bool,
+    /// Whether a per-key breakdown was actually produced, so the matrix does not
+    /// certify rows the document does not contain.
+    breakdown_shown: bool,
     /// Whether any arm actually carries a `self_ms` figure.
     ///
     /// Tracked because the nesting remedy is "quote `self_ms`", and a merged arm
@@ -322,6 +325,7 @@ impl Facts {
             f.sampled_available |= a.projections.is_some();
         }
         for c in comparisons {
+            f.breakdown_shown |= !c.groups.is_empty();
             f.overflow_suppressed += c.overflow_rows_suppressed;
             // A suppressed `avg_ms` row is how the diff reports that the
             // denominator moved, so read it from there rather than
@@ -560,7 +564,7 @@ impl Facts {
                 // A missing floor makes any delta unresolvable, whatever tier.
                 "no floor" => true,
                 // Only the per-key breakdown folds; the overall figures do not.
-                "cardinality" => false,
+                "cardinality" => metric == "per-key breakdown rows",
                 // Skew moves interval arithmetic, not sums or counts.
                 "clock skew" => {
                     matches!(metric, "self_ms" | "wall_union_ms / achieved_concurrency")
@@ -577,6 +581,7 @@ impl Facts {
                 "sampled p50/p80/p95/p99" | "wall_union_ms / achieved_concurrency" => {
                     self.sampled_available
                 }
+                "per-key breakdown rows" => self.breakdown_shown,
                 _ => true,
             }
         };
@@ -598,6 +603,11 @@ impl Facts {
             "sampled p50/p80/p95/p99",
             "self_ms",
             "wall_union_ms / achieved_concurrency",
+            // The row the cardinality cap actually reaches. Without it that
+            // column is all dashes under a sentence promising a dash means
+            // "checked and unaffected" — the jointly-misleading shape this
+            // matrix exists to prevent.
+            "per-key breakdown rows",
         ];
         let rows = metrics
             .iter()
@@ -1015,12 +1025,26 @@ fn group_table(s: &mut String, c: &DiffResult) {
     // table is noise that makes the informative case easier to ignore.
     if let Some(o) = overall {
         let rest = o - shown_delta;
-        if truncated || rest.abs() > 1e-9 {
+        // A RELATIVE tolerance. `overall` and every group delta are independent
+        // integer-nanosecond-to-f64-millisecond conversions, so each carries a
+        // rounding; past about 10^6 ms aggregate — which a tree-level collector
+        // over a test suite reaches easily — the accumulated error exceeds any
+        // fixed epsilon and a fully-reconciling table grows a spurious residual
+        // row, which is the noise this condition exists to suppress.
+        let tolerance = (o.abs() * 1e-9).max(1e-6);
+        // A row present on one arm only has no delta to subtract, so it lands in
+        // the residual — but its mass IS attributed, to a row visible in this
+        // same table. Naming that "unattributed" sends the reader looking for
+        // something that is not missing.
+        let one_sided = c.groups.iter().any(|g| g.presence != "both");
+        if truncated || rest.abs() > tolerance {
             let _ = writeln!(
                 s,
                 "| _other ({})_ | - | - | - | - | {rest:+.1} | - | {} |",
                 if truncated {
                     format!("{} rows not shown", c.groups_total - c.groups.len())
+                } else if one_sided {
+                    "rows present on one arm only, which have no delta to subtract".to_string()
                 } else {
                     "unattributed residual".to_string()
                 },
@@ -1581,7 +1605,16 @@ fn folded(arms: &[Arm], _opts: &DocumentOptions) -> Result<Document, DocumentErr
             // graph rather than silently attributed to whatever comes next.
             frames.push("[?]".into());
         }
-        frames.extend(p.frames.iter().map(|f| f.replace(';', ",")));
+        // `;` is the frame separator, and any control character would split
+        // one stack across two lines — after which speedscope drops the
+        // orphaned half silently, which is the failure mode this whole format
+        // is written defensively against. Span names come off the wire.
+        frames.extend(p.frames.iter().map(|f| {
+            f.replace(';', ",")
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect::<String>()
+        }));
         // Integer microseconds: see the doc comment. Rounded rather than
         // truncated so a sub-microsecond path does not become a zero-count line
         // that both tools then treat as absent.
@@ -1789,11 +1822,36 @@ fn floor_cv(f: &Option<RunToRunFloor>) -> String {
     }
 }
 
-/// Double-quoted with the two characters that would break YAML escaped. Not a
-/// general YAML emitter — the schema is fixed and every value here is a name, a
-/// filter string, or free text from the caller.
+/// A double-quoted YAML scalar.
+///
+/// Escapes the backslash, the quote, **and every control character** — the last
+/// because `question`, `finding`, `filter_intent` and `meta` are free text from
+/// the caller, and an ordinary multi-line finding puts a raw newline inside the
+/// scalar. A conforming parser then either folds the break to a space, silently
+/// changing the recorded value, or fails on the front-matter altogether, which
+/// is the part that exists to be grep-able. No adversarial input needed.
+///
+/// Not a general YAML emitter: the schema here is fixed and every value is a
+/// name, a filter string, or caller text.
 fn yaml_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Everything else C0, plus DEL, as a YAML hex escape.
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn yaml_opt(v: &Option<String>) -> String {

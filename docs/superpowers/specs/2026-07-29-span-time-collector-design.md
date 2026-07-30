@@ -1194,6 +1194,82 @@ and deployed**. That is the evidence for keeping it, stated as a number.
 - `.claude/` is now git-ignored: an agent worktree was committed as an embedded
   repo and caught in the commit output.
 
+### Phases 4 and 5 — landed, 0.6.0
+
+**`collectors.diff` (§5.6).** Three arm shapes from one syntax: `c` (live), `c@label`
+(one run), `c@*` (every run merged). `*` cannot be a valid label, so the wildcard can
+never collide. The merged shape is not a convenience — it is the only one that yields a
+run-to-run floor, so with single-run arms on both sides every threshold reads `unknown`
+and §6.5's "one printed threshold" has nothing to print.
+
+Four decisions worth not re-deriving:
+
+- `Arm` holds breakdowns keyed by **resolved label**, not interner id. A merged arm spans
+  snapshots that each carry their own interner, so ids would graft one run's `db.query`
+  onto another's — a plausible number with no error.
+- A merge refuses to combine three things: sample-derived projections (a self time across
+  two runs is not a self time), per-axis breakdowns **unless every run recorded them** (a
+  partial breakdown cannot reconcile to the total, breaking A11 undetectably), and ingest
+  loss when any window could not attribute it (unknown, not the sum of the known ones).
+- The **nesting verdict is carried explicitly**, not derived from `projections`. Deriving
+  it made every merged arm read `unknown`, so every multi-run diff advised "re-run at
+  `tree`" to someone already at `tree`. Caught by a test, not by inspection.
+- Run-to-run floors are **per metric**. A fixed-iteration suite has near-zero count
+  variance while its timings vary by percent, so a duration CV applied to a count row
+  strikes out a real five-span difference in three hundred.
+
+**`collectors.document` (§9).** The cold-reader lens ran and was worth every minute: it
+found eight things, two serious, and it found a **regression introduced 20 minutes
+earlier while acting on an earlier finding** — "did not change at all" is provable for an
+exact count and forbidden for an estimated percentile, because two equal sketch outputs
+mean only that both fell in the same bucket. Fixing one side of a message left the other
+unsampled, which is exactly the failure the ways-of-working skill warns about.
+
+The other findings are all now guards: every active limitation gets a column in the reach
+table (it had two columns for six limitations, so a `-` read as "clean" when the truth was
+"no column"); absent numbers read `n/a` rather than being certified; a merged arm states
+that its figures are **sums**; the ranked table has a count column, because without it a
+reader cannot tell "fewer of them" from "each one cheaper"; and the threshold column names
+its basis rather than silently switching between the two floors §6.5 says must not be
+conflated.
+
+The reader also named what NOT to cut, which is half the value: the DDSketch ±1% sentence
+(it stopped a false bug report about an estimated p80 exceeding the exact max — 0.76%
+over, inside the bound), "all 3 rows" (what made the by-name sum usable as proof), the
+per-run **range** and not just the CV (the only way they discovered the totals were sums),
+the two `git_sha`s, and §4's insistence on printing zero counters.
+
+**Paths are stored as frames, not a joined string.** A span named `parse > eval` is
+indistinguishable from two frames once ` > ` is the separator, and the flame-graph
+renderer that splits the joined form apart would emit a stack that never ran. `folded`
+therefore works on a recorded run (the user chose this over erroring, since no snapshots
+existed on disk yet).
+
+**Threshold triggers (§8).** The ring lives outside the collector's `RwLock` — all
+atomics, so ingest never needs the write lock that gates every domain's ingest. Pull-only
+reporting, by the user's choice: the verdict rides on `list` and `get`, and on `get` only
+for a **live** read, because a recorded run has no rolling window and reporting the live
+verdict beside a closed window's numbers would attach a fact about now to a window that
+ended.
+
+A threshold change is **structural** and zeroes the window (§7.1), because the ring is
+measurement state. Two defects the tests caught: `registry.edit` never applied
+`change.threshold` to the new definition (reported `zeroed: true`, kept the old limit),
+and the handler built the report as a `json!` literal, emitting `"last_value": null` where
+the schema promises the key is absent — and absent-versus-null is the whole distinction
+that field carries.
+
+**One spec/implementation discrepancy, resolved toward the substance.** §9.6's limitation
+row is labelled `nesting: "undetected"` but its body describes the *below-`tree`* case,
+which the code calls `"unknown"` and whose remedy ("re-run at `tree`") only makes sense
+there. The code reserves `"undetected"` for "we looked and found none". Implemented per
+the body; the label in §9.6 is the thing that is wrong.
+
+`FORMAT_VERSION` and `PROTOCOL_VERSION` both stay at **1**. Every addition is optional and
+defaulted, and the only version gate refuses a file *newer* than the running build — so a
+defaulted field reads correctly in both directions, where a bump would make every existing
+snapshot unreadable in exchange for nothing.
+
 ### Not yet built
 
 1. **§4.2 matcher de-allocation** — confirmed real but **0.2 % of per-session ingest
@@ -1203,21 +1279,19 @@ and deployed**. That is the evidence for keeping it, stated as a number.
    shutdown path is involved at all — which is what §12's objection to `restart()`
    was actually about. A true out-of-process test additionally needs a config-dir
    override; there is no env var or flag for it, only `DaemonOverrides`.
-3. **Phase 4 — comparison.** `collectors.diff` (§5.6) and `collectors.document`
-   (§9). Read those two sections first; both are unusually specified. §5.6's table
-   of mark/block/refuse conditions is the load-bearing part, and the error bound
-   is `α(a+b)/|a−b|` — **not** √2·α, which an earlier revision got wrong. §9's
-   document is written for a reader who does *not* have the authoring context,
-   so it earns a **cold-reader lens** at design time (hand a fresh agent only the
-   rendered artifact, barred from spec and code, and ask what it cannot conclude).
-4. **Phase 5 — guards.** Threshold triggers (§8), built rather than reused.
-5. **Micro-retro is owed** for this branch, and the log is past five entries since
-   the last `## Consolidated through` marker — so `/process-retro` is due before
-   the next feature starts, not after.
 3. **`status.get` does not surface the new counters.** Deliberate: `receiver_drops`
    documents itself as counting entries the broker *silently* lost, and both transports
    carry a comment explaining why a shed is not one of those. Adding a sibling field is
    a protocol change worth making on its own terms.
+4. **A rolling percentile threshold.** Refused rather than deferred: it needs a duration
+   sketch per bucket, and the per-collector memory bound is the reason this design can
+   promise anything about its own cost. The error says so and names `avg_ms`.
+5. **The document's per-arm `wall_ms` on a merged arm is a sum**, and is labelled as such
+   rather than replaced with an elapsed time. A real elapsed figure across merged runs
+   would need the gaps between them, which nothing records.
+6. **Micro-retro is owed** for this branch, and the log is past five entries since the
+   last `## Consolidated through` marker — so `/process-retro` is due before the next
+   feature starts, not after.
 
 ### Facts that cost time to establish — do not re-derive
 

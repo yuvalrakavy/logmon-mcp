@@ -345,6 +345,14 @@ pub enum MergeError {
         first: String,
         offending: String,
     },
+    /// Runs recorded under different definitions. §7.1 keeps history across a
+    /// structural edit, so this is reachable through the sanctioned workflow —
+    /// and combining them would report the spread across *configurations* as
+    /// scheduling variance.
+    DefinitionMismatch {
+        a: String,
+        b: String,
+    },
 }
 
 impl std::fmt::Display for MergeError {
@@ -356,6 +364,15 @@ impl std::fmt::Display for MergeError {
                 "cannot merge snapshots recorded with different sketch layouts \
                  ({first} vs {offending}); merging them would produce percentiles with no \
                  stated accuracy at all"
+            ),
+            MergeError::DefinitionMismatch { a, b } => write!(
+                f,
+                "cannot merge runs recorded under different definitions: {a} vs {b}. An arm \
+                 is one measurement of one population — summing two of them would report \
+                 the spread across configurations as scheduling variance, and would fold \
+                 one filter's span names into another's. Name the runs you want \
+                 individually (`<collector>@<label>`), or re-record them under one \
+                 definition"
             ),
         }
     }
