@@ -752,6 +752,7 @@ impl RpcHandler {
         let session_info = self.sessions.get(session_id);
         let stats = d.pipeline.store_stats();
         let drops = d.metrics.snapshot();
+        let trace_ingest = d.metrics.trace_ingest_loss();
         // §7 situational awareness: where the session is bound + what is
         // narrowing it, so one call answers "where am I / what's filtering me".
         let current_domain = self.sessions.domain_of(session_id).to_string();
@@ -798,6 +799,11 @@ impl RpcHandler {
                 "otlp_http_traces": drops.otlp_http_traces,
                 "otlp_grpc_logs": drops.otlp_grpc_logs,
                 "otlp_grpc_traces": drops.otlp_grpc_traces,
+            },
+            "trace_ingest": {
+                "dropped": trace_ingest.dropped,
+                "shed_batches": trace_ingest.shed_batches,
+                "malformed_dropped": trace_ingest.malformed,
             },
             "current_domain": current_domain,
             "active_filters": active_filters,

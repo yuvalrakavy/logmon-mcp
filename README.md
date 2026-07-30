@@ -500,6 +500,7 @@ A noisy producer should slow itself down, not take the broker down. Concretely:
 - GELF UDP sets `SO_RCVBUF` to **8 MB** so a slow consumer has a sizeable OS-side cushion before datagrams start falling on the floor.
 - OTLP gRPC and OTLP HTTP both check channel fill before consuming a payload. At **≥ 80% full**, gRPC returns `UNAVAILABLE` and HTTP returns `429`. The producer is expected to retry with backoff. The protocol-level rejection *is* the backpressure signal — per-source drop counters aren't bumped, because nothing was silently dropped.
 - Per-source drop counts surface in `status.get` under `receiver_drops` (`gelf_udp`, `gelf_tcp`, `otlp_http_logs`, `otlp_http_traces`, `otlp_grpc_logs`, `otlp_grpc_traces`). Healthy operation keeps all six at zero.
+- `status.get` also carries `trace_ingest` (`dropped`, `shed_batches`, `malformed_dropped`) — span loss on the OTLP trace transports specifically. It's a sibling of `receiver_drops`, deliberately not merged into it: `receiver_drops` counts silent channel-full loss, while `shed_batches` is a loud 429/UNAVAILABLE the client saw, and `malformed_dropped` is a parse-time refusal. Healthy operation keeps all three at zero.
 
 If you're seeing nonzero drops, the broker is the bottleneck — bump `buffer_size` / `span_buffer_size`, or check whether a runaway producer is genuinely outpacing the consumer.
 

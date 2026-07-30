@@ -112,6 +112,7 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "SessionDropResult":     schema_for!(SessionDropResult),
             "StatusGet":             schema_for!(StatusGet),
             "StatusGetResult":       schema_for!(StatusGetResult),
+            "TraceIngestCounts":     schema_for!(TraceIngestCounts),
             "SessionStartParams":    schema_for!(SessionStartParams),
             "SessionStartResult":    schema_for!(SessionStartResult),
             // domains.* (DomainsCreateResult / DomainsUseResult are aliases of DomainInfo)

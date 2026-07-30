@@ -37,6 +37,16 @@ pub async fn dispatch(broker: &Broker, json: bool) -> i32 {
         result.store.malformed_count,
         result.store.current_size,
     );
+    // Sibling of receiver_drops (never itself printed here; JSON-only today —
+    // see TraceIngestCounts's doc for why the two don't merge). Silent like
+    // the rest of this human view when there's nothing to report.
+    let ti = &result.trace_ingest;
+    if ti.dropped != 0 || ti.shed_batches != 0 || ti.malformed_dropped != 0 {
+        println!(
+            "trace ingest: {} dropped, {} batches shed, {} malformed",
+            ti.dropped, ti.shed_batches, ti.malformed_dropped,
+        );
+    }
     if let Some(s) = &result.session {
         println!(
             "session: id={} name={} connected={} triggers={} filters={} queue={} last_seen={}s",
