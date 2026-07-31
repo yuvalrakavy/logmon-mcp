@@ -453,6 +453,7 @@ nobody invented a second spelling.
 | `/Env/container` | image tag, when the runtime is not the host |
 | `/Data/dataset` | which fixture or corpus |
 | `/Data/seed` | **the highest-value key for the flaky-test case** (§0's motivating use): a recorded seed turns "fails 1 in 20" into a reproduction |
+| `/case-name` | the filename prefix for this project's case documents (§5.3) — a **slug**, not prose: `checkout`, `ht-server`. The one key here that is read by logmon rather than only rendered by it, which is why it is spelled once and sanitised on use |
 
 Rules: `<component>` and other leaf names are project-chosen and should be stable across
 documents. Anything outside these namespaces is free for project-specific use;
@@ -1068,18 +1069,45 @@ string is a path-traversal surface — `../../` in a prefix would escape the arc
 `safe_name` collapses everything outside `[A-Za-z0-9_-]`, and the prefix is **truncated**
 to 48 bytes rather than rejected, on a UTF-8 boundary.
 
-**`prefix` defaults to `case`** when omitted. The draft left the optional parameter with no
-default, which is the common path: an absent prefix would have produced `-260731-021530.md`
-— a leading-dash filename that most CLI tools read as a flag — or `260731-021530.md`, which
-parse-from-the-right cannot separate from a six-digit prefix.
+#### Where the prefix comes from
 
-**The name carries no domain and no incarnation, and that is a real limit.** §3.5 argues
-that a domain name is not an identity and that a document must record its incarnation
-beside its seq range — but the *filename* carries neither, and the filename is the only
-index §2 permits. `ls` cannot separate two eras or two domains; you open the file. The
-alternative — encoding either into the name — re-privileges a query axis the way §4.1
-argues against, for a discrimination that front-matter already makes. Stated here so a
-future reader knows it was weighed rather than missed.
+Three levels, most specific first:
+
+| Source | Result |
+|---|---|
+| The `prefix` parameter | `checkout-hang-260731-021530.md` |
+| `/case-name` in the registry (§3.6.1) | `ht-server-260731-021530.md` |
+| Neither → **the domain name** | `t3-260731-021530.md` |
+
+The parameter wins because a caller naming *this* capture knows more than a session-wide
+default. The registry key sits between them so a project sets its archive's vocabulary once
+rather than on every call — which is §3.6.2's argument again: a convention that has to be
+restated per call is one that gets skipped.
+
+**The domain name is the floor, and it earns that place.** It is the only identity logmon
+already has; the skill recommends one domain per project or test run, so it is already
+per-project; and it repairs the limit stated below at no cost. An earlier draft defaulted to
+the literal `case`, which spends the first five sort-significant characters of every
+filename saying nothing.
+
+**A prefix that sanitises to nothing falls back the same way.** `safe_name("...")` is
+`___`, and a directory of `___-260731-*.md` is worse than a directory of `t3-260731-*.md`.
+If the sanitised prefix is empty or has no alphanumeric character, the next level down is
+used. Leaving the optional parameter with no default at all — the draft's position — would
+have produced `-260731-021530.md`, a leading-dash filename most CLI tools read as a flag.
+
+**`/case-name` is a slug, not prose**, and the skill says so: `checkout`, `ht-server`,
+`auth-flow`. `/Action` is the key that carries a sentence; this one is a filename component
+and is sanitised as such.
+
+**The name carries no incarnation, and that is a real limit** — reduced but not removed by
+the above. §3.5 argues that a domain name is not an identity and that a document must record
+its incarnation beside its seq range. Defaulting the prefix to the domain means `ls` can now
+usually separate two *domains*; it still cannot separate two **eras** of one domain, and a
+project that sets `/case-name` has opted out of even the first. The filename is the only
+index §2 permits, and encoding the incarnation into it would re-privilege a query axis the
+way §4.1 argues against, for a discrimination front-matter already makes. Weighed, not
+missed.
 
 ### 5.4 Collector state at capture
 
@@ -1363,7 +1391,10 @@ and a year boundary; the timestamp is **UTC** even when the host is not, asserte
 non-UTC `TZ`; a prefix containing `-` (`checkout-hang`) round-trips and the fields still
 parse from the right; a prefix with `/`, `..` or a control character is sanitised before it
 reaches a path, and one over 48 bytes is truncated on a UTF-8 boundary rather than
-rejected; **an omitted prefix produces `case-…`**, never a leading dash; and **two captures
+rejected; the prefix **falls back parameter → `/case-name` → domain name**, asserted at each
+level and at the transitions, including that a prefix sanitising to `___` drops through
+rather than landing in the archive, and that an omitted prefix never produces a leading
+dash; and **two captures
 in the same second under one prefix produce two files** — driven concurrently, not
 sequentially, because `create_new` is what makes that true and a sequential test passes
 against a check-then-write that races.
@@ -1550,6 +1581,7 @@ lenses. The **mechanism** decisions largely did not.
 | No format version in the archive | **A header record per JSONL file** (§5.2) | §2 makes the format the contract, and the collector path already had `FORMAT_VERSION` for the same reason |
 | "Per-entry outcomes", untyped | **Enums** (§3.3), incl. a third `unknown` cause | `rejected` reasons were never enumerated, and the two stated causes are not distinguishable from the registry alone |
 | No module, no phases | **§2** | Four files change before any feature logic exists; "Phase 1 is unblocked" named no phase |
+| Prefix defaulted to the literal `case` | **parameter → `/case-name` → domain name** (§5.3) | The domain is the only identity logmon already has, and using it means `ls` can separate two domains' cases — recovering most of the limit §5.3 had recorded as unavoidable |
 
 Two citations were wrong and are corrected in place: `server.rs:530` is `export_logs`
 writing to a caller-supplied path (it was cited as evidence that clients write — it is the
