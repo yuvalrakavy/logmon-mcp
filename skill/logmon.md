@@ -93,7 +93,7 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 
 ### Logs
 
-- **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=100`.
+- **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=50`.
 - **`get_log_context(seq, before?, after?)`** — logs around a specific entry. Use this when you have a `seq` from another query.
 - **`export_logs(path, count?, filter?, format?)`** — write matching logs to a file (`json` or `text`).
 - **`clear_logs()`** — clear the in-memory buffer. **Shared across all sessions.** Prefer bookmarks for "see only what happens next" — see below.
@@ -140,7 +140,9 @@ Collectors need a **named** session (`--session NAME`, or `session.start` with a
 - **`add_collector(name, filter, level?, group_keys?, description?)`** — arm it. `level`: `scalar` (counts and totals), `timing` (adds percentiles, wall union, warm-up exclusion), `tree` (adds self time, nesting and call paths — the default). `group_keys` splits the numbers by span attribute, which is how you run both arms of an A/B in one pass: `group_keys=["cache.enabled"]`. Always give a `description` — it comes back with every read.
 - **`get_collector(name, snapshot?, group_by?, skip_warmup_ms?, top_n?)`** — read it. `group_by`: `name`, `group`, `trace`, `path`. `snapshot` reads a recorded run instead of the live window — and a recorded run is served from what it stored, so `group_by` and `skip_warmup_ms` cannot apply to one and will say so. **Shape the read before you snapshot, not after.**
 - **`list_collectors()`** — what this session has armed, and how much each has matched. Check this before arming: only about four default-sized collectors fit in the daemon-wide budget.
-- **`snapshot_collector(name, label?, description?, meta?)`** — record the current window as a named run and start the next one. **This is the between-runs move**, not `reset_collector`: it keeps the run. Pass a `description` and, when you have one, a `meta` like `{"commit": "abc123"}`.
+- **`snapshot_collector(name, label?, description?, meta?, reset?, projections?, per_name?, per_group?)`** — record the current window as a named run and start the next one. **This is the between-runs move**, not `reset_collector`: it keeps the run. Pass a `description` and, when you have one, a `meta` like `{"commit": "abc123"}`.
+  - `reset` defaults **true** — ending one run and starting the next is the usual intent. Pass `false` to record without zeroing.
+  - `projections`, `per_name`, `per_group` all default **true** and are **computed now or never**: the samples behind them are not retained, so a run recorded with one of these false can never grow the breakdown later. Leave them alone unless you know you do not want the detail.
 - **`get_collector_history(name, limit?, merge?)`** — the recorded runs, oldest first, each with the definition it was taken under. `merge=true` also combines them and reports the run-to-run spread — which is what tells you whether a gap between two runs is real or noise. A single run reports that spread as *unknown*, never zero.
 - **`edit_collector(name, …)`** — change an armed collector. `group_keys` is capped at 8 (group by one attribute — that is the case this is built for). A structural edit is refused if it would exceed the daemon-wide sample reservation, and a refused edit changes nothing. Editing only `description` costs nothing; editing `filter`, `level`, `group_keys`, `max_sample_bytes` or `domain` **discards the live window** (snapshots are never touched). Use it to re-pin a collector orphaned by a restart, or to drop `tree` → `timing` for 2.5× the records when the sample budget runs out.
 - **`reset_collector(name)`** — zero it and **discard** the run. Prefer `snapshot_collector` unless you genuinely want it gone.

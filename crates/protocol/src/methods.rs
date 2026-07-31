@@ -988,6 +988,22 @@ pub struct CollectorsListResult {
     pub reserved_bytes: u64,
 }
 
+/// `collectors.reset` — zero a collector and **discard** the window.
+///
+/// A one-field request type still earns its place: without it the method has no
+/// schema, and a tool whose parameters nothing describes cannot be checked
+/// against the shim, generated from, or published in a manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsReset {
+    pub name: String,
+}
+
+/// `collectors.remove` — disarm and delete, taking its recorded runs with it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CollectorsRemove {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CollectorsGet {
     pub name: String,

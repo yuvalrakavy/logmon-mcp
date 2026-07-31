@@ -115,7 +115,8 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "TraceIngestCounts":     schema_for!(TraceIngestCounts),
             "SessionStartParams":    schema_for!(SessionStartParams),
             "SessionStartResult":    schema_for!(SessionStartResult),
-            // domains.* (DomainsCreateResult / DomainsUseResult are aliases of DomainInfo)
+            // domains.* (DomainsCreateResult is an alias of DomainInfo; DomainsUseResult is
+            // its own struct and is listed below — the old comment said otherwise)
             "DomainInfo":            schema_for!(DomainInfo),
             "DomainsCreate":         schema_for!(DomainsCreate),
             "DomainsDelete":         schema_for!(DomainsDelete),
@@ -125,6 +126,16 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "DomainsUse":            schema_for!(DomainsUse),
             "DomainsClear":          schema_for!(DomainsClear),
             "DomainsClearResult":    schema_for!(DomainsClearResult),
+            // Single-field request types. Present because the list below is
+            // hand-maintained, so an omission means a live tool whose parameters
+            // nothing describes — and `verify-schema` cannot see it, since it
+            // re-runs this same list against itself. A drift test in the shim
+            // (`param_drift_tests`) is what catches that from the other side.
+            "CollectorsReset":       schema_for!(CollectorsReset),
+            "CollectorsRemove":      schema_for!(CollectorsRemove),
+            "SessionRename":         schema_for!(SessionRename),
+            "SessionRenameResult":   schema_for!(SessionRenameResult),
+            "DomainsUseResult":      schema_for!(DomainsUseResult),
             // domain_data.* — the provenance registry
             "DomainDataEntry":         schema_for!(DomainDataEntry),
             "DomainDataUpdate":        schema_for!(DomainDataUpdate),

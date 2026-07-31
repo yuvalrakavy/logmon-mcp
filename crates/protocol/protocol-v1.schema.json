@@ -3321,6 +3321,190 @@
         "spans_cleared"
       ]
     },
+    "CollectorsReset": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsReset",
+      "description": "`collectors.reset` — zero a collector and **discard** the window.\n\nA one-field request type still earns its place: without it the method has no\nschema, and a tool whose parameters nothing describes cannot be checked\nagainst the shim, generated from, or published in a manifest.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "CollectorsRemove": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CollectorsRemove",
+      "description": "`collectors.remove` — disarm and delete, taking its recorded runs with it.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "SessionRename": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionRename",
+      "description": "`session.rename` — re-key the calling session to a meaningful name\n(`<Project>-Main-<short8>` / `<Project>-tN-<branch>`, spec 2026-07-17),\npreserving all state. Errors with \"already connected\" when the target name\nis held by a LIVE session — the one-conversation-per-lane invariant.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "SessionRenameResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SessionRenameResult",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "The session's new name (echoed; the connection re-keys itself on it).",
+          "type": "string"
+        },
+        "displaced_stale_holder": {
+          "description": "Set when a stale (disconnected) holder of this name was displaced.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "DomainsUseResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsUseResult",
+      "description": "`domains.use` returns the now-bound domain (same shape as a `domains.list`\nentry), plus a warning when the bind REPLACED a different non-default\nbinding.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "gelf_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_grpc_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_http_port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "source": {
+          "description": "`\"config\"` | `\"persistent\"` | `\"ephemeral\"`.",
+          "type": "string"
+        },
+        "log_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "span_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "log_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "span_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "oldest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "bound_sessions": {
+          "description": "Sessions currently bound to this domain (connected first, disconnected\nsuffixed). DERIVED from the session registry — never caller-supplied —\nso with meaningful session names, `domains.list` answers \"which\nconversation is using which domain\" authoritatively. Populated by\n`domains.list`; empty elsewhere.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "last_log_received_at": {
+          "description": "Wall-clock of the last log ingested into this domain (across any listener),\nor `None` if none ever arrived. A `None` here is the \"nothing is shipping\nto this domain — did I misconfigure the port?\" signal. (Consumer #2.)",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_span_received_at": {
+          "description": "Wall-clock of the last span ingested into this domain, or `None`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "idle_secs": {
+          "description": "Seconds since the most recent log OR span ingest; `None` if neither ever\narrived.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stale": {
+          "description": "`true` when the domain HAS received before but has been idle longer than\nthe broker's `stale_after_secs` (config, default 60s). A never-received\ndomain is `false` — distinguish it via `last_*_received_at == None`.",
+          "type": "boolean",
+          "default": false
+        },
+        "rebind_warning": {
+          "description": "Set when this bind switched the session from one NON-default domain to\na different one. A session's normal lifecycle is `default → its domain`,\nthen idempotent re-binds; a non-default→non-default switch is the\nsignature of two clients sharing one session (e.g. two agent\nconversations behind one shared MCP server process), each rebinding the\nother's reads out from under it. The bind still succeeds — the warning\nrides the response so BOTH consumers of the shared stream see it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "gelf_port",
+        "otlp_grpc_port",
+        "otlp_http_port",
+        "source",
+        "log_buffer_size",
+        "span_buffer_size",
+        "log_count",
+        "span_count"
+      ]
+    },
     "DomainDataEntry": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "DomainDataEntry",

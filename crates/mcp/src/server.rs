@@ -25,8 +25,9 @@ impl GelfMcpServer {
 // ---- Parameter structs ----
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetRecentLogsParams {
-    /// Number of log entries to return (default: 100)
+    /// Number of log entries to return (default: 50)
     count: Option<u32>,
     /// Optional DSL filter expression
     filter: Option<String>,
@@ -35,6 +36,7 @@ struct GetRecentLogsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetLogContextParams {
     /// Sequence number of the anchor entry
     seq: Option<u64>,
@@ -45,6 +47,7 @@ struct GetLogContextParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExportLogsParams {
     /// File path to write logs to
     path: String,
@@ -57,6 +60,7 @@ struct ExportLogsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddFilterParams {
     /// DSL filter expression
     filter: String,
@@ -65,6 +69,7 @@ struct AddFilterParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EditFilterParams {
     /// Filter ID to edit
     id: u32,
@@ -75,12 +80,14 @@ struct EditFilterParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveFilterParams {
     /// Filter ID to remove
     id: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddTriggerParams {
     /// DSL filter expression that activates the trigger
     filter: String,
@@ -92,9 +99,17 @@ struct AddTriggerParams {
     notify_context: Option<u32>,
     /// Human-readable description
     description: Option<String>,
+    /// Fire once, then disarm. Default `false` — the trigger stays armed.
+    ///
+    /// The daemon has honoured this since the trigger surface shipped and the
+    /// skill has documented it; the shim simply had no field for it, so the key
+    /// was dropped by serde and a caller asking for one-shot got a permanent
+    /// trigger, reported as success.
+    oneshot: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EditTriggerParams {
     /// Trigger ID to edit
     id: u32,
@@ -108,42 +123,59 @@ struct EditTriggerParams {
     notify_context: Option<u32>,
     /// New description
     description: Option<String>,
+    /// Set or clear fire-once. Absent leaves it as it is.
+    oneshot: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveTriggerParams {
     /// Trigger ID to remove
     id: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DropSessionParams {
     /// Name of the session to drop
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddBookmarkParams {
     /// Bookmark name (alphanumerics, '-', '_'; max 64 chars). Will be qualified
     /// with the calling session's name automatically.
     name: String,
     /// If true, overwrite an existing bookmark with the same qualified name.
     replace: Option<bool>,
+    /// Anchor the bookmark at this seq instead of the current position.
+    ///
+    /// The point of a bookmark is usually "from here on", so the default is the
+    /// daemon's current seq. This is for the other case: marking a boundary you
+    /// have already passed, from a seq another query returned.
+    start_seq: Option<u64>,
+    /// What this bookmark marks. Recorded with it, so a name found weeks later
+    /// still says what it was for.
+    description: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListBookmarksParams {
     /// Optional: filter to bookmarks created by this session name.
     session: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveBookmarkParams {
     /// Bare name (resolved against current session) or qualified "session/name".
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ClearBookmarksParams {
     /// Optional session name to clear. Defaults to the calling session.
     /// Use to clear another session's bookmarks (no nuclear "clear all" — call
@@ -152,6 +184,7 @@ struct ClearBookmarksParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetRecentTracesParams {
     /// Max traces to return (default: 20)
     count: Option<u32>,
@@ -160,6 +193,7 @@ struct GetRecentTracesParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetTraceParams {
     /// 32-character hex trace ID
     trace_id: String,
@@ -170,12 +204,14 @@ struct GetTraceParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetTraceSummaryParams {
     /// 32-character hex trace ID
     trace_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetSlowSpansParams {
     /// Duration threshold in milliseconds (default: 100)
     min_duration_ms: Option<f64>,
@@ -188,6 +224,7 @@ struct GetSlowSpansParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetSpanContextParams {
     /// Span sequence number
     seq: u64,
@@ -198,6 +235,7 @@ struct GetSpanContextParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetTraceLogsParams {
     /// 32-character hex trace ID
     trace_id: String,
@@ -206,6 +244,7 @@ struct GetTraceLogsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateDomainParams {
     /// Domain name — the isolation key.
     name: String,
@@ -222,12 +261,14 @@ struct CreateDomainParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteDomainParams {
     /// Name of the domain to delete. Refuses config-declared domains (incl. 'default').
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RenameSessionParams {
     /// New session name: <Project>-Main-<short8> or <Project>-tN-<branch>
     /// ('/' sanitized to '-'; alphanumerics, '-' and '_' only).
@@ -235,12 +276,14 @@ struct RenameSessionParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UseDomainParams {
     /// Domain to bind this session to for subsequent queries and notifications.
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateDomainDataParams {
     /// Entries to record. Each is `{path, value?, ttl?}`.
     ///
@@ -255,6 +298,7 @@ struct UpdateDomainDataParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetDomainDataParams {
     /// Narrow to a subtree, matched on segment boundaries: `/Versions` returns
     /// `/Versions/*`, `/Ver` returns nothing.
@@ -267,12 +311,14 @@ struct GetDomainDataParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveDomainDataParams {
     /// Prefix patterns, matched on segment boundaries. **There is no undo.**
     patterns: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AddCollectorParams {
     /// Collector name. Letters, digits, '_' and '-' only.
     name: String,
@@ -297,11 +343,13 @@ struct AddCollectorParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CollectorNameParams {
     name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetCollectorParams {
     name: String,
     /// Read a recorded run by its label instead of the live window.
@@ -315,6 +363,7 @@ struct GetCollectorParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EditCollectorParams {
     name: String,
     /// Free — changes nothing about what is collected.
@@ -331,9 +380,39 @@ struct EditCollectorParams {
     /// Re-pin to another domain, only while zeroed. The remedy for a collector
     /// orphaned by a restart.
     domain: Option<String>,
+    /// Set or replace the rolling guard; send JSON `null` to remove one.
+    ///
+    /// **Doubly optional, and it has to be.** "Leave it alone" and "take it
+    /// away" are different requests and one `Option` cannot express both — the
+    /// daemon's own wire type is `Option<Option<ThresholdSpec>>`
+    /// (`protocol/src/methods.rs:1068`), the only tri-state parameter in the
+    /// protocol. `deserialize_some` is what makes an explicitly-null field
+    /// arrive as `Some(None)` rather than collapsing into the absent case.
+    ///
+    /// Shape: `{ metric, op, value, window_ms, group? }`. Validated by the
+    /// daemon, which is the only party that knows whether `group` names a key
+    /// this collector actually carries.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    threshold: Option<Option<serde_json::Value>>,
+}
+
+/// Distinguish an absent field from one explicitly set to `null`.
+///
+/// `Option<T>` collapses both to `None`. Wrapping in a second `Option` and
+/// deserializing the inner one unconditionally makes absent → `None` and
+/// `null` → `Some(None)`. Only `collectors.edit`'s `threshold` needs this, and
+/// it needs it because the difference is the difference between leaving a guard
+/// armed and removing it.
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SnapshotCollectorParams {
     name: String,
     /// Unique per collector. Omitted → "snapshot-<n>", and n never repeats.
@@ -348,9 +427,18 @@ struct SnapshotCollectorParams {
     /// Store the sample-derived figures (self time, percentiles). Computed now
     /// or never — the samples themselves are not retained. Default true.
     projections: Option<bool>,
+    /// Keep the per-span-name breakdown in the recorded run. Default true.
+    ///
+    /// Per-axis breakdowns are what a later comparison splits by, and they are
+    /// dropped on the way to disk when this is false — so the choice is made
+    /// here, once, and cannot be revisited from a recorded run.
+    per_name: Option<bool>,
+    /// Keep the per-group-key breakdown in the recorded run. Default true.
+    per_group: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CollectorHistoryParams {
     name: String,
     /// Most recent N runs. Omitted → all retained.
@@ -361,6 +449,7 @@ struct CollectorHistoryParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ThresholdParams {
     /// "count", "total_ms", "avg_ms", "error_count" or "error_rate_pct".
     /// Percentiles are NOT available: a rolling percentile needs a duration
@@ -379,6 +468,7 @@ struct ThresholdParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CollectorDiffParams {
     /// Baseline arm: "<collector>" for the live window, "<collector>@<label>"
     /// for one recorded run, or "<collector>@*" for every recorded run merged.
@@ -399,6 +489,7 @@ struct CollectorDiffParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CollectorDocumentParams {
     /// The arms to document. The FIRST is the baseline; every other is compared
     /// against it. Same syntax as diff_collectors: "<collector>",
@@ -427,6 +518,7 @@ struct CollectorDocumentParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ProfileTracesParams {
     /// Span filter DSL. Default "ALL".
     filter: Option<String>,
@@ -699,6 +791,7 @@ impl GelfMcpServer {
                     "post_window": p.post_window,
                     "notify_context": p.notify_context,
                     "description": p.description,
+                    "oneshot": p.oneshot,
                 }),
             )
             .await
@@ -726,6 +819,7 @@ impl GelfMcpServer {
                     "post_window": p.post_window,
                     "notify_context": p.notify_context,
                     "description": p.description,
+                    "oneshot": p.oneshot,
                 }),
             )
             .await
@@ -932,20 +1026,41 @@ impl GelfMcpServer {
         &self,
         Parameters(p): Parameters<EditCollectorParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Built key-by-key rather than with `json!`, because `json!` renders a
+        // `None` field as **`null`** — and on this one call `null` is not
+        // "absent", it is "remove the threshold". Sending the whole struct would
+        // clear the guard on every edit that did not mention it.
+        //
+        // The same shape used to be actively destructive here: `group_keys:
+        // null` counted as a structural change, so an edit that only set a
+        // description discarded the collector's live window. The daemon now
+        // treats absent and null alike for every parameter except this one, but
+        // building the object honestly is what keeps that from mattering again.
+        let mut args = serde_json::Map::new();
+        args.insert("name".into(), p.name.into());
+        for (k, v) in [
+            ("description", p.description),
+            ("filter", p.filter),
+            ("level", p.level),
+            ("domain", p.domain),
+        ] {
+            if let Some(v) = v {
+                args.insert(k.into(), v.into());
+            }
+        }
+        if let Some(v) = p.group_keys {
+            args.insert("group_keys".into(), serde_json::to_value(v).unwrap());
+        }
+        if let Some(v) = p.max_sample_bytes {
+            args.insert("max_sample_bytes".into(), v.into());
+        }
+        // Present-and-null is the removal, so this arm must survive to the wire.
+        if let Some(t) = p.threshold {
+            args.insert("threshold".into(), t.unwrap_or(serde_json::Value::Null));
+        }
         let result = self
             .broker
-            .call(
-                "collectors.edit",
-                serde_json::json!({
-                    "name": p.name,
-                    "description": p.description,
-                    "filter": p.filter,
-                    "level": p.level,
-                    "group_keys": p.group_keys,
-                    "max_sample_bytes": p.max_sample_bytes,
-                    "domain": p.domain,
-                }),
-            )
+            .call("collectors.edit", serde_json::Value::Object(args))
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(
@@ -974,6 +1089,8 @@ impl GelfMcpServer {
                     "meta": p.meta,
                     "reset": p.reset,
                     "projections": p.projections,
+                    "per_name": p.per_name,
+                    "per_group": p.per_group,
                 }),
             )
             .await
@@ -1223,6 +1340,8 @@ impl GelfMcpServer {
                 serde_json::json!({
                     "name": p.name,
                     "replace": p.replace,
+                    "start_seq": p.start_seq,
+                    "description": p.description,
                 }),
             )
             .await
@@ -1784,5 +1903,129 @@ mod tests {
             assert_eq!(after.get(k), Some(v), "annotation altered `{k}`");
         }
         assert!(after.get("shim_note").is_some());
+    }
+}
+
+#[cfg(test)]
+mod param_drift_tests {
+    use logmon_broker_protocol::mcp_tools::TOOLS;
+    use std::collections::BTreeSet;
+
+    /// The committed schema, generated from the protocol crate's request types
+    /// by `cargo xtask gen-schema`.
+    const PROTOCOL_SCHEMA: &str = include_str!("../../protocol/protocol-v1.schema.json");
+
+    /// `collectors.edit` → `CollectorsEdit`. The generator names definitions
+    /// after the Rust type, and the types are named after the methods, so the
+    /// mapping is mechanical rather than a table someone has to maintain.
+    fn definition_name(method: &str) -> String {
+        method
+            .split('.')
+            .flat_map(|seg| seg.split('_'))
+            .map(|word| {
+                let mut c = word.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// Parameters deliberately not on both sides, each with the reason it is not
+    /// drift. Anything not listed here is a bug, in one direction or the other.
+    fn justified(tool: &str, param: &str) -> Option<&'static str> {
+        match (tool, param) {
+            // Client-side: the shim formats and writes the file itself, because
+            // a service resolves a relative path against its own working
+            // directory rather than the caller's.
+            ("export_logs", "path") | ("export_logs", "format") => {
+                Some("client-side file write, never sent to the daemon")
+            }
+            // The daemon reads it and refuses every non-default value
+            // ("persistent domains are not yet supported"). Exposing it would
+            // offer a knob whose only other setting is always an error.
+            ("create_domain", "persist") => Some("daemon refuses true; not agent-facing yet"),
+            _ => None,
+        }
+    }
+
+    fn props(schema: &serde_json::Value) -> BTreeSet<String> {
+        schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every tool's parameters, against the daemon's own request type.
+    ///
+    /// This is the guard whose absence let eight parameters diverge unnoticed:
+    /// the daemon honoured `oneshot`, `per_name`, `per_group`, `threshold`,
+    /// `start_seq` and `description`, the skill documented several of them, and
+    /// the shim had no field — so serde dropped the key and the call returned
+    /// success. A permanent trigger, reported as the one-shot that was asked
+    /// for.
+    ///
+    /// The existing source-scan tests could not catch it: one compares tool
+    /// *names* against the router, the other pairs each tool with its *method*.
+    /// Both were green throughout, and `skew_note` reported "45 of 45" the whole
+    /// time, because it compares names too.
+    #[test]
+    fn no_tool_parameter_has_drifted_from_the_daemons_request_type() {
+        let schema: serde_json::Value =
+            serde_json::from_str(PROTOCOL_SCHEMA).expect("committed schema parses");
+        let defs = schema
+            .get("definitions")
+            .and_then(|d| d.as_object())
+            .expect("schema has definitions");
+
+        let all = super::GelfMcpServer::tool_router().list_all();
+        let mut problems: Vec<String> = Vec::new();
+
+        for (tool, method) in TOOLS {
+            let Some(route) = all.iter().find(|t| t.name == *tool) else {
+                problems.push(format!("{tool}: in TOOLS but not in the router"));
+                continue;
+            };
+            let shim = props(&serde_json::Value::Object((*route.input_schema).clone()));
+            let def_name = definition_name(method);
+
+            let Some(def) = defs.get(&def_name) else {
+                // Not "this tool takes no parameters" — the generator's type
+                // list is hand-maintained, so a missing definition means a live
+                // tool whose parameters nothing describes.
+                if !shim.is_empty() {
+                    problems.push(format!(
+                        "{tool} ({method}): no `{def_name}` in the committed schema, but the \
+                         shim sends {shim:?}"
+                    ));
+                }
+                continue;
+            };
+            let wire = props(def);
+
+            for p in wire.difference(&shim) {
+                if justified(tool, p).is_none() {
+                    problems.push(format!(
+                        "{tool}: the daemon accepts `{p}` and the shim cannot send it"
+                    ));
+                }
+            }
+            for p in shim.difference(&wire) {
+                if justified(tool, p).is_none() {
+                    problems.push(format!(
+                        "{tool}: the shim sends `{p}` and `{def_name}` has no such field"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "shim/daemon parameter drift ({} problem(s)):\n  {}",
+            problems.len(),
+            problems.join("\n  ")
+        );
     }
 }
