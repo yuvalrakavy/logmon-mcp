@@ -541,6 +541,16 @@ names the filter, and does not report `complete`**; an empty registry is stated,
 omitted; no collectors armed produces a section saying so; a persist failure is logged and
 the call still returns.
 
+**The recommended key set (§3.6):** coverage names the **missing** core keys, not only a
+count — "missing `/Build/commit`" is actionable where "2 of 3" is not; full coverage still
+prints the line rather than omitting it, since silence is indistinguishable from a document
+that never checked; **zero recommended keys reports `0 of 3`** rather than omitting the
+section, that being the case most likely to render as nothing at all. And the
+false-positive guard, because a convention hardening into a schema is how this goes wrong:
+`update` **accepts a non-recommended key with no warning, no rejection, and no effect on
+any other entry's outcome** — coverage is a property of the document, never of the
+registry.
+
 ---
 
 ## 11. Open questions for the gate
