@@ -114,16 +114,49 @@ and `/Versions`; it does **not** match `/VersionsOld/x`. Byte-prefix matching wo
 ```
 created_at    when THIS VALUE came into force
 validated_at  when someone last confirmed it is still true
+ttl           optional: how long this value stays believable
 ```
 
 A single "last modified" conflates two questions. Set six days ago and never revisited is
 a guess; the same value confirmed five minutes ago is evidence. Invariant:
 **`validated_at >= created_at`**.
 
+**`ttl` is optional and per-key**, because staleness is not measured on one clock.
+`/Action` is wrong within minutes of switching tasks; `/Versions/*` is wrong on deploy and
+fine for weeks otherwise. Without it, the only reader who can judge is one who already
+knows which duration to ask about for which key — which the caller writing a document does
+not. With it, a document can say *"`/Action` — set 4 minutes ago, past its 2-minute
+lifetime"* rather than reporting an age and leaving the judgement unmade.
+
+Three rules keep it from becoming a claim of its own:
+
+- **Absent means unknown, not fresh.** A key without a `ttl` reports its age and no verdict
+  — never "current". This is the §4.1 rule; a `ttl` is the only thing that licenses saying
+  more than age.
+- **Expiry never mutates.** A past-`ttl` key keeps its value and both timestamps; nothing
+  is deleted or blanked. The document reports it as expired, and a reader can still see
+  what was believed and when — which is the whole point of an archive.
+- **`ttl` is advice from the writer, not a fact about the world.** It says how long the
+  author expected this to hold. A `/Versions/*` key inside its `ttl` can still be wrong if
+  someone deployed; the document therefore says "within its stated lifetime", never
+  "verified".
+
 ### 3.3 `domain_data.update(entries)`
 
-Each entry is `{path, value?}`. **Value present** → set (differs ⇒ both timestamps move;
-same ⇒ only `validated_at`). **Value absent** → validate only.
+Each entry is `{path, value?, ttl?}`. **Value present** → set (differs ⇒ both timestamps
+move; same ⇒ only `validated_at`). **Value absent** → validate only.
+
+**`ttl` follows the same absent rule as `value`, deliberately.** Absent ≡ `null` ≡
+*unchanged* — so a validate-only entry does not silently drop a lifetime the key already
+had, and a caller restating a value without repeating its `ttl` does not either. Two
+optional fields on one object with opposite absent semantics is precisely the footgun this
+section exists to prevent, so there is one rule for both.
+
+**A `ttl` can be changed but not cleared in place.** Clearing means `remove` then re-set.
+The alternative is a sentinel, and every candidate is ambiguous — `0` reads as *"stale
+immediately"* at least as naturally as *"no lifetime"*, and shipping a value whose meaning
+a reader has to look up is how a provenance field starts lying. Un-setting a lifetime is
+rare enough to pay two calls for.
 
 **Absent ≡ `null` ≡ validate.** Erasure is `remove`, never `set(null)`. Stated because a
 client serialising a missing field as `null` would otherwise mean the opposite — the
@@ -391,14 +424,33 @@ then:
 6. **Collector state** (§5.4).
 7. Sidecar pointer.
 
-**Sidecar** carries the full window and span trees, following `document.rs`'s rule: bulk
-*moves*, with a pointer, rather than being cut without saying so.
+**Sidecar** carries the full window and span trees as **JSONL**, one record per line,
+following `document.rs`'s rule: bulk *moves*, with a pointer, rather than being cut without
+saying so. JSONL because the bulk is the half most likely to be machine-read — grepped,
+filtered, streamed into a tool — and it needs no whole-file parse to use. The document
+remains the half a human reads.
 
 ### 5.3 Naming
 
-`<prefix>-<UTC timestamp>-<short hash>.md`, sidecar `.sidecar.json` beside it. The hash is
-required: `safe_name` collapses punctuation (§1), so prefix+timestamp alone collides in a
-flat archive.
+**`<prefix>-<id>.md`**, with the sidecar `<prefix>-<id>.sidecar.jsonl` beside it.
+`<prefix>` is caller-supplied; `<id>` is a short random identifier (8 hex characters).
+
+**No timestamp in the name.** An earlier draft used `<prefix>-<UTC timestamp>-<hash>`, which
+is §4.1's own mistake one level down: encoding a query axis in the layout. The capture time
+is front-matter, where it is queryable alongside everything else, and a timestamp in a
+filename only invites sorting by name — which breaks the moment a format or timezone
+varies. The name's job is to be recognisable and unique, nothing more.
+
+**The id is required and random, not derived.** `safe_name` collapses punctuation (§1), so
+two captures under one prefix collide without it. Random rather than a content hash because
+two captures of the same window are genuinely different documents and should not share a
+name. Eight hex characters keeps the birthday probability negligible across an archive that
+is never pruned; the writer still checks for an existing file and re-rolls.
+
+**The prefix is sanitised and length-bounded before it reaches a path.** The client writes
+`dir.join(name)` with a daemon-supplied name (`cli/collectors.rs:679`), so an unsanitised
+caller string is a path-traversal surface — `../../` in a prefix would escape the archive.
+It goes through `safe_name` (`document.rs:1874`) and is capped at 48 bytes.
 
 ### 5.4 Collector state at capture
 
@@ -541,6 +593,12 @@ names the filter, and does not report `complete`**; an empty registry is stated,
 omitted; no collectors armed produces a section saying so; a persist failure is logged and
 the call still returns.
 
+**`ttl` (§3.2):** a validate-only entry leaves an existing `ttl` intact; restating a value
+without a `ttl` leaves it intact; `{path, ttl}` with no value both validates and sets the
+lifetime; a past-`ttl` key **keeps its value and both timestamps** and is reported expired
+rather than blanked; and a key with no `ttl` reports its **age with no verdict** — never
+"current", which is the §4.1 rule the whole field is constrained by.
+
 **The recommended key set (§3.6):** coverage names the **missing** core keys, not only a
 count — "missing `/Build/commit`" is actionable where "2 of 3" is not; full coverage still
 prints the line rather than omitting it, since silence is indistinguishable from a document
@@ -555,10 +613,20 @@ registry.
 
 ## 11. Open questions for the gate
 
-1. Per-key volatility hint (`/Action` staleness is minutes, `/Versions/*` is per-deploy).
-   Deferred; the format must leave room, since retrofitting a field into a persisted
-   contract is expensive.
-2. Sidecar format — markdown for reading or JSONL for machines. The bulk is the half most
-   likely to be machine-read.
+1. ~~Per-key volatility hint~~ — **decided**: an optional `ttl` ships in v1 (§3.2), so a
+   document can judge `/Action` without the reader knowing which duration to ask about.
+2. ~~Sidecar format~~ — **decided**: JSONL (§5.2). The bulk is the machine-read half.
 3. ~~Whether `/logmon/first_seen` suffices for the reused-domain-name case~~ — **closed**:
    it cannot (monotone), so §3.5 counts incarnations instead.
+
+**Still open, and it blocks Phase 1:**
+
+4. **Where build provenance lives.** `document.rs:779` already promotes `build_profile` and
+   `git_sha` out of collector `meta` into front-matter, arguing verbatim what §3.6.1 argues
+   for `/Build/profile`. A case document would otherwise print `/Build/profile: release`
+   from `domain_data` beside `build_profile: debug` from a collector arm, unreconciled.
+   My reading: they are **different facts** — an arm's provenance is what was true when
+   that run was recorded, `domain_data`'s is what is true now, and comparing a run against
+   a newer build is the entire point of collectors. So keep both, label them ("as recorded"
+   / "current"), and have the document reconcile explicitly. The key set, the coverage line
+   and the skill are all unstable until this is settled.
