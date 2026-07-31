@@ -612,15 +612,7 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let (_, reg) = self.resolve_domain_data(session_id)?;
-        let patterns: Vec<String> = params
-            .get("patterns")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let patterns = opt_str_array(params, "patterns")?.unwrap_or_default();
         if patterns.is_empty() {
             return Err("patterns is required and must be a non-empty array".into());
         }
@@ -650,20 +642,31 @@ impl RpcHandler {
             .ok_or("domain_data is not available on this broker")?;
         let d = self.resolve_domain(session_id)?;
         let name = d.config.name.to_string();
-        let prefix = params
-            .get("prefix")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let prefix = opt_str(params, "prefix")?;
         let now = chrono::Utc::now();
-        let cutoff = params
-            .get("validated_before_secs")
-            .and_then(|v| v.as_u64())
-            .map(|s| now - chrono::Duration::seconds(s as i64));
+        // Checked, not cast. `chrono::Duration::seconds` PANICS out of range and
+        // `s as i64` turns a large `u64` negative, so the old form could either
+        // move the cutoff into the future or take the connection task down —
+        // `validated_before_secs: 9223372036854775807` did the latter.
+        let cutoff = match opt_u64(params, "validated_before_secs")? {
+            None => None,
+            Some(s) => Some(
+                i64::try_from(s)
+                    .ok()
+                    .and_then(chrono::Duration::try_seconds)
+                    .and_then(|age| now.checked_sub_signed(age))
+                    .ok_or_else(|| {
+                        format!(
+                            "`validated_before_secs` is {s}, which is not a usable age in seconds"
+                        )
+                    })?,
+            ),
+        };
 
         let reg = store.for_domain(&name);
         let (keys, total, missing_core) = reg.read(|r| {
             let keys: Vec<DomainDataKey> = r
-                .query(prefix.as_deref(), cutoff)
+                .query(prefix, cutoff)
                 .into_iter()
                 .map(|(path, e)| DomainDataKey {
                     path: path.clone(),
@@ -754,11 +757,11 @@ impl RpcHandler {
 
     fn handle_logs_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let count = opt_usize(params, "count")?.unwrap_or(50);
+        let filter_str = opt_str(params, "filter")?;
 
         // trace_id shortcut path — does NOT support cursor; reject c>= if present.
-        if let Some(trace_id_hex) = params.get("trace_id").and_then(|v| v.as_str()) {
+        if let Some(trace_id_hex) = opt_str(params, "trace_id")? {
             if let Some(s) = filter_str {
                 if !s.trim().is_empty() {
                     let parsed =
@@ -834,23 +837,17 @@ impl RpcHandler {
 
     fn handle_logs_context(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let seq = params
-            .get("seq")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "missing required parameter: seq".to_string())?;
-        let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-        let after = params.get("after").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+        let seq = req_u64(params, "seq")?;
+        let before = opt_context_window(params, "before")?.unwrap_or(10);
+        let after = opt_context_window(params, "after")?.unwrap_or(10);
         let entries = d.pipeline.context_by_seq(seq, before, after);
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
 
     fn handle_logs_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let count = params
-            .get("count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(u64::MAX) as usize;
-        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
+        let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         let oldest_first = cursor_commit.is_some();
@@ -1009,10 +1006,7 @@ impl RpcHandler {
 
     fn handle_filters_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let filter = params
-            .get("filter")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required parameter: filter".to_string())?;
+        let filter = req_str(params, "filter")?;
         // Reject bookmark filters in registered (long-lived) filters.
         let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
@@ -1021,7 +1015,7 @@ impl RpcHandler {
                     .to_string(),
             );
         }
-        let desc = params.get("description").and_then(|v| v.as_str());
+        let desc = opt_str(params, "description")?;
         let id = self
             .sessions
             .add_filter(session_id, filter, desc)
@@ -1031,13 +1025,9 @@ impl RpcHandler {
     }
 
     fn handle_filters_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
-        let filter_id = params
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "missing required parameter: id".to_string())?
-            as u32;
-        let filter = params.get("filter").and_then(|v| v.as_str());
-        let desc = params.get("description").and_then(|v| v.as_str());
+        let filter_id = req_u32(params, "id")?;
+        let filter = opt_str(params, "filter")?;
+        let desc = opt_str(params, "description")?;
         let info = self
             .sessions
             .edit_filter(session_id, filter_id, filter, desc)
@@ -1055,11 +1045,7 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let filter_id = params
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "missing required parameter: id".to_string())?
-            as u32;
+        let filter_id = req_u32(params, "id")?;
         self.sessions
             .remove_filter(session_id, filter_id)
             .map_err(|e| e.to_string())?;
@@ -1094,10 +1080,7 @@ impl RpcHandler {
 
     fn handle_triggers_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let filter = params
-            .get("filter")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required parameter: filter".to_string())?;
+        let filter = req_str(params, "filter")?;
         // Reject bookmark filters in registered (long-lived) triggers.
         let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
         if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
@@ -1108,27 +1091,15 @@ impl RpcHandler {
         }
         // Omitted windows default to 500/200/5 (§6, decision #4) so an ad-hoc
         // trigger captures context by default. An EXPLICIT value — including 0 —
-        // is honored (the `.map(...).unwrap_or(...)` only defaults when absent).
-        let pre = params
-            .get("pre_window")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
+        // is honored (only an absent or null value defaults).
+        let pre = opt_u32(params, "pre_window")?
             .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_PRE_WINDOW);
-        let post = params
-            .get("post_window")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
+        let post = opt_u32(params, "post_window")?
             .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_POST_WINDOW);
-        let ctx = params
-            .get("notify_context")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
+        let ctx = opt_u32(params, "notify_context")?
             .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_NOTIFY_CONTEXT);
-        let desc = params.get("description").and_then(|v| v.as_str());
-        let oneshot = params
-            .get("oneshot")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let desc = opt_str(params, "description")?;
+        let oneshot = opt_bool(params, "oneshot")?.unwrap_or(false);
         let id = self
             .sessions
             .add_trigger(session_id, filter, pre, post, ctx, desc, oneshot)
@@ -1143,26 +1114,13 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let trigger_id = params
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "missing required parameter: id".to_string())?
-            as u32;
-        let filter = params.get("filter").and_then(|v| v.as_str());
-        let pre = params
-            .get("pre_window")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let post = params
-            .get("post_window")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let ctx = params
-            .get("notify_context")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let desc = params.get("description").and_then(|v| v.as_str());
-        let oneshot = params.get("oneshot").and_then(|v| v.as_bool());
+        let trigger_id = req_u32(params, "id")?;
+        let filter = opt_str(params, "filter")?;
+        let pre = opt_u32(params, "pre_window")?;
+        let post = opt_u32(params, "post_window")?;
+        let ctx = opt_u32(params, "notify_context")?;
+        let desc = opt_str(params, "description")?;
+        let oneshot = opt_bool(params, "oneshot")?;
         let info = self
             .sessions
             .edit_trigger(
@@ -1189,11 +1147,7 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let trigger_id = params
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "missing required parameter: id".to_string())?
-            as u32;
+        let trigger_id = req_u32(params, "id")?;
         self.sessions
             .remove_trigger(session_id, trigger_id)
             .map_err(|e| e.to_string())?;
@@ -1211,8 +1165,8 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let count = opt_usize(params, "count")?.unwrap_or(20);
+        let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
@@ -1242,19 +1196,13 @@ impl RpcHandler {
 
     fn handle_traces_get(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let trace_id_hex = params
-            .get("trace_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing required parameter: trace_id")?;
+        let trace_id_hex = req_str(params, "trace_id")?;
         let trace_id = u128::from_str_radix(trace_id_hex, 16)
             .map_err(|_| "invalid trace_id: must be 32-char hex")?;
-        let include_logs = params
-            .get("include_logs")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let include_logs = opt_bool(params, "include_logs")?.unwrap_or(true);
 
         // Resolve filter (used to filter spans within the trace below)
-        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
@@ -1286,10 +1234,7 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let trace_id_hex = params
-            .get("trace_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing required parameter: trace_id")?;
+        let trace_id_hex = req_str(params, "trace_id")?;
         let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
         let spans = d.span_store.get_trace(trace_id);
@@ -1361,18 +1306,18 @@ impl RpcHandler {
 
     fn handle_traces_slow(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let min_duration = params
-            .get("min_duration_ms")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(100.0);
-        let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let min_duration = opt_f64(params, "min_duration_ms")?.unwrap_or(100.0);
+        let count = opt_usize(params, "count")?.unwrap_or(20);
+        let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
             return Err("cursor qualifier not permitted in traces.slow".to_string());
         }
-        let group_by = params.get("group_by").and_then(|v| v.as_str());
+        // An unrecognised STRING still selects the ungrouped arm — that is the
+        // documented contract (`protocol/src/methods.rs:534`), not an accident,
+        // so only the wrong-TYPE case changes here.
+        let group_by = opt_str(params, "group_by")?;
 
         match group_by {
             // §1.1: the grouped arm aggregates the FULL matching population.
@@ -1434,13 +1379,10 @@ impl RpcHandler {
 
     fn handle_traces_logs(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let trace_id_hex = params
-            .get("trace_id")
-            .and_then(|v| v.as_str())
-            .ok_or("missing required parameter: trace_id")?;
+        let trace_id_hex = req_str(params, "trace_id")?;
         let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
 
-        let filter_str = params.get("filter").and_then(|v| v.as_str());
+        let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
 
@@ -1478,12 +1420,9 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let seq = params
-            .get("seq")
-            .and_then(|v| v.as_u64())
-            .ok_or("missing required parameter: seq")?;
-        let before = params.get("before").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-        let after = params.get("after").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let seq = req_u64(params, "seq")?;
+        let before = opt_context_window(params, "before")?.unwrap_or(5);
+        let after = opt_context_window(params, "after")?.unwrap_or(5);
 
         let spans = d.span_store.context_by_seq(seq, before, after);
         Ok(json!({ "spans": spans, "count": spans.len() }))
@@ -1517,10 +1456,7 @@ impl RpcHandler {
     }
 
     fn handle_session_drop(&self, params: &Value) -> Result<Value, String> {
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required parameter: name".to_string())?;
+        let name = req_str(params, "name")?;
         // Collectors first, and unconditionally. They are owned by the session
         // and hold a slice of a daemon-wide reservation that only four
         // default-sized collectors fit inside, so a dropped session that kept
@@ -1552,27 +1488,15 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required parameter: name".to_string())?;
-        let replace = params
-            .get("replace")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let name = req_str(params, "name")?;
+        let replace = opt_bool(params, "replace")?.unwrap_or(false);
         // `start_seq` defaults to the daemon's current seq counter — i.e.,
         // "the cursor we'd hand out right now". Cursor auto-create (later
-        // task) uses 0 explicitly to mean "before all records". Distinguish
-        // "absent / null" (use default) from "present but wrong type/range"
-        // (error, don't silently coerce).
-        let start_seq = match params.get("start_seq") {
-            None => d.pipeline.current_seq(),
-            Some(v) if v.is_null() => d.pipeline.current_seq(),
-            Some(v) => v
-                .as_u64()
-                .ok_or_else(|| "start_seq must be a non-negative integer".to_string())?,
-        };
-        let description = params.get("description").and_then(|v| v.as_str());
+        // task) uses 0 explicitly to mean "before all records". This was the
+        // one parameter in the file that already refused a wrong-typed value;
+        // it is now the rule rather than the exception.
+        let start_seq = opt_u64(params, "start_seq")?.unwrap_or_else(|| d.pipeline.current_seq());
+        let description = opt_str(params, "description")?;
 
         // Sweep before adding so the store stays tidy.
         self.sweep_bookmarks(&d);
@@ -1596,7 +1520,7 @@ impl RpcHandler {
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         self.sweep_bookmarks(&d);
-        let session_filter = params.get("session").and_then(|v| v.as_str());
+        let session_filter = opt_str(params, "session")?;
 
         let items: Vec<Value> = d
             .bookmarks
@@ -1624,10 +1548,7 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing required parameter: name".to_string())?;
+        let name = req_str(params, "name")?;
         let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
         d.bookmarks.remove(&qualified).map_err(|e| e.to_string())?;
         Ok(json!({ "removed": qualified }))
@@ -1639,11 +1560,11 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        // Default to the calling session if no explicit session is given.
-        let session = params
-            .get("session")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        // Default to the calling session if no explicit session is given — which
+        // is why a wrong-typed one cannot be read as absent: it would clear the
+        // CALLER's bookmarks in place of the ones they named.
+        let session = opt_str(params, "session")?
+            .map(str::to_string)
             .unwrap_or_else(|| session_id.to_string());
         let removed_count = d.bookmarks.clear_session(&session);
         Ok(json!({ "removed_count": removed_count, "session": session }))
@@ -1693,7 +1614,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
+        let name = req_str(params, "name")?;
         if !is_valid_collector_name(name) {
             return Err(format!(
                 "invalid collector name `{name}`: use letters, digits, `_` and `-` only. \
@@ -1713,7 +1634,7 @@ impl RpcHandler {
                     .to_string(),
             );
         }
-        let filter_string = require_str(params, "filter")?;
+        let filter_string = req_str(params, "filter")?;
         let d = self.resolve_domain(session_id)?;
 
         let parsed = crate::filter::parser::parse_filter(filter_string)
@@ -1725,7 +1646,7 @@ impl RpcHandler {
             .map(|w| w.to_string())
             .collect();
 
-        let level = match params.get("level").and_then(|v| v.as_str()) {
+        let level = match opt_str(params, "level")? {
             None => Level::Tree,
             Some("scalar") => Level::Scalar,
             Some("timing") => Level::Timing,
@@ -1736,12 +1657,9 @@ impl RpcHandler {
                 ))
             }
         };
-        let group_keys = group_keys_of(params)?;
-        let max_sample_bytes = params
-            .get("max_sample_bytes")
-            .and_then(|v| v.as_u64())
-            .map(|b| b as usize)
-            .unwrap_or(DEFAULT_MAX_SAMPLE_BYTES);
+        let group_keys = group_keys_of(params)?.unwrap_or_default();
+        let max_sample_bytes =
+            opt_usize(params, "max_sample_bytes")?.unwrap_or(DEFAULT_MAX_SAMPLE_BYTES);
 
         // Validated against the group keys resolved above, so a threshold naming
         // a group the collector does not split by is refused at arm time rather
@@ -1757,10 +1675,7 @@ impl RpcHandler {
             level,
             group_keys,
             max_sample_bytes,
-            description: params
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            description: opt_str(params, "description")?.map(str::to_string),
             threshold: threshold.flatten(),
         };
 
@@ -1833,7 +1748,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
+        let name = req_str(params, "name")?;
         // A label reads a recorded run. Served from what the snapshot stored
         // rather than re-projected, because the samples it was projected from
         // are gone — and re-deriving from the live collector would answer a
@@ -1844,7 +1759,7 @@ impl RpcHandler {
         // the same mistake, two different outcomes, and the quiet one is the
         // failure this whole surface exists to close.
         let opts = self.profile_options(params)?;
-        if let Some(label) = params.get("snapshot").and_then(|v| v.as_str()) {
+        if let Some(label) = opt_str(params, "snapshot")? {
             let snap = self
                 .collectors
                 .get_snapshot(session_id, name, label)
@@ -1876,8 +1791,8 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
-        let level = match params.get("level").and_then(|v| v.as_str()) {
+        let name = req_str(params, "name")?;
+        let level = match opt_str(params, "level")? {
             None => None,
             Some("scalar") => Some(Level::Scalar),
             Some("timing") => Some(Level::Timing),
@@ -1892,7 +1807,8 @@ impl RpcHandler {
         // rule is "re-run every gate add runs", and admission is one of them —
         // an edit that skipped it could arm a filter `add` would have refused.
         let mut warnings: Vec<String> = Vec::new();
-        if let Some(f) = params.get("filter").and_then(|v| v.as_str()) {
+        let new_filter = opt_str(params, "filter")?;
+        if let Some(f) = new_filter {
             let parsed = crate::filter::parser::parse_filter(f)
                 .map_err(|e| format!("invalid filter: {e}"))?;
             warnings = crate::filter::admission::admit_span_filter(&parsed)
@@ -1907,7 +1823,7 @@ impl RpcHandler {
         // be attributed is pointer equality on this handle, so a re-pin that
         // moved the name but not the counters would report "the pinned domain
         // is gone" about a domain it had just successfully re-pinned to.
-        let (domain, new_metrics) = match params.get("domain").and_then(|v| v.as_str()) {
+        let (domain, new_metrics) = match opt_str(params, "domain")? {
             None => (None, None),
             Some(d) => {
                 let id = DomainId::new(d).map_err(|e| e.to_string())?;
@@ -1918,12 +1834,19 @@ impl RpcHandler {
             }
         };
 
+        // Present-or-absent matters here (absent means "leave alone"), and when
+        // present it goes through the same width check as `add` — §7.1 requires
+        // an edit to re-run every gate arming runs, and this is one. Read ONCE
+        // and reused below: a second read would have to agree with this one
+        // about what "present" means, and there is no reason to give it the
+        // chance to disagree.
+        let group_keys = group_keys_of(params)?;
         // Against the group keys that will be IN FORCE after this edit, not the
         // ones currently armed: a caller adding a group key and a threshold that
         // uses it in one call must not be refused for a state neither before nor
         // after the edit.
-        let effective_group_keys = match params.get("group_keys") {
-            Some(_) => group_keys_of(params)?,
+        let effective_group_keys = match &group_keys {
+            Some(k) => k.clone(),
             None => self
                 .collectors
                 .get(session_id, name)
@@ -1934,26 +1857,11 @@ impl RpcHandler {
         warnings.extend(threshold_warnings);
 
         let change = CollectorEdit {
-            description: params
-                .get("description")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            filter: params
-                .get("filter")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            description: opt_str(params, "description")?.map(str::to_string),
+            filter: new_filter.map(str::to_string),
             level,
-            // Present-or-absent matters here (absent means "leave alone"), but
-            // when present it goes through the same width check as `add` — §7.1
-            // requires an edit to re-run every gate arming runs, and this is one.
-            group_keys: match params.get("group_keys") {
-                None => None,
-                Some(_) => Some(group_keys_of(params)?),
-            },
-            max_sample_bytes: params
-                .get("max_sample_bytes")
-                .and_then(|v| v.as_u64())
-                .map(|b| b as usize),
+            group_keys,
+            max_sample_bytes: opt_usize(params, "max_sample_bytes")?,
             domain,
             threshold,
         };
@@ -1996,20 +1904,11 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
+        let name = req_str(params, "name")?;
         let policy = SnapshotPolicy {
-            per_name: params
-                .get("per_name")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            per_group: params
-                .get("per_group")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            projections: params
-                .get("projections")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true),
+            per_name: opt_bool(params, "per_name")?.unwrap_or(true),
+            per_group: opt_bool(params, "per_group")?.unwrap_or(true),
+            projections: opt_bool(params, "projections")?.unwrap_or(true),
         };
         let snap = self
             .collectors
@@ -2017,24 +1916,20 @@ impl RpcHandler {
                 session_id,
                 SnapshotRequest {
                     name: name.to_string(),
-                    label: params
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    description: params
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
+                    label: opt_str(params, "label")?.map(str::to_string),
+                    description: opt_str(params, "description")?.map(str::to_string),
+                    // `meta` is deliberately untyped — any JSON the caller wants
+                    // recorded alongside the run — so there is no wrong type to
+                    // reject, and absence really is the only default.
                     meta: params.get("meta").cloned().unwrap_or(Value::Null),
                     policy,
                     // Reset by default: the point of a snapshot is usually to
                     // end one run and begin the next in a single call, which is
                     // what makes the between-runs step one action rather than
-                    // two that traffic can be interleaved between.
-                    reset: params
-                        .get("reset")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
+                    // two that traffic can be interleaved between. It is also
+                    // why a wrong-typed `reset` cannot read as absent — the
+                    // default here DESTROYS the live window.
+                    reset: opt_bool(params, "reset")?.unwrap_or(true),
                     now: Utc::now(),
                 },
                 crate::collector::project::project_for_snapshot,
@@ -2060,15 +1955,14 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
+        let name = req_str(params, "name")?;
         let (mut snapshots, evicted) = self
             .collectors
             .history(session_id, name)
             .map_err(|e| e.to_string())?;
         // `limit` takes the most RECENT n, then they are presented oldest
         // first — the order a sequence of runs is read in.
-        if let Some(limit) = params.get("limit").and_then(|v| v.as_u64()) {
-            let limit = limit as usize;
+        if let Some(limit) = opt_usize(params, "limit")? {
             if snapshots.len() > limit {
                 snapshots.drain(..snapshots.len() - limit);
             }
@@ -2081,11 +1975,7 @@ impl RpcHandler {
             "evicted": evicted,
         });
 
-        if params
-            .get("merge")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
+        if opt_bool(params, "merge")?.unwrap_or(false) {
             let mut suppressed: Vec<Value> = Vec::new();
             match crate::collector::history::merge(&snapshots) {
                 Ok(m) => {
@@ -2133,10 +2023,10 @@ impl RpcHandler {
     ) -> Result<Value, String> {
         use crate::collector::diff::{diff, DiffAllowances, DiffGroupBy, DiffOptions};
 
-        let a = self.resolve_arm(session_id, require_str(params, "a")?)?;
-        let b = self.resolve_arm(session_id, require_str(params, "b")?)?;
+        let a = self.resolve_arm(session_id, req_str(params, "a")?)?;
+        let b = self.resolve_arm(session_id, req_str(params, "b")?)?;
 
-        let group_by = match params.get("group_by").and_then(|v| v.as_str()) {
+        let group_by = match opt_str(params, "group_by")? {
             None => DiffGroupBy::None,
             Some(s) => DiffGroupBy::parse(s).ok_or_else(|| {
                 format!(
@@ -2146,18 +2036,14 @@ impl RpcHandler {
                 )
             })?,
         };
-        let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        let flag = |k: &str| opt_bool(params, k).map(|b| b.unwrap_or(false));
         let opts = DiffOptions {
             group_by,
-            top_n: params
-                .get("top_n")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(20),
+            top_n: opt_usize(params, "top_n")?.unwrap_or(20),
             allow: DiffAllowances {
-                mismatch: flag("allow_mismatch"),
-                lossy: flag("allow_lossy"),
-                truncated: flag("allow_truncated"),
+                mismatch: flag("allow_mismatch")?,
+                lossy: flag("allow_lossy")?,
+                truncated: flag("allow_truncated")?,
             },
         };
 
@@ -2174,15 +2060,7 @@ impl RpcHandler {
         use crate::collector::diff::{DiffAllowances, DiffGroupBy};
         use crate::collector::document::{document, DocumentOptions, Format};
 
-        let names: Vec<String> = params
-            .get("names")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let names = opt_str_array(params, "names")?.unwrap_or_default();
         if names.is_empty() {
             return Err(
                 "missing required parameter: names — the arms to document, first one the \
@@ -2205,36 +2083,35 @@ impl RpcHandler {
             ));
         }
 
-        let format = match params.get("format").and_then(|v| v.as_str()) {
+        let format = match opt_str(params, "format")? {
             None => Format::Md,
             Some(s) => Format::parse(s).ok_or_else(|| {
                 format!("unknown format `{s}`: expected `md`, `json` or `folded`")
             })?,
         };
-        let group_by = match params.get("group_by").and_then(|v| v.as_str()) {
+        let group_by = match opt_str(params, "group_by")? {
             None => DiffGroupBy::Name,
             Some(s) => DiffGroupBy::parse(s)
                 .ok_or_else(|| format!("unknown group_by `{s}`: expected `name` or `group`"))?,
         };
-        let opt_str = |k: &str| params.get(k).and_then(|v| v.as_str()).map(str::to_string);
-        let flag = |k: &str| params.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        // The prose fields are the point of a document. Dropping a wrong-typed
+        // `finding` silently would publish a measurement with the conclusion
+        // missing and nothing in the output to say one was sent.
+        let text = |k: &str| opt_str(params, k).map(|s| s.map(str::to_string));
+        let flag = |k: &str| opt_bool(params, k).map(|b| b.unwrap_or(false));
 
         let opts = DocumentOptions {
             format,
-            question: opt_str("question"),
-            finding: opt_str("finding"),
-            filter_intent: opt_str("filter_intent"),
-            correctness_evidence: opt_str("correctness_evidence"),
+            question: text("question")?,
+            finding: text("finding")?,
+            filter_intent: text("filter_intent")?,
+            correctness_evidence: text("correctness_evidence")?,
             group_by,
-            top_n: params
-                .get("top_n")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(15),
+            top_n: opt_usize(params, "top_n")?.unwrap_or(15),
             allow: DiffAllowances {
-                mismatch: flag("allow_mismatch"),
-                lossy: flag("allow_lossy"),
-                truncated: flag("allow_truncated"),
+                mismatch: flag("allow_mismatch")?,
+                lossy: flag("allow_lossy")?,
+                truncated: flag("allow_truncated")?,
             },
         };
 
@@ -2329,7 +2206,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
+        let name = req_str(params, "name")?;
         let taken = self
             .collectors
             .reset(session_id, name, Utc::now())
@@ -2353,7 +2230,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let name = require_str(params, "name")?;
+        let name = req_str(params, "name")?;
         self.collectors
             .remove(session_id, name)
             .map_err(|e| e.to_string())?;
@@ -2376,10 +2253,7 @@ impl RpcHandler {
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
-        let filter_string = params
-            .get("filter")
-            .and_then(|v| v.as_str())
-            .unwrap_or("ALL");
+        let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(Some(filter_string), session_id, &d.bookmarks)?;
         if cursor_commit.is_some() {
@@ -2399,7 +2273,7 @@ impl RpcHandler {
         // Checked here too, and this is the widest surface of the three: the
         // throwaway collector below is built directly, so it never passes
         // through the registry's reservation gate at all.
-        let group_keys = group_keys_of(params)?;
+        let group_keys = group_keys_of(params)?.unwrap_or_default();
 
         // A throwaway collector fed the matching spans, so the ad-hoc path and
         // the armed path share one projection implementation rather than two
@@ -2438,7 +2312,7 @@ impl RpcHandler {
     }
 
     fn profile_options(&self, params: &Value) -> Result<ProfileOptions, String> {
-        let group_by = match params.get("group_by").and_then(|v| v.as_str()) {
+        let group_by = match opt_str(params, "group_by")? {
             None => GroupBy::None,
             Some(s) => GroupBy::parse(s).ok_or_else(|| {
                 format!("unknown group_by `{s}`: expected `name`, `group`, `trace` or `path`")
@@ -2446,12 +2320,8 @@ impl RpcHandler {
         };
         Ok(ProfileOptions {
             group_by,
-            skip_warmup_ms: params.get("skip_warmup_ms").and_then(|v| v.as_f64()),
-            top_n: params
-                .get("top_n")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize)
-                .unwrap_or(20),
+            skip_warmup_ms: opt_f64(params, "skip_warmup_ms")?,
+            top_n: opt_usize(params, "top_n")?.unwrap_or(20),
         })
     }
 
@@ -2655,16 +2525,16 @@ fn snapshot_as_profile(s: &StoredSnapshot, opts: &ProfileOptions) -> Value {
 /// aborting the process. Refused here, with the number, rather than clamped
 /// silently: a caller who asked to group by fifty things wants to know they did
 /// not get it.
-fn group_keys_of(params: &Value) -> Result<Vec<String>, String> {
-    let keys: Vec<String> = params
-        .get("group_keys")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+///
+/// `None` for absent/`null`, `Some(vec![])` for an explicit empty array. The
+/// distinction is load-bearing on `collectors.edit`, where an empty list is a
+/// structural change that discards the live window and absence means "leave it
+/// alone" — so a wrong-typed value read as an empty array zeroed a measurement
+/// nobody asked to end.
+fn group_keys_of(params: &Value) -> Result<Option<Vec<String>>, String> {
+    let Some(keys) = opt_str_array(params, "group_keys")? else {
+        return Ok(None);
+    };
     if keys.len() > MAX_GROUP_KEYS {
         return Err(format!(
             "too many group_keys ({} > {MAX_GROUP_KEYS}): each one costs a column in every \
@@ -2673,7 +2543,7 @@ fn group_keys_of(params: &Value) -> Result<Vec<String>, String> {
             keys.len()
         ));
     }
-    Ok(keys)
+    Ok(Some(keys))
 }
 
 /// Parse a `threshold` parameter (§8), validating it against the collector's
@@ -2726,10 +2596,19 @@ fn threshold_of(
         .ok_or("threshold.window_ms must be a positive integer")?;
     let t = Threshold {
         metric,
-        group: obj
-            .get("group")
-            .and_then(|g| g.as_str())
-            .map(str::to_string),
+        // A wrong-typed `group` read as absent moved the guard from the named
+        // group onto the collector total — a different question, answered
+        // without saying so.
+        group: match obj.get("group") {
+            None | Some(Value::Null) => None,
+            Some(g) => Some(
+                g.as_str()
+                    .ok_or_else(|| {
+                        format!("threshold.group must be a string, not {}", json_type(g))
+                    })?
+                    .to_string(),
+            ),
+        },
         op,
         value,
         window_ms,
@@ -2762,11 +2641,173 @@ fn threshold_json(r: &crate::collector::threshold::ThresholdReport) -> Value {
     .unwrap_or(Value::Null)
 }
 
-fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
-    params
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("missing required parameter: {key}"))
+// ---------------------------------------------------------------------------
+// Reading parameters — absent, `null`, and present-but-wrong-typed are three
+// different things, and only two of them mean the same thing
+// ---------------------------------------------------------------------------
+//
+// `Value::as_str` and its siblings answer `None` to two different questions —
+// "was the key absent?" and "was it present with the wrong type?" — and every
+// reader in this file used to treat both answers as *absent*. That is how
+// `{"filter": {"expr": "level>=ERROR"}}` came to mean **no filter** and return
+// the whole buffer, and how `{"reset": "false"}` came to mean **reset** and
+// zero a collector's live window, each reporting success.
+//
+// The rule these helpers impose: **absent — or an explicit `null` — takes the
+// default; a present value of the wrong type is refused, naming the parameter
+// and what was expected.** Absent ≡ `null` is the rule `DataEntry` already
+// states, for the same reason (`domain_data/store.rs:12`): a client that
+// serialises an omitted field as `null` must not thereby mean something
+// different from a client that omits it.
+//
+// That half is not a nicety, it is load-bearing. logmon's own MCP shim builds
+// its params with `json!({"count": p.count, …})` over `Option` fields
+// (`crates/mcp/src/server.rs:475`), and `json!` renders `None` as `null` rather
+// than omitting the key — so **every** call from every agent arrives with a
+// `null` for each parameter it did not set. Treating `null` as a wrong-typed
+// value would refuse the shim's entire surface on first use.
+
+/// How a JSON value reads in an error message. The *type*, never the value:
+/// a rejected parameter may be an arbitrarily large object, and an error
+/// message is not a place to echo one back.
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// The shared shape: absent/`null` → `Ok(None)`, wrong type → `Err`.
+fn opt_of<'a, T>(
+    params: &'a Value,
+    key: &str,
+    expected: &str,
+    read: impl FnOnce(&'a Value) -> Option<T>,
+) -> Result<Option<T>, String> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => read(v)
+            .map(Some)
+            .ok_or_else(|| format!("`{key}` must be {expected}, not {got}", got = json_type(v))),
+    }
+}
+
+fn missing(key: &str) -> String {
+    format!("missing required parameter: {key}")
+}
+
+fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    opt_of(params, key, "a string", Value::as_str)
+}
+
+fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
+    opt_str(params, key)?.ok_or_else(|| missing(key))
+}
+
+fn opt_bool(params: &Value, key: &str) -> Result<Option<bool>, String> {
+    // A stringified boolean is the common client mistake, and it used to be the
+    // destructive one: `{"reset": "false"}` read as absent, took the default
+    // `true`, and discarded the collector's live window. Named explicitly, so
+    // the remedy is in the message rather than in the reader's head.
+    if let Some(Value::String(s)) = params.get(key) {
+        if s == "true" || s == "false" {
+            return Err(format!(
+                "`{key}` must be a boolean, not the string \"{s}\" — send {s} unquoted"
+            ));
+        }
+    }
+    opt_of(params, key, "a boolean", Value::as_bool)
+}
+
+fn opt_u64(params: &Value, key: &str) -> Result<Option<u64>, String> {
+    opt_of(params, key, "a non-negative integer", Value::as_u64)
+}
+
+fn req_u64(params: &Value, key: &str) -> Result<u64, String> {
+    opt_u64(params, key)?.ok_or_else(|| missing(key))
+}
+
+fn opt_f64(params: &Value, key: &str) -> Result<Option<f64>, String> {
+    opt_of(params, key, "a number", Value::as_f64)
+}
+
+/// A `u32` parameter, refused rather than truncated when it does not fit.
+///
+/// `as u32` on a `u64` is a silent wrap: `pre_window: 4294967296` became **0**
+/// — the largest window a caller could ask for, capturing nothing, reported as
+/// success — and `id: 4294967297` addressed filter **1**. Same defect class as
+/// `skip_warmup_ms` in 0.9.0 (CHANGELOG "A large `skip_warmup_ms` no longer
+/// silently does nothing"), which is why it is a checked conversion here and
+/// not a cast at each call site.
+fn opt_u32(params: &Value, key: &str) -> Result<Option<u32>, String> {
+    match opt_u64(params, key)? {
+        None => Ok(None),
+        Some(n) => u32::try_from(n)
+            .map(Some)
+            .map_err(|_| format!("`{key}` is {n}, which exceeds the maximum {}", u32::MAX)),
+    }
+}
+
+fn req_u32(params: &Value, key: &str) -> Result<u32, String> {
+    opt_u32(params, key)?.ok_or_else(|| missing(key))
+}
+
+fn opt_usize(params: &Value, key: &str) -> Result<Option<usize>, String> {
+    match opt_u64(params, key)? {
+        None => Ok(None),
+        Some(n) => usize::try_from(n)
+            .map(Some)
+            .map_err(|_| format!("`{key}` is {n}, which exceeds the maximum {}", usize::MAX)),
+    }
+}
+
+/// Upper bound on a `before` / `after` context window.
+///
+/// `context_by_seq` computes `idx + after + 1` (`store/memory.rs:161`,
+/// `span/store.rs:221`). The workspace declares no `[profile.release]`
+/// overflow-checks setting, so that addition wraps in release and panics in
+/// debug — inside the per-connection task. Bounded by the largest buffer a
+/// domain can be given, because a window wider than any possible buffer is
+/// asking for records that cannot exist.
+const MAX_CONTEXT_WINDOW: u64 = RpcHandler::MAX_DOMAIN_BUFFER_SIZE as u64;
+
+fn opt_context_window(params: &Value, key: &str) -> Result<Option<usize>, String> {
+    match opt_u64(params, key)? {
+        None => Ok(None),
+        Some(n) if n > MAX_CONTEXT_WINDOW => Err(format!(
+            "`{key}` is {n}, which exceeds the maximum context window {MAX_CONTEXT_WINDOW}"
+        )),
+        Some(n) => Ok(Some(n as usize)),
+    }
+}
+
+/// An array-of-strings parameter.
+///
+/// `Some(vec![])` for a present-but-empty array, `None` for absent/`null`: the
+/// two are not interchangeable. `collectors.edit` treats an empty `group_keys`
+/// as a structural change and discards the live window, so reading a wrong-typed
+/// value as an empty array — which is what `filter_map` used to do — zeroed a
+/// measurement the caller never asked to end.
+///
+/// Elements are checked too. `filter_map(as_str)` silently DROPPED non-string
+/// elements, so `["service", 7]` armed a collector grouped by one key when two
+/// were asked for: the same silent substitution, one level down.
+fn opt_str_array(params: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(arr) = opt_of(params, key, "an array of strings", Value::as_array)? else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("`{key}[{i}]` must be a string, not {}", json_type(v)))?;
+        out.push(s.to_string());
+    }
+    Ok(Some(out))
 }
 
 /// The rule session and domain names already share (§7). Collector names reach
@@ -2812,11 +2853,21 @@ fn parse_data_entries(
     let mut entries = Vec::with_capacity(arr.len());
     let mut rejected = Vec::new();
     for (i, item) in arr.iter().enumerate() {
-        let path = item
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or("each entry needs a string \"path\"")?
-            .to_string();
+        // Named by INDEX, and absent distinguished from wrong-typed. This is a
+        // batch: "each entry needs a string path" told a caller with thirty
+        // entries only that one of them was wrong, and said "needs a string"
+        // whether the key was missing or a number — the same conflation this
+        // change removes everywhere else, in miniature.
+        let path = match item.get("path") {
+            Some(Value::String(s)) => s.clone(),
+            None | Some(Value::Null) => return Err(format!("`entries[{i}]` is missing `path`")),
+            Some(other) => {
+                return Err(format!(
+                    "`entries[{i}].path` must be a string, not {}",
+                    json_type(other)
+                ))
+            }
+        };
         let reject = |reason| {
             (
                 i,

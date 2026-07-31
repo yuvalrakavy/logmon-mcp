@@ -46,6 +46,62 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
   successfully — a flat layout could silently cost every named session, trigger,
   filter and bookmark on the next boot.
 
+### Fixed
+
+- **A parameter of the wrong type is now an error, not a different answer.**
+  Every RPC parameter was read with `params.get(k).and_then(|v| v.as_TYPE())`,
+  and `as_TYPE` returns `None` both when a key is **absent** and when it is
+  **present with the wrong type**. Nothing downstream could tell those apart, so
+  the wrong type did not produce an error message — it produced *a different
+  operation*, reported as success.
+
+  Where the default merely narrowed a query, the caller got more than they
+  asked for: a wrong-typed `filter` meant **no filter**, so `logs.recent` with
+  `{"filter": {"expr": "level>=ERROR"}}` returned the entire buffer. Where the
+  default was `true`, it was worse. `{"reset": "false"}` — a stringified
+  boolean, the commonest client mistake there is — read as absent, took
+  `reset`'s default of `true`, and **discarded the collector's live window**. A
+  wrong-typed `group_keys` armed an *ungrouped* collector and persisted it,
+  holding a 64 MiB slice of a daemon-wide reservation that fits about four; on
+  `collectors.edit` the same value counted as a structural change and zeroed the
+  window. A wrong-typed `session` on `bookmarks.clear` cleared the **caller's
+  own** bookmarks instead of the ones they named.
+
+  The rule now, everywhere: **absent — or an explicit `null` — takes the
+  default; a present value of the wrong type is refused, naming the parameter
+  and what was expected.** Absent ≡ `null` is the rule `domain_data` already
+  states for the same reason: a client that serialises an omitted field as
+  `null` must not thereby mean something different from one that omits it. An
+  explicitly empty array stays legal and stays distinct from a wrong type, which
+  is what keeps `group_keys: []` a deliberate clearing rather than an accident.
+
+  **One of these was already firing, through logmon's own shim.** The MCP
+  server builds its params over `Option` fields, and `json!` renders `None` as
+  `null` rather than omitting the key — so every `edit_collector` call sent
+  `group_keys: null`. The old reader checked *presence*, found the key there,
+  read the null as an empty array, and handed the registry an explicit
+  "no group keys". Against a collector that had any, that is a structural
+  change: an agent editing only the description silently cleared its group keys
+  and discarded its live window. No malformed client was needed; the shipped
+  shim did it on the documented path.
+
+  Two neighbouring conflations went with it. `"missing required parameter: X"`
+  was reported for values that were present but wrongly typed, sending callers
+  to look for a key they had already sent. And numbers were **truncated**
+  instead of range-checked: `pre_window: 4294967296` became `0` — the largest
+  window a caller could ask for, capturing nothing, reported as success — and
+  `id: 4294967297` addressed filter `1`. A `before`/`after` context window
+  larger than any possible buffer reached an unchecked `idx + after + 1`, which
+  wraps in release and panics in debug inside the connection task; a
+  `validated_before_secs` above `i64::MAX` seconds reached a `chrono::Duration`
+  constructor that panics. Both are refused at the boundary, naming the bound.
+
+  Error **codes** are unchanged: every handler failure still returns `-32601`
+  with its message. Splitting parameter errors out to `-32602` is right and is
+  worth its own change, but half a surface carrying a meaningful code is worse
+  than a whole one carrying none — a client would start branching on a code that
+  is only sometimes true.
+
 ## 0.9.0 — 2026-07-31
 
 Makes capability skew visible. On 2026-07-30 a project filed a report proposing
