@@ -62,7 +62,8 @@ because a doc comment describes intent and is not evidence of a code path.
 ## 2. Scope
 
 **In:** the `domain_data` registry with its own persistence; `cases.create` (manual);
-a seq range on `logs.export`.
+a `data` list on `collectors.add` in the same path format (§3.8); a seq range on
+`logs.export`.
 
 **Out, deferred to v2:** **watches** — automatic case-writing on a filter match. §9.1
 records why that is a design problem rather than an implementation one.
@@ -261,6 +262,13 @@ So the set is **defined here, documented in the skill (§8), and reported agains
 It is a **convention, not a schema**: any path is still legal, nothing is rejected for
 being absent, and a project with a concept logmon never anticipated just adds a key.
 
+**The set is the vocabulary for all three lists (§3.8), not just the domain registry.**
+`/Build/commit` means the same thing whether it arrives via `domain_data.update`,
+`collectors.add(data)` or `cases.create(data)` — only the *moment* differs, and the path
+prefix already records that. One vocabulary is what makes the three comparable at all: had
+each list invented its own names, the mismatch warnings §3.8 relies on would have nothing
+to compare.
+
 #### 3.6.1 The set
 
 **Core — a document missing these cannot be acted on.**
@@ -303,7 +311,18 @@ document says which.
 `update` never rejects a non-recommended key, and never warns. Coverage is a property of
 the *document*, not of the registry.
 
-### 3.7 The reserved `/logmon/` namespace
+**Which is why coverage counts all three lists (§3.8), and names the source when it is not
+the registry.** A core key satisfied only by `/case/data/Build/commit` still lets the reader
+act, so reporting it missing would be false. But a case-supplied value is the capturer's
+assertion while a registry one carries a validation timestamp, so the line says so:
+
+> provenance: **3 of 3 core keys** — `/Build/commit` from this capture, not the registry
+
+The alternative — counting only the registry — would push capturers into writing provenance
+into `reason` as prose to get it into the document at all, which is the shape §3.6 exists to
+prevent.
+
+### 3.7 The reserved namespaces
 
 `/logmon/...` is written only by logmon; `update` and `remove` both reject agent access.
 These keys are **stored**, not computed at document time, so `get_domain_data` can show
@@ -319,8 +338,72 @@ the registry a reader has been told to trust.
 `/logmon/*` keys do **not** count against §3.1's 256-key cap — otherwise logmon could lock
 an agent out of its own registry.
 
+**`/collector/` and `/case/` are reserved in the domain registry too**, rejected by
+`domain_data.update` the same way. §3.8 gives those prefixes a meaning in a document — a
+fact supplied by a collector or a capture rather than by the domain. If the domain registry
+could also write them, a domain key would render identically to a collector-supplied one
+and the prefix would stop being evidence of anything. Cheap to reserve now; impossible
+after the first archive exists.
+
 Per-document facts (capture time, trigger) are **not** registry keys — they are document
 front-matter (§5.2). The first draft conflated the two.
+
+### 3.8 Data lists: the same format, at three different moments
+
+The registry answers "what is true of this domain **now**." Two other moments matter to a
+document, and each gets its own list in the **same path format** (§3.1 rules verbatim —
+leading `/`, ASCII segments, byte-wise comparison, ≤ 256-byte path, ≤ 4 KiB value):
+
+| Supplied on | Renders as | The moment it describes |
+|---|---|---|
+| `domain_data.update` | `/Build/profile` | the domain, **now**, with `validated_at` (§3.2) |
+| `collectors.add(data)` and `collectors.snapshot(meta)` | `/collector/data/Build/profile` | the window that produced **this collector's numbers** |
+| `cases.create(data)` and a watch's `data` (§9.1) | `/case/data/Build/profile` | what the capturer asserted **about this document** |
+
+**The prefix is the label, and that is the point.** §11's open question 4 asked how a reader
+tells `/Build/profile: release` from a domain registry apart from `build_profile: debug` on
+a collector arm. The answer is no longer "a warning explains it" — it is that they were
+never the same key. Three paths, three moments, and a fact carries its own provenance
+instead of leaving the reader to infer it from which YAML block it appeared in. Mismatch
+detection survives and gets easier: comparing `/Build/commit` against
+`/collector/data/Build/commit` is comparing two well-defined paths.
+
+**Arm-time and snapshot-time merge into one `/collector/data/` list, snapshot winning.**
+They bracket the same window — the collector's numbers are produced *between* them — so
+splitting them into two namespaces would hand the reader two lists for one measurement,
+which is the problem this section exists to remove. `collectors.add` has no `meta` today
+(`methods.rs:905`); `collectors.snapshot` does (`:1103`, "per-snapshot because two arms of
+a comparison differ in it"). Both now feed one rendered list.
+
+**A key set at both ends with different values is a first-class warning**, and a worse one
+than any cross-arm mismatch: `/collector/data/Build/commit` = `abc` at arm and `def` at
+snapshot means the window straddled a rebuild, so the numbers are a blend of two builds.
+That is not a comparison problem, it is a corrupted single measurement — and no existing
+mechanism can see it.
+
+Every §3.8 mismatch lands in **two** places: a line in the document's Evidence section
+(§5.2 orders it before anything it qualifies) and an entry in §5.1's `warnings`, so a
+caller scripting over `cases.create` sees it without parsing markdown. Three comparisons
+are made, all cheap string compares over paths that already exist at render time:
+arm-vs-snapshot within one collector, registry-vs-collector, and registry-vs-case.
+
+**A watch's data has an age; `cases.create`'s does not.** Pairs given to `cases.create` are
+supplied at the capture instant and need no timestamp. A watch is armed once and fires for
+days, so its data can go stale exactly as a registry key can — armed under `release`, still
+firing after a debug rebuild. The document therefore records **when the watch was armed**
+beside its `/case/data/`, so those keys carry an age the way §3.2's keys do.
+
+**Caps: 64 keys per list**, against the registry's 256. The registry's cap is justified by
+"copied into every never-deleted document"; a collector list has the same property and a
+document can embed several of them plus the registry. A lower per-list cap is what keeps
+the total bounded. Both `CollectorsDocumentResult.bytes` and §5.1's `CaseFile.bytes` report
+the actual size, so a pathological document is visible rather than merely capped.
+
+**`collectors.document`'s promoted `build_profile` / `git_sha` front-matter is unchanged**
+(`document.rs:779`). It is a shipped format, and §9.4 of the collector spec argued the
+promotion for a reason that still holds. `meta` folds into `/collector/data/` under its own
+key names, so those two values appear twice in a `collectors.document` — deliberate, and
+safe because it is one source rendered twice rather than two sources that can disagree.
 
 ---
 
@@ -392,8 +475,8 @@ otherwise read as *0 entries, complete*.
 
 ### 5.1 Shape
 
-`cases.create(reason, anchor, prefix?, before?, after?)` → the document and its two logdata
-files, returned **as content**, written by the client (§1). No daemon-side archival writer in v1:
+`cases.create(reason, anchor, prefix?, data?, before?, after?)` → the document and its two
+logdata files, returned **as content**, written by the client (§1). No daemon-side archival writer in v1:
 the existing path already writes documents, and adding one would bring file naming,
 atomicity, ENOSPC handling and concurrency — all of which belong with watches (§9.1), the
 only feature that genuinely cannot use a client.
@@ -409,6 +492,10 @@ they were measured from.
 
 `reason` is **required**. A manual case that cannot say why it exists has no provenance,
 and unlike a watch there is no filter standing in for one.
+
+`data` is the §3.8 list, rendered under `/case/data/`. It is optional and its absence is
+reported by §3.6.2's coverage line like any other gap — a capturer who knows the seed that
+reproduced a flake should not have to write it into `reason` as prose.
 
 **Result shape.** The existing `CollectorsDocumentResult`
 (`protocol/src/methods.rs:1410`) carries one optional companion as `sidecar_name` +
@@ -630,11 +717,18 @@ the skill names the two moments rather than leaving it to judgement:
   in particular is stale within minutes of switching tasks, and a stale `/Action` is worse
   than an absent one because it reads as fact.
 
-**3. When to reach for `create_case`**, in the bold "reach for X when…" form the
+**3. Which list to put a fact in** (§3.8), as one sentence per moment rather than a
+mechanism description: *what is true of this project* goes in the domain registry once per
+session; *what this run was built from* goes on the collector when you arm it; *what you
+know about this incident specifically* — the seed, the iteration, the hypothesis — goes on
+`create_case`. An agent that puts everything in the registry loses the ability to tell a
+measurement's conditions from the current ones, which is the whole reason there are three.
+
+**4. When to reach for `create_case`**, in the bold "reach for X when…" form the
 `profile_traces` fix used — a comparison table alone is what left `profile_traces` unused
 in the one production trial we have.
 
-**4. How to read the evidence verdict**, including that `filtered` and `partial` are not
+**5. How to read the evidence verdict**, including that `filtered` and `partial` are not
 warnings to skim past: they say the window is not what it appears to be, and a conclusion
 drawn from "nothing appeared before the error" is unsound under either.
 
@@ -716,6 +810,20 @@ false-positive guard, because a convention hardening into a schema is how this g
 any other entry's outcome** — coverage is a property of the document, never of the
 registry.
 
+**Data lists (§3.8):** `domain_data.update` rejects `/collector/` and `/case/` exactly as
+it rejects `/logmon/`, so a domain key can never impersonate a collector-supplied one;
+`collectors.add(data)` and `collectors.snapshot(meta)` render into **one** `/collector/data/`
+list with the snapshot's value winning on collision; that collision **emits a warning in
+both places** (§5.2's Evidence line and §5.1's `warnings`) — and the mutation to check is
+deleting the comparison, since a warning nothing produces is the failure mode here; a key
+present at only one end is **not** a mismatch and warns nothing, which is the false-positive
+guard; the same path rules and 4 KiB value cap apply to all three lists, asserted by feeding
+each the same malformed key; the 64-key cap is per list, so a document with the registry at
+256 and two collectors at 64 is legal; and coverage counts a core key satisfied only by
+`/case/data/` as **present, with its source named** — reporting it missing would be false,
+and reporting it silently would erase the difference between an assertion and a validated
+fact.
+
 ---
 
 ## 11. Open questions for the gate
@@ -728,14 +836,12 @@ registry.
 3. ~~Whether `/logmon/first_seen` suffices for the reused-domain-name case~~ — **closed**:
    it cannot (monotone), so §3.5 counts incarnations instead.
 
-**Still open, and it blocks Phase 1:**
+4. ~~Where build provenance lives~~ — **closed by §3.8**, and by a better mechanism than
+   the one proposed here. The draft answer was "keep both and label them"; the truth is that
+   they were never one key. `/Build/profile` is the domain now, `/collector/data/Build/profile`
+   is the window that produced those numbers, `/case/data/Build/profile` is what the capturer
+   asserted. The prefix carries the moment, so reconciliation is a path comparison rather
+   than a convention a reader has to know. `document.rs:779`'s promoted front-matter is left
+   untouched — it is a shipped format and §9.4's argument for it still holds.
 
-4. **Where build provenance lives.** `document.rs:779` already promotes `build_profile` and
-   `git_sha` out of collector `meta` into front-matter, arguing verbatim what §3.6.1 argues
-   for `/Build/profile`. A case document would otherwise print `/Build/profile: release`
-   from `domain_data` beside `build_profile: debug` from a collector arm, unreconciled.
-   My reading: they are **different facts** — an arm's provenance is what was true when
-   that run was recorded, `domain_data`'s is what is true now, and comparing a run against
-   a newer build is the entire point of collectors. So keep both, label them ("as recorded"
-   / "current"), and have the document reconcile explicitly. The key set, the coverage line
-   and the skill are all unstable until this is settled.
+**Nothing is open. Phase 1 is unblocked.**
