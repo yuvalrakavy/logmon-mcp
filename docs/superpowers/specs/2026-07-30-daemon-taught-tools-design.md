@@ -30,12 +30,23 @@ Two guards, then, not one. **Record a withdrawal in the artifact it withdraws.**
 And, for the reader: *a spec whose status reads "pending" is a claim like any
 other* — check the retro log and `git log --` the file before believing it.
 
-**→ §11 IS THE PLAN. Start there.** Everything above it is how it was arrived at.
+**→ §11 IS THE PLAN, and §11.0 IS THE GOAL. Start there.** Everything above is how it was
+arrived at.
 
 §10 (revision 3) was gated by four lenses on `7a61856`. **§10.2 — generating the CLI — did
-not survive** and is dead (§11.5). The rest of §10 stands, and §11 sequences it behind a
-Phase 0 that may make the whole thing unnecessary — which is the point of putting Phase 0
-first.
+not survive** and is dead (§11.5). The rest of §10 stands.
+
+**One framing correction that supersedes every "is this worth it" argument in §§0–10.**
+Those sections all argue from *defects* — drifted parameters, a lying skill, tools a stale
+shim cannot reach — and Phase 0 (§11.2) fixes every one of them. That made the natural next
+question *"is the rest still needed?"*, and it is the wrong question. **The goal is
+architectural** (§11.0): cut the shim's dependency on the daemon, and make the daemon the
+single point of truth. No number of defect fixes reaches that, so Phase 0 removing the pain
+says nothing about whether to continue.
+
+**Scope: being logmon-agnostic is not a current goal** — the architecture only has to leave
+it *possible*. The plan is **A → B → C**; "generic" is a property to preserve, not a phase
+to build (§11.0).
 
 **Read in this order:** §11 for the plan, §10.1/§10.3 for the manifest shape it uses,
 §9.3–§9.6 for what that inherits, §9.8 for what is dead in §§0–8, and §§0–8 only for
@@ -887,6 +898,57 @@ disagreed in 30 of 45 pairs **for months**, undetected, because nothing compared
 Written architect-then-reviewer to convergence before anyone read it; §11.6 records what
 that pass changed, because a plan that claims a method should show its work.
 
+## 11.0 The goal, stated by the user 2026-08-01 — and it is architectural
+
+Every earlier version of this document argued from **defects**: a stale shim cannot reach
+new tools, parameters have drifted, the skill lies. Phase 0 fixes all of that, which made
+the obvious question *"is the rest still worth it?"* — and that question was aimed at the
+wrong target.
+
+> **Cut the dependency between the shim and the daemon. Enhance the daemon without
+> reinstalling the shim. One point of truth: the daemon. The shim becomes generic — no
+> particular knowledge of logmon — and usable by other daemons.**
+
+That is a goal about **architecture**, not about a bug count, and it is not reachable by
+fixing defects however many you fix. So the residue argument does not apply to it: Phase 0
+was never going to satisfy this, and the fact that Phase 0 removes the *pain* is beside the
+point.
+
+**What this changes about the plan.** Phases A–C stay, and stop being conditional. They are
+are **not sufficient for the fourth clause**, and §9.6 already measured why: the tool
+*surface* becomes daemon-taught, while the *adapter* stays logmon-shaped. Still compiled in
+after Phase C —
+
+- the notification map (`notifications.rs:9`'s `TRIGGER_FIRED_METHOD`, with `Reconnected`
+  deliberately dropped),
+- the per-invocation domain bind and its three-way per-tool classification (§9.5),
+- `LOGMON_DOMAIN` and its fail-loud contract,
+- mode-dependent transport (CLI: zero reconnect attempts, 5s timeout, per-subcommand
+  `argv`; MCP: reconnecting defaults),
+- and `auto_start.rs`'s ten-plus hardcoded identities — binary name across three lookup
+  tiers, `daemon.lock`, `daemon.pid`, `logmon.sock`, `autostart.log`, `config.json`, the
+  `LOGMON_CONFIG_DIR` policy, a Windows port fallback, and remediation text naming
+  `cargo install --path crates/broker`.
+
+**Scope, settled 2026-08-01: being logmon-agnostic is NOT a current goal. The architecture
+making it possible is enough at this stage.** So the plan is **A → B → C**, and there is no
+Phase E in it.
+
+The list above is therefore not a work item; it is the **test** the architecture has to
+pass. For each entry, A–C must leave it *extractable* — reachable through a seam rather than
+welded into the tool path — without extracting it. Concretely: the notification map and the
+domain bind stay logmon-specific and stay where they are, but nothing in the manifest, the
+registration path or the descriptor may come to *depend* on them. If a later phase would
+have to unpick the tool surface to make the adapter generic, A–C got the seam wrong, and
+that is a design error to catch now rather than a feature to build now.
+
+The distinction matters because it changes what "done" means for A–C: not "the shim is
+generic" — it will not be — but "nothing new was welded in."
+
+Phase D — generating the CLI — remains dead (§11.5), and it is worth being clear that this
+goal does **not** revive it. A generic *MCP adapter* is reachable. A generic CLI is a
+different artifact and the measurements in §10.2's header still stand against it.
+
 ## 11.1 What is actually broken, measured
 
 Not "a stale shim cannot reach new tools" (§0). That is the smaller half and it is already
@@ -917,30 +979,122 @@ as the one-shot the agent asked for.
    This is the guard whose absence let 8 parameters diverge unnoticed; it is ~40 lines.
 4. **Add the 8 parameters**, and correct the 4 skill statements.
 
-**Exit:** the skill is true, and drift cannot recur silently. **This may be the whole
-project** — afterwards the residual problem is only that a *new* daemon tool needs a shim
-rebuild, which 0.9.0 already makes visible. Decide whether to continue *after* this, with
-the motivation measured rather than assumed.
+**Exit:** the skill is true, and drift cannot recur silently. Phase 0 removes the *pain*,
+**not the goal** (§11.0) — the architecture is the point, and Phase 0 does not touch it.
+
+An earlier version of this paragraph said Phase 0 *"may be the whole project"*, on the
+grounds that afterwards the only residue is a new daemon tool needing a shim rebuild, which
+0.9.0 already makes visible. That reasoning was sound and aimed at the wrong target: it
+weighed the remaining *pain*, and the goal is not pain relief. Kept as a record because the
+error is instructive — a plan that argues from defects will always conclude "stop" once the
+defects are gone, whatever the design was actually for.
+
+What Phase 0 does buy for A–C is that they no longer race a live defect, and that the drift
+test becomes the mechanical checker Phase B's assertion needs (§11.4).
 
 ## 11.3 Phase A — make the schema sufficient
 
 Only if Phase 0's residue justifies continuing.
 
-- **The 8 prose-enums become Rust enums.** Wire-compatible, and verified rather than
-  assumed: `Level` already does exactly this and schemars emits
-  `"type":"string","enum":["Trace",…]`. Serde's output is unchanged, so no client sees a
-  difference.
+### 11.3.1 Revision 2, 2026-08-01 — the enum plan was wrong, and measuring it is what showed that
+
+Revision 1 said *"the 8 prose-enums become Rust enums."* Both halves are false. Grounding
+each field in the parser that actually reads it — rather than in the doc comment beside it
+— produced this table. **The daemon parses raw `Value` for all ten**: `rpc_handler`
+deserializes into a protocol struct for exactly four methods (`DomainsCreate`,
+`DomainsDelete`, `SessionRename`, `DomainsUse` — `rpc_handler.rs:292/403/455/508`), and
+none of those four contains any field below.
+
+| # | Request field | What the daemon actually accepts | Parser | Doc comment says | Δ |
+|---|---|---|---|---|---|
+| 1 | `TracesSlow.group_by` | `name` groups; **any other string** silently returns ungrouped | `rpc_handler.rs:1320` | same | — open set |
+| 2 | `ThresholdSpec.metric` | `count`, `total_ms`, `avg_ms`, `error_count`, `error_rate_pct` | `threshold.rs:72` | same 5 | — closed |
+| 3 | `ThresholdSpec.op` | `gt`/`>`, `gte`/`>=`, `lt`/`<`, `lte`/`<=` | `threshold.rs:120` | the 4 word forms only | **omits 4 aliases** |
+| 4 | `CollectorsAdd.level` | `scalar`, `timing`, `tree` | `rpc_handler.rs:1651` | same 3 | — closed |
+| 5 | `CollectorsEdit.level` | `scalar`, `timing`, `tree` | `rpc_handler.rs:1797` | same 3 | — closed |
+| 6 | `CollectorsGet.group_by` | `none`/`""`, `name`, `group`, `trace`, `path` | `project.rs:72` via `rpc_handler.rs:2314` | omits `none`, `""` | **omits 2** |
+| 7 | `TracesProfile.group_by` | identical — same `profile_options` | `project.rs:72` via `rpc_handler.rs:2314` | **no doc comment at all** | **undocumented** |
+| 8 | `CollectorsDiff.group_by` | `none`/`""`, `name`, `group` | `diff.rs:75` via `rpc_handler.rs:2029` | omits `none`, `""` | **omits 2** |
+| 9 | `CollectorsDocument.group_by` | `none`/`""`, `name`, `group` | `diff.rs:75` via `rpc_handler.rs:2092` | omits `none`, `""` | **omits 2** |
+| 10 | `CollectorsDocument.format` | `md`/`markdown`/`""`, `json`, `folded`/`collapsed` | `document.rs:56` | `md`, `json`, `folded` | **omits 3 aliases** |
+
+**Ten, not eight** — the "8" was never measured. And **six of the ten have prose that
+misstates the accepted set.** The justification for Phase A is therefore stronger than
+revision 1 claimed, but its *mechanism* was wrong in a way that would have broken the wire:
+
+> Converting these ten to Rust enums would have **narrowed five of them** — dropping `>`,
+> `>=`, `<`, `<=` from `op`; dropping `none` and `""` from four `group_by` fields; dropping
+> `markdown`, `collapsed` and `""` from `format` — and would have made `traces.slow`
+> hard-error where it deliberately passes. Five wire-contract breaks, from following the
+> plan as written.
+
+`#[serde(alias)]` does not rescue this: aliases affect deserialization only, so schemars
+would still emit the narrow set and the schema would be **narrower than the daemon** — a
+CLI validating against it would reject input the daemon accepts.
+
+### 11.3.2 What Phase A actually delivers: an accurate schema, not Rust enums
+
+The deliverable was never the enums; it was **a schema that exactly describes what the
+daemon accepts**. Rust enums were one means, and for six of the ten they are a worse
+means, because they cannot express the real accepted set. So:
+
+- **`#[schemars(extend("enum" = [...]))]` on the existing `String`/`Option<String>` fields**,
+  listing the accepted values *including every alias*, transcribed from the parser. One
+  mechanism for all ten. **No Rust type changes, no wire change, no daemon change** — and
+  the schema becomes exactly as wide as the daemon, in both directions.
+
+  **Probed, not assumed** (schemars **1.2.1** — the version actually resolved in
+  `Cargo.lock`, not the 1.2.2 an earlier note claimed). A scratch crate deriving the real
+  field shapes confirms `extend("enum" = [...])` emits `"enum"` beside `"type"`, and that
+  `extend("default" = true)` on an `Option<bool>` emits `"default": true` — which is what
+  closes the `persist` question with no type migration.
+
+  The probe also caught a defect that inspection would not have. On an `Option<String>`,
+  schemars widens `"type"` to `["string","null"]` but **does not add `null` to the `enum`
+  list** — so a validator would reject `group_by: null`, which the daemon accepts as
+  absent (`opt_of` maps `Some(Value::Null)` → `None`). That is precisely the
+  narrower-than-the-daemon false positive this phase exists to avoid, and it is the shape
+  that caused the `edit_collector` production bug: `json!` renders `None` as `null`, so
+  `null` genuinely appears on the wire. Hence the rule:
+
+  | Field shape | Declaration |
+  |---|---|
+  | required `String`, closed set | `extend("enum" = [ …values… ])` |
+  | `Option<String>`, closed set | `extend("enum" = [ …values…, null ])` — **`null` included** |
+  | open set (`traces.slow.group_by`) | description only, no `enum` |
+- **`traces.slow.group_by` (#1) gets a description, not an `enum`** — its accepted set is
+  genuinely open, and declaring `["name"]` would be a false positive on every valid call
+  that means "don't group".
 - **The 45 tool descriptions are authored in the protocol crate.** They are §0's "product",
   and today they live where a daemon cannot reach them.
 - **`xtask`'s hand-maintained type list is replaced or completed**, so a tool cannot have no
   schema. `verify-schema` cannot catch this today: it compares the schema against the list
   it was given, so an omission is invisible from both sides.
 
-**Exit, and it is a query rather than a judgement:** zero request parameters with
-prose-only alternatives; every tool in `TOOLS` resolves to a schema.
+**Exit, and it is a query rather than a judgement:** every request parameter with a
+closed accepted set declares that set in the schema, alias-complete; every tool in `TOOLS`
+resolves to a schema.
 
 **Worth alone:** enum validation for the SDK and every schema consumer, and the
 `rename_session` hole closed. Ships without anything below it.
+
+### 11.3.3 Two daemon defects found here, deliberately NOT fixed in Phase A
+
+Both are daemon-behaviour questions surfaced by the grounding pass. Phase A is a
+*typing* phase; changing acceptance semantics inside it would be changing the mechanism
+when only the description is at fault. They are logged for the daemon session:
+
+1. **`traces.slow.group_by` swallows typos.** `group_by: "nmae"` returns ungrouped spans
+   with no error — the caller asked for grouping and silently got none. The comment at
+   `rpc_handler.rs:1317` calls this leniency "the documented contract"; the comment at
+   `rpc_handler.rs:1757`, about the *same parameter name* on `collectors.get`, calls
+   precisely that quiet pass "the failure this whole surface exists to close." **The
+   codebase holds two opposite philosophies on one parameter, deliberately, and at most
+   one can be right.**
+2. **`GroupBy`'s error message understates its own parser.** `rpc_handler.rs:2318` says
+   "expected `name`, `group`, `trace` or `path`" while `GroupBy::parse` also accepts
+   `none` and `""` (`project.rs:74`). A caller told the truth by the error message cannot
+   discover the ungrouped spelling.
 
 ## 11.4 Phase B — one generator, two callers, no behaviour change
 
@@ -972,22 +1126,48 @@ union. The shim is then tool-independent **for MCP**. The three non-passthrough 
 (`export_logs`, `get_status`, `document_collectors`) keep local implementations and are
 marked as such in the descriptor (§9.5).
 
-**D — generating the CLI — is dead as specified in §10.2, and is a separate decision even
-after Phase A.** Two independent reasons:
+**D — generating the CLI. As specified in §10.2 it is dead; as a phase it is back in scope,
+on a different basis** (decided 2026-08-01, because "finish the shim" means the CLI too —
+a shim that is daemon-taught for MCP and hand-written for CLI still drags every new daemon
+tool back into `crates/mcp`).
+
+The two reasons §10.2 died, and what happened to each:
 
 1. **The derivation table read features this schema does not have.** Measured: `enum` on a
    request parameter — **0**; `"default": true` — **0**; `dependentRequired` — **0**;
    `"type":"boolean"` matches **2 of 16** booleans, because schemars renders `Option<bool>`
-   as `["boolean","null"]`. Phase A fixes the first; it does not fix the rest.
-2. **It makes a broker upgrade able to change how the CLI parses argv.** The CLI connects on
-   every invocation and fetched-wins, so flag names and defaults would come from the running
-   daemon. Today clap parses before the daemon is contacted at all. A CI script pinned to
-   one shim version could stop parsing because someone upgraded the broker. That is a new
-   failure mode with no precedent here, and §10 did not list it.
+   as `["boolean","null"]`. **This is what Phase A is for**, and it is reachable without a
+   wire change: `schemars_derive` 1.2.2 supports `extend(...)` (`attr/mod.rs:124`), which
+   injects arbitrary schema keywords — so `"default": true` and `dependentRequired` can be
+   declared **on the existing types**. `Option<bool>` stays `Option<bool>`, and nothing a
+   client sends changes meaning. Phase A is therefore purely additive.
+2. **It makes a broker upgrade able to change how the CLI parses argv.** Under §11.0's goal
+   this is largely **the intended behaviour** rather than an objection: if the daemon is the
+   single point of truth and the point is to enhance it without touching the shim, the CLI
+   surface following the daemon is what was asked for. What remains is a consequence to
+   manage, not a blocker — and the one real residue is that offline `--help` renders from
+   the bundle while execution uses the fetch. Bounded, because a CLI invocation that cannot
+   reach the daemon cannot do anything anyway.
 
-If D is ever wanted it needs its own design, its own deprecation period, and an answer to
-(2). "The CLI syntax may change" removes the *compatibility* objection; it does not remove
-the *coupling* one.
+**Surface decision, 2026-08-01: take the clean surface.** Command paths are **derived** from
+the RPC method (`status.get` → `status get`, `session.list` → `session list`,
+`traces.profile` → `traces profile`), with **no `path` override key at all**. Reasoning, and
+the second half is the load-bearing one:
+
+- logmon is not deployed, so there are no external scripts to break, and the surface is
+  skill-driven — an agent gets the new spelling the moment the skill regenerates.
+- **A `path` override table is a place drift can hide again.** A declared path can be
+  declared wrong; a derived one cannot. This entire document is a record of declared-vs-actual
+  drift, so deriving is not merely simpler, it removes a whole class.
+
+`positional` and `variadic` **stay**, for the two tools that use them — `collectors diff a b`
+and `collectors document base after`. Those are argument *shape*, not path, and nothing
+derives them; turning them into `--a X --b Y` and a repeated `--name` is the one change that
+costs a human at a terminal something real, for no architectural gain.
+
+D still needs **its own design and its own gate** — it does not inherit §10.2's, which the
+measurements above killed. It is written after Phase A, against the schema Phase A produces,
+which is the mistake §10.2 made in reverse.
 
 ## 11.6 What the internal review changed
 
