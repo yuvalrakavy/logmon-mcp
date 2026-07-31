@@ -392,14 +392,16 @@ otherwise read as *0 entries, complete*.
 
 ### 5.1 Shape
 
-`cases.create(reason, anchor, prefix?, before?, after?)` → the document and its sidecar,
-returned **as content**, written by the client (§1). No daemon-side archival writer in v1:
+`cases.create(reason, anchor, prefix?, before?, after?)` → the document and its two logdata
+files, returned **as content**, written by the client (§1). No daemon-side archival writer in v1:
 the existing path already writes documents, and adding one would bring file naming,
 atomicity, ENOSPC handling and concurrency — all of which belong with watches (§9.1), the
 only feature that genuinely cannot use a client.
 
 **`anchor` is explicit** — a seq, a bookmark name, or a `trace_id`. `before`/`after` are
-relative to it, and §5.2 makes the anchor's message the headline and a front-matter key. An
+relative to it and size the **logdata**, not the document: the document always shows the
+anchor and ±10 (§5.2), so widening the window buys evidence without diluting triage.
+§5.2 makes the anchor's message the headline and a front-matter key. An
 implicit "newest entry" anchor would headline a case created five minutes after the fact
 with whatever happened to arrive last, which fails §5.2's own test that a headline must
 distinguish two documents. The first draft's signature had the windows and not the point
@@ -407,6 +409,32 @@ they were measured from.
 
 `reason` is **required**. A manual case that cannot say why it exists has no provenance,
 and unlike a watch there is no filter standing in for one.
+
+**Result shape.** The existing `CollectorsDocumentResult`
+(`protocol/src/methods.rs:1410`) carries one optional companion as `sidecar_name` +
+`sidecar_content`. `cases.create` needs two, each with its record count, so it gets its own
+result rather than a third and fourth `sidecar_*` field:
+
+```rust
+pub struct CasesCreateResult {
+    pub stem: String,              // "checkout-hang-260731-021530" — §5.3
+    pub document: String,          // markdown; write as <stem>.md
+    pub logdata: CaseFile,         // write as <stem>.logdata.jsonl
+    pub spandata: CaseFile,        // write as <stem>.spandata.jsonl
+    pub warnings: Vec<String>,     // what could not be captured (§4.2)
+}
+pub struct CaseFile { pub content: String, pub records: u64, pub bytes: u64 }
+```
+
+`records` is on the wire rather than left for the client to count, because the document
+already prints it (§5.2) and two places computing the same number is how they come to
+disagree. `stem` is returned rather than reconstructed: §5.3's collision rule runs in the
+daemon, so only the daemon knows whether an `<id>` was appended.
+
+**The existing `sidecar_*` fields are not renamed.** They are a shipped wire contract with
+shims in the field (the §2 grounding table's first row is that clients write the files),
+and `collectors.document`'s companion genuinely is a different thing — a percentile table,
+not log records. The rename is this feature's vocabulary, not a migration.
 
 ### 5.2 Structure: discriminating first, then qualifying, then bulk
 
@@ -422,22 +450,77 @@ then:
 4. **Anchor entry and neighbours.**
 5. **Provenance** — the registry copy, each key with its age.
 6. **Collector state** (§5.4).
-7. Sidecar pointer.
+7. Pointer to the logdata files, with their record counts.
 
-**Sidecar** carries the full window and span trees as **JSONL**, one record per line,
-following `document.rs`'s rule: bulk *moves*, with a pointer, rather than being cut without
-saying so. JSONL because the bulk is the half most likely to be machine-read — grepped,
-filtered, streamed into a tool — and it needs no whole-file parse to use. The document
-remains the half a human reads.
+#### The split, stated as a rule
 
-### 5.3 Naming
+**The document is what you read to decide whether this is your bug and what to do about
+it. The logdata is the evidence you consult once you have decided it is.** The test for
+any future field is which of those two jobs it serves.
 
-**`<prefix>-<yymmdd>-<hhmmss>[-<id>].md`**, sidecar `<same stem>.sidecar.jsonl`.
+| In the document | In logdata |
+|---|---|
+| The anchor entry and **±10 neighbours** — enough to see the shape of the failure | The full pre/post window |
+| A **span timing summary** — the slowest few, their durations, the anchor's own trace | Full span trees, every attribute and event |
+| Collector numbers at capture (§5.4) | — |
+| The registry copy, with ages | — |
+| The evidence verdict, and what could not be captured | — |
+
+The ±10 is load-bearing: with only the anchor, every reader must open the logdata to learn
+anything and the document stops being a triage surface; with hundreds, the caveats at the
+top get scrolled past, which the ordering above exists to prevent.
+
+**Two logdata files, not one, and the name says which:**
 
 ```
 checkout-hang-260731-021530.md
-checkout-hang-260731-021530.sidecar.jsonl
+checkout-hang-260731-021530.logdata.jsonl     ← log entries
+checkout-hang-260731-021530.spandata.jsonl    ← spans
 ```
+
+"Sidecar" named a *role* — companion file — and said nothing about contents. `logdata`
+says what it is, and that is exactly why it splits: one mixed stream would make the name a
+lie the moment spans went in, and every consumer would filter by record kind before doing
+anything. Logs and spans are different shapes with different consumers, and wanting one
+without the other is the common case.
+
+JSONL because this half is machine-read — grepped, filtered, streamed — and needs no
+whole-file parse. Following `document.rs`'s rule: bulk *moves*, with a pointer and a
+record count, rather than being cut without saying so. A file with no records is still
+written, empty, rather than omitted: absent cannot be told from "we captured none".
+
+**Not compressed, and that is a decision rather than an omission.** §2's boundary is that
+the format is the contract and indexing belongs to whatever walks the directory —
+compression puts a codec between the archive and every tool that would do so, and `grep`
+over a case archive is the cheapest thing a person can do.
+
+The sizes do not force it. **Measured**, not derived: 200 entries and 50 spans pulled from
+this machine's live broker serialise to **507 B/entry** and **238 B/span** as compact
+JSONL, so a 700-entry window with its spans is ~**350 KB** and a thousand cases is a few
+hundred megabytes. The caveat that number carries: it was measured on *this* broker's
+traffic, and record size scales with how many fields the emitting app sets — an app with
+fat structured context could be several times larger. It does not change the decision,
+because the answer at 350 KB and the answer at 2 MB are the same answer.
+
+Anyone wanting the space back has two routes that cost nothing here — filesystem-level
+compression (APFS, btrfs, ZFS) is transparent and keeps `grep` working, and gzipping cold
+files later
+needs no change to this contract, because compression is a property of storage rather than
+of the record format.
+
+### 5.3 Naming
+
+**`<prefix>-<yymmdd>-<hhmmss>[-<id>].md`**, with `<same stem>.logdata.jsonl` and
+`<same stem>.spandata.jsonl` (§5.2).
+
+```
+checkout-hang-260731-021530.md
+checkout-hang-260731-021530.logdata.jsonl
+checkout-hang-260731-021530.spandata.jsonl
+```
+
+The three share a stem, so the collision rule below covers the set: an `<id>` that
+disambiguates the document disambiguates its logdata with it.
 
 **The timestamp is in the name deliberately, and it is the one axis that earns a place
 there.** §4.1 argues against encoding a query axis in the layout — but that argument is
@@ -639,7 +722,9 @@ registry.
 
 1. ~~Per-key volatility hint~~ — **decided**: an optional `ttl` ships in v1 (§3.2), so a
    document can judge `/Action` without the reader knowing which duration to ask about.
-2. ~~Sidecar format~~ — **decided**: JSONL (§5.2). The bulk is the machine-read half.
+2. ~~Bulk-evidence format~~ — **decided** (§5.2): two JSONL files, `.logdata.jsonl` and
+   `.spandata.jsonl`, uncompressed. The bulk is the machine-read half, logs and spans have
+   different consumers, and compression would put a codec between the archive and `grep`.
 3. ~~Whether `/logmon/first_seen` suffices for the reused-domain-name case~~ — **closed**:
    it cannot (monotone), so §3.5 counts incarnations instead.
 
