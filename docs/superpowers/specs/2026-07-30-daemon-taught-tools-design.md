@@ -30,15 +30,17 @@ Two guards, then, not one. **Record a withdrawal in the artifact it withdraws.**
 And, for the reader: *a spec whose status reads "pending" is a claim like any
 other* — check the retro log and `git log --` the file before believing it.
 
-**Status of the redesign:** **§10 (revision 3) is the current draft and has NOT been
-gated.** It supersedes §9.2, §9.7 and §9.11 Q3–Q4; the rest of §9 stands. Revision 1 was
-gated by four lenses on `dfa37a5` (~40 findings); §9.9 records what revision 2 changed and
-§10's header records what revision 3 changes. **"Current" is not "approved to build"** —
-this is T2 work and T2 does not proceed before a gate. §9.8 lists which subsections of
-§§0–8 are dead, so a reader never has to derive that by subtraction.
+**→ §11 IS THE PLAN. Start there.** Everything above it is how it was arrived at.
 
-**Read in this order:** §10 for the shape, §9.3–§9.6 for what it inherits, §9.8 for what
-is dead, §§0–8 only for reasoning.
+§10 (revision 3) was gated by four lenses on `7a61856`. **§10.2 — generating the CLI — did
+not survive** and is dead (§11.5). The rest of §10 stands, and §11 sequences it behind a
+Phase 0 that may make the whole thing unnecessary — which is the point of putting Phase 0
+first.
+
+**Read in this order:** §11 for the plan, §10.1/§10.3 for the manifest shape it uses,
+§9.3–§9.6 for what that inherits, §9.8 for what is dead in §§0–8, and §§0–8 only for
+reasoning. **"Current" is still not "approved to build"** — §11 has been through an
+architect/reviewer pass (§11.6) but not a gate.
 
 **Tier:** T2 — mints a wire contract (the descriptor manifest) that outlives the code.
 
@@ -738,7 +740,15 @@ unregistered, because a rename is a removal plus an addition and unregistering m
 old name vanish before the agent learns the new one. A tool only in the fetch is registered
 dynamically. Both directions are the skew note's content.
 
-## 10.2 The CLI, now that its syntax may change
+## 10.2 The CLI, now that its syntax may change — **DEAD (gated 2026-08-01)**
+
+> **This section did not survive its gate. Do not build from it.** Two reasons, both
+> measured, both in §11.5: the derivation table reads schema features this project's schema
+> does not have (`enum` on a request param — **0**; `"default": true` — **0**;
+> `dependentRequired` — **0**; `"type":"boolean"` matches **2 of 16** booleans), and it
+> would make a broker upgrade able to change how the CLI parses argv. Kept because the
+> reasoning about *why* reproducing a hand-written surface is the wrong question is still
+> right — it is the answer that was wrong.
 
 §9.11 Q4 asked whether the CLI can be generated, and answered *"probably not"* — because
 JSON Schema cannot express `collectors diff a b`, `--merge` as a presence flag,
@@ -859,3 +869,130 @@ disagreed in 30 of 45 pairs **for months**, undetected, because nothing compared
    they can be staged — but staging them means shipping a generated CLI that deliberately
    reproduces the old surface for a release, which is the "reproduce a hand-written surface"
    trap this section exists to escape.
+
+---
+
+# 11. The plan — 2026-08-01
+
+**Status:** the live plan. §§0–8 withdrawn, §9 partly live (§9.3–§9.6), §10 live except
+**§10.2, which is dead** — see §11.5.
+
+Written architect-then-reviewer to convergence before anyone read it; §11.6 records what
+that pass changed, because a plan that claims a method should show its work.
+
+## 11.1 What is actually broken, measured
+
+Not "a stale shim cannot reach new tools" (§0). That is the smaller half and it is already
+*visible* — 0.9.0's skew note reports it. The larger half is live, silent, and costing
+something today:
+
+| | Measured at `7a61856` |
+|---|---|
+| Tool descriptions with no home in the protocol crate | **45** — all in `#[rmcp::tool(description=…)]` attributes in the shim |
+| Request parameters whose legal values live in **prose** rather than in the schema | **8** (`level` ×2, `group_by` ×3, `format`, `threshold.metric`, `threshold.op`) |
+| Tools in `mcp_tools::TOOLS` with **no schema at all** | **1** — `rename_session`; `SessionRename` occurs **0** times in `protocol-v1.schema.json` because `xtask`'s type list is hand-maintained |
+| Parameters the daemon honours that the shim cannot send | **8**, across 7 methods |
+| Statements in `skill/logmon.md` that are **false** because of the above | **4** |
+
+The last row is the one that matters. `crates/mcp/src/server.rs` has **no
+`deny_unknown_fields`** on any params struct, so an agent following the skill sends
+`oneshot`, serde drops it, and the call returns **success**. A permanent trigger, reported
+as the one-shot the agent asked for.
+
+**None of that needs a manifest to fix**, which is why §11.2 comes first and can ship alone.
+
+## 11.2 Phase 0 — stop the bleeding (no design required)
+
+1. **Parameter typing** — absent vs present-but-wrong-typed, ~35 sites. *Landed.*
+2. **`deny_unknown_fields`** on the shim's param structs, so a parameter the shim cannot
+   send is an error rather than a silent drop.
+3. **A drift test** between the shim's `*Params` and the protocol crate's request types.
+   This is the guard whose absence let 8 parameters diverge unnoticed; it is ~40 lines.
+4. **Add the 8 parameters**, and correct the 4 skill statements.
+
+**Exit:** the skill is true, and drift cannot recur silently. **This may be the whole
+project** — afterwards the residual problem is only that a *new* daemon tool needs a shim
+rebuild, which 0.9.0 already makes visible. Decide whether to continue *after* this, with
+the motivation measured rather than assumed.
+
+## 11.3 Phase A — make the schema sufficient
+
+Only if Phase 0's residue justifies continuing.
+
+- **The 8 prose-enums become Rust enums.** Wire-compatible, and verified rather than
+  assumed: `Level` already does exactly this and schemars emits
+  `"type":"string","enum":["Trace",…]`. Serde's output is unchanged, so no client sees a
+  difference.
+- **The 45 tool descriptions are authored in the protocol crate.** They are §0's "product",
+  and today they live where a daemon cannot reach them.
+- **`xtask`'s hand-maintained type list is replaced or completed**, so a tool cannot have no
+  schema. `verify-schema` cannot catch this today: it compares the schema against the list
+  it was given, so an omission is invisible from both sides.
+
+**Exit, and it is a query rather than a judgement:** zero request parameters with
+prose-only alternatives; every tool in `TOOLS` resolves to a schema.
+
+**Worth alone:** enum validation for the SDK and every schema consumer, and the
+`rename_session` hole closed. Ships without anything below it.
+
+## 11.4 Phase B — one generator, two callers, no behaviour change
+
+`protocol::manifest()` builds descriptors from schemas + `TOOLS` + descriptions.
+`schema_for!` is an ordinary **runtime** call (`schemars/src/macros.rs:43-46`), so `xtask`
+serialises it to a committed file and the daemon calls the same function. The shim fetches
+it and **asserts it matches the tools it already has**.
+
+**Phase B does not end when the assertion exists. It ends when the assertion is clean** —
+which means Phase 0's drift is resolved, not merely detected. An earlier draft of this plan
+had Phase C building on the compiled-in tools as a fallback while they still disagreed with
+the manifest by 8 parameters; the fallback would have been known-inconsistent from the
+first commit.
+
+**What the assertion is and is not.** It compares a build-time snapshot against a runtime
+call of the same function, so it detects **version** skew at parameter resolution. It does
+**not** validate either against the daemon's actual `params.get()` reads — 33 handlers read
+raw, and the repo says so in its own words at `crates/core/tests/trigger_window_defaults.rs:34-36`.
+Phase 0 item 1 narrows that gap; nothing here closes it.
+
+## 11.5 Phase C — the shim registers from the manifest, and D is a separate decision
+
+**C.** `tool_router` becomes a shared handle so registration can happen after `serve()`,
+which takes `self` by value today. `#[tool_handler]` generates a **synchronous** `get_tool`
+alongside an async `call_tool` returning a `Send` future, so neither `std` nor `tokio`
+`RwLock` works — it is `ArcSwap` (**a new dependency**, zero occurrences in `Cargo.lock`) or
+three hand-written handler methods. Compiled-in becomes the fallback, fetched the override,
+union. The shim is then tool-independent **for MCP**. The three non-passthrough tools
+(`export_logs`, `get_status`, `document_collectors`) keep local implementations and are
+marked as such in the descriptor (§9.5).
+
+**D — generating the CLI — is dead as specified in §10.2, and is a separate decision even
+after Phase A.** Two independent reasons:
+
+1. **The derivation table read features this schema does not have.** Measured: `enum` on a
+   request parameter — **0**; `"default": true` — **0**; `dependentRequired` — **0**;
+   `"type":"boolean"` matches **2 of 16** booleans, because schemars renders `Option<bool>`
+   as `["boolean","null"]`. Phase A fixes the first; it does not fix the rest.
+2. **It makes a broker upgrade able to change how the CLI parses argv.** The CLI connects on
+   every invocation and fetched-wins, so flag names and defaults would come from the running
+   daemon. Today clap parses before the daemon is contacted at all. A CI script pinned to
+   one shim version could stop parsing because someone upgraded the broker. That is a new
+   failure mode with no precedent here, and §10 did not list it.
+
+If D is ever wanted it needs its own design, its own deprecation period, and an answer to
+(2). "The CLI syntax may change" removes the *compatibility* objection; it does not remove
+the *coupling* one.
+
+## 11.6 What the internal review changed
+
+Recorded because the method is new and its value is testable.
+
+| Architect wrote | Reviewer found | Fix |
+|---|---|---|
+| "Rust enums are wire-compatible" | Asserted, not checked | Opened the schema: `Level` emits `"enum":[…]` and serde is unchanged. **Confirmed** |
+| "~10 prose-enums" | A number with no command behind it | Queried the schema: **8** |
+| Phase C falls back to the compiled-in tools | **They still disagree by 8 parameters at that point** | Phase B ends when the assertion is *clean*, not when it exists |
+| The prose-enums are a defect | Might have been a choice — forward-compat for new levels? | The daemon already hard-errors on an unknown level, so a loose schema buys nothing. **Drift, not design** |
+| ArcSwap "or a hand-written handler" | A new dependency stated as an aside | Named as a cost in §11.5 |
+
+Two of these — the number and the Phase B/C gap — are the classes that cost the most in the
+2026-07-31 gate. Catching them at the desk is the whole point.
