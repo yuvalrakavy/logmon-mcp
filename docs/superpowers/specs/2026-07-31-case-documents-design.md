@@ -218,7 +218,59 @@ This matters beyond provenance: a re-created domain restarts seq at 0
 ranges meaning different records. **The document therefore records the incarnation beside
 the seq range**, or its window identifier is ambiguous across eras.
 
-### 3.6 The reserved `/logmon/` namespace
+### 3.6 The recommended key set
+
+A registry whose keys are freely invented is a registry that cannot be correlated. Under
+time pressure one person writes `/version`, another `/Versions/server`, and six months on
+there is nothing to group by — which defeats the only reason the archive is global (§4.1).
+So the set is **defined here, documented in the skill (§8), and reported against (§3.6.2)**.
+
+It is a **convention, not a schema**: any path is still legal, nothing is rejected for
+being absent, and a project with a concept logmon never anticipated just adds a key.
+
+#### 3.6.1 The set
+
+**Core — a document missing these cannot be acted on.**
+
+| Key | Why it earns its place |
+|---|---|
+| `/Build/commit` | The only exact identity of the code. A version string is a label someone maintains; a SHA is what actually ran. |
+| `/Build/profile` | `debug` or `release`. Load-bearing *for logmon specifically*: it is a timing instrument, and the two profiles differ by an order of magnitude. A case comparing durations across profiles is not a comparison. |
+| `/Action` | What was being done, in prose — "full test suite", "checkout smoke, 20 iterations". Without it a reader has logs and no scenario. |
+
+**Contextual — record when they apply; each answers a question a reader will ask.**
+
+| Key | Answers |
+|---|---|
+| `/Versions/<component>` | "which release of *which part*" — plural because a system has several, and the failing one is rarely the one you upgraded |
+| `/Build/branch` | "was this even mainline" |
+| `/Env/host` | "only on CI?" — the first question about anything intermittent |
+| `/Env/os` | platform-specific behaviour |
+| `/Env/container` | image tag, when the runtime is not the host |
+| `/Data/dataset` | which fixture or corpus |
+| `/Data/seed` | **the highest-value key for the flaky-test case** (§0's motivating use): a recorded seed turns "fails 1 in 20" into a reproduction |
+
+Rules: `<component>` and other leaf names are project-chosen and should be stable across
+documents. Anything outside these namespaces is free for project-specific use;
+`/logmon/` is reserved (§3.7).
+
+#### 3.6.2 Coverage is reported, never enforced
+
+A recommended set that only exists in documentation is the failure this project keeps
+paying for — a capability nobody reaches for. So the document's evidence section reports
+coverage:
+
+> provenance: **2 of 3 core keys** — missing `/Build/commit`; 4 contextual keys present
+
+That makes the convention self-enforcing at the moment it matters, without rejecting a
+single legitimate key. It is the same rule as the rest of §4: absence stated as plainly as
+staleness, because a reader cannot tell "not recorded" from "not applicable" unless the
+document says which.
+
+`update` never rejects a non-recommended key, and never warns. Coverage is a property of
+the *document*, not of the registry.
+
+### 3.7 The reserved `/logmon/` namespace
 
 `/logmon/...` is written only by logmon; `update` and `remove` both reject agent access.
 These keys are **stored**, not computed at document time, so `get_domain_data` can show
@@ -408,16 +460,37 @@ caller's read position. There is precedent for refusing them at `rpc_handler.rs:
 
 Nine tools were proposed; v1 adds **four**. The Store report's finding was that
 documentation, not capability, was the binding constraint, and this project has since paid
-for that twice — so `skill/logmon.md` gains, in the same change, not afterwards:
+for that twice — so `skill/logmon.md` changes **in the same commit as the code**, not
+after. Specifically:
 
-- a worked `domain_data` example with a **recommended key set** (`/Versions/*`, `/Action`,
-  `/Env/*`), because the whole value is cross-document correlation and two spellings of
-  one concept destroy it;
-- when to reach for `create_case`, in the "reach for X when…" form the `profile_traces`
-  fix used, not a comparison table alone;
-- how to read the evidence verdict.
+**1. The key set from §3.6, as a table an agent can act on**, with the core three called
+out and the seed key argued rather than listed — `/Data/seed` is what turns "fails 1 in 20"
+into a reproduction, and it is the key most likely to be skipped because recording it feels
+like bookkeeping at the moment it costs nothing and pays later.
 
-A capability nobody reaches for is the failure this project keeps repeating.
+**2. When to set them.** The set is worthless if it is populated once and rots (§4.1), so
+the skill names the two moments rather than leaving it to judgement:
+
+- **At session start**, one `update_domain_data` restating everything currently believed —
+  versions read from a lockfile, the commit from `git rev-parse`, the profile. The
+  per-entry outcomes make this cheap and informative: what came back `created` is news,
+  `validated` is confirmation, and `unknown` means the registry was lost under you (§3.3).
+- **When the answer changes** — a deploy, a branch switch, a different scenario. `/Action`
+  in particular is stale within minutes of switching tasks, and a stale `/Action` is worse
+  than an absent one because it reads as fact.
+
+**3. When to reach for `create_case`**, in the bold "reach for X when…" form the
+`profile_traces` fix used — a comparison table alone is what left `profile_traces` unused
+in the one production trial we have.
+
+**4. How to read the evidence verdict**, including that `filtered` and `partial` are not
+warnings to skim past: they say the window is not what it appears to be, and a conclusion
+drawn from "nothing appeared before the error" is unsound under either.
+
+A capability nobody reaches for is the failure this project keeps repeating — and the
+recommended key set is the part most likely to repeat it, because a convention is exactly
+the kind of thing that lives only in prose. §3.6.2's coverage line is the mechanism that
+stops that; the skill is what makes the first document have anything to report.
 
 ---
 
