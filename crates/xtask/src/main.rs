@@ -125,6 +125,17 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "DomainsUse":            schema_for!(DomainsUse),
             "DomainsClear":          schema_for!(DomainsClear),
             "DomainsClearResult":    schema_for!(DomainsClearResult),
+            // domain_data.* — the provenance registry
+            "DomainDataEntry":         schema_for!(DomainDataEntry),
+            "DomainDataUpdate":        schema_for!(DomainDataUpdate),
+            "DomainDataOutcome":       schema_for!(DomainDataOutcome),
+            "DomainDataUpdateResult":  schema_for!(DomainDataUpdateResult),
+            "DomainDataRemove":        schema_for!(DomainDataRemove),
+            "DomainDataRemoveOutcome": schema_for!(DomainDataRemoveOutcome),
+            "DomainDataRemoveResult":  schema_for!(DomainDataRemoveResult),
+            "DomainDataGet":           schema_for!(DomainDataGet),
+            "DomainDataKey":           schema_for!(DomainDataKey),
+            "DomainDataGetResult":     schema_for!(DomainDataGetResult),
             // Notification payloads
             "TriggerFiredPayload":   schema_for!(TriggerFiredPayload),
             // Shared types

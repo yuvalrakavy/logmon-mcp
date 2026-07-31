@@ -20,6 +20,7 @@ Reach for it when any of these are true:
 - You're about to insert `println!` / `console.log` / `print` to understand control flow — query logmon first.
 - **The user wants to know whether a change made things faster** — "did the cache help," "is this slower than before," "where is the time going." Arm a collector *before* the run, not after. See [Time profiling](#time-profiling).
 - You're about to time something by hand — wrapping a block in `Instant::now()`, or eyeballing durations across a few traces. A collector aggregates over the whole run instead.
+- **You are starting a session on a project with a live telemetry pipeline** — record the provenance once, before you need it. It costs one call, and every log you look at afterwards carries the context that makes it evidence. See [Provenance](#provenance-domain_data).
 
 ## When NOT to reach for logmon
 
@@ -46,6 +47,8 @@ Skip it (and say so) when:
 | Profile what already ran | `profile_traces(filter=…, group_by="name")` |
 | Stream "what's new since I last checked" | `c>=name` filter (cursor — see below) |
 | Get notified when X happens later | `add_trigger(filter=…, pre_window=…, post_window=…)` |
+| Record what this run was built from | `update_domain_data([{path:"/Build/commit", value:…}, …])` |
+| Check whether the provenance has gone stale | `get_domain_data(validated_before_secs=…)` |
 | See the daemon's health | `get_status` |
 
 ## Quick commands (Claude Code slash-command UX)
@@ -293,6 +296,87 @@ Domains are isolated broker instances — each has its own log/span buffers, rec
 - **`delete_domain(name)`** — delete a domain and tear down its receivers (refuses `default`).
 
 The MCP shim can bind a domain **at connect** via the `LOGMON_DOMAIN` env var (or `--domain`), re-applied on every reconnect **when paired with a named `--session`** — set both once per worktree/project so every session auto-scopes to its track, durably. (An anonymous session can't resume a restart: it fails loud, never a silent revert to `default`; a missing domain is a loud error.) In CLI mode there is no `use` verb — pass `--domain NAME` (or `LOGMON_DOMAIN`) to scope one invocation (e.g. `logmon-mcp --domain t3 logs recent`); it resets to `default` when both are absent. Durable domains can be declared in `config.json`. **Lifecycle:** an ephemeral domain lives until you `delete_domain` it or the broker restarts — there is no idle auto-reaping (so a stopped stack's logs stay queryable), and re-creating with the same name + ports is an idempotent no-op.
+
+### Provenance (`domain_data`)
+
+A small key/value registry per domain, recording what was true of the project while the
+logs were being produced. **Logs without provenance are a log dump; logs with it are
+evidence.** Six months on, "the checkout worker stalled" is worth nothing without "under
+which commit, in which build, doing what".
+
+- **`update_domain_data(entries)`** — `entries` is a list of `{path, value?, ttl?}`.
+  **Value present** → set it. **Value absent** → *validate*: confirm what is already there
+  without changing it. Never creates from a key alone.
+- **`get_domain_data(prefix?, validated_before_secs?)`** — read it back, each key with its
+  age and any expiry verdict. `validated_before_secs` is the "what has gone stale" query.
+- **`remove_domain_data(patterns)`** — prefix patterns, matched on segment boundaries
+  (`/Versions` removes `/Versions/*`; `/Ver` removes nothing). **There is no undo.**
+
+#### The keys to record
+
+**Core — record these three, always.** A case document missing them cannot be acted on.
+
+| Key | What it is |
+|---|---|
+| `/Build/commit` | `git rev-parse HEAD`. The only exact identity of the code — a version string is a label someone maintains, a SHA is what actually ran |
+| `/Build/profile` | `debug` or `release`. logmon is a timing instrument and the two differ by an order of magnitude, so comparing durations across profiles is not a comparison |
+| `/Action` | what you are doing, in prose: `"full test suite"`, `"checkout smoke, 20 iterations"`. Without it a reader has logs and no scenario |
+
+**Contextual — record when they apply.**
+
+| Key | Answers |
+|---|---|
+| `/Versions/<component>` | "which release of *which part*" — plural, because the failing one is rarely the one you upgraded |
+| `/Build/branch` | "was this even mainline" |
+| `/Env/host`, `/Env/os`, `/Env/container` | "only on CI?" — the first question about anything intermittent |
+| `/Data/dataset`, `/Data/seed` | **`/Data/seed` is the highest-value key you can record.** It turns "fails 1 in 20" into a reproduction, and it is the one most often skipped because writing it down feels like bookkeeping at the moment it costs nothing |
+| `/case-name` | the filename prefix for this project's case documents — a slug (`checkout`, `ht-server`), not prose |
+
+`/logmon/*` is logmon's own and is rejected if you write to it. Anything outside these
+namespaces is yours.
+
+#### When to record
+
+**At session start**, one call with **what you actually re-read** — the commit from
+`git rev-parse`, versions from the lockfile, the profile from the build you just ran.
+Anything you did *not* re-derive, send **key-only** to validate rather than restating its
+value: a `ttl` runs from the last confirmation, so restating a value you only assumed buys
+it a freshness it has not earned.
+
+```
+update_domain_data(entries: [
+  {path: "/Build/commit",  value: "<git rev-parse HEAD>"},
+  {path: "/Build/profile", value: "release"},
+  {path: "/Action",        value: "checkout smoke, 20 iterations", ttl: "30m"},
+  {path: "/Env/host"},                        # key-only: confirm, do not restate
+])
+```
+
+**When the answer changes** — a deploy, a branch switch, a different scenario. `/Action`
+in particular is stale within minutes of switching tasks, and **a stale `/Action` is worse
+than an absent one, because it reads as fact.**
+
+**Create a domain per project.** Everything that does not is sharing one registry with
+every other project on this machine.
+
+#### Reading the outcomes
+
+One per entry, in the order you sent them. `created` is news. `updated` means the value
+changed — worth noticing if you did not expect it to. `validated` is confirmation.
+`rejected` carries a `reason`. `unknown` means a key-only entry found nothing, with a
+`cause`: `never_set` (the registry is there, that key is not) or `undetermined` (no
+registry at all, and nothing establishes why — which may mean it was lost). If you see
+`undetermined` where you expected a populated registry, check `/logmon/first_seen` and
+`/logmon/incarnation` before re-setting everything: re-setting resets each key's
+`created_at`, which turns months-old confirmed facts into fresh-looking ones.
+
+#### `ttl` — how long a value stays believable
+
+Optional, per key, as `30s` / `5m` / `2h` / `7d` / `4w`. `ttl: false` clears one.
+
+Set it where you know the answer rots on a clock: `/Action` in minutes, `/Versions/*` in
+days. **Leave it off and the reader gets an age and no verdict** — which is correct and
+deliberate: without a stated lifetime, logmon will not tell anyone a value is current.
 
 ## Filter DSL
 

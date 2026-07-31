@@ -3,6 +3,49 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## Unreleased
+
+### Added
+
+- **`domain_data` — a per-domain provenance registry.** A small key/value store
+  recording what was true of the project while the logs were produced. Logs
+  without it are a dump; logs with it are evidence, and six months on that is the
+  whole difference. Three tools: `update_domain_data`, `get_domain_data`,
+  `remove_domain_data`.
+
+  **Two timestamps per key, not one.** `created_at` is when *this value* came
+  into force; `validated_at` is when someone last confirmed it. A single
+  "modified" stamp conflates two different questions — set six days ago and never
+  revisited is a guess, the same value confirmed five minutes ago is evidence —
+  and only the pair can tell them apart. So sending a value that has not changed
+  reports `validated`, not `updated`, and moves only the confirmation.
+
+  **Sending a key with no value confirms it rather than creating it.** Inventing
+  a valueless key is the helpful guess that becomes wrong data, so a key-only
+  entry against a missing key reports `unknown` with a cause: `never_set` when
+  the registry is there and the key is not, `undetermined` when there is no
+  registry and nothing establishes why. The third case exists because those two
+  really are indistinguishable from the registry alone, and claiming the first
+  for both would be a guess dressed as a fact.
+
+  **An optional `ttl` per key** (`30s`, `5m`, `2h`, `7d`, `4w`; `false` clears
+  it), measured from the last confirmation. Without one, a key reports its age
+  and **no verdict** — deliberately. logmon will not tell anyone a value is
+  current on the strength of a duration nobody stated.
+
+  **`/logmon/*` is logmon's own** — the domain, the broker version, when the
+  registry was first seen, and which era of a reused domain name this is. Agents
+  cannot write there, and cannot remove it either: the reservation is over path
+  *segments*, so the bare `/logmon` is refused as firmly as `/logmon/version`,
+  in both directions. A `remove` pattern that would take the subtree with it is
+  refused for the same reason, because `remove` has no undo.
+
+  **Its own file per domain, in its own subdirectory**, written whole and
+  atomically. The subdirectory is not cosmetic: `config` and `state` are legal
+  domain names, and the daemon's own `state.json` parses any JSON object
+  successfully — a flat layout could silently cost every named session, trigger,
+  filter and bookmark on the next boot.
+
 ## 0.9.0 — 2026-07-31
 
 Makes capability skew visible. On 2026-07-30 a project filed a report proposing

@@ -10,12 +10,28 @@
 //! cause rather than a shrug, and expiry that never mutates what it reports on.
 
 pub mod entry;
+pub mod map;
 pub mod path;
 pub mod persist;
 pub mod store;
 
 pub use entry::{parse_duration, render_duration, Entry, TtlParseError, TtlSpec};
+pub use map::DomainDataStore;
 pub use path::{Key, KeyError, MAX_KEYS, MAX_PATH_BYTES, MAX_SIGIL_KEYS, MAX_VALUE_BYTES};
 pub use store::{
-    DataEntry, DataOutcome, Outcome, RegistryError, RejectReason, RemoveOutcome, UnknownCause,
+    partition_scoped, DataEntry, DataOutcome, Outcome, Registry, RegistryError, RejectReason,
+    RemoveOutcome, ScopedData, ScopedFact, UnknownCause,
 };
+
+/// The recommended core keys (§3.6.1) — the set a document missing which
+/// cannot be acted on.
+///
+/// Reported against, never enforced: `update` accepts any path and warns about
+/// none. Coverage is a property of the *document*, not of the registry, and it
+/// exists because a convention that lives only in prose is a capability nobody
+/// reaches for.
+pub const CORE_KEYS: [&str; 3] = ["/Build/commit", "/Build/profile", "/Action"];
+
+/// The registry key holding this project's case-document filename prefix
+/// (§5.3). The one key logmon *reads* rather than only renders.
+pub const CASE_NAME_KEY: &str = "/case-name";

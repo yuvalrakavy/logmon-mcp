@@ -241,6 +241,38 @@ struct UseDomainParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct UpdateDomainDataParams {
+    /// Entries to record. Each is `{path, value?, ttl?}`.
+    ///
+    /// **Value present** → set it. **Value absent** → *validate*: confirm what
+    /// is already there, moving only its confirmation time. A key-only entry
+    /// never creates — recording a key with no value would be a guess.
+    ///
+    /// `ttl` is `30s` / `5m` / `2h` / `7d` / `4w`, or `false` to clear one.
+    /// Absent leaves any existing lifetime alone, exactly as an absent value
+    /// does, so restating a value cannot silently drop its lifetime.
+    entries: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GetDomainDataParams {
+    /// Narrow to a subtree, matched on segment boundaries: `/Versions` returns
+    /// `/Versions/*`, `/Ver` returns nothing.
+    #[serde(default)]
+    prefix: Option<String>,
+    /// Return only keys last confirmed longer ago than this — the "what has
+    /// gone stale" query.
+    #[serde(default)]
+    validated_before_secs: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RemoveDomainDataParams {
+    /// Prefix patterns, matched on segment boundaries. **There is no undo.**
+    patterns: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct AddCollectorParams {
     /// Collector name. Letters, digits, '_' and '-' only.
     name: String,
@@ -1392,6 +1424,70 @@ impl GelfMcpServer {
         let result = self
             .broker
             .call("domains.clear", serde_json::json!({}))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Record provenance for the bound domain — what was true of the project while these logs were produced. Logs without it are a dump; logs with it are evidence. Core keys: /Build/commit, /Build/profile, /Action. Also /Versions/<component>, /Env/host, /Data/seed (the one that turns \"fails 1 in 20\" into a reproduction). Send a value to set it, or a key alone to confirm what is already there. Returns one outcome per entry: created, updated, validated, unknown, or rejected."
+    )]
+    async fn update_domain_data(
+        &self,
+        Parameters(p): Parameters<UpdateDomainDataParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "domain_data.update",
+                serde_json::json!({ "entries": p.entries }),
+            )
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Read the bound domain's provenance registry. Each key carries its value, when that value came into force, when it was last confirmed, and its age. A key with a stated lifetime also carries an expiry verdict; a key without one carries an age and NO verdict, deliberately — absent means unknown, not fresh. Also reports which recommended core keys are missing."
+    )]
+    async fn get_domain_data(
+        &self,
+        Parameters(p): Parameters<GetDomainDataParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let mut params = serde_json::Map::new();
+        if let Some(prefix) = p.prefix {
+            params.insert("prefix".into(), serde_json::Value::String(prefix));
+        }
+        if let Some(secs) = p.validated_before_secs {
+            params.insert("validated_before_secs".into(), secs.into());
+        }
+        let result = self
+            .broker
+            .call("domain_data.get", serde_json::Value::Object(params))
+            .await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string_pretty(&result).unwrap(),
+        )]))
+    }
+
+    #[rmcp::tool(
+        description = "Remove provenance keys by prefix, matched on segment boundaries (/Versions removes /Versions/*; /Ver removes nothing). Reports a count per pattern. THERE IS NO UNDO — and note that removing a key and setting it again resets when its value came into force, which turns a months-old confirmed fact into a fresh-looking one. To drop only a lifetime, send ttl: false to update_domain_data instead."
+    )]
+    async fn remove_domain_data(
+        &self,
+        Parameters(p): Parameters<RemoveDomainDataParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let result = self
+            .broker
+            .call(
+                "domain_data.remove",
+                serde_json::json!({ "patterns": p.patterns }),
+            )
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::text(

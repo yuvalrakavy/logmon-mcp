@@ -106,6 +106,10 @@ pub struct RpcHandler {
     sessions: Arc<SessionRegistry>,
     /// Daemon-wide, domain-keyed collector registry (spec section 4.4).
     collectors: Arc<CollectorRegistry>,
+    /// The per-domain provenance registry (case-documents spec §3). Optional so
+    /// a test harness can build a handler without a config dir; when absent the
+    /// `domain_data.*` methods say so rather than pretending an empty registry.
+    domain_data: Option<Arc<crate::domain_data::DomainDataStore>>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
     domain_policy: DomainPolicy,
@@ -133,11 +137,22 @@ impl RpcHandler {
             domains,
             sessions,
             collectors,
+            domain_data: None,
             start_time: std::time::Instant::now(),
             receivers_info,
             domain_policy,
             create_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Attach the provenance registry.
+    ///
+    /// Builder-style rather than a fifth constructor argument, so the four
+    /// existing `RpcHandler::new` call sites — three of them tests — do not all
+    /// have to learn about a config directory to keep compiling.
+    pub fn with_domain_data(mut self, store: Arc<crate::domain_data::DomainDataStore>) -> Self {
+        self.domain_data = Some(store);
+        self
     }
 
     /// Resolve the [`Domain`] the session is currently bound to, cloning its
@@ -183,6 +198,9 @@ impl RpcHandler {
             "domains.use" => self.handle_domains_use(session_id, &request.params),
             "session.rename" => self.handle_session_rename(session_id, &request.params),
             "domains.clear" => self.handle_domains_clear(session_id),
+            "domain_data.update" => self.handle_domain_data_update(session_id, &request.params),
+            "domain_data.remove" => self.handle_domain_data_remove(session_id, &request.params),
+            "domain_data.get" => self.handle_domain_data_get(session_id, &request.params),
             "traces.recent" => self.handle_traces_recent(session_id, &request.params),
             "traces.get" => self.handle_traces_get(session_id, &request.params),
             "traces.summary" => self.handle_traces_summary(session_id, &request.params),
@@ -533,6 +551,143 @@ impl RpcHandler {
         serde_json::to_value(logmon_broker_protocol::DomainsUseResult {
             domain: domain_to_info(&new_domain, self.domain_policy.stale_after_secs),
             rebind_warning,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    // -----------------------------------------------------------------------
+    // domain_data.* — the provenance registry (case-documents spec §3)
+    // -----------------------------------------------------------------------
+
+    /// Resolve the calling session's registry.
+    ///
+    /// Keyed on the session's **bound domain**, so provenance follows the
+    /// domain rather than the connection — which is what makes it survive a
+    /// disconnect and be readable by whoever captures the case later.
+    fn resolve_domain_data(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(String, Arc<crate::domain_data::persist::DomainRegistry>), String> {
+        let store = self
+            .domain_data
+            .as_ref()
+            .ok_or("domain_data is not available on this broker")?;
+        // Resolve through the domain registry first, so a session bound to a
+        // deleted domain gets the same vanished-domain error every other query
+        // gives rather than silently opening a registry for a domain that is
+        // gone.
+        let d = self.resolve_domain(session_id)?;
+        let name = d.config.name.to_string();
+        let reg = store.for_domain(&name);
+        Ok((name, reg))
+    }
+
+    fn handle_domain_data_update(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let (_, reg) = self.resolve_domain_data(session_id)?;
+        let (indexed, rejected) = parse_data_entries(params.get("entries"))?;
+        let (indices, entries): (Vec<usize>, Vec<_>) = indexed.into_iter().unzip();
+        let now = chrono::Utc::now();
+        let (applied, saved) = reg.mutate(|r| r.update(&entries, now));
+
+        // Malformed `value`/`ttl` were rejected before the registry saw them.
+        // Splice them back **by index** so the caller gets one outcome per entry
+        // sent, in the order sent — a caller matching results to inputs
+        // positionally must not have to reconcile two lists.
+        let outcomes = merge_outcomes(applied, indices, rejected);
+
+        serde_json::to_value(DomainDataUpdateResult {
+            outcomes: outcomes.iter().map(wire_outcome).collect(),
+            persist_error: saved.err(),
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn handle_domain_data_remove(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let (_, reg) = self.resolve_domain_data(session_id)?;
+        let patterns: Vec<String> = params
+            .get("patterns")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if patterns.is_empty() {
+            return Err("patterns is required and must be a non-empty array".into());
+        }
+        let (outcomes, saved) = reg.mutate(|r| r.remove(&patterns));
+        serde_json::to_value(DomainDataRemoveResult {
+            outcomes: outcomes
+                .into_iter()
+                .map(|o| DomainDataRemoveOutcome {
+                    pattern: o.pattern,
+                    removed: o.removed,
+                    reason: o.rejected.map(|r| r.as_str().to_string()),
+                })
+                .collect(),
+            persist_error: saved.err(),
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    fn handle_domain_data_get(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let store = self
+            .domain_data
+            .as_ref()
+            .ok_or("domain_data is not available on this broker")?;
+        let d = self.resolve_domain(session_id)?;
+        let name = d.config.name.to_string();
+        let prefix = params
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let now = chrono::Utc::now();
+        let cutoff = params
+            .get("validated_before_secs")
+            .and_then(|v| v.as_u64())
+            .map(|s| now - chrono::Duration::seconds(s as i64));
+
+        let reg = store.for_domain(&name);
+        let (keys, total, missing_core) = reg.read(|r| {
+            let keys: Vec<DomainDataKey> = r
+                .query(prefix.as_deref(), cutoff)
+                .into_iter()
+                .map(|(path, e)| DomainDataKey {
+                    path: path.clone(),
+                    value: e.value.clone(),
+                    created_at: e.created_at.to_rfc3339(),
+                    validated_at: e.validated_at.to_rfc3339(),
+                    age_secs: e.age(now).num_seconds(),
+                    ttl: e.ttl_secs.map(crate::domain_data::render_duration),
+                    expired: e.is_expired(now),
+                })
+                .collect();
+            let missing: Vec<String> = crate::domain_data::CORE_KEYS
+                .iter()
+                .filter(|k| r.get(k).is_none())
+                .map(|k| k.to_string())
+                .collect();
+            (keys, r.entries().len(), missing)
+        });
+
+        serde_json::to_value(DomainDataGetResult {
+            domain: name,
+            keys,
+            total,
+            missing_core,
         })
         .map_err(|e| e.to_string())
     }
@@ -2629,4 +2784,107 @@ fn quantile_ms(sorted: &[f64], q: f64) -> f64 {
     crate::collector::project::quantile_index(sorted.len(), q)
         .map(|i| sorted[i])
         .unwrap_or(0.0)
+}
+
+// ---------------------------------------------------------------------------
+// domain_data.* helpers
+// ---------------------------------------------------------------------------
+
+/// Parse the `entries` array into registry entries plus any outcomes that could
+/// be decided before the registry saw them.
+///
+/// `ttl` is the only field that can fail here, and it fails *per entry* rather
+/// than failing the batch — matching §3.3's rule that one malformed entry never
+/// rejects the rest. Returning the rejections separately keeps that rule in one
+/// place instead of teaching the registry about wire types.
+type IndexedEntry = (usize, crate::domain_data::DataEntry);
+type IndexedOutcome = (usize, crate::domain_data::DataOutcome);
+
+fn parse_data_entries(
+    raw: Option<&Value>,
+) -> Result<(Vec<IndexedEntry>, Vec<IndexedOutcome>), String> {
+    let arr = raw
+        .and_then(|v| v.as_array())
+        .ok_or("entries is required and must be an array")?;
+    if arr.is_empty() {
+        return Err("entries must not be empty".into());
+    }
+    let mut entries = Vec::with_capacity(arr.len());
+    let mut rejected = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        let path = item
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("each entry needs a string \"path\"")?
+            .to_string();
+        let reject = |reason| {
+            (
+                i,
+                crate::domain_data::DataOutcome {
+                    path: path.clone(),
+                    outcome: crate::domain_data::Outcome::Rejected { reason },
+                },
+            )
+        };
+        // Absent and `null` both mean *validate*. Anything else that is not a
+        // string is REJECTED rather than read as absent: `{"value": 42}` would
+        // otherwise silently confirm the old value instead of setting the new
+        // one, and report `validated` while having done nothing the caller
+        // asked for. A wrong answer that looks like a right one is the failure
+        // this registry exists to prevent.
+        let value = match item.get("value") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => {
+                rejected.push(reject(crate::domain_data::RejectReason::MalformedValue));
+                continue;
+            }
+        };
+        let ttl = match item.get("ttl") {
+            None => None,
+            Some(v) => match crate::domain_data::store::parse_ttl(v) {
+                Ok(t) => t,
+                Err(_) => {
+                    rejected.push(reject(crate::domain_data::RejectReason::MalformedTtl));
+                    continue;
+                }
+            },
+        };
+        entries.push((i, crate::domain_data::DataEntry { path, value, ttl }));
+    }
+    Ok((entries, rejected))
+}
+
+/// Merge applied outcomes and pre-registry rejections back into the caller's
+/// order.
+///
+/// By **index**, not by path. Matching on the path looked equivalent and is not:
+/// a batch may legitimately repeat a key, and every outcome for that key would
+/// then take the position of its first occurrence — reordering the whole reply
+/// against a list the caller matches up positionally.
+fn merge_outcomes(
+    applied: Vec<crate::domain_data::DataOutcome>,
+    indices: Vec<usize>,
+    rejected: Vec<IndexedOutcome>,
+) -> Vec<crate::domain_data::DataOutcome> {
+    let mut all: Vec<IndexedOutcome> = indices.into_iter().zip(applied).collect();
+    all.extend(rejected);
+    all.sort_by_key(|(i, _)| *i);
+    all.into_iter().map(|(_, o)| o).collect()
+}
+
+fn wire_outcome(o: &crate::domain_data::DataOutcome) -> DomainDataOutcome {
+    use crate::domain_data::Outcome;
+    DomainDataOutcome {
+        path: o.path.clone(),
+        outcome: o.outcome.as_str().to_string(),
+        cause: match &o.outcome {
+            Outcome::Unknown { cause } => Some(cause.as_str().to_string()),
+            _ => None,
+        },
+        reason: match &o.outcome {
+            Outcome::Rejected { reason } => Some(reason.as_str().to_string()),
+            _ => None,
+        },
+    }
 }

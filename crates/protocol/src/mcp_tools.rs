@@ -63,6 +63,9 @@ pub const TOOLS: &[(&str, &str)] = &[
     ("use_domain", "domains.use"),
     ("rename_session", "session.rename"),
     ("clear_domain", "domains.clear"),
+    ("update_domain_data", "domain_data.update"),
+    ("get_domain_data", "domain_data.get"),
+    ("remove_domain_data", "domain_data.remove"),
 ];
 
 /// Tool names, sorted — what the daemon puts in `broker_tools`.
@@ -144,7 +147,9 @@ mod tests {
 
     #[test]
     fn every_pair_is_well_formed_and_unique() {
-        assert_eq!(TOOLS.len(), 42);
+        // Pinned so a tool cannot be added here without also being added to the
+        // shim — the source-scan test in `mcp/src/server.rs` is the other half.
+        assert_eq!(TOOLS.len(), 45);
         for (tool, method) in TOOLS {
             assert!(!tool.is_empty() && !method.is_empty());
             assert!(

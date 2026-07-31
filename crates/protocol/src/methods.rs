@@ -1865,3 +1865,141 @@ pub struct DomainsClearResult {
     /// Number of spans disposed from the bound domain.
     pub spans_cleared: usize,
 }
+
+// ---------------------------------------------------------------------------
+// domain_data.* — the per-domain provenance registry (case-documents spec §3)
+// ---------------------------------------------------------------------------
+
+/// One requested change to the registry.
+///
+/// **Absent ≡ `null` ≡ unchanged, for both `value` and `ttl`**, and the two
+/// share one rule deliberately: two optional fields on one object with opposite
+/// absent semantics is the footgun this surface exists to avoid, and a client
+/// serialising a missing field as `null` would otherwise mean the opposite of
+/// what it sent. Erasure is `domain_data.remove`, never `value: null`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataEntry {
+    /// A registry path — `/Build/commit`. A leading `@` scopes the fact to one
+    /// case document instead of the domain, and is accepted only where a
+    /// document exists to receive it.
+    pub path: String,
+    /// Present → set. Absent → validate only, which never creates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear
+    /// one in place. Absent leaves any existing lifetime untouched.
+    ///
+    /// `false` rather than `null` carries the clear because `null` is already
+    /// spoken for above. This is the opposite convention to
+    /// `CollectorsEdit.threshold`, where `null` removes — noted because the two
+    /// live in one daemon and the difference is deliberate rather than drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataUpdate {
+    pub entries: Vec<DomainDataEntry>,
+}
+
+/// What happened to one entry.
+///
+/// `outcome` is one of `created`, `updated`, `validated`, `unknown`,
+/// `rejected`. The last two carry a discriminant rather than prose, so a caller
+/// can branch instead of string-matching a sentence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataOutcome {
+    /// The key as the caller spelled it, sigil included.
+    pub path: String,
+    pub outcome: String,
+    /// `never_set` | `no_registry` | `undetermined` — present on `unknown`.
+    ///
+    /// Three, not two: `/logmon/first_seen` is written identically for a
+    /// brand-new domain and for one whose file was lost, so from the registry
+    /// alone those are not distinguishable. `undetermined` is the honest
+    /// default and `no_registry` is claimed only with a quarantine artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    /// `malformed_path` | `path_too_long` | `value_too_long` |
+    /// `reserved_prefix` | `sigil_not_allowed_here` | `malformed_ttl` |
+    /// `registry_full` — present on `rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataUpdateResult {
+    pub outcomes: Vec<DomainDataOutcome>,
+    /// Set when the change is in memory but did not reach disk. Named rather
+    /// than swallowed: the caller's provenance will not survive a restart, and
+    /// silence there is exactly the failure this registry exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataRemove {
+    /// Prefix patterns, matched on **segment boundaries** — `/Versions` matches
+    /// `/Versions/ht_server` but `/Ver` matches neither. There is no undo.
+    pub patterns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataRemoveOutcome {
+    pub pattern: String,
+    pub removed: usize,
+    /// Present when the pattern was refused — notably `reserved_prefix`, which
+    /// covers the bare `/logmon` as well as `/logmon/version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataRemoveResult {
+    pub outcomes: Vec<DomainDataRemoveOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataGet {
+    /// Narrow to a subtree, on segment boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Return only keys last confirmed before this many seconds ago — the
+    /// "what is stale" question, as a filter over `get` rather than a tool of
+    /// its own, so there are not two surfaces to keep in step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_before_secs: Option<u64>,
+}
+
+/// One key as read back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataKey {
+    pub path: String,
+    pub value: String,
+    /// When THIS VALUE came into force. Moves only when the value changes, so a
+    /// value confirmed daily for a month still reports the month.
+    pub created_at: String,
+    /// When someone last confirmed it. Invariant: `>= created_at`.
+    pub validated_at: String,
+    pub age_secs: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+    /// `true`/`false` only when a `ttl` was stated. **Absent means unknown, not
+    /// fresh** — a key without a lifetime reports its age and no verdict, ever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainDataGetResult {
+    pub domain: String,
+    pub keys: Vec<DomainDataKey>,
+    /// Total keys in the registry before `prefix`/`validated_before_secs`
+    /// narrowed it, so a filtered read cannot be mistaken for an empty one.
+    pub total: usize,
+    /// Coverage against the recommended core set, named rather than counted:
+    /// which of `/Build/commit`, `/Build/profile`, `/Action` are missing.
+    pub missing_core: Vec<String>,
+}

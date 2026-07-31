@@ -3321,6 +3321,402 @@
         "spans_cleared"
       ]
     },
+    "DomainDataEntry": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataEntry",
+      "description": "One requested change to the registry.\n\n**Absent ≡ `null` ≡ unchanged, for both `value` and `ttl`**, and the two\nshare one rule deliberately: two optional fields on one object with opposite\nabsent semantics is the footgun this surface exists to avoid, and a client\nserialising a missing field as `null` would otherwise mean the opposite of\nwhat it sent. Erasure is `domain_data.remove`, never `value: null`.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "A registry path — `/Build/commit`. A leading `@` scopes the fact to one\ncase document instead of the domain, and is accepted only where a\ndocument exists to receive it.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Present → set. Absent → validate only, which never creates.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ttl": {
+          "description": "A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear\none in place. Absent leaves any existing lifetime untouched.\n\n`false` rather than `null` carries the clear because `null` is already\nspoken for above. This is the opposite convention to\n`CollectorsEdit.threshold`, where `null` removes — noted because the two\nlive in one daemon and the difference is deliberate rather than drift."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "DomainDataUpdate": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataUpdate",
+      "type": "object",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainDataEntry"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "$defs": {
+        "DomainDataEntry": {
+          "description": "One requested change to the registry.\n\n**Absent ≡ `null` ≡ unchanged, for both `value` and `ttl`**, and the two\nshare one rule deliberately: two optional fields on one object with opposite\nabsent semantics is the footgun this surface exists to avoid, and a client\nserialising a missing field as `null` would otherwise mean the opposite of\nwhat it sent. Erasure is `domain_data.remove`, never `value: null`.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "A registry path — `/Build/commit`. A leading `@` scopes the fact to one\ncase document instead of the domain, and is accepted only where a\ndocument exists to receive it.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Present → set. Absent → validate only, which never creates.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ttl": {
+              "description": "A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear\none in place. Absent leaves any existing lifetime untouched.\n\n`false` rather than `null` carries the clear because `null` is already\nspoken for above. This is the opposite convention to\n`CollectorsEdit.threshold`, where `null` removes — noted because the two\nlive in one daemon and the difference is deliberate rather than drift."
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    "DomainDataOutcome": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataOutcome",
+      "description": "What happened to one entry.\n\n`outcome` is one of `created`, `updated`, `validated`, `unknown`,\n`rejected`. The last two carry a discriminant rather than prose, so a caller\ncan branch instead of string-matching a sentence.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "The key as the caller spelled it, sigil included.",
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "cause": {
+          "description": "`never_set` | `no_registry` | `undetermined` — present on `unknown`.\n\nThree, not two: `/logmon/first_seen` is written identically for a\nbrand-new domain and for one whose file was lost, so from the registry\nalone those are not distinguishable. `undetermined` is the honest\ndefault and `no_registry` is claimed only with a quarantine artifact.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "`malformed_path` | `path_too_long` | `value_too_long` |\n`reserved_prefix` | `sigil_not_allowed_here` | `malformed_ttl` |\n`registry_full` — present on `rejected`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "outcome"
+      ]
+    },
+    "DomainDataUpdateResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataUpdateResult",
+      "type": "object",
+      "properties": {
+        "outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainDataOutcome"
+          }
+        },
+        "persist_error": {
+          "description": "Set when the change is in memory but did not reach disk. Named rather\nthan swallowed: the caller's provenance will not survive a restart, and\nsilence there is exactly the failure this registry exists to prevent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "outcomes"
+      ],
+      "$defs": {
+        "DomainDataOutcome": {
+          "description": "What happened to one entry.\n\n`outcome` is one of `created`, `updated`, `validated`, `unknown`,\n`rejected`. The last two carry a discriminant rather than prose, so a caller\ncan branch instead of string-matching a sentence.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "The key as the caller spelled it, sigil included.",
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "cause": {
+              "description": "`never_set` | `no_registry` | `undetermined` — present on `unknown`.\n\nThree, not two: `/logmon/first_seen` is written identically for a\nbrand-new domain and for one whose file was lost, so from the registry\nalone those are not distinguishable. `undetermined` is the honest\ndefault and `no_registry` is claimed only with a quarantine artifact.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "description": "`malformed_path` | `path_too_long` | `value_too_long` |\n`reserved_prefix` | `sigil_not_allowed_here` | `malformed_ttl` |\n`registry_full` — present on `rejected`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path",
+            "outcome"
+          ]
+        }
+      }
+    },
+    "DomainDataRemove": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataRemove",
+      "type": "object",
+      "properties": {
+        "patterns": {
+          "description": "Prefix patterns, matched on **segment boundaries** — `/Versions` matches\n`/Versions/ht_server` but `/Ver` matches neither. There is no undo.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "patterns"
+      ]
+    },
+    "DomainDataRemoveOutcome": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataRemoveOutcome",
+      "type": "object",
+      "properties": {
+        "pattern": {
+          "type": "string"
+        },
+        "removed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "reason": {
+          "description": "Present when the pattern was refused — notably `reserved_prefix`, which\ncovers the bare `/logmon` as well as `/logmon/version`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pattern",
+        "removed"
+      ]
+    },
+    "DomainDataRemoveResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataRemoveResult",
+      "type": "object",
+      "properties": {
+        "outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainDataRemoveOutcome"
+          }
+        },
+        "persist_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "outcomes"
+      ],
+      "$defs": {
+        "DomainDataRemoveOutcome": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string"
+            },
+            "removed": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "reason": {
+              "description": "Present when the pattern was refused — notably `reserved_prefix`, which\ncovers the bare `/logmon` as well as `/logmon/version`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pattern",
+            "removed"
+          ]
+        }
+      }
+    },
+    "DomainDataGet": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataGet",
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "description": "Narrow to a subtree, on segment boundaries.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "validated_before_secs": {
+          "description": "Return only keys last confirmed before this many seconds ago — the\n\"what is stale\" question, as a filter over `get` rather than a tool of\nits own, so there are not two surfaces to keep in step.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "DomainDataKey": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataKey",
+      "description": "One key as read back.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        },
+        "created_at": {
+          "description": "When THIS VALUE came into force. Moves only when the value changes, so a\nvalue confirmed daily for a month still reports the month.",
+          "type": "string"
+        },
+        "validated_at": {
+          "description": "When someone last confirmed it. Invariant: `>= created_at`.",
+          "type": "string"
+        },
+        "age_secs": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "ttl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expired": {
+          "description": "`true`/`false` only when a `ttl` was stated. **Absent means unknown, not\nfresh** — a key without a lifetime reports its age and no verdict, ever.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "value",
+        "created_at",
+        "validated_at",
+        "age_secs"
+      ]
+    },
+    "DomainDataGetResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainDataGetResult",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string"
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainDataKey"
+          }
+        },
+        "total": {
+          "description": "Total keys in the registry before `prefix`/`validated_before_secs`\nnarrowed it, so a filtered read cannot be mistaken for an empty one.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "missing_core": {
+          "description": "Coverage against the recommended core set, named rather than counted:\nwhich of `/Build/commit`, `/Build/profile`, `/Action` are missing.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "domain",
+        "keys",
+        "total",
+        "missing_core"
+      ],
+      "$defs": {
+        "DomainDataKey": {
+          "description": "One key as read back.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            },
+            "created_at": {
+              "description": "When THIS VALUE came into force. Moves only when the value changes, so a\nvalue confirmed daily for a month still reports the month.",
+              "type": "string"
+            },
+            "validated_at": {
+              "description": "When someone last confirmed it. Invariant: `>= created_at`.",
+              "type": "string"
+            },
+            "age_secs": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "ttl": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expired": {
+              "description": "`true`/`false` only when a `ttl` was stated. **Absent means unknown, not\nfresh** — a key without a lifetime reports its age and no verdict, ever.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path",
+            "value",
+            "created_at",
+            "validated_at",
+            "age_secs"
+          ]
+        }
+      }
+    },
     "TriggerFiredPayload": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TriggerFiredPayload",

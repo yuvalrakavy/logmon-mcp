@@ -487,18 +487,28 @@ pub async fn run_with_overrides(
     //     registry (once, at the boundary) and runs the store code against it.
     //     The domain policy (max_domains + default buffer sizes) drives
     //     `domains.create`.
-    let handler = Arc::new(RpcHandler::new(
-        domains.clone(),
-        sessions.clone(),
-        collectors.clone(),
-        all_receivers_info,
-        DomainPolicy {
-            max_domains: config.max_domains,
-            default_log_buffer_size: config.buffer_size,
-            default_span_buffer_size: config.span_buffer_size,
-            stale_after_secs: config.stale_after_secs,
-        },
-    ));
+    let handler = Arc::new(
+        RpcHandler::new(
+            domains.clone(),
+            sessions.clone(),
+            collectors.clone(),
+            all_receivers_info,
+            DomainPolicy {
+                max_domains: config.max_domains,
+                default_log_buffer_size: config.buffer_size,
+                default_span_buffer_size: config.span_buffer_size,
+                stale_after_secs: config.stale_after_secs,
+            },
+        )
+        // 13a1. The provenance registry (case-documents spec §3). Registries open
+        //       lazily per domain on first use — the skill recommends one domain
+        //       per test run, so opening eagerly would leave a permanent file for
+        //       every run that never recorded anything.
+        .with_domain_data(Arc::new(crate::domain_data::DomainDataStore::new(
+            dir.clone(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ))),
+    );
 
     // 13a2. Restore collectors (§10). Deliberately AFTER the domain registry
     //       exists, so a restored collector can be handed the metrics of the

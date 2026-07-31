@@ -58,6 +58,10 @@ pub enum UnknownCause {
 pub enum RejectReason {
     MalformedPath,
     PathTooLong,
+    /// A `value` that was present but not a string. Rejected rather than read
+    /// as absent, because absent means *validate* — so a number would silently
+    /// confirm the old value and report success for a set that never happened.
+    MalformedValue,
     ValueTooLong,
     ReservedPrefix,
     SigilNotAllowedHere,
@@ -70,6 +74,7 @@ impl RejectReason {
         match self {
             Self::MalformedPath => "malformed_path",
             Self::PathTooLong => "path_too_long",
+            Self::MalformedValue => "malformed_value",
             Self::ValueTooLong => "value_too_long",
             Self::ReservedPrefix => "reserved_prefix",
             Self::SigilNotAllowedHere => "sigil_not_allowed_here",
