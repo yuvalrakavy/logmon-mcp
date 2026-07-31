@@ -4,26 +4,31 @@
 immediate purpose by `2026-07-30-capability-skew-visibility-design.md`, which
 shipped in 0.9.0. Kept for its reasoning, and because §9's redesign is live.
 
-**Why it was withdrawn** — two objections from the gate, recorded in `9706a23`'s
-commit message and, until 2026-07-31, *only* there:
+**Why it was withdrawn** — two objections from the gate (~35 findings), recorded
+in `9706a23`'s commit message and in `docs/process/retro-log.md`:
 
-1. **It deletes argument validation across all 42 tools.** Today the shim's tools
-   are derived from Rust types at compile time, so a bad argument fails in the
-   shim. A manifest-driven shim builds routes at runtime from JSON Schema and
-   cannot type-check anything — validation moves entirely to the daemon, one
-   round trip later.
-2. **It cannot deliver its own bootstrap explanation.** If tools come from the
-   daemon, then when the daemon is unreachable the shim has *no* tools — and no
-   tool with which to say why. §4.1 attempted an answer; the gate found it
-   insufficient.
+1. **It deletes argument validation across all 42 tools.** `ToolRoute::new_dyn`
+   takes a raw `JsonObject` and **rmcp validates nothing against `inputSchema`**,
+   so a dynamic route receives whatever the client sent. The compiled-in tools it
+   would have replaced at least get a serde type check.
+2. **It cannot deliver its own bootstrap explanation.** Concretely: `main.rs`
+   `?`-exits before `serve()`, so a failed manifest fetch kills the process before
+   the MCP server starts. §4.1's "expose zero tools plus `instructions`" cannot
+   run at all on that path.
 
 **Why this line exists.** For a day this file's status read *"draft for design
-gate. No code written"*, which any reader — including the author, on
-2026-07-31 — takes to mean *pending*. It was not pending; it was decided. The
-decision and its reasons lived in a commit message, which is not where anyone
-looks. **A withdrawal that is not recorded in the artifact is indistinguishable
-from a backlog item**, and the cost is real: it was re-proposed as new work a day
-later, and the re-proposal was accepted before anyone opened the commit.
+gate. No code written"*, which any reader takes to mean *pending*. It was not
+pending; it was decided.
+
+The honest failure is narrower than "nobody wrote it down", because two places
+did. It is that **the decision was not where the decision's own artifact was**,
+and a reader who opens the spec — as the author did on 2026-07-31 — finds a status
+line that contradicts it. The cost was real: it was re-proposed as new work, and
+the re-proposal was accepted before either record was opened.
+
+Two guards, then, not one. **Record a withdrawal in the artifact it withdraws.**
+And, for the reader: *a spec whose status reads "pending" is a claim like any
+other* — check the retro log and `git log --` the file before believing it.
 
 **Status of the redesign:** §9 (2026-07-31) answers both objections and is the
 live document. This file's §§0–8 describe the withdrawn design.
@@ -371,38 +376,94 @@ supersedes them where they conflict.
 adapter for any daemon that speaks the manifest — rather than logmon's shim with a
 daemon-taught extension bolted on.
 
-## 9.1 Why the first objection was wrong, not answered
+## 9.1 Validation belongs to the daemon, and always did
 
 The gate withdrew the original because *"it deletes argument validation across all
-42 tools."* That reads as *compile-time validation → none*. The premise is false,
-and the seam table above already recorded the fact that falsifies it:
+42 tools."* Both the objection and my own first answer to it assumed the same
+thing: that the **shim** is where validation lives. It is not, and it should not
+be.
 
-> | CLI enum validation | **Confirmed absent.** `--level tre` passes clap and fails at the daemon: `rpc error -32601: unknown level 'tre'`. Enums live as prose in help text, so clap cannot enforce them. |
+**The socket is open.** Anything can connect to `~/.config/logmon/logmon.sock` —
+the CLI, a script, a future tool, another vendor's client. Verified by probe on
+2026-07-31: a raw `nc -U` session reached `logs.recent` in two lines. So any check
+that exists only in the shim is not a check. It is a **convention that has held
+because there has so far been one careful client**, and the daemon has been
+trusting it.
 
-Verified again at `757b2e7`: the tool parameter is `level: Option<String>`
-(`mcp/src/server.rs:285`). What compile-time derivation buys today is a **type**
-check — is it a string — and nothing else. It cannot check that the string is one
-of `scalar` / `timing` / `tree`, cannot check a range, cannot check a pattern.
+That is the wrong shape independently of this design, and it means the objection's
+premise — *the shim validates today* — is only accidentally true.
 
-**A JSON Schema can check all three.** So the real comparison is:
+### What the daemon actually checks today
 
-| | Today (derived from Rust types) | Manifest (JSON Schema, validated in the shim) |
+| | Checked? | Evidence |
 |---|---|---|
-| Is it a string? | ✅ | ✅ |
-| Is it one of the three legal levels? | ❌ — reaches the daemon and fails there | ✅ |
-| Is the number in range? | ❌ | ✅ |
-| Does the pattern match? | ❌ | ✅ |
+| `level: "tre"` is not a legal level | ✅ errors | seam table above |
+| Filter DSL syntax | ✅ errors | `parse_filter` |
+| **`count: "abc"` — present but wrong type** | ❌ **silently substitutes `50`** | `rpc_handler.rs:757`, and probed live |
+| `before` / `after` wrong type | ❌ silently substitutes `10` | `rpc_handler.rs:841-842` |
 
-Runtime schema validation is **not a downgrade to be tolerated for learned tools.
-It is an upgrade, for every tool.** The objection was sound against a design that
-forwarded blind; it does not survive one that carries a validator.
+Ten sites read parameters as `params.get(k).and_then(|v| v.as_u64()).unwrap_or(d)`.
+A present-but-wrong-typed parameter is therefore **indistinguishable from an absent
+one** — the absent-vs-zero conflation this codebase refuses everywhere else,
+sitting on the wire.
 
-**This is what my own first redesign got wrong.** It kept compile-time validation
-for the 42 and gave runtime validation to learned tools — two classes of tool with
-two mechanisms, side by side, differing in a property neither needed to differ in.
-That is the exact shape a four-lens gate spent 58 findings on earlier the same day
-in `2026-07-31-case-documents-design.md`. The rule that came out of that gate
-applies here verbatim: **where one mechanism will do, two is the defect.**
+Probed against the running 0.9.0 daemon:
+
+```
+→ {"method":"logs.recent","params":{"count":"abc"}}
+← {"result":{"count":50, "buffer_total":1103}}      # no error
+```
+
+The caller asked for something the daemon could not interpret, and got fifty
+entries and no indication. Today the shim's `Params` structs mask this on the MCP
+path, which is precisely the accidental protection described above.
+
+### The rule
+
+> **The daemon validates. The shim transmits.** No check that matters may live
+> only in the shim, because the daemon does not control who is calling it.
+
+This is stronger than either the withdrawn design or my first redesign, and it is
+simpler than both:
+
+- **The shim carries no validator.** No `jsonschema` dependency, no second
+  implementation of the rules, nothing to diverge. This deletes what was open
+  question #1.
+
+  And it is the only honest option, because **rmcp validates nothing against
+  `inputSchema`** — the retro log recorded this as part of the original
+  withdrawal. A `new_dyn` route receives a raw `JsonObject`. So "the shim
+  validates" was never going to be free; it meant *the shim ships a JSON Schema
+  engine*. Stated that way, against a daemon that must validate anyway because
+  the socket is open, it is obviously the wrong place for it.
+- **The daemon validates with full knowledge of the tool**, not against a
+  published schema's approximation of it. A schema can say `"level"` is one of
+  three strings; the daemon knows whether that level is legal *for this
+  collector's shape*, whether the seq is inside the buffer, whether the domain
+  exists. Structural validation is the floor, and the daemon is the only party
+  that can go past it.
+- **The manifest's schemas describe rather than enforce.** They build the CLI's
+  flag surface and tell an MCP client what to send — both are UX. Enforcement is
+  elsewhere and is not their job.
+
+### The precondition this creates
+
+Delegating is only safe once the daemon stops silently defaulting, so **fixing
+those ten sites is a precondition of this design, not a consequence of it** — and
+is worth doing on its own, today, because the defect is live for every non-shim
+caller. The rule to apply at each: *absent takes the default; present-but-wrong
+is an error naming the parameter and what was expected.*
+
+### What is NOT lost
+
+- **CLI arg checking stays local and free.** Clap built from the schema (§5.1)
+  rejects `--count abc` at parse time as an ordinary consequence of being told the
+  type. That is clap doing its job, not the shim implementing validation.
+- **Error latency.** A round trip over a Unix socket is microseconds. The
+  round-trip objection was never quantified; it does not survive being measured.
+- **Enum, range and pattern checking.** Today's derived `Option<String>` cannot do
+  any of them (`server.rs:285`). A daemon that validates properly does all three,
+  for every client.
 
 ## 9.2 Why the second objection has a ladder, not an answer
 
@@ -415,6 +476,13 @@ tools", which is why that was rejected. But bootstrap is not one situation:
 | Daemon not running, **but startable** | **the shim already starts it** (`auto_start.rs:172` spawns the broker), then fetches | common, and already solved |
 | Daemon unreachable, manifest cached from a prior connect | register the **cached** manifest; calls fail with "daemon unreachable, start it with `<cmd>`" | rare |
 | No daemon, no cache — a truly cold first run | zero tools, plus `instructions` | once, ever, per install |
+
+**One structural precondition the retro log named and §4.1 did not:** `main.rs`
+`?`-exits before `serve()`, so today a failed manifest fetch would kill the
+process rather than degrade it. Every row of that table below the first is
+unreachable until the fetch is moved off the `?` path and its failure becomes a
+value rather than a return. That is the first thing to build, and it is why the
+original's answer could not run even in principle.
 
 The original design's rejection of a cache — *"a cached manifest advertises tools
 that will fail, and can advertise tools a newer daemon has since removed"* — is
@@ -470,31 +538,37 @@ output, never correctness, and never reachability.
 ## 9.5 What this buys, and what it costs
 
 **Buys.** Upgrading the daemon makes new capabilities reachable with no shim
-rebuild — the original goal. Enum, range and pattern validation the CLI has never
-had. A skill file that cannot go stale. And a shim reusable against any daemon
-that speaks the manifest, which is a larger thing than logmon.
+rebuild — the original goal. Enum, range and pattern checking the CLI has never
+had, **for every client rather than for ours**. A skill file that cannot go stale.
+A shim reusable against any daemon that speaks the manifest, which is a larger
+thing than logmon. And, as a precondition rather than a side effect, a daemon that
+no longer silently substitutes a default for a parameter it could not read.
 
 **Costs, stated because the gate will ask.**
 
-- **A JSON Schema validator dependency.** `jsonschema` or equivalent — real
-  weight and real supply-chain surface, and load-bearing: without it §9.1's whole
-  argument collapses back into the original objection.
 - **Clap built at runtime** (`Command::new`/`Arg::new`), not derived. §5.1 already
   worked this out; it comes back into scope here, because a tool-independent shim
   cannot have a derived CLI.
 - **`--help` needs the daemon**, or the cache. Today it does not. This is a real
   regression in the cold case and the cache is what bounds it.
-- **The error surface moves.** A malformed call fails against a schema rather than
-  against a Rust type, and the message must be at least as good. A worse error
-  message would be a genuine loss and is not automatically avoided.
+- **The error surface moves into the daemon**, and its messages must be at least as
+  good as the ones rmcp produces from a Rust type today. Naming the parameter and
+  what was expected is the floor; a worse message is a genuine loss and is not
+  avoided automatically.
+- **Ten handler sites must change before any of this is safe** (§9.1). Small, but
+  it gates the rest.
+
+What is **not** a cost, and was in both earlier versions: a JSON Schema validator
+dependency in the shim. There is no validator in the shim. There is nothing to
+diverge from the daemon, and nothing to keep in step.
 
 ## 9.6 Open questions for the gate
 
-1. **Does schema validation in the shim actually match the daemon's?** If the
-   daemon's real rules are stricter than its published schema, the shim passes
-   calls the daemon rejects, and the "validate early" claim is half true. The
-   manifest generator must derive schemas from the same types the handler parses,
-   or this is decoration.
+1. **Are the daemon's error messages good enough to be the only ones?** Today a
+   wrong type fails in rmcp against a Rust type, with a message serde wrote. After
+   this it fails in the handler, with a message we write, and the shim adds
+   nothing. That is correct and it is also a quality commitment: every one of the
+   ten sites needs a message a reader can act on, and "invalid params" is not one.
 2. **What is the cache's invalidation rule?** Keyed on daemon version? On a
    manifest hash? Never, until a successful fetch replaces it? §9.2 leans on the
    cache heavily and does not specify it.
