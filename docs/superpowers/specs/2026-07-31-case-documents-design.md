@@ -38,6 +38,8 @@ because a mechanism could not tell a reader the truth about its own completeness
 | Sidecar naming collides in a flat archive | `format!("{}.sidecar.json", safe_name(…))` (`document.rs:1690`); `safe_name` (`:1874`) collapses non-alphanumerics to `_`. §5.3 names files itself. |
 | Material-first section order | `document.rs:839,1068,1156,1349` — `1. What moved` → `2. What to do next` → detail → definitions. |
 | Recorded artifacts carry their own definition | `StoredSnapshot.def` (`collector/history.rs:84`), pinned by `a_snapshot_records_the_definition_it_was_taken_under`. |
+| **A restart keeps the definition and the history, and discards the live window** | `persist.rs:9-13`: restored *"armed but zeroed — its definition and every recorded run survive, its live window does not."* §3.7's version stamp anchors to **window start**, not to `collectors.add`, because of this row; the draft that anchored to arm time would have warned on every ordinary upgrade. |
+| Snapshot provenance is already per-snapshot | `PersistedSnapshot.meta` (`persist.rs:159`) and `CollectorsSnapshot.meta` (`protocol/src/methods.rs:1103`), whose doc comment states the reason: *"per-snapshot because two arms of a comparison differ in it."* §3.8 folds into this rather than adding a parallel store. |
 
 ### 1.1 What the first draft got wrong here, and why the table format changed
 
@@ -364,12 +366,31 @@ was available from a "last modified" stamp, and neither needed a rule of its own
 `/logmon/*` keys do **not** count against §3.1's 256-key cap, or against §3.8's 64-key
 per-list cap — otherwise logmon could lock an agent out of its own registry.
 
-**In a collector's list**, logmon contributes `/logmon/version` at both arm and snapshot.
-That is not decoration: §3.8's collision warning then detects *the daemon was upgraded
-mid-window*, which is the version-skew failure the 0.9.0 work was about, and which no
-existing mechanism can see. **Anything logmon already renders as a first-class field —
-`level`, `filter`, `wall_ms`, `matched` — is not duplicated into the list**, or the list
-becomes a second rendering of the struct beside the first, with two places to disagree.
+**In a collector's list**, logmon contributes `/logmon/version` — **per snapshot, and
+anchored to window start for the live window.** The first draft of this paragraph said "at
+both arm and snapshot" and claimed the arm-vs-snapshot collision would detect a daemon
+upgraded mid-window. That is wrong twice, and the second error is the interesting one:
+
+- A collector restores **armed but zeroed** — "its definition and every recorded run
+  survive, its live window does not" (`persist.rs:9-13`). So a definition that predates an
+  upgrade would stamp a pre-upgrade version onto a window that is entirely post-upgrade:
+  a **false** mid-window-rebuild warning, fired on the most ordinary upgrade path there is.
+- And once that is corrected to window start, the two can never differ **at all**. The
+  broker version is compiled in, so changing it needs a new process, and a new process
+  discards every live window. A warning that cannot fire is worse than no warning: it reads
+  as a check.
+
+**The real skew is cross-snapshot, and it is a likelier failure than the one the draft
+imagined.** History survives a restart, so one collector's file can hold a run recorded
+under 0.9.0 and the next under 0.10.0 — and `collectors.diff` and `collectors.document`
+will happily compare them. `PersistedSnapshot.meta` is already per-snapshot
+(`persist.rs:159`), which is exactly the right place, and the check is between two
+snapshots' `/collector/data/logmon/version` rather than between two ends of one window.
+Given this project's release cadence, that comparison is one an agent will actually hit.
+
+**Anything logmon already renders as a first-class field — `level`, `filter`, `wall_ms`,
+`matched` — is not duplicated into the list**, or the list becomes a second rendering of
+the struct beside the first, with two places to disagree.
 
 **In a case's list, logmon contributes nothing today**, and saying so is better than
 inventing a key to fill the row. The capture instant and the trigger are front-matter; the
@@ -421,17 +442,46 @@ which is the problem this section exists to remove. `collectors.add` has no `met
 (`methods.rs:905`); `collectors.snapshot` does (`:1103`, "per-snapshot because two arms of
 a comparison differ in it"). Both now feed one rendered list.
 
-**A key set at both ends with different values is a first-class warning**, and a worse one
-than any cross-arm mismatch: `/collector/data/Build/commit` = `abc` at arm and `def` at
-snapshot means the window straddled a rebuild, so the numbers are a blend of two builds.
-That is not a comparison problem, it is a corrupted single measurement — and no existing
-mechanism can see it.
+**A key set at both ends with different values is a first-class warning**:
+`/collector/data/Build/commit` = `abc` at arm and `def` at snapshot means the window
+straddled a rebuild, so the numbers are a blend of two builds. That is not a comparison
+problem, it is a corrupted single measurement, and no existing mechanism can see it. Note
+what this does **not** cover — the broker's own version cannot move this way, for the
+reason §3.7 gives; only facts the agent supplies can.
 
 Every §3.8 mismatch lands in **two** places: a line in the document's Evidence section
 (§5.2 orders it before anything it qualifies) and an entry in §5.1's `warnings`, so a
-caller scripting over `cases.create` sees it without parsing markdown. Three comparisons
-are made, all cheap string compares over paths that already exist at render time:
-arm-vs-snapshot within one collector, registry-vs-collector, and registry-vs-case.
+caller scripting over `cases.create` sees it without parsing markdown. Four comparisons are
+made, all cheap string compares over paths that already exist at render time:
+arm-vs-snapshot within one collector, snapshot-vs-snapshot across a collector's history
+(§3.7 — the one that catches a broker upgrade), registry-vs-collector, and
+registry-vs-case.
+
+#### Folding `meta` into the list, without pretending it is already this format
+
+`meta` is `Option<Value>` — arbitrary JSON, shipped, and written by agents who have never
+read this spec. "Folds in under its own key names" is not a rule until it says what happens
+to the shapes registry format does not have:
+
+| `meta` entry | Renders as |
+|---|---|
+| `"build_profile": "release"` | `/collector/data/build_profile: release` |
+| `"runs": 20` (any non-string scalar) | its compact JSON text — matching `meta_field`'s existing `v.to_string()` (`document.rs:1810`) |
+| `"config": {"nested": true}` | its compact JSON text **as the value**, not flattened into paths — flattening invents keys the author never wrote, and the path it invents is indistinguishable from one they did |
+| `"my key"`, `"héllo"`, `""` — not a legal §3.1 segment | **not folded**, and named in `warnings` |
+
+That last row is the one that matters. Dropping an unfoldable key silently would put logmon
+in the position of deciding an agent's provenance did not count, without saying so — the
+exact failure §4's every rule exists to prevent. It is also not an error: `meta` never
+promised this format, and rejecting the snapshot over it would break a shipped call.
+
+**Two aliases, and the list is closed**: `build_profile` → `/Build/profile` and `git_sha` →
+`/Build/commit`. Without them the mismatch check above cannot fire on the two keys the whole
+question was about — `/Build/profile` and `build_profile` are different paths under
+byte-wise comparison (§3.1), so a registry saying `release` and a snapshot saying `debug`
+would sit side by side, uncompared. These two are already privileged by `document.rs:779`,
+so aliasing them adds no new privilege. The list does not grow: a general aliasing mechanism
+would make two spellings permanently equal and destroy the reason §3.6 has one vocabulary.
 
 **A watch's data has an age; `cases.create`'s does not.** Pairs given to `cases.create` are
 supplied at the capture instant and need no timestamp. A watch is armed once and fires for
@@ -864,9 +914,14 @@ place is the shape this repo has already paid for; `domain_data.update` addition
 while a `data` list **accepts** those segments, since a prefixed render cannot collide;
 `/logmon/version` moves only `validated_at` across a same-version boot and **both**
 timestamps across an upgrade, which is the §3.2 semantics that replaced the draft's
-"refreshed on boot" special case; `/logmon/*` counts against **neither** cap; a collector
-armed and snapshotted across a broker upgrade warns, and one armed and snapshotted on the
-same version does not;
+"refreshed on boot" special case; `/logmon/*` counts against **neither** cap; **two
+snapshots in one collector's history recorded under different broker versions warn**, while
+a collector restored across an upgrade and snapshotted once does **not** — that being the
+false positive the draft would have shipped, and the one worth a named test rather than a
+line in a list; `meta` folding is asserted per row of §3.8's table, including that an
+unfoldable key is **named in `warnings` and the snapshot still succeeds**; and the two
+aliases fire the mismatch check while a third spelling (`buildProfile`) does not, which is
+what keeps the list closed;
 `collectors.add(data)` and `collectors.snapshot(meta)` render into **one** `/collector/data/`
 list with the snapshot's value winning on collision; that collision **emits a warning in
 both places** (§5.2's Evidence line and §5.1's `warnings`) — and the mutation to check is
