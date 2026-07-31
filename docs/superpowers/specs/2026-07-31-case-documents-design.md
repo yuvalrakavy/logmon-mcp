@@ -324,26 +324,66 @@ prevent.
 
 ### 3.7 The reserved namespaces
 
-`/logmon/...` is written only by logmon; `update` and `remove` both reject agent access.
+**The rule: every key/value logmon itself produces lives under `/logmon/`, in every list
+(§3.8), and agents cannot write there** — `update`, `remove`, and the `data` parameters of
+`collectors.add`, `collectors.snapshot` and `cases.create` all reject the prefix.
+
+Stating it as a rule rather than as the list below is the point. The set logmon knows will
+grow; what a reader needs to be able to do forever is glance at a path and know whether a
+human asserted it or the broker observed it. Those are different kinds of claim, and §4.1's
+whole position is that a document records belief and must say whose.
+
 These keys are **stored**, not computed at document time, so `get_domain_data` can show
-what logmon knows. Populated: `/logmon/domain`, `/logmon/first_seen` (when the *file* was
-created — the signal that a registry is new, which is what §3.3's `unknown` cause leans
-on), `/logmon/incarnation` and `/logmon/incarnation_started` (§3.5, which is what detects
-*reuse*; `first_seen` cannot), and `/logmon/broker_version`.
+what logmon knows, and so an archived document carries what was true rather than what is
+true at read time.
 
-`/logmon/broker_version` is **refreshed on boot**, not written once. Stored-and-stale would
-put the pre-upgrade version into every document after an upgrade, as a fact, in the half of
-the registry a reader has been told to trust.
+**In the domain registry:**
 
-`/logmon/*` keys do **not** count against §3.1's 256-key cap — otherwise logmon could lock
-an agent out of its own registry.
+| Key | What it is |
+|---|---|
+| `/logmon/domain` | the domain name |
+| `/logmon/version` | the broker version — `0.10.0` |
+| `/logmon/first_seen` | when the *file* was created, the signal that a registry is new, which is what §3.3's `unknown` cause leans on |
+| `/logmon/incarnation`, `/logmon/incarnation_started` | §3.5, which is what detects *reuse* — `first_seen` cannot |
 
-**`/collector/` and `/case/` are reserved in the domain registry too**, rejected by
-`domain_data.update` the same way. §3.8 gives those prefixes a meaning in a document — a
-fact supplied by a collector or a capture rather than by the domain. If the domain registry
-could also write them, a domain key would render identically to a collector-supplied one
-and the prefix would stop being evidence of anything. Cheap to reserve now; impossible
-after the first archive exists.
+`/logmon/version`, not `/logmon/broker_version`: under this prefix the qualifier says
+nothing the path has not already said. (`status.get`'s shipped `broker_version` field is
+unaffected — that is an RPC result, not a registry key.)
+
+**Logmon's keys carry both timestamps, like everyone else's**, and that turns §3.7's old
+special case into ordinary machinery. The draft said `/logmon/version` is "refreshed on
+boot, not written once." With §3.2's semantics — `created_at` is *when this value came into
+force* — a boot that writes the same version moves only `validated_at`, and a boot after an
+upgrade moves both. So the key reads:
+
+> `/logmon/version: 0.10.0` — created 3 days ago, validated 2 minutes ago
+
+which says the daemon has been on 0.10.0 for three days and is running now. Neither fact
+was available from a "last modified" stamp, and neither needed a rule of its own.
+
+`/logmon/*` keys do **not** count against §3.1's 256-key cap, or against §3.8's 64-key
+per-list cap — otherwise logmon could lock an agent out of its own registry.
+
+**In a collector's list**, logmon contributes `/logmon/version` at both arm and snapshot.
+That is not decoration: §3.8's collision warning then detects *the daemon was upgraded
+mid-window*, which is the version-skew failure the 0.9.0 work was about, and which no
+existing mechanism can see. **Anything logmon already renders as a first-class field —
+`level`, `filter`, `wall_ms`, `matched` — is not duplicated into the list**, or the list
+becomes a second rendering of the struct beside the first, with two places to disagree.
+
+**In a case's list, logmon contributes nothing today**, and saying so is better than
+inventing a key to fill the row. The capture instant and the trigger are front-matter; the
+verdict is its own section; and the broker version at capture cannot differ from the
+registry's, because both are read from the running daemon in the same breath. The namespace
+exists for when that stops being true.
+
+**`/collector/` and `/case/` are reserved in the *domain registry* only** — rejected by
+`domain_data.update`, and legal inside a `data` list. That asymmetry looks inconsistent and
+is not: registry keys render with **no** prefix, so a registry key literally named
+`/collector/data/Build/profile` would render identically to a genuine collector fact. Inside
+a list the prefix is prepended, so `/collector/data/case/x` collides with nothing. The
+reservation exists to stop impersonation, and impersonation is only possible where the
+rendered path is not already qualified. Cheap now; impossible after the first archive exists.
 
 Per-document facts (capture time, trigger) are **not** registry keys — they are document
 front-matter (§5.2). The first draft conflated the two.
@@ -359,6 +399,12 @@ leading `/`, ASCII segments, byte-wise comparison, ≤ 256-byte path, ≤ 4 KiB 
 | `domain_data.update` | `/Build/profile` | the domain, **now**, with `validated_at` (§3.2) |
 | `collectors.add(data)` and `collectors.snapshot(meta)` | `/collector/data/Build/profile` | the window that produced **this collector's numbers** |
 | `cases.create(data)` and a watch's `data` (§9.1) | `/case/data/Build/profile` | what the capturer asserted **about this document** |
+
+**Two prefixes compose, and they answer different questions.** The outer one — none,
+`/collector/data/`, `/case/data/` — says *which moment*. `/logmon/` inside any of them says
+*who produced it* (§3.7). So `/collector/data/logmon/version` is the broker version at that
+collector's window, and it is unambiguous without a legend: moment, then producer, then the
+fact.
 
 **The prefix is the label, and that is the point.** §11's open question 4 asked how a reader
 tells `/Build/profile: release` from a domain registry apart from `build_profile: debug` on
@@ -810,8 +856,17 @@ false-positive guard, because a convention hardening into a schema is how this g
 any other entry's outcome** — coverage is a property of the document, never of the
 registry.
 
-**Data lists (§3.8):** `domain_data.update` rejects `/collector/` and `/case/` exactly as
-it rejects `/logmon/`, so a domain key can never impersonate a collector-supplied one;
+**Data lists (§3.8) and `/logmon/` (§3.7):** every writable surface rejects `/logmon/` —
+`update`, `remove`, and the `data` params of `collectors.add`, `collectors.snapshot` and
+`cases.create`, asserted **per surface**, since a rule stated once and enforced in one
+place is the shape this repo has already paid for; `domain_data.update` additionally rejects
+`/collector/` and `/case/`, so a domain key can never impersonate a collector-supplied one,
+while a `data` list **accepts** those segments, since a prefixed render cannot collide;
+`/logmon/version` moves only `validated_at` across a same-version boot and **both**
+timestamps across an upgrade, which is the §3.2 semantics that replaced the draft's
+"refreshed on boot" special case; `/logmon/*` counts against **neither** cap; a collector
+armed and snapshotted across a broker upgrade warns, and one armed and snapshotted on the
+same version does not;
 `collectors.add(data)` and `collectors.snapshot(meta)` render into **one** `/collector/data/`
 list with the snapshot's value winning on collision; that collision **emits a warning in
 both places** (§5.2's Evidence line and §5.1's `warnings`) — and the mutation to check is
