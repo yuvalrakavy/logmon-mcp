@@ -1,8 +1,35 @@
 # Daemon-taught tools — design
 
-**Status:** draft for design gate. No code written.
+**Status:** **WITHDRAWN at the design gate, 2026-07-30.** Superseded for its
+immediate purpose by `2026-07-30-capability-skew-visibility-design.md`, which
+shipped in 0.9.0. Kept for its reasoning, and because §9's redesign is live.
+
+**Why it was withdrawn** — two objections from the gate, recorded in `9706a23`'s
+commit message and, until 2026-07-31, *only* there:
+
+1. **It deletes argument validation across all 42 tools.** Today the shim's tools
+   are derived from Rust types at compile time, so a bad argument fails in the
+   shim. A manifest-driven shim builds routes at runtime from JSON Schema and
+   cannot type-check anything — validation moves entirely to the daemon, one
+   round trip later.
+2. **It cannot deliver its own bootstrap explanation.** If tools come from the
+   daemon, then when the daemon is unreachable the shim has *no* tools — and no
+   tool with which to say why. §4.1 attempted an answer; the gate found it
+   insufficient.
+
+**Why this line exists.** For a day this file's status read *"draft for design
+gate. No code written"*, which any reader — including the author, on
+2026-07-31 — takes to mean *pending*. It was not pending; it was decided. The
+decision and its reasons lived in a commit message, which is not where anyone
+looks. **A withdrawal that is not recorded in the artifact is indistinguishable
+from a backlog item**, and the cost is real: it was re-proposed as new work a day
+later, and the re-proposal was accepted before anyone opened the commit.
+
+**Status of the redesign:** §9 (2026-07-31) answers both objections and is the
+live document. This file's §§0–8 describe the withdrawn design.
+
 **Tier:** T2 — mints a wire contract (the descriptor manifest) that outlives the code.
-**Seams verified at:** `98e75cc`.
+**Seams verified at:** `98e75cc` (§§0–8). §9 has not been re-grounded.
 
 ---
 
@@ -332,3 +359,153 @@ silently losing reconnect.
 2. Does the banner survive a context compaction? If the agent's context is
    summarised away, the notice is lost and the tools are silent again. A cheap
    answer is to re-arm on reconnect rather than once per session.
+
+---
+
+# 9. Redesign — 2026-07-31
+
+**Status:** draft. Not gated. §§0–8 above are the withdrawn design; this section
+supersedes them where they conflict.
+
+**The change in one line:** the shim becomes **tool-independent** — a generic MCP
+adapter for any daemon that speaks the manifest — rather than logmon's shim with a
+daemon-taught extension bolted on.
+
+## 9.1 Why the first objection was wrong, not answered
+
+The gate withdrew the original because *"it deletes argument validation across all
+42 tools."* That reads as *compile-time validation → none*. The premise is false,
+and the seam table above already recorded the fact that falsifies it:
+
+> | CLI enum validation | **Confirmed absent.** `--level tre` passes clap and fails at the daemon: `rpc error -32601: unknown level 'tre'`. Enums live as prose in help text, so clap cannot enforce them. |
+
+Verified again at `757b2e7`: the tool parameter is `level: Option<String>`
+(`mcp/src/server.rs:285`). What compile-time derivation buys today is a **type**
+check — is it a string — and nothing else. It cannot check that the string is one
+of `scalar` / `timing` / `tree`, cannot check a range, cannot check a pattern.
+
+**A JSON Schema can check all three.** So the real comparison is:
+
+| | Today (derived from Rust types) | Manifest (JSON Schema, validated in the shim) |
+|---|---|---|
+| Is it a string? | ✅ | ✅ |
+| Is it one of the three legal levels? | ❌ — reaches the daemon and fails there | ✅ |
+| Is the number in range? | ❌ | ✅ |
+| Does the pattern match? | ❌ | ✅ |
+
+Runtime schema validation is **not a downgrade to be tolerated for learned tools.
+It is an upgrade, for every tool.** The objection was sound against a design that
+forwarded blind; it does not survive one that carries a validator.
+
+**This is what my own first redesign got wrong.** It kept compile-time validation
+for the 42 and gave runtime validation to learned tools — two classes of tool with
+two mechanisms, side by side, differing in a property neither needed to differ in.
+That is the exact shape a four-lens gate spent 58 findings on earlier the same day
+in `2026-07-31-case-documents-design.md`. The rule that came out of that gate
+applies here verbatim: **where one mechanism will do, two is the defect.**
+
+## 9.2 Why the second objection has a ladder, not an answer
+
+*"It cannot deliver its own bootstrap explanation."* True of §4.1's "expose zero
+tools", which is why that was rejected. But bootstrap is not one situation:
+
+| Situation | What happens | Frequency |
+|---|---|---|
+| Daemon running | fetch the manifest, register | the normal case |
+| Daemon not running, **but startable** | **the shim already starts it** (`auto_start.rs:172` spawns the broker), then fetches | common, and already solved |
+| Daemon unreachable, manifest cached from a prior connect | register the **cached** manifest; calls fail with "daemon unreachable, start it with `<cmd>`" | rare |
+| No daemon, no cache — a truly cold first run | zero tools, plus `instructions` | once, ever, per install |
+
+The original design's rejection of a cache — *"a cached manifest advertises tools
+that will fail, and can advertise tools a newer daemon has since removed"* — is
+true and is the lesser evil. A tool that fails with *"the daemon is not running,
+start it with X"* has told the agent exactly what to do. Zero tools tells it
+nothing unless the client happens to surface `instructions`, which is per-client
+behaviour we do not control. **A stale-but-actionable answer beats a correct
+silence**, and a removed tool called against a live daemon fails with a clear
+`unknown method` — which the shim then reconciles on the next manifest fetch.
+
+## 9.3 What "tool-independent" means, concretely
+
+The shim compiles in **no tool names, no parameter structs, no skill text, and no
+RPC method names.** What it compiles in is the *mechanism*: transport, the MCP
+handshake, reconnect, schema validation, CLI construction, rendering.
+
+Three things must therefore move onto the wire, and the third is the one this
+redesign adds over the original:
+
+1. **Tool descriptors** — §3.2's shape, unchanged.
+2. **Which RPC each maps to** — §3.2's `x-logmon.method`, renamed to something
+   daemon-neutral (`x-manifest`), since the whole point is that logmon is one
+   instance.
+3. **The instructions/skill text.** `SKILL_INSTRUCTIONS` is
+   `include_str!("../../../skill/logmon.md")` (`server.rs:1504`) — compiled in,
+   with exactly the staleness problem the tool list has. The 0.9.0 commit message
+   named both in one breath: *"both the tool list and the skill file are compiled
+   into that binary, so a stale shim is silent by construction."* A redesign that
+   fixes one and not the other has fixed half a problem.
+
+**What identifies the daemon** then becomes configuration rather than code: the
+socket path, the auto-start command, and the server name. `logmon-mcp` becomes a
+thin binary that supplies those three constants to a generic core — and anyone
+else's daemon can supply its own.
+
+## 9.4 The one thing that stays local, and why that is not a second mechanism
+
+**Rendering.** The CLI's human-readable output — 2689 lines across 7 files, the
+markdown passthrough for `document_collectors`, the log tables — cannot come from
+a schema, because a schema describes *what a value is*, not *how it should read*.
+
+This is not §9.1's two-mechanisms defect, and the distinction is worth stating
+because it is the line the whole design rests on:
+
+> **Reaching a capability is mechanism. Presenting its result is presentation.**
+> One mechanism, always. Presentation may be locally overridden, and its absence
+> costs nothing but prettiness — `--json` is always correct.
+
+So: every tool is reachable generically. A tool the local binary happens to know
+how to render, it renders; anything else prints JSON. A missing renderer degrades
+output, never correctness, and never reachability.
+
+## 9.5 What this buys, and what it costs
+
+**Buys.** Upgrading the daemon makes new capabilities reachable with no shim
+rebuild — the original goal. Enum, range and pattern validation the CLI has never
+had. A skill file that cannot go stale. And a shim reusable against any daemon
+that speaks the manifest, which is a larger thing than logmon.
+
+**Costs, stated because the gate will ask.**
+
+- **A JSON Schema validator dependency.** `jsonschema` or equivalent — real
+  weight and real supply-chain surface, and load-bearing: without it §9.1's whole
+  argument collapses back into the original objection.
+- **Clap built at runtime** (`Command::new`/`Arg::new`), not derived. §5.1 already
+  worked this out; it comes back into scope here, because a tool-independent shim
+  cannot have a derived CLI.
+- **`--help` needs the daemon**, or the cache. Today it does not. This is a real
+  regression in the cold case and the cache is what bounds it.
+- **The error surface moves.** A malformed call fails against a schema rather than
+  against a Rust type, and the message must be at least as good. A worse error
+  message would be a genuine loss and is not automatically avoided.
+
+## 9.6 Open questions for the gate
+
+1. **Does schema validation in the shim actually match the daemon's?** If the
+   daemon's real rules are stricter than its published schema, the shim passes
+   calls the daemon rejects, and the "validate early" claim is half true. The
+   manifest generator must derive schemas from the same types the handler parses,
+   or this is decoration.
+2. **What is the cache's invalidation rule?** Keyed on daemon version? On a
+   manifest hash? Never, until a successful fetch replaces it? §9.2 leans on the
+   cache heavily and does not specify it.
+3. **Should this ride `status.get` rather than a new `tools.manifest`?**
+   `status.get` already carries `broker_tools` and already reaches every shim ever
+   built, which is the property 0.9.0 was designed around. Descriptors are much
+   larger than a name list, though, and putting them in a status response makes
+   every status call pay for them.
+4. **Does `document_collectors`' markdown passthrough survive?** §3.4 handled it
+   with a `result: text` hint. That hint is presentation, and §9.4 says
+   presentation is local — so either the hint is an exception to §9.4, or the
+   passthrough becomes a local renderer. They cannot both be true.
+5. **Is the generic core a separate crate?** The reuse claim in §9.5 is only real
+   if someone else can depend on it without depending on logmon.
