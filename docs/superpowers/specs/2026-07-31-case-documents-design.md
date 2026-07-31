@@ -432,25 +432,41 @@ remains the half a human reads.
 
 ### 5.3 Naming
 
-**`<prefix>-<id>.md`**, with the sidecar `<prefix>-<id>.sidecar.jsonl` beside it.
-`<prefix>` is caller-supplied; `<id>` is a short random identifier (8 hex characters).
+**`<prefix>-<yymmdd>-<hhmmss>[-<id>].md`**, sidecar `<same stem>.sidecar.jsonl`.
 
-**No timestamp in the name.** An earlier draft used `<prefix>-<UTC timestamp>-<hash>`, which
-is §4.1's own mistake one level down: encoding a query axis in the layout. The capture time
-is front-matter, where it is queryable alongside everything else, and a timestamp in a
-filename only invites sorting by name — which breaks the moment a format or timezone
-varies. The name's job is to be recognisable and unique, nothing more.
+```
+checkout-hang-260731-021530.md
+checkout-hang-260731-021530.sidecar.jsonl
+```
 
-**The id is required and random, not derived.** `safe_name` collapses punctuation (§1), so
-two captures under one prefix collide without it. Random rather than a content hash because
-two captures of the same window are genuinely different documents and should not share a
-name. Eight hex characters keeps the birthday probability negligible across an archive that
-is never pruned; the writer still checks for an existing file and re-rolls.
+**The timestamp is in the name deliberately, and it is the one axis that earns a place
+there.** §4.1 argues against encoding a query axis in the layout — but that argument is
+about axes where picking one privileges it over equally good alternatives. Time is not one
+of many: it is the axis the filesystem already sorts by, for free, with no tooling at all.
+Fixed-width `yymmdd-hhmmss` makes lexicographic order chronological order, so `ls` answers
+"what happened around then" on an archive nobody has indexed. Metadata queries are about
+*content*; this does not compete with them.
+
+**UTC, not local.** Local time makes names unsortable across a DST boundary and
+incomparable between machines — and this archive is meant to be shared and read years
+later. The name carries second resolution; front-matter carries the precise instant, and
+remains the record.
+
+**`<id>` appears only on collision** — two captures in the same second under the same
+prefix. Four hex characters, random rather than a counter: a counter has to enumerate the
+directory to pick a value, which races another writer, and the client is what writes
+(§5.1). The writer checks for an existing file and adds or re-rolls the id.
+
+**Parse from the right.** `safe_name` (`document.rs:1874`) **preserves `-`**, so a natural
+prefix like `checkout-hang` survives intact and splitting from the left is ambiguous. The
+trailing fields are fixed-shape — six digits, six digits, optional hex — so a tool walking
+the archive can recover them deterministically from the end.
 
 **The prefix is sanitised and length-bounded before it reaches a path.** The client writes
 `dir.join(name)` with a daemon-supplied name (`cli/collectors.rs:679`), so an unsanitised
 caller string is a path-traversal surface — `../../` in a prefix would escape the archive.
-It goes through `safe_name` (`document.rs:1874`) and is capped at 48 bytes.
+`safe_name` collapses everything outside `[A-Za-z0-9_-]`, and the prefix is capped at
+48 bytes.
 
 ### 5.4 Collector state at capture
 
@@ -598,6 +614,14 @@ without a `ttl` leaves it intact; `{path, ttl}` with no value both validates and
 lifetime; a past-`ttl` key **keeps its value and both timestamps** and is reported expired
 rather than blanked; and a key with no `ttl` reports its **age with no verdict** — never
 "current", which is the §4.1 rule the whole field is constrained by.
+
+**Naming (§5.3):** names sort lexicographically into chronological order across a month
+and a year boundary; the timestamp is **UTC** even when the host is not, asserted against a
+non-UTC `TZ`; a prefix containing `-` (`checkout-hang`) round-trips and the fields still
+parse from the right; a prefix with `/`, `..` or a control character is sanitised before it
+reaches a path, and one over 48 bytes is truncated rather than rejected; two captures in the
+same second under one prefix produce **two files**, the second carrying an id — not an
+overwrite, which in a never-deleted archive would destroy evidence silently.
 
 **The recommended key set (§3.6):** coverage names the **missing** core keys, not only a
 count — "missing `/Build/commit`" is actionable where "2 of 3" is not; full coverage still
