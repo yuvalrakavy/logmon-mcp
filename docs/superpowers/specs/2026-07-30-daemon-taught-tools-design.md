@@ -30,11 +30,15 @@ Two guards, then, not one. **Record a withdrawal in the artifact it withdraws.**
 And, for the reader: *a spec whose status reads "pending" is a claim like any
 other* — check the retro log and `git log --` the file before believing it.
 
-**Status of the redesign:** **§9 revision 2 (2026-07-31) is the current draft and has
-NOT been gated.** Revision 1 was gated by four lenses on `dfa37a5` (~40 findings) and is
-superseded; §9.9 records what changed. **"Current" is not "approved to build"** — this is
-T2 work and T2 does not proceed before a gate. §9.8 lists which subsections of §§0–8 are
-dead, so a reader never has to derive that by subtraction.
+**Status of the redesign:** **§10 (revision 3) is the current draft and has NOT been
+gated.** It supersedes §9.2, §9.7 and §9.11 Q3–Q4; the rest of §9 stands. Revision 1 was
+gated by four lenses on `dfa37a5` (~40 findings); §9.9 records what revision 2 changed and
+§10's header records what revision 3 changes. **"Current" is not "approved to build"** —
+this is T2 work and T2 does not proceed before a gate. §9.8 lists which subsections of
+§§0–8 are dead, so a reader never has to derive that by subtraction.
+
+**Read in this order:** §10 for the shape, §9.3–§9.6 for what it inherits, §9.8 for what
+is dead, §§0–8 only for reasoning.
 
 **Tier:** T2 — mints a wire contract (the descriptor manifest) that outlives the code.
 
@@ -695,3 +699,163 @@ subtraction. Stated:
    Blocking makes every client pay the daemon's latency at initialize — and `auto_start`
    already waits up to 10s for a socket. Not blocking means the first run after install is
    the one run with no skill text, which is the run that needs it most.
+
+---
+
+# 10. The bundled manifest — 2026-07-31, revision 3
+
+**Status:** draft. Not gated. Supersedes §9.2, §9.7 and §9.11 Q3–Q4.
+
+Revision 2 treated the shim's compiled-in tools as **legacy to be deleted**, which forced
+every hard question: what happens at bootstrap, where does the cache live, how does
+`--help` work offline, what becomes of 0.9.0's skew detection. All four dissolve under one
+change of framing.
+
+> **The shim ships a manifest. The daemon serves a manifest. They are the same artifact
+> from two sources.**
+
+The compiled-in tools are not legacy. They are the **bundled manifest** — generated at
+build time from the same protocol types the daemon generates its own from, embedded the
+way `SKILL_INSTRUCTIONS` already is (`server.rs:1504`).
+
+## 10.1 What this makes free
+
+| Question revision 2 had to answer | Answer now |
+|---|---|
+| Bootstrap with no daemon (§9.7) | The bundled manifest. **Exactly today's behaviour**, because it is today's tool set |
+| Where does the cache live (§9.11 Q3) | It does not have to exist. The bundled manifest is the floor; a runtime cache is an optimisation, not a mechanism |
+| `--help` offline | Works, at today's quality, from the bundle |
+| What happens to 0.9.0's skew note (§9.11 Q5) | **It improves.** `bundled ⊖ fetched` is the skew, computed over *parameters* rather than tool names — which is exactly the blindness §9.1 identified |
+| The phase-B assertion (§9.2) | Not a migration step that gets deleted. It is the **permanent** comparison, and it is how the note is computed |
+| "One cutover" vs incremental | Neither. Nothing is ever deleted; a second source is added |
+
+Phase E of §9.2 — *"delete the attributes"* — becomes **"replace the attributes with a
+generated bundle"**. No capability is ever removed, so there is no step with no rollback.
+
+**Merge rule.** Union, fetched descriptor winning for a tool in both. A tool only in the
+bundle stays registered and is reported as *not advertised by this daemon* — never
+unregistered, because a rename is a removal plus an addition and unregistering makes the
+old name vanish before the agent learns the new one. A tool only in the fetch is registered
+dynamically. Both directions are the skew note's content.
+
+## 10.2 The CLI, now that its syntax may change
+
+§9.11 Q4 asked whether the CLI can be generated, and answered *"probably not"* — because
+JSON Schema cannot express `collectors diff a b`, `--merge` as a presence flag,
+`--no-reset`, or `requires_all`.
+
+**That framing was wrong. It asked whether generation can reproduce a surface that was
+hand-written under no constraint.** Once the surface may change, the question becomes: what
+CLI does a schema describe *well*? The answer is: nearly all of one, by convention, with a
+short override vocabulary for the rest.
+
+### Derivation, needing no metadata at all
+
+| From the schema | Becomes |
+|---|---|
+| the RPC method, `.` → space | the command path: `collectors.diff` → `collectors diff` |
+| a property name, snake → kebab | `group_keys` → `--group-keys` |
+| `"type": "boolean"` | a presence flag `--x`; plus `--no-x` when the schema's default is `true` |
+| `"type": "array"` of scalars | a repeatable singular flag — `--group-key` used N times |
+| `"type": "object"` | prefix-flattened — `threshold.metric` → `--threshold-metric` |
+| `"enum": [...]` | clap `possible_values` — **validated locally, and listed in `--help`** |
+| `"default": v` | the flag's default |
+| `"description"` | the flag's help text |
+| `dependentRequired` | clap `requires_all` |
+
+Every shape §9.11 Q4 listed as impossible is on that table. The obstacle was never
+expressiveness; it was the requirement to reproduce choices made without a schema in mind.
+
+**Two of these rows are repairs, not ports.**
+
+- **Enums become validated.** §1 records that `--level tre` passes clap today and fails at
+  the daemon, because enums live in prose. A generated CLI checks them, offline, and shows
+  them in `--help`.
+- **Defaults stop diverging.** `triggers add` defaults to `0/0/0` in the CLI and `500/200/5`
+  in the daemon — a divergence a test currently *pins*
+  (`crates/core/tests/trigger_window_defaults.rs`). Under generation the schema's default is
+  the only default, so that class of bug cannot exist. The gate reported this as
+  *"regeneration would silently change every such invocation"*; that is true, and the
+  change is a fix. It is a breaking CLI change and belongs in the changelog as one.
+
+### The override vocabulary, for what convention gets wrong
+
+In the descriptor, and **empty for most tools**:
+
+```json
+"cli": {
+  "path":       ["collectors", "diff"],   // when it should differ from the method
+  "positional": ["a", "b"],               // collectors diff base@* new@*
+  "variadic":   "names",                  // collectors document base after
+  "hidden":     ["internal_flag"]         // reachable via --params-json only
+}
+```
+
+Four keys. `collectors diff` and `collectors document` need one each; on the current
+surface nothing else needs any.
+
+### Rendering, by the same shape
+
+MCP descriptors carry an **`outputSchema`** (`rmcp/src/model/tool.rs:30`), which this
+project does not use. With it, a generic renderer can do better than raw JSON:
+
+```json
+"cli": { "table": ["seq", "level", "message"] }
+```
+
+— a generic table renderer for the ~45% of CLI lines that are presentation, with **bespoke
+renderers remaining as local overrides** where they earn it (§9.5's rule is unchanged: the
+client owns what happens on the client). A tool with no hint and no local renderer prints
+JSON, which is correct if plain.
+
+## 10.3 Why this is one mechanism and not two
+
+The obvious objection: bundled *and* fetched is two sources, which is the shape this
+project keeps being burned by.
+
+It is not, and the test is whether they can **disagree about the same thing without anyone
+noticing**. They cannot:
+
+- They are the **same format**, generated by the **same code** from the **same types** —
+  the bundle is `cargo xtask` output, the daemon's is that function called at runtime.
+- Their difference is not a bug to be avoided; it is **the product**. `bundled ⊖ fetched`
+  is precisely the skew this whole design exists to surface, and it is reported on every
+  `status.get`.
+- A divergence is therefore loud by construction. The failure mode of two sources of truth
+  is silence, and silence is the one outcome this arrangement cannot produce.
+
+Compare the situation it replaces: three descriptions of every parameter — the shim's
+`Params`, the protocol crate's type, and the daemon's `params.get()` reads — which
+disagreed in 30 of 45 pairs **for months**, undetected, because nothing compared them.
+
+## 10.4 What this does not solve
+
+- **§9.5's client-side behaviour** stands unchanged. `export_logs`, `get_status` and
+  `document_collectors` do things no descriptor can delegate, and the descriptor must mark
+  them so the generic path refuses rather than mishandles.
+- **The domain bind** (§9.5) stands. A per-tool pre-call hook is still needed, and it is
+  still logmon-specific.
+- **§9.3's validation** is unchanged, and gets simpler: the shim validates against whichever
+  manifest it is using, and there is always one.
+- **§9.4's precondition** is unchanged and is being fixed independently (§9.10).
+- **The reuse claim** (§9.6) is unchanged: the tool surface generalizes, the adapter does
+  not.
+
+## 10.5 Open questions for the gate
+
+1. **Does the bundle generate cleanly from the protocol crate?** §9.1 says 30 of 45 pairs
+   have drifted, and the bundle must be generated from *one* of them. Generating from the
+   protocol types means the bundled manifest is **not** what today's shim exposes — it is
+   what the daemon accepts, which is larger by six parameters. That is the right target and
+   it means the first bundle is itself a behaviour change.
+2. **`cli` under `_meta`, or a sibling?** §9.11 Q1 established that `x-` keys are silently
+   dropped by `rmcp::model::Tool`, so it must ride `_meta`. Whether the CLI block belongs in
+   the same envelope as the routing method or beside it is a wire-shape decision.
+3. **Does `--params-json` survive?** With `hidden` in the override vocabulary it becomes the
+   escape hatch for deliberately-unexposed parameters, which is a narrower and more
+   defensible role than revision 1's "anything the generator could not handle".
+4. **Is the breaking CLI change acceptable in one release?** Positional-to-flag moves,
+   changed defaults, and enum validation are all user-visible. The bundled manifest means
+   they can be staged — but staging them means shipping a generated CLI that deliberately
+   reproduces the old surface for a release, which is the "reproduce a hand-written surface"
+   trap this section exists to escape.
