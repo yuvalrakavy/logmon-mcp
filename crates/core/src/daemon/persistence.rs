@@ -265,7 +265,7 @@ pub fn sweep_temp_files(dir: &Path) -> usize {
 /// Returns where it went. Renamed rather than deleted: it is the only evidence
 /// of whatever went wrong, and a daemon that silently destroys the file it
 /// could not parse leaves nothing to diagnose.
-fn quarantine(path: &Path) -> Option<std::path::PathBuf> {
+pub(crate) fn quarantine(path: &Path) -> Option<std::path::PathBuf> {
     let base = format!("{}.corrupt", path.display());
     for n in 0..10 {
         let candidate = if n == 0 {
