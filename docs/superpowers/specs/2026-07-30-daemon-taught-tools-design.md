@@ -507,11 +507,18 @@ via `as u32` to **0** — largest window requested, none captured, success repor
 and, with no `[profile.release]` overflow setting, wrap in release. This repo has already
 paid for exactly this once — `CHANGELOG.md:482`, `skip_warmup_ms`.
 
-**And the error surface cannot support what §9.5 asks of it.** Every handler error returns
-`-32601`, method-not-found, with a bare string (`rpc_handler.rs:232`, `:244`). There is no
-`-32602` in the daemon at all. So a shim cannot tell *"that tool no longer exists"* from
-*"your filter is malformed"* by code — which is precisely the discrimination §9.5's
-reconciliation needs.
+**And the error surface cannot support what §9.5 asks of it.** Every *handler* error returns
+`-32601`, method-not-found, with a bare string (`rpc_handler.rs:232`, `:244`). So a shim
+cannot tell *"that tool no longer exists"* from *"your filter is malformed"* by code — which
+is precisely the discrimination §9.5's reconciliation needs.
+
+**Correction, 2026-08-01:** an earlier version of this paragraph said *"there is no `-32602`
+in the daemon at all."* False — `server.rs:870`, `:885`, `:894` emit it for handshake-time
+invalid params. The claim was made by grepping `rpc_handler.rs` alone, and **two gate lenses
+repeated it from the same narrow grep.** The corrected fact is narrower and still supports
+the point: `-32602` exists but no *handler* uses it. Recorded because the error is a
+negative asserted without widening the search — the exact check this project's own
+self-review list names, and three readers walked past it.
 
 **This precondition is being fixed independently of this design**, because it is a live
 defect for every non-shim caller. See §9.10.
