@@ -158,17 +158,43 @@ is acted on: §5.2's evidence line, and the skill (§8).
 
 ### 3.5 Persistence — new work, not inherited
 
-One JSON file per domain under the config dir, written **through on every mutation**,
-following the collector precedent (§1) exactly:
+One JSON file per domain at **`<config_dir>/domain_data/<domain>.json`**, written through
+on every mutation.
 
-- Whole-file atomic write (temp + rename), not append.
-- **Called with no registry lock held.** This is the load-bearing rule, not a detail:
-  `atomic_write` does two `fsync`s, and holding a lock across one can stall ingest
-  daemon-wide (§1). `domain_data` mutations are agent-driven and rare, but the constraint
-  is about the fsync, not the frequency.
+**The subdirectory is not cosmetic.** Domain names allow any alphanumeric
+(`session.rs:183`), so `config` and `state` are legal — and a file written straight into
+the config dir as `<domain>.json` would overwrite `config.json` or `state.json`. Both then
+*parse successfully*, because every field of `DaemonConfig` and `DaemonState` has a
+default: the broker comes back on default ports having silently lost every named session,
+trigger, filter and bookmark, without even reaching the quarantine path. The collector
+precedent already solved this and states why — `COLLECTORS_DIR` (`persist.rs:34-37`):
+*"Keeps collector files out of the directory holding `state.json`, `daemon.pid` and the
+socket, so the boot sweeps and this one cannot reach each other's files by accident."*
+The first draft claimed to follow that precedent "exactly" and omitted the part carrying
+the reason.
+
+- Whole-file atomic write (temp + fsync + rename + directory fsync) — the mechanism at
+  `persistence.rs:214-241`, which already has a boot sweep and a racing-reader test.
+- **A per-domain write mutex, held across serialize-and-write and never across the data
+  lock.** This is the load-bearing rule here. The collector precedent is safe with none
+  because its files are keyed `(owner, name)` and have one logical writer; `domain_data` is
+  keyed by **domain**, and many sessions bind one domain by design. Two concurrent updates
+  can otherwise reach `atomic_write` out of order, and the older landing last silently
+  drops the newer key from disk while memory keeps serving it — invisible until a restart.
+  §0's failure produced by the persistence layer itself.
 - Write failure is **logged and named** — "will not survive a restart" — never silent.
-- Load quarantines unparseable files rather than deleting them (`persist.rs`'s
-  `LoadOutcome` precedent).
+- Load quarantines unparseable files with the **numbered** scheme
+  (`persistence.rs:268-283`), not `with_extension("json.corrupt")`, which overwrites the
+  previous corrupt file.
+
+**On the fsync-outside-the-lock rule:** it is worth keeping, but it is *not* load-bearing
+here and the first draft was wrong to call it so. That rule matters for collectors because
+`ingest_span` takes the *same* registry lock on every span (`registry.rs:905`); nothing on
+any ingest path reads `domain_data`. Asserting it as central was the error §1.1 diagnoses —
+a constraint taken from a doc comment without naming the caller that makes it true —
+committed two sections later in this same document. The real hazard is the concurrent
+write above. (One genuine inherited note, not a rule: RPC handlers are sync fns on tokio
+workers, so an fsync blocks a worker — already true of the collector path.)
 
 **Lifetime is by file, not by `DomainSource`.** The registry for domain `X` survives while
 its file does; a domain re-created under the same name adopts it. This is chosen over
@@ -177,15 +203,36 @@ lifecycle-coupling because the alternative requires the deferred `persist=true` 
 archive meant to be read years later.
 
 **The consequence, stated rather than discovered:** a domain name is not an identity. Two
-unrelated ephemeral `t3`s a week apart share a registry. `/logmon/first_seen` records when
-the file was created so a reader can notice.
+unrelated ephemeral `t3`s a week apart share a registry — and the skill actively
+recommends the topology that produces this, one domain per test run.
+
+**So the registry counts incarnations, not first sight.** Each time logmon creates a domain
+whose file already exists, it increments `/logmon/incarnation` and stamps
+`/logmon/incarnation_started`. A draft using `first_seen` alone could not work: it is
+monotone, so after adoption it still reports era 1, and five unrelated eras are
+indistinguishable from one long-lived domain — with the older timestamp reading as *more*
+established rather than less.
+
+This matters beyond provenance: a re-created domain restarts seq at 0
+(`domain_lifecycle.rs:99`), so two archived documents for `t3` can carry overlapping seq
+ranges meaning different records. **The document therefore records the incarnation beside
+the seq range**, or its window identifier is ambiguous across eras.
 
 ### 3.6 The reserved `/logmon/` namespace
 
 `/logmon/...` is written only by logmon; `update` and `remove` both reject agent access.
 These keys are **stored**, not computed at document time, so `get_domain_data` can show
-what logmon knows. Populated: `/logmon/domain`, `/logmon/first_seen`,
-`/logmon/broker_version`.
+what logmon knows. Populated: `/logmon/domain`, `/logmon/first_seen` (when the *file* was
+created — the signal that a registry is new, which is what §3.3's `unknown` cause leans
+on), `/logmon/incarnation` and `/logmon/incarnation_started` (§3.5, which is what detects
+*reuse*; `first_seen` cannot), and `/logmon/broker_version`.
+
+`/logmon/broker_version` is **refreshed on boot**, not written once. Stored-and-stale would
+put the pre-upgrade version into every document after an upgrade, as a fact, in the half of
+the registry a reader has been told to trust.
+
+`/logmon/*` keys do **not** count against §3.1's 256-key cap — otherwise logmon could lock
+an agent out of its own registry.
 
 Per-document facts (capture time, trigger) are **not** registry keys — they are document
 front-matter (§5.2). The first draft conflated the two.
@@ -208,22 +255,51 @@ confidence would reproduce §0's failure inside the mitigation for it.
 **An empty registry is stated as loudly as a stale one.** Absence must not read as
 validation — the `matched: 0` / `zeroed_by` lesson, applied to provenance.
 
-### 4.2 It distinguishes three kinds of incompleteness
+### 4.2 It distinguishes kinds of incompleteness — and `complete` is the hard one
 
-The store is conditional (§1). `LogsExportResult.evicted_before_window` detects
-**eviction** and cannot detect **never-stored** — so a window shaped by another session's
-filter would otherwise report as complete. The evidence line therefore separates:
+The store is conditional (§1). `evicted_before_window` detects **eviction** and cannot
+detect **never-stored**, so a window shaped by another session's filter would otherwise
+report as complete. This is the document's most important correctness property: "nothing
+appeared before the error" must not read as absence of cause when it is absence of
+recording.
+
+Verdicts, pessimistic when a range is mixed:
 
 | | |
 |---|---|
-| `complete` | asked N, got N, no filter was narrowing the store |
-| `evicted` | the ring dropped the older part — how much |
-| `filtered` | a session filter was active, so non-matching entries were never stored — **which filters** |
+| `complete` | the range lies wholly inside an unfiltered epoch **and** no eviction was detected **and** nothing was capped |
+| `evicted` | the ring dropped part of the range |
+| `filtered` | a session filter was narrowing the store for some of the range — **which filters, and over which seqs** |
+| `partial` | the range straddles a trigger post-window, during which entries were stored *unconditionally* while the rest was filtered |
 
-The third requires recording the domain's active filter set at capture; it is not
-surfacing an existing field. This is the single most important correctness property in the
-document, because "nothing appeared before the error" otherwise reads as absence of cause
-when it is absence of recording.
+**A point-in-time filter read cannot compute this.** The first draft said "record the
+domain's active filter set at capture" — but that is a snapshot of a time-extended
+property, and three routine events empty it silently: an anonymous session is **removed**
+on disconnect and takes its filters with it (`session.rs:271-279`), `remove_filter`, and
+`set_domain` re-binding a session out of the domain. Session A filters, the run happens,
+A disconnects; agent B captures and sees no filters, so the document asserts "no filter
+was narrowing the store" over a window that recorded a tenth of it.
+
+**So the daemon maintains a per-domain narrowing marker**, updated by the mutations that
+can flip *does this domain have any filter* — `filters.add/remove/edit`, `set_domain`,
+session disposal — stamping `pipeline.current_seq()` and the filter strings at each flip.
+`complete` is then claimable only for a range wholly inside an unfiltered epoch. This is
+new recording, and more of it than one field.
+
+**Two further sources of false `complete`, both closed at the source:**
+
+- **A capped export satisfies "asked N, got N".** `recent_with_scanned` walks newest→oldest
+  (`memory.rs:58-101`), so `count` drops the **oldest** entries — the context *before* the
+  anchor, which is the half that matters. §6 therefore caps outward from the anchor, and a
+  capped result is never `complete`.
+- **Seq is shared with spans.** One `SeqCounter` feeds both the pipeline and the span store
+  (`domain.rs:176`), so a 200-seq range holding 160 spans returns 40 logs with nothing
+  missing. Completeness is therefore defined over **stored-entry provenance**, never over
+  seq arithmetic or counts.
+
+**An empty store is "cannot verify", not "no eviction".** `evicted_before_window` returns
+`None` when `buffer_oldest_seq` is `None`, so a capture after `clear_domain` would
+otherwise read as *0 entries, complete*.
 
 ---
 
@@ -231,11 +307,18 @@ when it is absence of recording.
 
 ### 5.1 Shape
 
-`cases.create(reason, prefix?, before?, after?)` → the document and its sidecar, returned
-**as content**, written by the client (§1). No daemon-side archival writer in v1: the
-existing path already writes documents, and adding one would bring file naming, atomicity,
-ENOSPC handling and concurrency — all of which belong with watches (§9.1), which is the
+`cases.create(reason, anchor, prefix?, before?, after?)` → the document and its sidecar,
+returned **as content**, written by the client (§1). No daemon-side archival writer in v1:
+the existing path already writes documents, and adding one would bring file naming,
+atomicity, ENOSPC handling and concurrency — all of which belong with watches (§9.1), the
 only feature that genuinely cannot use a client.
+
+**`anchor` is explicit** — a seq, a bookmark name, or a `trace_id`. `before`/`after` are
+relative to it, and §5.2 makes the anchor's message the headline and a front-matter key. An
+implicit "newest entry" anchor would headline a case created five minutes after the fact
+with whatever happened to arrive last, which fails §5.2's own test that a headline must
+distinguish two documents. The first draft's signature had the windows and not the point
+they were measured from.
 
 `reason` is **required**. A manual case that cannot say why it exists has no provenance,
 and unlike a watch there is no filter standing in for one.
@@ -272,21 +355,38 @@ Include each collector's current numbers and any snapshot it holds. Two constrai
 
 - Projection is computed **outside the registry lock** — it sorts every retained duration,
   which under the lock would stall ingest.
-- **Which collectors** are visible must be decided, not assumed: `Registry::list` filters
-  by owner. v1 reads **the calling session's** collectors, which is the manual path's
-  natural scope and needs no isolation change. Watches would need a different answer, and
-  that is part of why they are deferred.
+- **Which collectors** are visible must be decided, not assumed. `Registry::list` filters
+  by **owner only** (`registry.rs:617`) and never by domain, while `ArmedCollector.domain`
+  is a pin that a later `use_domain` does not move. So "the calling session's collectors"
+  is wrong twice: it can embed collectors measuring a *different* domain, and it misses
+  collectors armed on *this* domain by anyone else — the CLI connects as session `cli`
+  while the shim uses its own, so an MCP-created case would see none of the CLI's.
+  v1 therefore selects **by the case's domain, across owners**, and names the owner beside
+  each collector.
 
-If no collectors are armed, the section **says so**. Omission reads as "nothing
-interesting."
+If no collectors are armed **on this domain**, the section says so in those words.
+Omission reads as "nothing interesting", and the first draft's session-scoped wording would
+have printed a claim about the domain that was false.
 
 ---
 
 ## 6. Seq range on `logs.export`
 
-Add `from_seq` / `to_seq`. Absent-safe (§1). Interaction with `count` is defined: the range
-bounds, `count` caps within it, and a bookmark-derived filter composes as an additional
-predicate rather than being rejected.
+Add `from_seq` / `to_seq`. Absent-safe (§1).
+
+**They are lowered into `SeqFilter` qualifiers before resolution, not carried as loose
+params.** `evicted_before_window` reads its lower bound out of the *parsed filter* via
+`resolved_lower_bound` (`filter/parser.rs:745-773`), which matches `Qualifier::SeqFilter` —
+today produced only by `b>=` / `c>=` resolution. A top-level `from_seq` would never reach
+it, so a range whose start had already rolled out of the ring would come back
+`truncated: false` and §4.2 would read that as `complete`. Lowering makes them compose with
+a bookmark bound through the existing max-of-lower-bounds rule and feeds the detector for
+free. State the inclusivity: `SeqFilter::Gt` is strict.
+
+`count` caps **outward from the anchor**, not from the newest end (§4.2), and a capped
+result is never `complete`. Cursor qualifiers (`c>=`) are **refused** in a capture: they
+commit the cursor (`rpc_handler.rs:706-717`), so gathering evidence would advance the
+caller's read position. There is precedent for refusing them at `rpc_handler.rs:606`.
 
 ---
 
@@ -299,7 +399,7 @@ predicate rather than being rejected.
 | H3 | A lost registry makes re-setting launder old facts as new | `unknown` carries a cause (§3.3); `/logmon/first_seen` (§3.5) |
 | H4 | An fsync under a lock stalls ingest | §3.5's no-lock rule, inherited verbatim from the collector precedent |
 | H5 | Archive grows unbounded | v1 is manual-only, so growth is caller-paced. `status.get` reports count and bytes; a WARN crosses a threshold. Real bounding belongs with watches (§9.1) |
-| H6 | A domain name is reused and two eras share a registry | Stated (§3.5) and detectable via `/logmon/first_seen` |
+| H6 | A domain name is reused and two eras share a registry, with overlapping seq ranges | `/logmon/incarnation` counts eras and the document records it beside the seq range (§3.5). A monotone `first_seen` cannot do this and was the draft's error |
 | H7 | A case captures a window whose evidence was already evicted | Inherent to a manual path. §4.2 makes it visible, which is the honest answer and part of why watches matter (§9.1) |
 
 ---
@@ -377,5 +477,5 @@ the call still returns.
    contract is expensive.
 2. Sidecar format — markdown for reading or JSONL for machines. The bulk is the half most
    likely to be machine-read.
-3. Whether `/logmon/first_seen` is sufficient for the reused-domain-name case, or whether
-   the registry file should carry a generated id the document copies.
+3. ~~Whether `/logmon/first_seen` suffices for the reused-domain-name case~~ — **closed**:
+   it cannot (monotone), so §3.5 counts incarnations instead.
