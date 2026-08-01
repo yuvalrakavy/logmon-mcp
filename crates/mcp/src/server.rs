@@ -59,6 +59,44 @@ struct ExportLogsParams {
     format: Option<String>,
 }
 
+/// Render a `logs.export` reply into file content, and say how many entries it
+/// holds.
+///
+/// **The reply is a `LogsExportResult` OBJECT — `{"logs": [...], "count": n, …}`
+/// (`rpc_handler.rs:875`) — not a bare array.** Reading it as one yielded `None`,
+/// so every export rendered from an empty slice and reported `exported: 0`: an
+/// empty file under `text`, and the whole result envelope instead of the entries
+/// under `json`. Both arms now read the `logs` member, and both write entries.
+///
+/// Split out of the tool because the tool needs a live broker and this does not:
+/// the defect was in the shape-reading, which is exactly what a test can reach.
+fn render_export(reply: &serde_json::Value, format: &str) -> Result<(String, usize), String> {
+    let empty = vec![];
+    let entries = reply
+        .get("logs")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+
+    let content = match format {
+        "text" => entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "[{}] {} {} {}",
+                    e.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?"),
+                    e.get("level").and_then(|v| v.as_str()).unwrap_or("?"),
+                    e.get("host").and_then(|v| v.as_str()).unwrap_or("?"),
+                    e.get("message").and_then(|v| v.as_str()).unwrap_or("?"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => serde_json::to_string_pretty(entries)
+            .map_err(|e| format!("serialization error: {e}"))?,
+    };
+    Ok((content, entries.len()))
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct AddFilterParams {
@@ -627,39 +665,27 @@ impl GelfMcpServer {
             .await
             .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-        // Format and write locally
-        let empty = vec![];
-        let entries = logs.as_array().unwrap_or(&empty);
-        let entry_count = entries.len();
-
-        let content = match format {
-            "text" => entries
-                .iter()
-                .map(|e| {
-                    format!(
-                        "[{}] {} {} {}",
-                        e.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?"),
-                        e.get("level").and_then(|v| v.as_str()).unwrap_or("?"),
-                        e.get("host").and_then(|v| v.as_str()).unwrap_or("?"),
-                        e.get("message").and_then(|v| v.as_str()).unwrap_or("?"),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => serde_json::to_string_pretty(&logs).map_err(|e| {
-                rmcp::ErrorData::internal_error(format!("serialization error: {e}"), None)
-            })?,
-        };
+        let (content, entry_count) =
+            render_export(&logs, format).map_err(|e| rmcp::ErrorData::internal_error(e, None))?;
 
         std::fs::write(&p.path, content).map_err(|e| {
             rmcp::ErrorData::internal_error(format!("failed to write file: {e}"), None)
         })?;
 
-        let result = serde_json::json!({
+        // `scanned` and `buffer_total` are what distinguish "nothing matched"
+        // from "nothing was there". They used to reach the caller only by
+        // accident, inside the envelope the json arm wrote to the file; now that
+        // the file holds entries, they are passed through deliberately.
+        let mut result = serde_json::json!({
             "exported": entry_count,
             "path": p.path,
             "format": format,
         });
+        for key in ["scanned", "buffer_total", "buffer_oldest_seq"] {
+            if let Some(v) = logs.get(key) {
+                result[key] = v.clone();
+            }
+        }
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string_pretty(&result).unwrap(),
         )]))
@@ -1903,6 +1929,79 @@ mod tests {
             assert_eq!(after.get(k), Some(v), "annotation altered `{k}`");
         }
         assert!(after.get("shim_note").is_some());
+    }
+}
+
+#[cfg(test)]
+mod export_render_tests {
+    use super::render_export;
+    use serde_json::json;
+
+    /// A reply in the shape `logs.export` actually returns.
+    fn reply() -> serde_json::Value {
+        json!({
+            "logs": [
+                { "timestamp": "2026-08-01T10:00:00Z", "level": "ERROR",
+                  "host": "h1", "message": "boom" },
+                { "timestamp": "2026-08-01T10:00:01Z", "level": "INFO",
+                  "host": "h1", "message": "fine" },
+            ],
+            "count": 2,
+            "format": "json",
+            "scanned": 40,
+            "buffer_total": 100,
+        })
+    }
+
+    /// The defect: the reply is an object, so `as_array` gave None and both the
+    /// count and the file came out empty.
+    #[test]
+    fn entries_are_read_from_the_logs_member_not_the_envelope() {
+        let (content, n) = render_export(&reply(), "json").unwrap();
+        assert_eq!(
+            n, 2,
+            "exported: 0 was this count, read off a failed as_array"
+        );
+        assert!(!content.is_empty());
+
+        // The file holds the ENTRIES, not the envelope that carries them.
+        let written: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(written.is_array(), "json export writes entries: {content}");
+        assert_eq!(written.as_array().unwrap().len(), 2);
+        assert_eq!(written[0]["message"], "boom");
+        assert!(
+            !content.contains("buffer_total"),
+            "the envelope's own fields must not land in the file"
+        );
+    }
+
+    /// The visible half of the bug: `text` rendered an empty slice, so the file
+    /// was zero bytes and nothing said why.
+    #[test]
+    fn text_format_writes_one_line_per_entry() {
+        let (content, n) = render_export(&reply(), "text").unwrap();
+        assert_eq!(n, 2);
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "an empty file was the reported symptom");
+        assert_eq!(lines[0], "[2026-08-01T10:00:00Z] ERROR h1 boom");
+        assert_eq!(lines[1], "[2026-08-01T10:00:01Z] INFO h1 fine");
+    }
+
+    /// An empty result is still a well-formed one, and must not be confused with
+    /// the failure above: zero entries, but a valid empty array.
+    #[test]
+    fn an_empty_export_is_not_an_error() {
+        let empty = json!({ "logs": [], "count": 0, "scanned": 0 });
+        assert_eq!(render_export(&empty, "text").unwrap(), (String::new(), 0));
+        assert_eq!(render_export(&empty, "json").unwrap().1, 0);
+        assert_eq!(render_export(&empty, "json").unwrap().0, "[]");
+    }
+
+    /// A reply missing `logs` entirely reads as zero rather than panicking —
+    /// the same tolerance the old code had, kept deliberately.
+    #[test]
+    fn a_reply_without_a_logs_member_reads_as_empty() {
+        assert_eq!(render_export(&json!({ "count": 0 }), "text").unwrap().1, 0);
     }
 }
 

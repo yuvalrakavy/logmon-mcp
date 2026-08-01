@@ -519,7 +519,7 @@ pub async fn run_with_overrides(
     {
         let domains_for_restore = domains.clone();
         let fallback_metrics = receiver_metrics.clone();
-        let report = collectors.restore(move |id| {
+        let report = collectors.restore(chrono::Utc::now(), move |id| {
             domains_for_restore
                 .get(id)
                 .map(|d| d.metrics.clone())

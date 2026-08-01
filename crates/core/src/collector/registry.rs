@@ -299,6 +299,7 @@ impl CollectorRegistry {
     /// The check is lazy, on first read.
     pub fn restore(
         &self,
+        now: DateTime<Utc>,
         metrics_for: impl Fn(&DomainId) -> Arc<ReceiverMetrics>,
     ) -> RestoreReport {
         let Some(dir) = &self.dir else {
@@ -311,7 +312,7 @@ impl CollectorRegistry {
         };
         let mut g = self.entries.write().expect("registry lock poisoned");
         for file in outcome.collectors {
-            match Self::entry_from_file(&file, &metrics_for) {
+            match Self::entry_from_file(&file, now, &metrics_for) {
                 Ok(entry) => {
                     report.restored.push(entry.collector.def().name.clone());
                     g.push(entry);
@@ -324,6 +325,7 @@ impl CollectorRegistry {
 
     fn entry_from_file(
         file: &crate::collector::persist::PersistedCollector,
+        now: DateTime<Utc>,
         metrics_for: &impl Fn(&DomainId) -> Arc<ReceiverMetrics>,
     ) -> Result<Entry, String> {
         let level = match file.level.as_str() {
@@ -377,8 +379,12 @@ impl CollectorRegistry {
             owner: SessionId::Named(file.owner.clone()),
             domain,
             // Armed at the ORIGINAL time, so `armed_at` still says when this
-            // measurement began rather than when the daemon last booted.
-            collector: Arc::new(Collector::new(def, file.armed_at)),
+            // measurement began rather than when the daemon last booted — but
+            // the WINDOW starts now. Those are two different instants, and
+            // passing only the first left `zeroed_at` unset, so `window_start`
+            // fell through to `armed_at` and `wall_ms` spanned the outage with a
+            // span count that skipped it.
+            collector: Arc::new(Collector::new_restored(def, file.armed_at, now)),
             ingest_baseline: metrics.trace_ingest_loss(),
             metrics,
             history,

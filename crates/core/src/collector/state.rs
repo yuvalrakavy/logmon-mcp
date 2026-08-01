@@ -149,6 +149,27 @@ impl Collector {
         }
     }
 
+    /// Restore a collector whose live window did not survive a daemon restart
+    /// (§10).
+    ///
+    /// **`armed_at` and the window start are two different instants, and only
+    /// restore makes that visible.** `armed_at` stays at the original arming, so
+    /// it still reports when the measurement began; the window starts at
+    /// `zeroed_at` — here, the moment of restore. Constructing with `new` alone
+    /// left `zeroed_at` at `None`, so `window_start` fell through to `armed_at`
+    /// and `wall_ms` measured across the outage while the counts that would have
+    /// filled it were zeroed: the exact reading that `persist`'s module doc says
+    /// restore exists to prevent.
+    pub fn new_restored(
+        def: CollectorDef,
+        armed_at: DateTime<Utc>,
+        restored_at: DateTime<Utc>,
+    ) -> Self {
+        let me = Self::new(def, armed_at);
+        me.inner.write().expect("collector lock poisoned").zeroed_at = Some(restored_at);
+        me
+    }
+
     /// The rolling threshold's current verdict, if one is armed.
     pub fn threshold(&self) -> Option<crate::collector::threshold::ThresholdReport> {
         self.threshold.as_ref().map(|t| t.report())

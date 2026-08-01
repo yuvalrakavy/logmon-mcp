@@ -368,8 +368,16 @@ fn clearing_a_sessions_collectors_leaves_every_other_session_alone() {
 /// so the point is to prove the files were already complete while the first
 /// daemon was still running.
 fn restart_over(dir: &std::path::Path) -> Harness {
+    restart_over_at(dir, chrono::Utc::now())
+}
+
+/// `restart_over` with the restore instant pinned, so a test can assert what
+/// the restored window measures from.
+fn restart_over_at(dir: &std::path::Path, now: chrono::DateTime<chrono::Utc>) -> Harness {
     let h = harness_in(Some(dir.to_path_buf()));
-    let report = h.collectors.restore(|_| Arc::new(ReceiverMetrics::new()));
+    let report = h
+        .collectors
+        .restore(now, |_| Arc::new(ReceiverMetrics::new()));
     assert!(
         report.quarantined.is_empty() && report.rejected.is_empty(),
         "restore had problems: {:?} {:?}",
@@ -527,6 +535,71 @@ fn a_collector_pinned_to_a_vanished_domain_is_reported_orphaned_with_the_remedy(
             .unwrap()["matched"],
         1,
         "collecting again on the new pin"
+    );
+}
+
+/// A restored window measures from the restart, not from the original arming.
+///
+/// The defect this pins: `entry_from_file` armed the restored collector at the
+/// ORIGINAL `armed_at` and left `zeroed_at` unset, so `window_start` fell
+/// through to `armed_at` and `wall_ms` covered the whole outage — while the
+/// spans that would have filled it were zeroed. A reader dividing by that
+/// window got a rate that was wrong by however long the daemon was down, and
+/// `persist`'s own module doc says restore exists precisely to prevent it.
+///
+/// `armed_at` is rewritten on disk rather than waiting an hour: the outage
+/// length is the whole variable under test, and a test that cannot make it
+/// large cannot tell the two readings apart.
+#[test]
+fn v11_a_restored_window_measures_from_the_restart_not_the_original_arming() {
+    let d = tempfile::TempDir::new().unwrap();
+    let armed_an_hour_ago = {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "sv=svc", "level": "tree" }),
+        )
+        .unwrap();
+        h.feed("default", &span("svc", "op", 10.0));
+
+        // Backdate the arming on disk, so the restore below is recovering a
+        // measurement that began an hour before the daemon went down.
+        let path = logmon_broker_core::collector::persist::collector_path(d.path(), "perf", "c");
+        let mut file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let backdated = chrono::Utc::now() - chrono::Duration::hours(1);
+        file["armed_at"] = json!(backdated);
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        backdated
+    };
+
+    let restored_at = chrono::Utc::now();
+    let after = restart_over_at(d.path(), restored_at);
+    let sid = after.sessions.create_named("perf").unwrap();
+    let got = after
+        .call(&sid, "collectors.get", json!({ "name": "c" }))
+        .expect("read");
+
+    assert_eq!(got["matched"], 0, "the live window did not survive");
+    let wall_ms = got["window"]["wall_ms"].as_f64().expect("a window");
+    assert!(
+        wall_ms < 60_000.0,
+        "the window must start at the restart, not an hour earlier: wall_ms = {wall_ms}"
+    );
+
+    // Both instants survive, and they are different — which is the whole point.
+    // `armed_at` still reports when the measurement began; the window does not.
+    let armed = got["window"]["armed_at"].as_str().expect("armed_at");
+    assert_eq!(
+        armed.parse::<chrono::DateTime<chrono::Utc>>().unwrap(),
+        armed_an_hour_ago,
+        "armed_at must still say when the measurement began"
+    );
+    assert!(
+        got["window"]["zeroed_at"].is_string(),
+        "and the window says when it restarted"
     );
 }
 
