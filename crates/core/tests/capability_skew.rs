@@ -146,7 +146,10 @@ async fn every_method_in_the_shared_table_is_dispatched_by_this_daemon() {
 
     let mut unknown = Vec::new();
     let mut probed = 0usize;
-    for (tool, method) in mcp_tools::TOOLS {
+    for mcp_tools::Tool {
+        name: tool, method, ..
+    } in mcp_tools::TOOLS
+    {
         let res: Result<Value, _> = client.call(method, json!({})).await;
         probed += 1;
         if let Err(e) = res {

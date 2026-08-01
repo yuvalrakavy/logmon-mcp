@@ -39,7 +39,7 @@ pub async fn dispatch(broker: &Broker, json: bool) -> i32 {
         &result.broker_tools,
         &logmon_broker_protocol::mcp_tools::TOOLS
             .iter()
-            .map(|(t, _)| *t)
+            .map(|t| t.name)
             .collect::<Vec<_>>(),
     ) {
         println!("{note}");

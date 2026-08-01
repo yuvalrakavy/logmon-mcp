@@ -136,6 +136,10 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "SessionRename":         schema_for!(SessionRename),
             "SessionRenameResult":   schema_for!(SessionRenameResult),
             "DomainsUseResult":      schema_for!(DomainsUseResult),
+            // tools.manifest — what the daemon tells a shim about its own surface
+            "ToolsManifest":          schema_for!(logmon_broker_protocol::mcp_tools::ToolsManifest),
+            "ToolsManifestResult":    schema_for!(logmon_broker_protocol::mcp_tools::ToolsManifestResult),
+            "ManifestEntry":          schema_for!(logmon_broker_protocol::mcp_tools::ManifestEntry),
             // domain_data.* — the provenance registry
             "DomainDataEntry":         schema_for!(DomainDataEntry),
             "DomainDataUpdate":        schema_for!(DomainDataUpdate),

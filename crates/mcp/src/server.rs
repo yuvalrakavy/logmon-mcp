@@ -1652,7 +1652,7 @@ const SKILL_INSTRUCTIONS: &str = include_str!("../../../skill/logmon.md");
 fn local_tool_names() -> Vec<&'static str> {
     logmon_broker_protocol::mcp_tools::TOOLS
         .iter()
-        .map(|(t, _)| *t)
+        .map(|t| t.name)
         .collect()
 }
 
@@ -1768,6 +1768,54 @@ mod tests {
         );
     }
 
+    /// The *description* half of the table, checked against the text rmcp
+    /// actually publishes.
+    ///
+    /// Descriptions are duplicated: once on the `#[rmcp::tool]` attribute, once
+    /// in `protocol::mcp_tools::TOOLS`. That is not an oversight — rmcp 1.2
+    /// parses `description` as a literal and rejects a const path (`error:
+    /// Unexpected type path`, probed 2026-08-01), so the attribute cannot
+    /// reference the protocol crate's copy. The daemon still has to serve this
+    /// text, and it does not link the shim, so the text has to exist on both
+    /// sides until the shim registers its tools dynamically and the attributes
+    /// go away entirely.
+    ///
+    /// Until then this test is what makes the duplicate safe: an agent choosing
+    /// a tool from the daemon's manifest must read the same sentence the shim
+    /// would have shown it, or the manifest is describing a tool that does not
+    /// exist in the shape described.
+    #[test]
+    fn every_description_in_the_table_is_the_one_the_router_publishes() {
+        let published: std::collections::HashMap<String, String> =
+            super::GelfMcpServer::tool_router()
+                .list_all()
+                .into_iter()
+                .map(|t| {
+                    (
+                        t.name.to_string(),
+                        t.description.map(|d| d.to_string()).unwrap_or_default(),
+                    )
+                })
+                .collect();
+
+        let mut wrong = Vec::new();
+        for entry in logmon_broker_protocol::mcp_tools::TOOLS {
+            match published.get(entry.name) {
+                None => wrong.push(format!("{}: in TOOLS but not in the router", entry.name)),
+                Some(actual) if actual != entry.description => wrong.push(format!(
+                    "{}:\n     table: {}\n    router: {actual}",
+                    entry.name, entry.description
+                )),
+                Some(_) => {}
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the daemon would serve a description the shim does not show:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
     /// The *method* half of the table, checked against the call each tool body
     /// actually makes.
     ///
@@ -1821,7 +1869,7 @@ mod tests {
         found.sort();
         let mut table: Vec<(String, String)> = logmon_broker_protocol::mcp_tools::TOOLS
             .iter()
-            .map(|(t, m)| ((*t).to_string(), (*m).to_string()))
+            .map(|t| (t.name.to_string(), t.method.to_string()))
             .collect();
         table.sort();
 
@@ -2012,7 +2060,7 @@ mod param_drift_tests {
 
     /// The committed schema, generated from the protocol crate's request types
     /// by `cargo xtask gen-schema`.
-    const PROTOCOL_SCHEMA: &str = include_str!("../../protocol/protocol-v1.schema.json");
+    use logmon_broker_protocol::mcp_tools::SCHEMA_JSON as PROTOCOL_SCHEMA;
 
     /// `collectors.edit` → `CollectorsEdit`. The generator names definitions
     /// after the Rust type, and the types are named after the methods, so the
@@ -2082,8 +2130,9 @@ mod param_drift_tests {
         let all = super::GelfMcpServer::tool_router().list_all();
         let mut problems: Vec<String> = Vec::new();
 
-        for (tool, method) in TOOLS {
-            let Some(route) = all.iter().find(|t| t.name == *tool) else {
+        for entry in TOOLS {
+            let (tool, method) = (entry.name, entry.method);
+            let Some(route) = all.iter().find(|t| t.name == tool) else {
                 problems.push(format!("{tool}: in TOOLS but not in the router"));
                 continue;
             };

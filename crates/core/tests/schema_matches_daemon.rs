@@ -27,7 +27,7 @@ use logmon_broker_core::collector::project::GroupBy;
 use logmon_broker_core::collector::sample::Level;
 use logmon_broker_core::collector::threshold::{Metric, Op};
 
-const SCHEMA: &str = include_str!("../../protocol/protocol-v1.schema.json");
+use logmon_broker_protocol::mcp_tools::SCHEMA_JSON as SCHEMA;
 
 /// The `enum` a definition declares for one field. `null` entries are dropped:
 /// they mean "the optional field may be null", which every `opt_*` reader maps

@@ -175,6 +175,7 @@ impl RpcHandler {
             "logs.export" => self.handle_logs_export(session_id, &request.params),
             "logs.clear" => self.handle_logs_clear(session_id),
             "status.get" => self.handle_status(session_id),
+            "tools.manifest" => Self::handle_tools_manifest(),
             "filters.list" => self.handle_filters_list(session_id),
             "filters.add" => self.handle_filters_add(session_id, &request.params),
             "filters.edit" => self.handle_filters_edit(session_id, &request.params),
@@ -898,6 +899,24 @@ impl RpcHandler {
     // -----------------------------------------------------------------------
     // status.*
     // -----------------------------------------------------------------------
+
+    /// Every tool this daemon knows, with the schema its arguments must satisfy.
+    ///
+    /// **This is what lets the daemon gain a tool without the shim being
+    /// reinstalled.** A shim that registers from this manifest exposes whatever
+    /// the daemon declares; one built against a fixed list can only ever expose
+    /// what it was compiled with.
+    ///
+    /// Takes no session and no parameters: the manifest describes the protocol,
+    /// not this connection, so there is nothing about the caller that could
+    /// change the answer.
+    fn handle_tools_manifest() -> Result<Value, String> {
+        Ok(json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "broker_version": env!("CARGO_PKG_VERSION"),
+            "tools": logmon_broker_protocol::mcp_tools::manifest(),
+        }))
+    }
 
     fn handle_status(&self, session_id: &SessionId) -> Result<Value, String> {
         // Neither of the two broker facts below depends on a domain, so they are

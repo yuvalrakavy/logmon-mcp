@@ -3505,6 +3505,90 @@
         "span_count"
       ]
     },
+    "ToolsManifest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ToolsManifest",
+      "description": "`tools.manifest` takes no parameters: the manifest describes the protocol,\nnot the connection, so nothing about the caller could change the answer.",
+      "type": "object"
+    },
+    "ToolsManifestResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ToolsManifestResult",
+      "description": "What `tools.manifest` answers with.\n\nLives here rather than in `methods` because it describes the MCP front-end's\nsurface, which is the boundary this module exists to keep separate from the\nwire protocol's own types.",
+      "type": "object",
+      "properties": {
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "broker_version": {
+          "description": "Which daemon build answered. A shim reports skew against this rather\nthan guessing from the tool list.",
+          "type": "string"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ManifestEntry"
+          }
+        }
+      },
+      "required": [
+        "protocol_version",
+        "broker_version",
+        "tools"
+      ],
+      "$defs": {
+        "ManifestEntry": {
+          "description": "One tool, as the daemon serves it: the name an agent calls, the text it reads\nto decide whether to, and the schema its arguments must satisfy.\n\nThis is the whole point of the exercise. A shim holding these three things\ncan register a tool it has never heard of, which is what lets the daemon gain\na tool without the shim being reinstalled.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "method": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "input_schema": {
+              "description": "The JSON Schema for this tool's parameters.\n\n`None` means the schema has no definition under this tool's derived name\n— which is a **generator gap, not a tool without parameters**. The two\nare indistinguishable from the outside, so they must not be conflated:\nserving `{}` for a missing definition would advertise \"takes nothing\" for\na tool that takes several, and every call would then be rejected for\nunknown fields."
+            }
+          },
+          "required": [
+            "name",
+            "method",
+            "description"
+          ]
+        }
+      }
+    },
+    "ManifestEntry": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ManifestEntry",
+      "description": "One tool, as the daemon serves it: the name an agent calls, the text it reads\nto decide whether to, and the schema its arguments must satisfy.\n\nThis is the whole point of the exercise. A shim holding these three things\ncan register a tool it has never heard of, which is what lets the daemon gain\na tool without the shim being reinstalled.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "method": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "input_schema": {
+          "description": "The JSON Schema for this tool's parameters.\n\n`None` means the schema has no definition under this tool's derived name\n— which is a **generator gap, not a tool without parameters**. The two\nare indistinguishable from the outside, so they must not be conflated:\nserving `{}` for a missing definition would advertise \"takes nothing\" for\na tool that takes several, and every call would then be rejected for\nunknown fields."
+        }
+      },
+      "required": [
+        "name",
+        "method",
+        "description"
+      ]
+    },
     "DomainDataEntry": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "DomainDataEntry",
