@@ -1,4 +1,6 @@
 /target
+# Spotlight skips `.noindex` directories; see .cargo/config.toml.
+/target.noindex
 .superpowers/
 
 # Agent worktrees and local Claude Code state — never project content.

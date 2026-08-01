@@ -1,2 +1,13 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Spotlight skips any directory whose name ends in `.noindex` — the same trick
+# Xcode uses for DerivedData. Measured here before doing it: Spotlight had
+# indexed 258,993 items under a 99 GB `target/`, every one of them a build
+# artifact that is rewritten and reindexed on the next compile.
+#
+# Renaming rather than adding a Privacy-list entry keeps this in the repo, so it
+# holds for a fresh clone and for anyone else who builds it, instead of being a
+# machine setting someone has to remember.
+[build]
+target-dir = "target.noindex"
