@@ -3396,3 +3396,133 @@ fn a_rejected_group_by_names_every_value_its_parser_accepts() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// §6.2 — spans.export, the seq-ranged span read that did not exist
+// ---------------------------------------------------------------------------
+
+/// The range selects spans by seq, inclusively at both ends.
+///
+/// `spans.context` could not answer this: it counts POSITIONS in the ring
+/// (`idx.saturating_sub(before)`), so it cannot say which spans belong to a seq
+/// window. A capture pairing logs with the spans over the same interval needs
+/// exactly that, which is why this method exists.
+#[test]
+fn spans_export_returns_the_inclusive_seq_range() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=6 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
+
+    let all = h.call(&sid, "spans.export", json!({})).unwrap();
+    let mut seqs: Vec<u64> = all["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["seq"].as_u64().unwrap())
+        .collect();
+    seqs.sort_unstable();
+    assert_eq!(seqs.len(), 6, "six inserted: {seqs:?}");
+
+    // Endpoints included — the single-seq case is what proves it.
+    let one = h
+        .call(
+            &sid,
+            "spans.export",
+            json!({ "from_seq": seqs[0], "to_seq": seqs[0] }),
+        )
+        .unwrap();
+    assert_eq!(one["count"], 1, "from == to must return that one span");
+    assert_eq!(one["spans"][0]["seq"], seqs[0]);
+
+    // And it narrows from both directions.
+    let inner = h
+        .call(
+            &sid,
+            "spans.export",
+            json!({ "from_seq": seqs[1], "to_seq": seqs[4] }),
+        )
+        .unwrap();
+    assert_eq!(inner["count"], 4, "endpoints included: {inner}");
+}
+
+/// `capped` is exact here, not inferred.
+///
+/// `logs.export` has to ask the store for one more than requested, because it
+/// only learns what it was handed. `for_each_matching` returns the total
+/// matched, so this path can report both how many came back and how many there
+/// were — and `matched` is the figure that says by how much it fell short.
+#[test]
+fn spans_export_reports_capping_with_the_true_total() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=6 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
+
+    let cut = h.call(&sid, "spans.export", json!({ "count": 4 })).unwrap();
+    assert_eq!(cut["count"], 4);
+    assert_eq!(cut["matched"], 6, "the total must survive the cap: {cut}");
+    assert_eq!(cut["capped"], true, "{cut}");
+
+    let exact = h.call(&sid, "spans.export", json!({ "count": 6 })).unwrap();
+    assert_eq!(exact["count"], 6);
+    assert_eq!(
+        exact["capped"], false,
+        "six of six is not capped, and that is the case an inference gets wrong: {exact}"
+    );
+}
+
+/// The verdict is the SPAN ring's, not the log pipeline's.
+///
+/// Both stores share one seq axis but evict independently, so a log window
+/// reported complete says nothing about whether the spans over that same range
+/// survived. §6.2 is explicit that one verdict cannot honestly cover two stores
+/// with independent retention — so this reports its own.
+#[test]
+fn spans_export_reports_the_span_rings_own_retention() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=4 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
+
+    let all = h.call(&sid, "spans.export", json!({})).unwrap();
+    let oldest = all["buffer_oldest_seq"]
+        .as_u64()
+        .expect("a non-empty span ring has an oldest seq");
+    assert!(all["buffer_newest_seq"].as_u64().is_some(), "{all}");
+
+    // A window starting below what the ring still holds is not complete.
+    let below = h
+        .call(
+            &sid,
+            "spans.export",
+            json!({ "from_seq": oldest.saturating_sub(50) }),
+        )
+        .unwrap();
+    assert_eq!(
+        below["truncated"], true,
+        "a window starting below the span ring is not complete: {below}"
+    );
+    assert!(
+        below["evicted_before_window"].as_u64().is_some(),
+        "and the gap must be named, not merely flagged: {below}"
+    );
+}
+
+/// A cursor would advance the caller's read position as a side effect of
+/// gathering evidence, so it is refused — the same rule `traces.slow` applies.
+#[test]
+fn spans_export_refuses_a_cursor_qualifier() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let err = h
+        .call(&sid, "spans.export", json!({ "filter": "c>=somecursor" }))
+        .expect_err("a read-and-advance cursor must not be usable for a capture");
+    assert!(err.contains("cursor"), "{err}");
+}

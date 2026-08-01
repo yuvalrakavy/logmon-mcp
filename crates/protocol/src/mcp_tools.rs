@@ -422,6 +422,12 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli::PLAIN,
     },
     Tool {
+        name: "export_spans",
+        method: "spans.export",
+        description: "Export every span whose sequence number falls in an inclusive range, for pairing spans with the logs over the same window. Reports the span ring's own retention: logs and spans share a sequence axis but evict independently, so a complete log window says nothing about whether its spans survived.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "get_trace_logs",
         method: "traces.logs",
         description: "Get all logs linked to a trace",
@@ -1049,7 +1055,7 @@ mod tests {
     fn every_pair_is_well_formed_and_unique() {
         // Pinned so a tool cannot be added here without also being added to the
         // shim — the source-scan test in `mcp/src/server.rs` is the other half.
-        assert_eq!(TOOLS.len(), 45);
+        assert_eq!(TOOLS.len(), 46);
         for Tool {
             name: tool, method, ..
         } in TOOLS

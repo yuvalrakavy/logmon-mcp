@@ -98,6 +98,8 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "TracesLogsResult":      schema_for!(TracesLogsResult),
             "SpansContext":          schema_for!(SpansContext),
             "SpansContextResult":    schema_for!(SpansContextResult),
+            "SpansExport":           schema_for!(SpansExport),
+            "SpansExportResult":     schema_for!(SpansExportResult),
             "BookmarksAdd":          schema_for!(BookmarksAdd),
             "BookmarksAddResult":    schema_for!(BookmarksAddResult),
             "BookmarksList":         schema_for!(BookmarksList),

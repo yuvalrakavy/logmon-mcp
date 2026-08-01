@@ -700,6 +700,62 @@ pub struct SpansContextResult {
     pub count: usize,
 }
 
+/// Every span whose seq falls in an inclusive range.
+///
+/// **The span store had no seq-ranged read at all.** Its whole surface was
+/// `get_trace`, `slow_spans`, `for_each_matching`, `duration_by_name`,
+/// `recent_traces` and `spans.context` — and `spans.context` counts *positions
+/// in the ring*, not seqs, so it cannot answer "what spans belong to this
+/// window". A capture that pairs logs with the spans covering the same interval
+/// needs one, which is what this is.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SpansExport {
+    /// Lowest seq to export, **inclusive**.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_seq: Option<u64>,
+    /// Highest seq to export, **inclusive**. Same convention as `logs.export`:
+    /// a window of "this span, none before and none after" must contain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_seq: Option<u64>,
+    /// Maximum spans to return. Everything matching is still counted, so
+    /// `capped` and `matched` stay truthful when this bites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    /// Additional span filter, ANDed with the range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SpansExportResult {
+    pub spans: Vec<SpanEntry>,
+    /// How many are in `spans`.
+    pub count: usize,
+    /// How many matched the range in total. Differs from `count` only when
+    /// `capped`, and it is the figure that says by how much.
+    #[serde(default)]
+    pub matched: usize,
+    /// `count` stopped this short of everything that matched.
+    #[serde(default)]
+    pub capped: bool,
+    /// **The span ring's own retention, not the log pipeline's.** The two
+    /// stores share a seq axis but evict independently, so a log window's
+    /// verdict says nothing about whether the spans over that same range
+    /// survived. One verdict cannot honestly cover two stores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_newest_seq: Option<u64>,
+    /// The requested range began before the span ring's oldest retained span.
+    #[serde(default)]
+    pub truncated: bool,
+    /// How many seqs lie between the requested start and the oldest span still
+    /// held — an upper bound on what was lost to eviction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_before_window: Option<u64>,
+}
+
 // =============================================================================
 // collectors.* / traces.profile
 // =============================================================================

@@ -209,6 +209,7 @@ impl RpcHandler {
             "traces.slow" => self.handle_traces_slow(session_id, &request.params),
             "traces.logs" => self.handle_traces_logs(session_id, &request.params),
             "spans.context" => self.handle_spans_context(session_id, &request.params),
+            "spans.export" => self.handle_spans_export(session_id, &request.params),
             "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
             "bookmarks.list" => self.handle_bookmarks_list(session_id, &request.params),
             "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
@@ -1492,6 +1493,63 @@ impl RpcHandler {
 
         let spans = d.span_store.context_by_seq(seq, before, after);
         Ok(json!({ "spans": spans, "count": spans.len() }))
+    }
+
+    /// `spans.export` — every span whose seq lies in an inclusive range (§6.2).
+    ///
+    /// **The range is lowered into the filter by the same `lower_seq_range` that
+    /// `logs.export` uses**, and `matches_span` already understands
+    /// `Qualifier::SeqFilter`. So the inclusive semantics, the saturating ±1 and
+    /// the eviction detection are shared with the log path by construction —
+    /// not written twice and kept in step.
+    ///
+    /// What is deliberately *not* shared is retention. The span ring evicts
+    /// independently of the log pipeline, so the verdict here is computed
+    /// against the span store's own `oldest_seq`. A log window reported complete
+    /// says nothing about whether the spans over that same range survived.
+    fn handle_spans_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
+        let filter_str = opt_str(params, "filter")?;
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
+        if cursor_commit.is_some() {
+            // A cursor is read-and-advance, so exporting through one would move
+            // the caller's read position as a side effect of gathering
+            // evidence. Refused for the reason `traces.slow` refuses it.
+            return Err("cursor qualifier not permitted in spans.export".to_string());
+        }
+        let resolved = lower_seq_range(
+            resolved,
+            opt_u64(params, "from_seq")?,
+            opt_u64(params, "to_seq")?,
+        );
+
+        // `for_each_matching` returns the TOTAL matched, so `capped` is exact
+        // here rather than probed as it must be on the log path — the store
+        // tells us how many there were, not merely how many it handed back.
+        let mut spans = Vec::new();
+        let matched = d.span_store.for_each_matching(resolved.as_ref(), |s| {
+            if spans.len() < count {
+                spans.push(s.clone());
+            }
+        });
+
+        let oldest = d.span_store.oldest_seq();
+        let evicted_before_window = resolved
+            .as_ref()
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, oldest));
+
+        Ok(json!({
+            "spans": spans,
+            "count": spans.len(),
+            "matched": matched,
+            "capped": matched > count,
+            "buffer_oldest_seq": oldest,
+            "buffer_newest_seq": d.span_store.newest_seq(),
+            "truncated": evicted_before_window.is_some(),
+            "evicted_before_window": evicted_before_window,
+        }))
     }
 
     // -----------------------------------------------------------------------

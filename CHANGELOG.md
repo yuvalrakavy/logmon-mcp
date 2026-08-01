@@ -147,6 +147,31 @@ is a second name to support forever.
   is true both when a range was cut and when exactly N existed — and it is a
   different kind of incompleteness from `truncated`, which reports eviction.
 
+- **`spans.export` — a seq-ranged span read, which did not exist.** The span
+  store's entire surface was `get_trace`, `slow_spans`, `for_each_matching`,
+  `duration_by_name`, `recent_traces` and `spans.context` — and `spans.context`
+  counts *positions in the ring*, not sequence numbers, so nothing could answer
+  "which spans belong to this window". Pairing spans with the logs over the same
+  interval needs exactly that.
+
+  Takes `from_seq` / `to_seq` (inclusive, same convention as `logs.export`),
+  an optional `count`, and an optional `filter` ANDed with the range. The range
+  is folded into the filter by the same code path `logs.export` uses, so the
+  bounds, the saturating adjustment and the eviction detection cannot drift
+  between the two.
+
+  **The verdict it reports is the span ring's own.** Logs and spans share a
+  sequence axis but evict independently, so a log window reported complete says
+  nothing about whether the spans covering it survived — `buffer_oldest_seq`,
+  `truncated` and `evicted_before_window` are all computed against the span
+  store. One verdict cannot honestly cover two stores with independent
+  retention.
+
+  `capped` is exact rather than inferred here: the store reports how many spans
+  matched in total, so the reply carries both `count` and `matched` and says by
+  how much it fell short. A cursor qualifier is refused — it is read-and-advance,
+  and gathering evidence must not move the caller's read position.
+
 ### Fixed
 
 - **A parameter of the wrong type is now an error, not a different answer.**

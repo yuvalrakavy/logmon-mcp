@@ -2317,6 +2317,268 @@
         }
       }
     },
+    "SpansExport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpansExport",
+      "description": "Every span whose seq falls in an inclusive range.\n\n**The span store had no seq-ranged read at all.** Its whole surface was\n`get_trace`, `slow_spans`, `for_each_matching`, `duration_by_name`,\n`recent_traces` and `spans.context` — and `spans.context` counts *positions\nin the ring*, not seqs, so it cannot answer \"what spans belong to this\nwindow\". A capture that pairs logs with the spans covering the same interval\nneeds one, which is what this is.",
+      "type": "object",
+      "properties": {
+        "from_seq": {
+          "description": "Lowest seq to export, **inclusive**.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "to_seq": {
+          "description": "Highest seq to export, **inclusive**. Same convention as `logs.export`:\na window of \"this span, none before and none after\" must contain it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "count": {
+          "description": "Maximum spans to return. Everything matching is still counted, so\n`capped` and `matched` stay truthful when this bites.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filter": {
+          "description": "Additional span filter, ANDed with the range.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SpansExportResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SpansExportResult",
+      "type": "object",
+      "properties": {
+        "spans": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SpanEntry"
+          }
+        },
+        "count": {
+          "description": "How many are in `spans`.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "matched": {
+          "description": "How many matched the range in total. Differs from `count` only when\n`capped`, and it is the figure that says by how much.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "capped": {
+          "description": "`count` stopped this short of everything that matched.",
+          "type": "boolean",
+          "default": false
+        },
+        "buffer_oldest_seq": {
+          "description": "**The span ring's own retention, not the log pipeline's.** The two\nstores share a seq axis but evict independently, so a log window's\nverdict says nothing about whether the spans over that same range\nsurvived. One verdict cannot honestly cover two stores.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "truncated": {
+          "description": "The requested range began before the span ring's oldest retained span.",
+          "type": "boolean",
+          "default": false
+        },
+        "evicted_before_window": {
+          "description": "How many seqs lie between the requested start and the oldest span still\nheld — an upper bound on what was lost to eviction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "spans",
+        "count"
+      ],
+      "$defs": {
+        "SpanEntry": {
+          "description": "A single span. Mirrors `core::span::types::SpanEntry`.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "trace_id": {
+              "description": "Trace id rendered as 32-char lowercase hex.",
+              "type": "string"
+            },
+            "span_id": {
+              "description": "Span id rendered as 16-char lowercase hex.",
+              "type": "string"
+            },
+            "parent_span_id": {
+              "description": "Parent span id rendered as 16-char lowercase hex (none for root spans).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "start_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "end_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "duration_ms": {
+              "type": "number",
+              "format": "double"
+            },
+            "name": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/$defs/SpanKind"
+            },
+            "service_name": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/SpanStatus"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "events": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SpanEvent"
+              },
+              "default": []
+            }
+          },
+          "required": [
+            "seq",
+            "trace_id",
+            "span_id",
+            "start_time",
+            "end_time",
+            "duration_ms",
+            "name",
+            "kind",
+            "service_name",
+            "status"
+          ]
+        },
+        "SpanKind": {
+          "description": "Span kind. Wire format is snake_case, matching `core::span::types::SpanKind`.",
+          "type": "string",
+          "enum": [
+            "unspecified",
+            "internal",
+            "server",
+            "client",
+            "producer",
+            "consumer"
+          ]
+        },
+        "SpanStatus": {
+          "description": "Span status. Wire format mirrors `core::span::types::SpanStatus`:\n`{\"type\":\"unset\"}`, `{\"type\":\"ok\"}`, `{\"type\":\"error\",\"message\":\"...\"}`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "unset"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "ok"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "error"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "message"
+              ]
+            }
+          ]
+        },
+        "SpanEvent": {
+          "description": "A timestamped event attached to a span. Mirrors `core::span::types::SpanEvent`.",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "attributes": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "name",
+            "timestamp"
+          ]
+        }
+      }
+    },
     "BookmarksAdd": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "BookmarksAdd",
