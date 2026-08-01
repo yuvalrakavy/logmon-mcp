@@ -109,6 +109,11 @@ pub struct SnapshotRequest {
 
 /// A collector plus everything the read path needs to interpret it.
 pub struct ArmedCollector {
+    /// The session that armed it. Carried because a case document selects
+    /// across owners (§5.4) and a reader needs to know whose collector a
+    /// number came from — the CLI and the shim are different sessions on the
+    /// same domain.
+    pub owner: SessionId,
     /// Why the live window is empty, when there is a reason worth reporting.
     /// Lets a caller reading zero matches tell "nothing has happened yet" from
     /// "the run you were measuring did not survive the restart".
@@ -125,6 +130,7 @@ pub struct ArmedCollector {
 impl Entry {
     fn armed(&self) -> ArmedCollector {
         ArmedCollector {
+            owner: self.owner.clone(),
             collector: self.collector.clone(),
             domain: self.domain.clone(),
             metrics: self.metrics.clone(),
@@ -624,6 +630,27 @@ impl CollectorRegistry {
         let g = self.entries.read().expect("registry lock poisoned");
         g.iter()
             .filter(|e| &e.owner == owner)
+            .map(Entry::armed)
+            .collect()
+    }
+
+    /// Every collector pinned to `domain`, **whoever armed it** — the selection
+    /// a case document needs (§5.4).
+    ///
+    /// "The calling session's collectors" is wrong twice here. `ArmedCollector.
+    /// domain` is a pin that a later `use_domain` does not move, so an
+    /// owner-scoped list can carry collectors measuring a *different* domain;
+    /// and the CLI connects as session `cli` while the shim uses its own, so an
+    /// MCP-created case would see none of the CLI's collectors on the very
+    /// domain it is about.
+    ///
+    /// Returns the `ArmedCollector`s and nothing derived, so projection — which
+    /// sorts every retained duration — happens after this guard drops rather
+    /// than under a lock the ingest path takes.
+    pub fn list_for_domain(&self, domain: &DomainId) -> Vec<ArmedCollector> {
+        let g = self.entries.read().expect("registry lock poisoned");
+        g.iter()
+            .filter(|e| &e.domain == domain)
             .map(Entry::armed)
             .collect()
     }

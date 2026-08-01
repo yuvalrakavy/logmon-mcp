@@ -26,6 +26,7 @@
 //! compression, which is transparent, and gzipping cold files later, which needs
 //! no change to this contract.
 
+pub mod document;
 pub mod naming;
 pub mod write;
 
