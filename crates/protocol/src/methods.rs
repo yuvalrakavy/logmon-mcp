@@ -1004,6 +1004,21 @@ pub struct CollectorsAdd {
     /// A rolling guard over this collector's matched spans (§8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<ThresholdSpec>,
+    /// Provenance to record while arming: `domain_data.update` entries, applied
+    /// to this call's domain. Same validation, same per-entry outcomes, same
+    /// `/logmon/` guard, same caps — one implementation, not a second store.
+    ///
+    /// A shorthand and nothing more. It is **not** persisted with the
+    /// collector, does not appear in its definition, and `collectors.edit` does
+    /// not touch it, because the registry already holds it. It exists because
+    /// recording what the project was *while you are already describing what
+    /// you are measuring* costs one parameter, where a separate call costs a
+    /// decision — and the decision is the part that does not get made.
+    ///
+    /// A `@`-sigilled key is **rejected**: the sigil scopes a fact to one
+    /// document, and arming a collector writes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<DomainDataEntry>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1022,6 +1037,17 @@ pub struct CollectorsAddResult {
     /// Never a refusal: each of these collects *something*.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// One outcome per `data` entry, in the order sent — exactly what
+    /// `domain_data.update` returns, so an agent learns one vocabulary rather
+    /// than two. Absent when no `data` was sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_outcomes: Vec<DomainDataOutcome>,
+    /// Set when `data` reached memory but not disk. Named rather than
+    /// swallowed, for the reason `domain_data.update` names it: provenance that
+    /// will not survive a restart, reported as success, is the exact failure
+    /// the registry exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_persist_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

@@ -5035,6 +5035,16 @@
               "type": "null"
             }
           ]
+        },
+        "data": {
+          "description": "Provenance to record while arming: `domain_data.update` entries, applied\nto this call's domain. Same validation, same per-entry outcomes, same\n`/logmon/` guard, same caps — one implementation, not a second store.\n\nA shorthand and nothing more. It is **not** persisted with the\ncollector, does not appear in its definition, and `collectors.edit` does\nnot touch it, because the registry already holds it. It exists because\nrecording what the project was *while you are already describing what\nyou are measuring* costs one parameter, where a separate call costs a\ndecision — and the decision is the part that does not get made.\n\nA `@`-sigilled key is **rejected**: the sigil scopes a fact to one\ndocument, and arming a collector writes none.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/DomainDataEntry"
+          }
         }
       },
       "additionalProperties": false,
@@ -5096,6 +5106,30 @@
             "value",
             "window_ms"
           ]
+        },
+        "DomainDataEntry": {
+          "description": "One requested change to the registry.\n\n**Absent ≡ `null` ≡ unchanged, for both `value` and `ttl`**, and the two\nshare one rule deliberately: two optional fields on one object with opposite\nabsent semantics is the footgun this surface exists to avoid, and a client\nserialising a missing field as `null` would otherwise mean the opposite of\nwhat it sent. Erasure is `domain_data.remove`, never `value: null`.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "A registry path — `/Build/commit`. A leading `@` scopes the fact to one\ncase document instead of the domain, and is accepted only where a\ndocument exists to receive it.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Present → set. Absent → validate only, which never creates.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ttl": {
+              "description": "A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear\none in place. Absent leaves any existing lifetime untouched.\n\n`false` rather than `null` carries the clear because `null` is already\nspoken for above. This is the opposite convention to\n`CollectorsEdit.threshold`, where `null` removes — noted because the two\nlive in one daemon and the difference is deliberate rather than drift."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "path"
+          ]
         }
       }
     },
@@ -5135,6 +5169,20 @@
           "items": {
             "type": "string"
           }
+        },
+        "data_outcomes": {
+          "description": "One outcome per `data` entry, in the order sent — exactly what\n`domain_data.update` returns, so an agent learns one vocabulary rather\nthan two. Absent when no `data` was sent.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainDataOutcome"
+          }
+        },
+        "data_persist_error": {
+          "description": "Set when `data` reached memory but not disk. Named rather than\nswallowed, for the reason `domain_data.update` names it: provenance that\nwill not survive a restart, reported as success, is the exact failure\nthe registry exists to prevent.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -5143,7 +5191,40 @@
         "level",
         "domain",
         "max_sample_bytes"
-      ]
+      ],
+      "$defs": {
+        "DomainDataOutcome": {
+          "description": "What happened to one entry.\n\n`outcome` is one of `created`, `updated`, `validated`, `unknown`,\n`rejected`. The last two carry a discriminant rather than prose, so a caller\ncan branch instead of string-matching a sentence.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "The key as the caller spelled it, sigil included.",
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "cause": {
+              "description": "`never_set` | `no_registry` | `undetermined` — present on `unknown`.\n\nThree, not two: `/logmon/first_seen` is written identically for a\nbrand-new domain and for one whose file was lost, so from the registry\nalone those are not distinguishable. `undetermined` is the honest\ndefault and `no_registry` is claimed only with a quarantine artifact.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "description": "`malformed_path` | `path_too_long` | `value_too_long` |\n`reserved_prefix` | `sigil_not_allowed_here` | `malformed_ttl` |\n`registry_full` — present on `rejected`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path",
+            "outcome"
+          ]
+        }
+      }
     },
     "CollectorsList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

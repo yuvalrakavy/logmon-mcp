@@ -106,6 +106,25 @@ is a second name to support forever.
   successfully — a flat layout could silently cost every named session, trigger,
   filter and bookmark on the next boot.
 
+  **`collectors.add` takes a `data` shorthand**, defined as
+  `domain_data.update(entries)` on that call's domain — the same validation, the
+  same per-entry outcomes, the same `/logmon/` guard, the same caps, one
+  implementation. Not a namespace, not a parallel store.
+
+  It exists because a convention that lives only in documentation is a
+  capability nobody reaches for. Recording what the project was *at the moment
+  you are already describing what you are measuring* costs one parameter;
+  recording it in a separate call costs a **decision**, and the decision is the
+  part that does not get made.
+
+  It is a shorthand and nothing more: not persisted with the collector, absent
+  from its definition, untouched by `collectors.edit` — the registry already
+  holds it. `@`-sigilled keys are refused, because the sigil scopes a fact to one
+  document and arming a collector writes none. The entries are applied only once
+  the collector is actually armed, so a refused call leaves nothing behind that
+  its caller never saw an outcome for. The reply carries `data_outcomes` only
+  when there is something to report.
+
 ### Fixed
 
 - **A parameter of the wrong type is now an error, not a different answer.**

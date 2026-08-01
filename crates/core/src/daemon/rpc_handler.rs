@@ -584,13 +584,25 @@ impl RpcHandler {
         Ok((name, reg))
     }
 
-    fn handle_domain_data_update(
+    /// Write an entry list into the calling session's domain registry.
+    ///
+    /// **The one implementation behind `domain_data.update` and the `data`
+    /// shorthands** (§3.8). `collectors.add(data)` and `cases.create(data)` are
+    /// *defined* as this call on that call's domain — the same validation, the
+    /// same per-entry outcomes, the same `/logmon/` guard, the same caps. Not a
+    /// namespace, not a parallel store, and not three semantics behind one
+    /// spelling.
+    ///
+    /// Sigilled keys are refused in here rather than at each caller: the
+    /// registry is the wrong scope for a key that names one document, and
+    /// `DomainDataRejection::SigilNotAllowedHere` already says so.
+    fn apply_data_entries(
         &self,
         session_id: &SessionId,
-        params: &Value,
-    ) -> Result<Value, String> {
+        raw: Option<&Value>,
+    ) -> Result<(Vec<DomainDataOutcome>, Option<String>), String> {
         let (_, reg) = self.resolve_domain_data(session_id)?;
-        let (indexed, rejected) = parse_data_entries(params.get("entries"))?;
+        let (indexed, rejected) = parse_data_entries(raw)?;
         let (indices, entries): (Vec<usize>, Vec<_>) = indexed.into_iter().unzip();
         let now = chrono::Utc::now();
         let (applied, saved) = reg.mutate(|r| r.update(&entries, now));
@@ -600,10 +612,19 @@ impl RpcHandler {
         // sent, in the order sent — a caller matching results to inputs
         // positionally must not have to reconcile two lists.
         let outcomes = merge_outcomes(applied, indices, rejected);
+        Ok((outcomes.iter().map(wire_outcome).collect(), saved.err()))
+    }
 
+    fn handle_domain_data_update(
+        &self,
+        session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let (outcomes, persist_error) =
+            self.apply_data_entries(session_id, params.get("entries"))?;
         serde_json::to_value(DomainDataUpdateResult {
-            outcomes: outcomes.iter().map(wire_outcome).collect(),
-            persist_error: saved.err(),
+            outcomes,
+            persist_error,
         })
         .map_err(|e| e.to_string())
     }
@@ -1715,7 +1736,17 @@ impl RpcHandler {
             .add(session_id, &domain_id, d.metrics.clone(), def, Utc::now())
             .map_err(|e| e.to_string())?;
 
-        Ok(json!({
+        // §3.8's shorthand, applied only once the collector is actually armed:
+        // a call that returns an error must not leave provenance behind that
+        // its caller never saw an outcome for. Absent — or an explicit null —
+        // means no entries, which is this crate's rule for every optional
+        // parameter; `domain_data.update` keeps requiring its own `entries`.
+        let (data_outcomes, data_persist_error) = match params.get("data") {
+            Some(v) if !v.is_null() => self.apply_data_entries(session_id, Some(v))?,
+            _ => (Vec::new(), None),
+        };
+
+        let mut result = json!({
             "name": collector.def().name,
             "filter": collector.def().filter_string,
             "level": collector.def().level.as_str(),
@@ -1727,7 +1758,18 @@ impl RpcHandler {
             // Returned on `add` because that is the moment the caller can
             // still cheaply change their mind.
             "warnings": warnings,
-        }))
+        });
+        // Added only when there is something to say, because the schema
+        // declares both as skippable and a reply that always carries an empty
+        // list and a null teaches a reader that `data` did something when it
+        // did nothing.
+        if !data_outcomes.is_empty() {
+            result["data_outcomes"] = serde_json::to_value(&data_outcomes).unwrap_or_default();
+        }
+        if let Some(e) = data_persist_error {
+            result["data_persist_error"] = json!(e);
+        }
+        Ok(result)
     }
 
     fn handle_collectors_list(&self, session_id: &SessionId) -> Result<Value, String> {

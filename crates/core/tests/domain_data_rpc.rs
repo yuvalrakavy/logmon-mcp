@@ -453,3 +453,149 @@ fn a_broker_without_the_registry_says_so_rather_than_reporting_it_empty() {
     assert!(r.result.is_none());
     assert!(r.error.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// §3.8 — `collectors.add(data)` IS `domain_data.update` on that call's domain
+// ---------------------------------------------------------------------------
+
+/// The shorthand writes the same registry, and says so in the same vocabulary.
+///
+/// It exists because recording what the project was, at the moment someone is
+/// already describing what they are measuring, costs one parameter — where a
+/// separate call costs a decision, and the decision is what does not get made.
+#[test]
+fn arming_a_collector_can_record_provenance_in_the_same_call() {
+    let h = harness();
+    let armed = h.ok(
+        "collectors.add",
+        json!({
+            "name": "cache",
+            "filter": "ALL",
+            "data": [
+                {"path": "/Build/commit", "value": "9f2a1c4"},
+                {"path": "/Build/profile", "value": "release"},
+            ],
+        }),
+    );
+
+    let outcomes: Vec<&str> = armed["data_outcomes"]
+        .as_array()
+        .expect("one outcome per entry, in the order sent")
+        .iter()
+        .map(|o| o["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, vec!["created", "created"]);
+
+    // The point of the shorthand: it is the registry, not a private copy.
+    let got = h.ok("domain_data.get", json!({}));
+    assert!(
+        registry_paths(&got).contains(&"/Build/commit".to_string()),
+        "the shorthand must write the domain registry, not a second store: {got}"
+    );
+}
+
+/// Every path currently in the registry, for the assertions below.
+fn registry_paths(got: &Value) -> Vec<String> {
+    got["keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .map(|k| k["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A reply says nothing about `data` when none was sent.
+///
+/// The schema declares both fields skippable; emitting an empty list and a null
+/// on every `collectors.add` would teach a reader that the parameter did
+/// something when it did nothing.
+#[test]
+fn arming_without_data_says_nothing_about_data() {
+    let h = harness();
+    let armed = h.ok(
+        "collectors.add",
+        json!({ "name": "plain", "filter": "ALL" }),
+    );
+    assert!(armed.get("data_outcomes").is_none(), "{armed}");
+    assert!(armed.get("data_persist_error").is_none(), "{armed}");
+}
+
+/// A sigilled key is refused here, and refused by the shared implementation
+/// rather than by a check written twice.
+///
+/// The sigil scopes a fact to one document. Arming a collector writes no
+/// document, so there is nowhere for it to go — and flattening it into the
+/// registry would launder exactly the distinction the sigil was added for.
+#[test]
+fn arming_refuses_a_key_scoped_to_a_document_that_does_not_exist() {
+    let h = harness();
+    let armed = h.ok(
+        "collectors.add",
+        json!({
+            "name": "scoped",
+            "filter": "ALL",
+            "data": [{"path": "@/Data/seed", "value": "1234"}],
+        }),
+    );
+    let outcome = &armed["data_outcomes"][0];
+    assert_eq!(outcome["outcome"], "rejected", "{armed}");
+    assert_eq!(outcome["reason"], "sigil_not_allowed_here", "{armed}");
+
+    // Refused, not quietly written under a stripped key.
+    let got = h.ok("domain_data.get", json!({}));
+    assert!(
+        !registry_paths(&got)
+            .iter()
+            .any(|p| p.contains("/Data/seed")),
+        "a refused key must not reach the registry by either spelling: {got}"
+    );
+}
+
+/// The reservation is not launderable through the shorthand either.
+#[test]
+fn arming_cannot_write_the_reserved_prefix() {
+    let h = harness();
+    let armed = h.ok(
+        "collectors.add",
+        json!({
+            "name": "reserved",
+            "filter": "ALL",
+            "data": [{"path": "/logmon/version", "value": "9.9.9"}],
+        }),
+    );
+    assert_eq!(armed["data_outcomes"][0]["outcome"], "rejected", "{armed}");
+    assert_eq!(
+        armed["data_outcomes"][0]["reason"], "reserved_prefix",
+        "{armed}"
+    );
+}
+
+/// Provenance is not left behind by a call that failed.
+///
+/// A caller who saw an error never saw an outcome list, so anything written
+/// under it would be invisible state. The entries are applied only once the
+/// collector is actually armed.
+#[test]
+fn a_refused_arming_records_no_provenance() {
+    let h = harness();
+    // An unknown `level` is a hard refusal. A malformed-looking filter is not:
+    // "this is not a filter" arms with warnings, because almost anything is a
+    // legal bare pattern — which is worth knowing when picking a failure to
+    // test with.
+    let bad = h.call(
+        "collectors.add",
+        json!({
+            "name": "doomed",
+            "filter": "ALL",
+            "level": "bogus",
+            "data": [{"path": "/Build/commit", "value": "should-not-land"}],
+        }),
+    );
+    assert!(bad.error.is_some(), "the level must be refused: {bad:?}");
+
+    let got = h.ok("domain_data.get", json!({}));
+    assert!(
+        !registry_paths(&got).contains(&"/Build/commit".to_string()),
+        "a failed add must leave nothing behind: {got}"
+    );
+}
