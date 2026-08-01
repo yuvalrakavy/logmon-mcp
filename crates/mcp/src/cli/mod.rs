@@ -8,7 +8,10 @@
 //! ## Where a global flag stops being global
 //!
 //! `--json`, `--help` and `--version` are recognised anywhere: no tool declares
-//! a parameter by those names, so there is nothing to collide with.
+//! a parameter by those names today, checked by a test against the manifest —
+//! **not an assumption, because the manifest is the daemon's to change.** The
+//! day a tool gains a `json` parameter, that test fails and the choice becomes
+//! explicit rather than a flag silently eaten here.
 //!
 //! `--session` and `--domain` are different — `bookmarks.list` takes a
 //! `session` and `collectors.edit` takes a `domain`. They are global **only
@@ -92,10 +95,19 @@ pub fn split_globals(args: &[String]) -> (Globals, Vec<String>) {
             "json" => g.json = true,
             "help" | "h" => g.help = true,
             "version" | "V" => g.version = true,
-            // An unknown leading flag is left for the command, which reports it
-            // against the tool's own parameter list — a better message than
-            // anything this layer could produce.
-            _ => break,
+            // An unknown leading flag ends the global run. It cannot be
+            // reported against a tool's parameter list — it PRECEDES the
+            // command, so nothing has been matched yet and the caller reports
+            // "no such command <whole argv>". Naming it here is the only place
+            // that can say anything useful about it.
+            other => {
+                g.error = Some(format!(
+                    "unknown option `--{other}` — global options are --session, \
+                     --domain, --json, --help, --version, and they come before \
+                     the command"
+                ));
+                break;
+            }
         }
         i += 1;
     }
@@ -137,6 +149,22 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
         }
     };
 
+    // Help answers BEFORE anything is bound. Asking a question must not change
+    // server state: `--domain t3 --help` used to rebind the persistent `cli`
+    // session to t3 as a side effect of printing help.
+    if globals.help {
+        // It still needs the daemon — the commands are its to describe.
+        let entries = match generic::fetch_manifest(&broker).await {
+            Ok(e) => e,
+            Err(e) => {
+                format::error(&format!("could not read the tool manifest: {e}"), json);
+                return 1;
+            }
+        };
+        print!("{}", generic::help_for(&entries, &argv));
+        return 0;
+    }
+
     // Bind this invocation's domain BEFORE the command runs — to `--domain` if
     // given, else back to `default`. The CLI connects with a persistent NAMED
     // session ("cli"), so this reset is load-bearing: without it a prior
@@ -144,8 +172,14 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
     // invocations to X.
     //
     // Registry-management verbs skip the bind, because binding to a domain you
-    // are about to create cannot succeed. Read off the derived command path
-    // rather than a hand-kept list of clap variants.
+    // are about to create cannot succeed.
+    //
+    // **This IS a hand-kept list, and it is the last piece of logmon knowledge
+    // in this file.** An earlier comment here claimed the opposite while
+    // sitting directly above the literals. It cannot be derived today: nothing
+    // in the manifest says which verbs are domain-agnostic. The honest fix is a
+    // manifest hint (`cli.domain_agnostic`), which belongs with the daemon work
+    // rather than smuggled in under a comment that denies the problem.
     let skip_bind = argv.first().map(String::as_str) == Some("domains")
         && matches!(
             argv.get(1).map(String::as_str),
@@ -160,22 +194,6 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
             format::error(&format!("--domain bind failed: {e}"), json);
             return 1;
         }
-    }
-
-    if globals.help {
-        // Help still needs the daemon: the commands are its to describe.
-        let entries = match generic::fetch_manifest(&broker).await {
-            Ok(e) => e,
-            Err(e) => {
-                format::error(&format!("could not read the tool manifest: {e}"), json);
-                return 1;
-            }
-        };
-        match generic::match_command(&entries, &argv) {
-            Some(m) => print!("{}", generic::help_command(m.entry)),
-            None => print!("{}", generic::help_index(&entries)),
-        }
-        return 0;
     }
 
     generic::dispatch(&broker, &argv, json).await
@@ -258,6 +276,39 @@ mod tests {
         assert!(
             g.error.is_some(),
             "a trailing --domain is an error, not `default`"
+        );
+    }
+
+    /// The always-global flags are stripped from anywhere in argv, so a tool
+    /// declaring a parameter by one of those names would have it silently
+    /// eaten. That is a claim about the DAEMON's manifest, which the daemon may
+    /// change without rebuilding this binary — so it is checked, not assumed.
+    ///
+    /// `--session` and `--domain` are deliberately absent from this list:
+    /// `bookmarks.list` and `collectors.edit` do declare those, which is why
+    /// position decides who owns them.
+    #[test]
+    fn no_tool_declares_a_parameter_named_like_an_always_global_flag() {
+        let clashing: Vec<String> = logmon_broker_protocol::mcp_tools::manifest()
+            .iter()
+            .filter_map(|e| e.input_schema.as_ref().map(|s| (e, s)))
+            .flat_map(|(e, s)| {
+                s.get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|p| {
+                        p.keys()
+                            .filter(|k| matches!(k.as_str(), "json" | "help" | "version"))
+                            .map(|k| format!("{}.{k}", e.name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            clashing.is_empty(),
+            "these would be swallowed as global flags and never reach the tool: \
+             {clashing:?} — either rename the parameter or make that flag \
+             position-scoped like --session and --domain"
         );
     }
 

@@ -1,11 +1,16 @@
 //! The CLI, built from the daemon's manifest rather than from knowledge of it.
 //!
-//! **No tool name, parameter name, result shape or rendering appears in this
-//! file.** Everything it needs arrives at runtime from `tools.manifest`: the
-//! command paths, the arguments, their types, their accepted values, and the
-//! few command-line facts a JSON Schema cannot carry. A daemon that gains a
-//! tool gains a command; one that renames a parameter renames a flag; and
-//! neither requires this binary to be rebuilt.
+//! **No tool name or parameter name appears in this file.** Everything it needs
+//! arrives at runtime from `tools.manifest`: the command paths, the arguments,
+//! their types, their accepted values, and the few command-line facts a JSON
+//! Schema cannot carry. A daemon that gains a tool gains a command; one that
+//! renames a parameter renames a flag; and neither requires this binary to be
+//! rebuilt.
+//!
+//! Two *conventions* it does know, both field names rather than tool knowledge,
+//! and both applying to every result type that has them: `_display` (a reply's
+//! pre-rendered human form) and `warnings`. An earlier version of this sentence
+//! claimed the file knew nothing at all, which was not true of either.
 //!
 //! ## Command paths are derived, never declared
 //!
@@ -294,10 +299,22 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
             // Positional, if this tool declares any.
             let hints = &entry.cli;
             let Some(name) = hints.positional.get(positional_taken) else {
-                return Err(format!(
-                    "`{}` takes no positional argument here — `{arg}` should be a `--flag`",
-                    entry.name
-                ));
+                // Two different mistakes, and telling a user to write a flag
+                // when they simply passed one argument too many sends them
+                // looking in the wrong place.
+                return Err(if hints.positional.is_empty() {
+                    format!(
+                        "`{}` takes no positional arguments — write `{arg}` as a `--flag`",
+                        entry.name
+                    )
+                } else {
+                    format!(
+                        "`{}` takes {} positional argument(s) ({}); `{arg}` is one too many",
+                        entry.name,
+                        hints.positional.len(),
+                        hints.positional.join(", ")
+                    )
+                });
             };
             let is_last = positional_taken + 1 == hints.positional.len();
             let node = node_for(schema, &[name.as_str()]);
@@ -338,12 +355,21 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
         let raw = match inline {
             Some(v) => v,
             None => {
-                let next_is_flag = args.get(i + 1).is_none_or(|n| n.starts_with("--"));
+                // **A bare boolean consumes the next token only if that token
+                // is a boolean.** Testing "does the next thing start with
+                // `--`" instead made flag order load-bearing:
+                // `diff --allow-lossy base@* cand@*` coerced `base@*` as the
+                // flag's value and failed with "`base@*` is not true or false",
+                // while the same flag written last worked. Both are invocations
+                // clap accepted.
+                //
                 // `node` is None only for a local output path, which always
-                // takes a value — so the boolean shorthand cannot apply.
+                // takes a value — so the shorthand cannot apply there.
                 let is_bool = node.and_then(json_type).as_deref() == Some("boolean");
-                if is_bool && next_is_flag {
-                    // A bare `--flag` on a boolean means true.
+                let next_is_a_bool = args.get(i + 1).is_some_and(|n| {
+                    matches!(n.as_str(), "true" | "1" | "yes" | "false" | "0" | "no")
+                });
+                if is_bool && !next_is_a_bool {
                     insert_nested(&mut out, &path, Value::Bool(true), false)?;
                     i += 1;
                     continue;
@@ -388,14 +414,44 @@ fn dashed(k: &str) -> String {
 /// and most handlers read parameters raw, so a forwarded typo is silently
 /// ignored rather than refused.
 fn unknown_key_error(entry: &ManifestEntry, schema: &Value, flag: &str) -> String {
-    let known: Vec<String> = props(schema)
-        .map(|p| p.keys().cloned().collect())
-        .unwrap_or_default();
     let normalised = flag.replace('-', "_");
-    let stem = normalised.split('.').next().unwrap_or(&normalised);
+    let segs: Vec<&str> = normalised.split('.').collect();
+
+    // For a dotted flag, the useful names are the NESTED ones. Suggesting
+    // `--threshold` for a mistyped `--threshold.metrik` points at a flag that,
+    // used bare, is a different failure — the parent is an object and cannot
+    // take a scalar.
+    let (scope, known): (String, Vec<String>) = match segs.split_last() {
+        Some((_, parents)) if !parents.is_empty() => {
+            let inner = node_for(schema, parents).and_then(props);
+            (
+                format!("--{}", parents.join(".").replace('_', "-")),
+                inner
+                    .map(|p| {
+                        p.keys()
+                            .map(|k| format!("{}.{k}", parents.join(".")))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            )
+        }
+        _ => (
+            entry.name.clone(),
+            props(schema)
+                .map(|p| p.keys().cloned().collect())
+                .unwrap_or_default(),
+        ),
+    };
+    let _ = scope;
+
+    let normalised_ref: &str = &normalised;
+    let stem = segs.last().copied().unwrap_or(normalised_ref);
     let close: Vec<String> = known
         .iter()
-        .filter(|k| k.starts_with(stem) || stem.starts_with(k.as_str()))
+        .filter(|k| {
+            let leaf = k.rsplit('.').next().unwrap_or(k);
+            leaf.starts_with(stem) || stem.starts_with(leaf)
+        })
         .map(|k| dashed(k))
         .collect();
 
@@ -419,6 +475,52 @@ fn unknown_key_error(entry: &ManifestEntry, schema: &Value, flag: &str) -> Strin
 // ---------------------------------------------------------------------------
 // Help, rendered from the manifest
 // ---------------------------------------------------------------------------
+
+/// Help at whatever level was asked for: one command, one group, or the index.
+///
+/// The group level existed under clap (`logmon-mcp collectors --help`) and was
+/// lost when the tree became derived — `collectors` matches several commands,
+/// so it fell through to the whole index and buried the ten verbs the user was
+/// asking about among forty-five.
+pub fn help_for(entries: &[ManifestEntry], argv: &[String]) -> String {
+    if let Some(m) = match_command(entries, argv) {
+        return help_command(m.entry);
+    }
+    let Some(head) = argv.iter().find(|a| !a.starts_with('-')) else {
+        return help_index(entries);
+    };
+
+    let mut rows: Vec<(String, &ManifestEntry)> = entries
+        .iter()
+        .filter_map(|e| {
+            let p = command_path(&e.method);
+            (p[0] == *head && p.len() > 1).then(|| (p[1..].join(" "), e))
+        })
+        .collect();
+    if rows.is_empty() {
+        return help_index(entries);
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = format!("{head} — {} commands\n\n", rows.len());
+    for (verb, e) in rows {
+        out.push_str(&format!("  {verb:<22} {}\n", first_sentence(e)));
+    }
+    out.push_str(&format!(
+        "\nlogmon-mcp {head} <verb> --help   for a command's arguments\n"
+    ));
+    out
+}
+
+/// The headline of a description — the list is for finding a tool, not reading
+/// about one.
+fn first_sentence(e: &ManifestEntry) -> &str {
+    e.description
+        .split_once(". ")
+        .map(|(h, _)| h)
+        .unwrap_or(&e.description)
+        .trim()
+}
 
 /// Every command, grouped by its first path segment.
 pub fn help_index(entries: &[ManifestEntry]) -> String {
@@ -998,10 +1100,43 @@ mod tests {
         assert!(h.contains("never sent to the daemon"), "{h}");
     }
 
+    /// The near-match hint must name the RIGHT one, and must be distinguishable
+    /// from a dump of every parameter — a mutation that emptied the near-match
+    /// list left the old assertion green, because the full list contains the
+    /// same substring.
     #[test]
     fn a_misspelled_flag_names_the_real_one() {
-        assert!(err("add_collector", &["--group-key", "a"]).contains("--group-keys"));
+        let e = err("add_collector", &["--group-key", "a"]);
+        assert!(e.contains("did you mean"), "a near match, not a dump: {e}");
+        assert!(e.contains("--group-keys"), "{e}");
+        assert!(
+            !e.contains("--filter"),
+            "and only the near match — a full dump would prove nothing: {e}"
+        );
+
         assert!(err("list_collectors", &["--bogus", "1"]).contains("takes no parameters"));
+    }
+
+    /// A mistyped NESTED field was answered with "did you mean --threshold" —
+    /// a flag that, used bare, is a different failure, because the parent is an
+    /// object and cannot take a scalar.
+    #[test]
+    fn a_misspelled_nested_field_names_its_sibling() {
+        let e = err(
+            "add_collector",
+            &[
+                "--name",
+                "c",
+                "--filter",
+                "ALL",
+                "--threshold.metrik",
+                "avg_ms",
+            ],
+        );
+        assert!(
+            e.contains("--threshold.metric"),
+            "must name the sibling, not the parent: {e}"
+        );
     }
 
     #[test]
@@ -1012,6 +1147,38 @@ mod tests {
         assert!(h.contains("tree"), "{h}");
         assert!(h.contains("--threshold.metric"), "nested fields: {h}");
         assert!(h.contains("(required)"), "{h}");
+    }
+
+    /// Group-level help existed under clap and was lost when the tree became
+    /// derived: `collectors` matches several commands, so it fell through to
+    /// the whole index and buried ten verbs among forty-five.
+    #[test]
+    fn help_answers_at_the_level_that_was_asked() {
+        let m = mcp_tools::manifest();
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // One command.
+        let h = help_for(&m, &argv(&["collectors", "add"]));
+        assert!(h.starts_with("collectors add"), "{h}");
+        assert!(h.contains("--filter"), "{h}");
+
+        // One group — its verbs, not the whole index.
+        let h = help_for(&m, &argv(&["collectors"]));
+        assert!(h.starts_with("collectors —"), "{h}");
+        assert!(h.contains("diff"), "{h}");
+        assert!(
+            !h.contains("bookmarks"),
+            "a group's help must not be the index: {h}"
+        );
+
+        // Nothing named — the index.
+        let h = help_for(&m, &argv(&[]));
+        assert!(h.contains("bookmarks"), "{h}");
+        assert!(h.contains("collectors"), "{h}");
+
+        // An unknown group falls back rather than printing an empty section.
+        let h = help_for(&m, &argv(&["nonsense"]));
+        assert!(h.contains("bookmarks"), "{h}");
     }
 
     #[test]

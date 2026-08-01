@@ -5,6 +5,40 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Changed — the shim is now built from the broker's manifest
+
+**Upgrade the broker BEFORE the shim.** The shim now requires `tools.manifest`
+and refuses to start without it; a broker older than that leaves you with no
+tools at all. Install `logmon-broker` first, confirm it is serving, then
+`logmon-mcp`.
+
+Both surfaces are assembled at startup from what the broker declares, so a tool
+added to the broker becomes an MCP tool and a CLI command with no reinstall.
+The 45 `#[rmcp::tool]` attributes, the 37 parameter structs and the ten
+hand-written CLI command groups are gone.
+
+CLI commands are now **derived from RPC method names**, which renames a few
+things and surfaced one long-standing inconsistency:
+
+| was | is |
+|---|---|
+| `sessions list` / `sessions drop` | `session list` / `session drop` (the method is `session.*`, singular) |
+| `collectors profile` | `traces profile` (the method is `traces.profile`) |
+| `--group-key a --group-key b` | `--group-keys a --group-keys b` |
+| `--threshold-metric` / `-op` / `-value` / `-window-ms` | `--threshold.metric` / `.op` / `.value` / `.window-ms` |
+| `logs export --out FILE` | `logs export --path FILE` (`--path -` for stdout) |
+| `collectors snapshot --no-reset` | `collectors snapshot --reset false` |
+| `--session` / `--domain` anywhere | before the command only — after it they belong to the tool (`collectors edit --domain` re-pins a collector; `bookmarks list --session` reads another session's) |
+
+`triggers add` now takes the broker's defaults (pre 500 / post 200 / notify 5)
+when those flags are omitted, and `traces get` includes linked logs by default.
+Both match what the MCP tools have always done — the CLI was the outlier,
+forcing 0/0/0 and `false`.
+
+Output is JSON unless the broker supplies a rendered form. The CLI's
+hand-written renderers went with the command groups; presentation now belongs
+to the broker.
+
 ### Added
 
 - **`domain_data` — a per-domain provenance registry.** A small key/value store

@@ -669,6 +669,14 @@ pub fn files_to_write(
     let (Some(out), Some(path)) = (&hints.file_output, path) else {
         return Vec::new();
     };
+    // `-` is stdout by long convention, and the deleted CLI honoured it
+    // (`Some("-") | None => print!(…)`). Taken literally it creates a file
+    // named `-` in the working directory, which is the kind of thing a user
+    // finds weeks later. Returning nothing routes the body to the caller's
+    // normal printing path, which is what `-` asks for.
+    if path == "-" {
+        return Vec::new();
+    }
 
     let render = |v: &serde_json::Value| match v {
         serde_json::Value::String(s) => s.clone(),
