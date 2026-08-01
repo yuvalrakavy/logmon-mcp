@@ -1177,6 +1177,29 @@ union. The shim is then tool-independent **for MCP**. The three non-passthrough 
 (`export_logs`, `get_status`, `document_collectors`) keep local implementations and are
 marked as such in the descriptor (§9.5).
 
+### 11.5.1 Which guards survive when the mirror becomes the source — settled 2026-08-01
+
+Today `TOOLS` is a **mirror** of the `#[rmcp::tool]` attributes and four tests hold the
+mirror honest. Build the router *from* `TOOLS` and those four compare the table with
+itself. **A tautological test is worse than a deleted one**: it keeps reporting green from a
+position where it can no longer fail, and the suite's test count hides that nothing is
+checked. So the migration must state, per guard, whether it survives — and retire the ones
+that do not, in the same commit, out loud.
+
+| Guard | After the router is built from the manifest |
+|---|---|
+| `capability_skew` — every method probed against a **live daemon** | **Survives, and becomes primary.** It is the only check that reaches outside the protocol crate, so it is what catches a table row naming a method the daemon does not implement — which after the migration is the failure that silently breaks a tool. |
+| `schema_matches_daemon` — declared enums vs the real parsers | **Survives unchanged.** It compares the schema against `GroupBy::parse` and friends, neither of which moves. |
+| `every_manifest_entry_yields_a_route` | **Survives.** Absorbs the one thing `param_drift_tests` was uniquely good at: catching a tool with no schema at all. |
+| `param_drift_tests` — router schema vs protocol schema | **Retire.** The router's schema *becomes* the protocol schema, so it would compare a value to itself. |
+| `the_shared_tool_table_matches_the_router` | **Retire.** Same reason: the router is generated from the table. |
+| `every_description_in_the_table_is_the_one_the_router_publishes` | **Retire.** The attribute it was holding the table honest against no longer exists. |
+| `every_tool_calls_the_method_the_shared_table_pairs_it_with` | **Retire** — but only because `capability_skew` covers the risk it was aimed at, from the daemon's side rather than by parsing tool bodies that will not exist. |
+
+Net: four guards retire, and the risk they covered lands on `capability_skew`, which must
+therefore keep probing **every** row — it already asserts exactly that, and asserts the
+probe connection did not die mid-loop, which is what stops it going quietly vacuous.
+
 **D — generating the CLI. As specified in §10.2 it is dead; as a phase it is back in scope,
 on a different basis** (decided 2026-08-01, because "finish the shim" means the CLI too —
 a shim that is daemon-taught for MCP and hand-written for CLI still drags every new daemon

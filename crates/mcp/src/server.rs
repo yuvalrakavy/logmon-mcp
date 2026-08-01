@@ -75,7 +75,86 @@ pub fn forwarding_route(
     ))
 }
 
+/// The tools whose work is not the daemon's to do, and which therefore keep
+/// their compiled-in implementations no matter what the manifest says.
+///
+/// Both are client-side for a concrete reason, not by preference: `export_logs`
+/// writes the file, because a daemon resolves a relative path against its own
+/// working directory rather than the caller's; and `get_status` appends the
+/// version-skew note, which is a statement *about the shim* that the daemon
+/// cannot make on its behalf.
+const CLIENT_SIDE_TOOLS: &[&str] = &["export_logs", "get_status"];
+
+/// Overlay what the daemon says it serves onto the compiled-in router.
+///
+/// Starts from the compiled-in routes and overwrites each one the daemon
+/// describes — `add_route` is keyed by tool name, so a manifest entry replaces
+/// the compiled-in route of the same name and an entry with a *new* name is
+/// simply added. That gives all three behaviours the goal asks for:
+///
+/// * the daemon gains a tool -> it appears, with no rebuild of this binary;
+/// * the daemon changes a tool's schema or description -> the change is served;
+/// * a compiled-in tool the daemon no longer lists -> kept, and `status.get`'s
+///   existing skew note is what reports it. Removing it here would make a
+///   daemon that is merely *older* look like it had deleted tools.
+fn overlay_manifest(
+    mut router: rmcp::handler::server::tool::ToolRouter<GelfMcpServer>,
+    entries: &[logmon_broker_protocol::mcp_tools::ManifestEntry],
+) -> rmcp::handler::server::tool::ToolRouter<GelfMcpServer> {
+    for entry in entries {
+        if CLIENT_SIDE_TOOLS.contains(&entry.name.as_str()) {
+            continue;
+        }
+        if let Some(route) = forwarding_route(entry) {
+            router.add_route(route);
+        }
+    }
+    router
+}
+
 impl GelfMcpServer {
+    /// Expose what the daemon says it serves, falling back to the compiled-in
+    /// tools when it cannot be asked.
+    ///
+    /// **The fallback is safe to prefer only because the manifest and the
+    /// attributes are checked to agree** (Phase B). An earlier draft of this
+    /// plan rejected a fallback precisely because the two disagreed by eight
+    /// parameters, which would have made the offline path known-wrong from its
+    /// first commit; that objection was conditional on the drift, and the drift
+    /// is gone.
+    ///
+    /// A daemon that cannot be reached is not an error here. The shim starts,
+    /// serves what it was built with, and every call reports the connection
+    /// problem itself — which is a better failure than refusing to start and
+    /// leaving the user with no tools and no diagnosis.
+    pub async fn taught_by(broker: Broker) -> Self {
+        let mut me = Self::new(broker);
+        match me
+            .broker
+            .call("tools.manifest", serde_json::json!({}))
+            .await
+            .and_then(|reply| {
+                serde_json::from_value::<Vec<logmon_broker_protocol::mcp_tools::ManifestEntry>>(
+                    reply.get("tools").cloned().unwrap_or_default(),
+                )
+                .map_err(|e| logmon_broker_sdk::BrokerError::Protocol(e.to_string()))
+            }) {
+            Ok(entries) => {
+                tracing::info!(tools = entries.len(), "registered tools from the daemon");
+                me.tool_router = overlay_manifest(std::mem::take(&mut me.tool_router), &entries);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not read the daemon's tool manifest; serving the compiled-in tools"
+                );
+            }
+        }
+        me
+    }
+
+    /// The compiled-in tools alone — what this binary was built with, and what
+    /// [`Self::taught_by`] starts from before the daemon has its say.
     pub fn new(broker: Broker) -> Self {
         Self {
             broker,
@@ -2039,6 +2118,149 @@ mod tests {
             assert_eq!(after.get(k), Some(v), "annotation altered `{k}`");
         }
         assert!(after.get("shim_note").is_some());
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::{overlay_manifest, GelfMcpServer, CLIENT_SIDE_TOOLS};
+    use logmon_broker_protocol::mcp_tools::{self, ManifestEntry};
+
+    fn compiled() -> rmcp::handler::server::tool::ToolRouter<GelfMcpServer> {
+        GelfMcpServer::tool_router()
+    }
+
+    fn names(r: &rmcp::handler::server::tool::ToolRouter<GelfMcpServer>) -> Vec<String> {
+        let mut v: Vec<String> = r
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The goal, stated as a test: a tool the daemon has and this binary does
+    /// not becomes callable without rebuilding this binary.
+    #[test]
+    fn a_tool_this_build_never_heard_of_becomes_available() {
+        let before = names(&compiled());
+        assert!(!before.iter().any(|n| n == "a_future_tool"));
+
+        let invented = ManifestEntry {
+            name: "a_future_tool".into(),
+            method: "future.thing".into(),
+            description: "Something this shim was not compiled with".into(),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "target": { "type": "string" } }
+            })),
+        };
+        let after = overlay_manifest(compiled(), &[invented]);
+
+        assert_eq!(
+            names(&after).len(),
+            before.len() + 1,
+            "the daemon's new tool must be added, not swapped in for another"
+        );
+        let tool = after
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "a_future_tool")
+            .expect("the new tool is registered");
+        assert_eq!(
+            tool.description.as_deref(),
+            Some("Something this shim was not compiled with")
+        );
+        assert!(tool.input_schema["properties"]
+            .as_object()
+            .is_some_and(|p| p.contains_key("target")));
+    }
+
+    /// A description or schema changed in the daemon reaches the agent, rather
+    /// than being shadowed by whatever this binary happens to hold.
+    #[test]
+    fn the_daemons_wording_wins_over_the_compiled_in_copy() {
+        let mut entry = mcp_tools::manifest()
+            .into_iter()
+            .find(|e| e.name == "list_collectors")
+            .expect("present");
+        entry.description = "Reworded by a newer daemon".into();
+
+        let after = overlay_manifest(compiled(), &[entry]);
+        let tool = after
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "list_collectors")
+            .expect("still registered");
+        assert_eq!(
+            tool.description.as_deref(),
+            Some("Reworded by a newer daemon")
+        );
+        assert_eq!(
+            names(&after).len(),
+            names(&compiled()).len(),
+            "an overwrite must not also add a duplicate row"
+        );
+    }
+
+    /// The two client-side tools do work the daemon cannot do for them, so a
+    /// manifest entry must not replace their implementations.
+    #[test]
+    fn client_side_tools_keep_their_own_implementations() {
+        // Manifest entries whose descriptions would be visible if they won.
+        let hijack: Vec<ManifestEntry> = CLIENT_SIDE_TOOLS
+            .iter()
+            .map(|n| ManifestEntry {
+                name: (*n).into(),
+                method: "nonsense.method".into(),
+                description: "REPLACED".into(),
+                input_schema: Some(serde_json::json!({"type": "object"})),
+            })
+            .collect();
+
+        let after = overlay_manifest(compiled(), &hijack);
+        for name in CLIENT_SIDE_TOOLS {
+            let tool = after
+                .list_all()
+                .into_iter()
+                .find(|t| &t.name == name)
+                .unwrap_or_else(|| panic!("{name} must still be registered"));
+            assert_ne!(
+                tool.description.as_deref(),
+                Some("REPLACED"),
+                "{name} writes files or reports shim state; the daemon cannot do it for us"
+            );
+        }
+    }
+
+    /// An older daemon lists fewer tools. Dropping the difference would make
+    /// "your daemon predates this tool" look like "this tool was removed".
+    #[test]
+    fn a_shorter_manifest_does_not_remove_compiled_in_tools() {
+        let one = mcp_tools::manifest()
+            .into_iter()
+            .take(1)
+            .collect::<Vec<_>>();
+        let after = overlay_manifest(compiled(), &one);
+        assert_eq!(
+            names(&after),
+            names(&compiled()),
+            "a short manifest must not amputate the shim"
+        );
+    }
+
+    /// The real manifest against the real router: the overlay must be a no-op
+    /// in name terms, because Phase B established the two already agree.
+    #[test]
+    fn the_real_manifest_changes_no_tool_names() {
+        let after = overlay_manifest(compiled(), &mcp_tools::manifest());
+        assert_eq!(
+            names(&after),
+            names(&compiled()),
+            "the manifest and the attributes are checked to agree, so overlaying \
+             one on the other must not change the surface"
+        );
     }
 }
 

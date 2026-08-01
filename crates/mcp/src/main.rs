@@ -115,7 +115,7 @@ async fn run_mcp_stdio(session: Option<String>, domain: Option<String>) -> anyho
     }
     let broker = builder.open().await?;
 
-    let mcp_server = server::GelfMcpServer::new(broker.clone());
+    let mcp_server = server::GelfMcpServer::taught_by(broker.clone()).await;
     let service = mcp_server.serve(rmcp::transport::stdio()).await?;
 
     notifications::spawn_notification_forwarder(
