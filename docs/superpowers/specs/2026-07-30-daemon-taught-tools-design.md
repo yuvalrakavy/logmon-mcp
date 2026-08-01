@@ -1200,6 +1200,50 @@ Net: four guards retire, and the risk they covered lands on `capability_skew`, w
 therefore keep probing **every** row — it already asserts exactly that, and asserts the
 probe connection did not die mid-loop, which is what stops it going quietly vacuous.
 
+### 11.5.3 Phase E, 2026-08-01 — the measurement was the wrong question
+
+**User, on being shown the numbers below: "It is not a matter of measuring, it is
+architecture. The shim should have minimal if any hardcoded knowledge of the logmon
+daemon."**
+
+That is prior to any cost/benefit, and it invalidates §11.5.2's conclusion — and the
+compromise this document proposed after it, which kept a per-tool renderer lookup in the
+shim. A renderer is hardcoded knowledge whether it is a `match` arm or a table;
+`print_profile(r: &ProfileResult)` imports a logmon type. The exception was carved out
+around the part that had just been measured as valuable, which is how the wrong question
+produces a wrong answer that looks principled.
+
+The measurement was also framed badly. §11.5.2 counted what a schema could **generate**
+(158 lines of `#[arg]`) rather than what a generic path **deletes** — declaration *and*
+dispatch, since one dispatcher replaces ten. Recounted: **1967 of 2181 lines (90%)**, with
+214 emitting output.
+
+**Delivered:**
+
+| | |
+|---|---|
+| **E1** | Manifest resolves `$ref`s and carries `cli.positional` / `cli.variadic` / `cli.output_path_param` |
+| **E2** | CLI command tree built from the manifest, paths derived, clap gone from the CLI path |
+| **E3** | The ten hand-written command groups deleted (−3180 / +1428) |
+| **E4** | The 45 `#[rmcp::tool]` attributes and 37 param structs deleted; `server.rs` 2554 → 396 lines |
+
+**Three things dissolved rather than moving**, which is the evidence the direction was right:
+
+1. **`CLIENT_SIDE_TOOLS`** — the one place a tool name was hardcoded. `export_logs` still
+   writes locally, but *which* parameter names the file is now a manifest fact.
+2. **The version-skew note** — it existed only to compare the broker's tool list against
+   the shim's compiled-in one. With no compiled-in list there is nothing to skew;
+   `missing_tools` and `skew_note` are deleted.
+3. **The `format.rs` renderers** — presentation moved to the daemon, which may return a
+   `_display` string beside its structured reply.
+
+**Two consequences worth stating plainly.** The shim now **fails to start** when it cannot
+read a manifest, because a shim serving zero tools is indistinguishable to an MCP client
+from a server that offers none — and clients cache that. And `session.list` is singular
+where every other group is plural, so the derived surface is `session list`; the
+hand-written CLI had been papering over that with a `sessions` alias. Derivation surfaces
+naming inconsistencies instead of absorbing them.
+
 ### 11.5.2 Phase D, remeasured 2026-08-01 — generation loses again, and the goal is met another way
 
 Phase A was supposed to be what made CLI generation viable. **Remeasured against §10.2's own
