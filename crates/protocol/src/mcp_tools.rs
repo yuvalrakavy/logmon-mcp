@@ -982,6 +982,44 @@ mod manifest_tests {
         );
     }
 
+    /// **Every parameter an agent can set must say what it is.**
+    ///
+    /// This regressed silently once and was worth 84 of 121 parameters: the
+    /// per-field doc comments lived on 37 hand-written shim param structs, and
+    /// deleting those structs took the text with them. Agents were choosing
+    /// `pre_window`, `oneshot` and `top_n` with nothing to go on — including
+    /// the default values the old text spelled out.
+    ///
+    /// A schema is only a single source of truth if it carries what the thing
+    /// it replaced carried.
+    #[test]
+    fn every_parameter_an_agent_can_set_is_documented() {
+        let undocumented: Vec<String> = manifest()
+            .iter()
+            .filter_map(|e| e.input_schema.as_ref().map(|s| (e, s)))
+            .flat_map(|(e, s)| {
+                s.get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|p| {
+                        p.iter()
+                            .filter(|(_, v)| {
+                                v.get("description")
+                                    .and_then(|d| d.as_str())
+                                    .is_none_or(str::is_empty)
+                            })
+                            .map(|(k, _)| format!("{}.{k}", e.name))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            undocumented.is_empty(),
+            "{} parameters an agent must guess at: {undocumented:?}",
+            undocumented.len()
+        );
+    }
+
     /// Descriptions are what an agent reads to choose a tool. An empty one is
     /// not a formatting problem, it is a tool nobody can tell is right.
     #[test]

@@ -10,6 +10,7 @@
       "type": "object",
       "properties": {
         "count": {
+          "description": "Number of log entries to return (default: 50)",
           "type": [
             "integer",
             "null"
@@ -18,18 +19,21 @@
           "minimum": 0
         },
         "filter": {
+          "description": "Optional DSL filter expression",
           "type": [
             "string",
             "null"
           ]
         },
         "trace_id": {
+          "description": "Filter logs by trace ID (32-char hex)",
           "type": [
             "string",
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "LogsRecentResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -220,11 +224,13 @@
       "type": "object",
       "properties": {
         "seq": {
+          "description": "Sequence number of the anchor entry",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
         "before": {
+          "description": "Number of entries before the anchor (default: 10)",
           "type": [
             "integer",
             "null"
@@ -233,6 +239,7 @@
           "minimum": 0
         },
         "after": {
+          "description": "Number of entries after the anchor (default: 10)",
           "type": [
             "integer",
             "null"
@@ -241,6 +248,7 @@
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "seq"
       ]
@@ -381,6 +389,7 @@
       "type": "object",
       "properties": {
         "count": {
+          "description": "Maximum number of entries to export",
           "type": [
             "integer",
             "null"
@@ -389,12 +398,14 @@
           "minimum": 0
         },
         "filter": {
+          "description": "Optional DSL filter expression",
           "type": [
             "string",
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "LogsExportResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -581,7 +592,8 @@
     "LogsClear": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "LogsClear",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "LogsClearResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -601,7 +613,8 @@
     "FiltersList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "FiltersList",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "FiltersListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -651,15 +664,18 @@
       "type": "object",
       "properties": {
         "filter": {
+          "description": "DSL filter expression",
           "type": "string"
         },
         "description": {
+          "description": "Human-readable description",
           "type": [
             "string",
             "null"
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "filter"
       ]
@@ -685,23 +701,27 @@
       "type": "object",
       "properties": {
         "id": {
+          "description": "Filter ID to edit",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
         "filter": {
+          "description": "New DSL filter expression",
           "type": [
             "string",
             "null"
           ]
         },
         "description": {
+          "description": "New description",
           "type": [
             "string",
             "null"
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "id"
       ]
@@ -737,11 +757,13 @@
       "type": "object",
       "properties": {
         "id": {
+          "description": "Filter ID to remove",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "id"
       ]
@@ -764,7 +786,8 @@
     "TriggersList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TriggersList",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "TriggersListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -850,9 +873,11 @@
       "type": "object",
       "properties": {
         "filter": {
+          "description": "DSL filter expression that activates the trigger",
           "type": "string"
         },
         "pre_window": {
+          "description": "Number of messages to capture before the triggering event (default: 500)",
           "type": [
             "integer",
             "null"
@@ -861,6 +886,7 @@
           "minimum": 0
         },
         "post_window": {
+          "description": "Number of messages to capture after the triggering event (default: 200)",
           "type": [
             "integer",
             "null"
@@ -869,6 +895,7 @@
           "minimum": 0
         },
         "notify_context": {
+          "description": "Number of context entries to include in the notification (default: 5)",
           "type": [
             "integer",
             "null"
@@ -877,6 +904,7 @@
           "minimum": 0
         },
         "description": {
+          "description": "Human-readable description",
           "type": [
             "string",
             "null"
@@ -888,6 +916,7 @@
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "filter"
       ]
@@ -913,17 +942,20 @@
       "type": "object",
       "properties": {
         "id": {
+          "description": "Trigger ID to edit",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         },
         "filter": {
+          "description": "New DSL filter expression",
           "type": [
             "string",
             "null"
           ]
         },
         "pre_window": {
+          "description": "New pre-window size",
           "type": [
             "integer",
             "null"
@@ -932,6 +964,7 @@
           "minimum": 0
         },
         "post_window": {
+          "description": "New post-window size",
           "type": [
             "integer",
             "null"
@@ -940,6 +973,7 @@
           "minimum": 0
         },
         "notify_context": {
+          "description": "New notify-context size",
           "type": [
             "integer",
             "null"
@@ -948,18 +982,21 @@
           "minimum": 0
         },
         "description": {
+          "description": "New description",
           "type": [
             "string",
             "null"
           ]
         },
         "oneshot": {
+          "description": "Set or clear fire-once. Absent leaves it as it is.",
           "type": [
             "boolean",
             "null"
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "id"
       ]
@@ -1030,11 +1067,13 @@
       "type": "object",
       "properties": {
         "id": {
+          "description": "Trigger ID to remove",
           "type": "integer",
           "format": "uint32",
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "id"
       ]
@@ -1060,6 +1099,7 @@
       "type": "object",
       "properties": {
         "count": {
+          "description": "Max traces to return (default: 20)",
           "type": [
             "integer",
             "null"
@@ -1068,12 +1108,14 @@
           "minimum": 0
         },
         "filter": {
+          "description": "Span filter DSL expression",
           "type": [
             "string",
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TracesRecentResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1183,21 +1225,25 @@
       "type": "object",
       "properties": {
         "trace_id": {
+          "description": "32-character hex trace ID",
           "type": "string"
         },
         "include_logs": {
+          "description": "Include linked logs (default: true)",
           "type": [
             "boolean",
             "null"
           ]
         },
         "filter": {
+          "description": "Filter spans within the trace",
           "type": [
             "string",
             "null"
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "trace_id"
       ]
@@ -1506,9 +1552,11 @@
       "type": "object",
       "properties": {
         "trace_id": {
+          "description": "32-character hex trace ID",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "trace_id"
       ]
@@ -1588,6 +1636,7 @@
       "type": "object",
       "properties": {
         "min_duration_ms": {
+          "description": "Duration threshold in milliseconds (default: 100)",
           "type": [
             "number",
             "null"
@@ -1595,6 +1644,7 @@
           "format": "double"
         },
         "count": {
+          "description": "Max results (default: 20)",
           "type": [
             "integer",
             "null"
@@ -1603,6 +1653,7 @@
           "minimum": 0
         },
         "filter": {
+          "description": "Additional span filter",
           "type": [
             "string",
             "null"
@@ -1615,7 +1666,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "TracesSlowResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1872,15 +1924,18 @@
       "type": "object",
       "properties": {
         "trace_id": {
+          "description": "32-character hex trace ID",
           "type": "string"
         },
         "filter": {
+          "description": "Additional log filter DSL",
           "type": [
             "string",
             "null"
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "trace_id"
       ]
@@ -2029,11 +2084,13 @@
       "type": "object",
       "properties": {
         "seq": {
+          "description": "Span sequence number",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
         "before": {
+          "description": "Spans before (default: 5)",
           "type": [
             "integer",
             "null"
@@ -2042,6 +2099,7 @@
           "minimum": 0
         },
         "after": {
+          "description": "Spans after (default: 5)",
           "type": [
             "integer",
             "null"
@@ -2050,6 +2108,7 @@
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "seq"
       ]
@@ -2235,6 +2294,7 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Bookmark name (alphanumerics, '-', '_'; max 64 chars). Will be qualified\nwith the calling session's name automatically.",
           "type": "string"
         },
         "start_seq": {
@@ -2254,10 +2314,12 @@
           ]
         },
         "replace": {
+          "description": "If true, overwrite an existing bookmark with the same qualified name.",
           "type": "boolean",
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -2292,12 +2354,14 @@
       "type": "object",
       "properties": {
         "session": {
+          "description": "Optional: filter to bookmarks created by this session name.",
           "type": [
             "string",
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "BookmarksListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2362,9 +2426,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Bare name (resolved against current session) or qualified\n\"session/name\".",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -2394,7 +2460,8 @@
             "null"
           ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     "BookmarksClearResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2418,7 +2485,8 @@
     "SessionList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "SessionList",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "SessionListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2493,9 +2561,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Name of the session to drop",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -2516,7 +2586,8 @@
     "StatusGet": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "StatusGet",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "StatusGetResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3056,6 +3127,7 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Domain name — the isolation key.",
           "type": "string"
         },
         "gelf_port": {
@@ -3069,6 +3141,7 @@
           "maximum": 65535
         },
         "otlp_grpc_port": {
+          "description": "OTLP gRPC port. Omitted → auto-allocate; 0 → disable.",
           "type": [
             "integer",
             "null"
@@ -3078,6 +3151,7 @@
           "maximum": 65535
         },
         "otlp_http_port": {
+          "description": "OTLP HTTP port. Omitted → auto-allocate; 0 → disable.",
           "type": [
             "integer",
             "null"
@@ -3087,6 +3161,7 @@
           "maximum": 65535
         },
         "log_buffer_size": {
+          "description": "Log ring capacity (default: the daemon's configured size).",
           "type": [
             "integer",
             "null"
@@ -3095,6 +3170,7 @@
           "minimum": 0
         },
         "span_buffer_size": {
+          "description": "Span ring capacity (default: the daemon's configured size).",
           "type": [
             "integer",
             "null"
@@ -3108,6 +3184,7 @@
           "default": false
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -3118,9 +3195,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Name of the domain to delete. Refuses config-declared domains (incl.\n'default').",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -3145,7 +3224,8 @@
     "DomainsList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "DomainsList",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "DomainsListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3286,9 +3366,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Domain to bind this session to for subsequent queries and notifications.",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -3296,7 +3378,8 @@
     "DomainsClear": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "DomainsClear",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "DomainsClearResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3328,9 +3411,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "The collector to zero.",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -3342,9 +3427,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "The collector to remove.",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -3356,9 +3443,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "New session name: <Project>-Main-<short8> or <Project>-tN-<branch> ('/'\nsanitized to '-'; alphanumerics, '-' and '_' only).",
           "type": "string"
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -3833,6 +3922,7 @@
           "description": "A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear\none in place. Absent leaves any existing lifetime untouched.\n\n`false` rather than `null` carries the clear because `null` is already\nspoken for above. This is the opposite convention to\n`CollectorsEdit.threshold`, where `null` removes — noted because the two\nlive in one daemon and the difference is deliberate rather than drift."
         }
       },
+      "additionalProperties": false,
       "required": [
         "path"
       ]
@@ -3843,12 +3933,14 @@
       "type": "object",
       "properties": {
         "entries": {
+          "description": "Entries to record. Each is `{path, value?, ttl?}`. **Value present** →\nset it. **Value absent** → *validate*: confirm what is already there,\nmoving only its confirmation time. A key-only entry never creates —\nrecording a key with no value would be a guess. `ttl` is `30s` / `5m` /\n`2h` / `7d` / `4w`, or `false` to clear one. Absent leaves any existing\nlifetime alone, exactly as an absent value does, so restating a value\ncannot silently drop its lifetime.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/DomainDataEntry"
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "entries"
       ],
@@ -3872,6 +3964,7 @@
               "description": "A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear\none in place. Absent leaves any existing lifetime untouched.\n\n`false` rather than `null` carries the clear because `null` is already\nspoken for above. This is the opposite convention to\n`CollectorsEdit.threshold`, where `null` removes — noted because the two\nlive in one daemon and the difference is deliberate rather than drift."
             }
           },
+          "additionalProperties": false,
           "required": [
             "path"
           ]
@@ -3980,6 +4073,7 @@
           }
         }
       },
+      "additionalProperties": false,
       "required": [
         "patterns"
       ]
@@ -4079,7 +4173,8 @@
           "format": "uint64",
           "minimum": 0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "DomainDataKey": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4878,9 +4973,11 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "Collector name. Letters, digits, '_' and '-' only.",
           "type": "string"
         },
         "filter": {
+          "description": "Span filter DSL. Matched against every span in the domain this session\nis bound to *now*; the collector stays pinned to that domain afterwards.",
           "type": "string"
         },
         "level": {
@@ -4907,12 +5004,14 @@
           }
         },
         "description": {
+          "description": "Why this collector exists. Returned with every read, so a result found\nlater still carries its context.",
           "type": [
             "string",
             "null"
           ]
         },
         "max_sample_bytes": {
+          "description": "Per-collector retained-sample budget in bytes (default 64 MiB).",
           "type": [
             "integer",
             "null"
@@ -4932,6 +5031,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name",
         "filter"
@@ -4983,6 +5083,7 @@
               "minimum": 0
             }
           },
+          "additionalProperties": false,
           "required": [
             "metric",
             "op",
@@ -5041,7 +5142,8 @@
     "CollectorsList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "CollectorsList",
-      "type": "object"
+      "type": "object",
+      "additionalProperties": false
     },
     "CollectorsListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5416,6 +5518,7 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "The collector to read.",
           "type": "string"
         },
         "snapshot": {
@@ -5442,6 +5545,7 @@
           ]
         },
         "skip_warmup_ms": {
+          "description": "Exclude spans starting within this many ms of the first matched span.",
           "type": [
             "number",
             "null"
@@ -5449,6 +5553,7 @@
           "format": "double"
         },
         "top_n": {
+          "description": "Rows returned in the breakdown (default 20).",
           "type": [
             "integer",
             "null"
@@ -5457,6 +5562,7 @@
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -5585,6 +5691,7 @@
       "type": "object",
       "properties": {
         "filter": {
+          "description": "Span filter DSL. Default \"ALL\".",
           "type": [
             "string",
             "null"
@@ -5607,6 +5714,7 @@
           ]
         },
         "group_keys": {
+          "description": "Span attributes to split by. Required for group_by \"group\".",
           "type": [
             "array",
             "null"
@@ -5616,6 +5724,7 @@
           }
         },
         "skip_warmup_ms": {
+          "description": "Exclude spans starting within this many ms of the first matched span.",
           "type": [
             "number",
             "null"
@@ -5623,6 +5732,7 @@
           "format": "double"
         },
         "top_n": {
+          "description": "Rows returned in the breakdown (default 20).",
           "type": [
             "integer",
             "null"
@@ -5630,7 +5740,8 @@
           "format": "uint64",
           "minimum": 0
         }
-      }
+      },
+      "additionalProperties": false
     },
     "CollectorsEdit": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5639,15 +5750,18 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "The collector to change.",
           "type": "string"
         },
         "description": {
+          "description": "Free — changes nothing about what is collected.",
           "type": [
             "string",
             "null"
           ]
         },
         "filter": {
+          "description": "Any of the fields below DISCARDS the live window. Recorded snapshots are\nuntouched and each keeps the definition it was taken under.",
           "type": [
             "string",
             "null"
@@ -5667,6 +5781,7 @@
           ]
         },
         "group_keys": {
+          "description": "Replace the declared group keys. A structural change: it zeroes the live\nwindow.",
           "type": [
             "array",
             "null"
@@ -5676,6 +5791,7 @@
           }
         },
         "max_sample_bytes": {
+          "description": "Replace the per-collector sample budget. A structural change: it zeroes\nthe live window.",
           "type": [
             "integer",
             "null"
@@ -5702,6 +5818,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ],
@@ -5752,6 +5869,7 @@
               "minimum": 0
             }
           },
+          "additionalProperties": false,
           "required": [
             "metric",
             "op",
@@ -5826,6 +5944,7 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "The collector to record.",
           "type": "string"
         },
         "label": {
@@ -5854,12 +5973,14 @@
           "default": null
         },
         "per_name": {
+          "description": "Keep the per-span-name breakdown in the recorded run. Default true. Per-\naxis breakdowns are what a later comparison splits by, and they are\ndropped on the way to disk when this is false — so the choice is made\nhere, once, and cannot be revisited from a recorded run.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "per_group": {
+          "description": "Keep the per-group-key breakdown in the recorded run. Default true.",
           "type": [
             "boolean",
             "null"
@@ -5873,6 +5994,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -5883,6 +6005,7 @@
       "type": "object",
       "properties": {
         "name": {
+          "description": "The collector whose recorded runs to list.",
           "type": "string"
         },
         "limit": {
@@ -5903,6 +6026,7 @@
           "default": null
         }
       },
+      "additionalProperties": false,
       "required": [
         "name"
       ]
@@ -6837,9 +6961,11 @@
       "type": "object",
       "properties": {
         "a": {
+          "description": "Baseline arm: \"<collector>\" for the live window, \"<collector>@<label>\"\nfor one recorded run, or \"<collector>@*\" for every recorded run merged.",
           "type": "string"
         },
         "b": {
+          "description": "The arm to compare against the baseline, same syntax.",
           "type": "string"
         },
         "group_by": {
@@ -6857,6 +6983,7 @@
           ]
         },
         "top_n": {
+          "description": "Rows returned in the breakdown (default 20).",
           "type": [
             "integer",
             "null"
@@ -6886,6 +7013,7 @@
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "a",
         "b"
@@ -7835,6 +7963,7 @@
           "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
         "metric",
         "op",
@@ -7986,6 +8115,7 @@
           ]
         },
         "top_n": {
+          "description": "Rows in the ranked table (default 15).",
           "type": [
             "integer",
             "null"
@@ -7994,24 +8124,28 @@
           "minimum": 0
         },
         "allow_mismatch": {
+          "description": "Document arms whose filters matched different populations. Off by\ndefault: the comparison is then between different things.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "allow_lossy": {
+          "description": "Document arms whose ingest dropped spans. Off by default: the missing\nspans are not random.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "allow_truncated": {
+          "description": "Document arms whose sample tier hit its cap. Off by default: the tail is\nthe part that was cut.",
           "type": [
             "boolean",
             "null"
           ]
         }
       },
+      "additionalProperties": false,
       "required": [
         "names"
       ]

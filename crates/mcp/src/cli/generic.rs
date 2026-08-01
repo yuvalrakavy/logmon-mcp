@@ -183,13 +183,29 @@ fn coerce(raw: &str, node: Option<&Value>) -> Result<Value, String> {
 /// the second occurrence looks right and is wrong for every one-element list —
 /// `--group-keys a` and `document a@base` both hit it, and the daemon rejects
 /// them with "must be an array of strings, not a string".
-fn insert(out: &mut Map<String, Value>, key: &str, value: Value, is_list: bool) {
+fn insert(
+    out: &mut Map<String, Value>,
+    key: &str,
+    value: Value,
+    is_list: bool,
+) -> Result<(), String> {
     match out.remove(key) {
         None if is_list => {
             out.insert(key.to_string(), Value::Array(vec![value]));
         }
         None => {
             out.insert(key.to_string(), value);
+        }
+        // **Repeating a SCALAR flag is a mistake, not a list.** Accumulating
+        // regardless of type turns the habit of re-typing a flag to override an
+        // earlier one (`--name a --name b`) into `{"name": ["a","b"]}` — a type
+        // the daemon must reject, with an error that blames the daemon rather
+        // than the command line.
+        _ if !is_list => {
+            return Err(format!(
+                "`--{}` was given more than once, and it takes a single value",
+                key.replace('_', "-")
+            ))
         }
         Some(Value::Array(mut existing)) => {
             existing.push(value);
@@ -199,6 +215,7 @@ fn insert(out: &mut Map<String, Value>, key: &str, value: Value, is_list: bool) 
             out.insert(key.to_string(), Value::Array(vec![first, value]));
         }
     }
+    Ok(())
 }
 
 /// Whether the schema says this parameter is a list.
@@ -213,13 +230,17 @@ fn is_list(node: Option<&Value>) -> bool {
 /// can express neither the name nor the fields. The hand-written CLI solved it
 /// by inventing `--threshold-metric` and friends — knowledge of the tool baked
 /// into the front-end, which is exactly what is being removed.
-fn insert_nested(out: &mut Map<String, Value>, path: &[&str], value: Value, is_list: bool) {
+fn insert_nested(
+    out: &mut Map<String, Value>,
+    path: &[&str],
+    value: Value,
+    is_list: bool,
+) -> Result<(), String> {
     let Some((head, tail)) = path.split_first() else {
-        return;
+        return Ok(());
     };
     if tail.is_empty() {
-        insert(out, head, value, is_list);
-        return;
+        return insert(out, head, value, is_list);
     }
     let slot = out
         .entry(head.to_string())
@@ -232,7 +253,7 @@ fn insert_nested(out: &mut Map<String, Value>, path: &[&str], value: Value, is_l
         tail,
         value,
         is_list,
-    );
+    )
 }
 
 /// Resolve `threshold.metric` to the schema node describing `metric`.
@@ -266,7 +287,7 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
             };
             let is_last = positional_taken + 1 == hints.positional.len();
             let node = node_for(schema, &[name.as_str()]);
-            insert(&mut out, name, coerce(arg, node)?, is_list(node));
+            insert(&mut out, name, coerce(arg, node)?, is_list(node))?;
             // A variadic tail keeps absorbing into the same key rather than
             // advancing, so `document a b c` fills one list.
             if !(is_last && hints.variadic) {
@@ -309,11 +330,27 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
                 let is_bool = node.and_then(json_type).as_deref() == Some("boolean");
                 if is_bool && next_is_flag {
                     // A bare `--flag` on a boolean means true.
-                    insert_nested(&mut out, &path, Value::Bool(true), false);
+                    insert_nested(&mut out, &path, Value::Bool(true), false)?;
                     i += 1;
                     continue;
                 }
                 match args.get(i + 1) {
+                    // **A flag must not eat the next flag.** Taking the next
+                    // token unconditionally turns `--name --filter ALL` into
+                    // `name = "--filter"`, and then `ALL` lands in the
+                    // positional branch — an unrelated error at best, and on a
+                    // variadic tool absorbed without a word. The old error only
+                    // ever fired for the last flag on the line.
+                    //
+                    // A value that genuinely begins with `--` is still
+                    // reachable as `--flag=--value`, which the inline form
+                    // above handles.
+                    Some(v) if v.starts_with("--") => {
+                        return Err(format!(
+                            "`--{flag}` was given no value — `{v}` looks like another flag. \
+                             Write `--{flag}={v}` if that really is the value."
+                        ))
+                    }
                     Some(v) => {
                         i += 1;
                         v.clone()
@@ -323,7 +360,7 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
             }
         };
         i += 1;
-        insert_nested(&mut out, &path, coerce(&raw, node)?, is_list(node));
+        insert_nested(&mut out, &path, coerce(&raw, node)?, is_list(node))?;
     }
     Ok(out)
 }
@@ -786,6 +823,51 @@ mod tests {
     }
 
     /// And a scalar parameter must NOT be wrapped just because it appears once.
+    /// The most common typo in the file, and it used to produce a well-formed
+    /// WRONG request: `--name --filter ALL` set `name = "--filter"`, then `ALL`
+    /// fell into the positional branch. The old error fired only for the last
+    /// flag on the line.
+    #[test]
+    fn a_flag_does_not_swallow_the_next_flag() {
+        let e = err("add_collector", &["--name", "--filter", "ALL"]);
+        assert!(e.contains("no value"), "{e}");
+        assert!(e.contains("--filter"), "and names what it saw: {e}");
+
+        // The escape hatch is real and the message points at it.
+        assert!(e.contains("--name=--filter"), "{e}");
+        let p = parse("add_collector", &["--name=--weird", "--filter", "ALL"]);
+        assert_eq!(p["name"], "--weird");
+    }
+
+    /// Re-typing a flag to override an earlier value is a habit, and it used to
+    /// build an array the daemon then rejected — blaming the daemon rather than
+    /// the command line.
+    #[test]
+    fn repeating_a_scalar_flag_is_refused() {
+        let e = err(
+            "add_collector",
+            &["--name", "a", "--name", "b", "--filter", "ALL"],
+        );
+        assert!(e.contains("more than once"), "{e}");
+        assert!(e.contains("--name"), "{e}");
+
+        // A genuine list still accumulates.
+        let p = parse(
+            "add_collector",
+            &[
+                "--name",
+                "c",
+                "--filter",
+                "ALL",
+                "--group-keys",
+                "a",
+                "--group-keys",
+                "b",
+            ],
+        );
+        assert_eq!(p["group_keys"], serde_json::json!(["a", "b"]));
+    }
+
     #[test]
     fn a_scalar_parameter_is_not_wrapped_in_a_list() {
         let p = parse("add_collector", &["--name", "c", "--filter", "ALL"]);

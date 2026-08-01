@@ -44,6 +44,16 @@ fn locate_broker_binary() -> anyhow::Result<PathBuf> {
 /// listening on its socket — but this function does NOT return a connection;
 /// the caller (typically the SDK's `Broker::connect`) opens its own.
 pub async fn ensure_broker_running() -> anyhow::Result<()> {
+    // **An explicitly named socket means "use that broker".** The SDK reads
+    // `LOGMON_BROKER_SOCKET` (`sdk/src/connect.rs:96`) and connects there, but
+    // this function works off `config_dir()` — so without this check, pointing
+    // the shim at one broker makes it start a SECOND one somewhere else, and
+    // then talk to neither the one it started nor the one it was told about.
+    if std::env::var_os("LOGMON_BROKER_SOCKET").is_some() {
+        tracing::debug!("LOGMON_BROKER_SOCKET is set; not starting a broker");
+        return Ok(());
+    }
+
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create config dir: {}", dir.display()))?;

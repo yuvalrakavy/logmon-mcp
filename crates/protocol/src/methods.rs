@@ -223,11 +223,15 @@ pub struct BookmarkInfo {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogsRecent {
+    /// Number of log entries to return (default: 50)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+    /// Optional DSL filter expression
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// Filter logs by trace ID (32-char hex)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
 }
@@ -264,10 +268,14 @@ pub struct LogsRecentResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogsContext {
+    /// Sequence number of the anchor entry
     pub seq: u64,
+    /// Number of entries before the anchor (default: 10)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<u64>,
+    /// Number of entries after the anchor (default: 10)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
 }
@@ -279,9 +287,12 @@ pub struct LogsContextResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogsExport {
+    /// Maximum number of entries to export
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+    /// Optional DSL filter expression
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
 }
@@ -308,6 +319,7 @@ pub struct LogsExportResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogsClear {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -320,6 +332,7 @@ pub struct LogsClearResult {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FiltersList {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -328,8 +341,11 @@ pub struct FiltersListResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FiltersAdd {
+    /// DSL filter expression
     pub filter: String,
+    /// Human-readable description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -340,10 +356,14 @@ pub struct FiltersAddResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FiltersEdit {
+    /// Filter ID to edit
     pub id: u32,
+    /// New DSL filter expression
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// New description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -357,7 +377,9 @@ pub struct FiltersEditResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FiltersRemove {
+    /// Filter ID to remove
     pub id: u32,
 }
 
@@ -371,6 +393,7 @@ pub struct FiltersRemoveResult {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TriggersList {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -379,14 +402,20 @@ pub struct TriggersListResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TriggersAdd {
+    /// DSL filter expression that activates the trigger
     pub filter: String,
+    /// Number of messages to capture before the triggering event (default: 500)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_window: Option<u32>,
+    /// Number of messages to capture after the triggering event (default: 200)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_window: Option<u32>,
+    /// Number of context entries to include in the notification (default: 5)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notify_context: Option<u32>,
+    /// Human-readable description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// When `true`, the trigger auto-removes after its first match. Defaults
@@ -401,18 +430,26 @@ pub struct TriggersAddResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TriggersEdit {
+    /// Trigger ID to edit
     pub id: u32,
+    /// New DSL filter expression
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// New pre-window size
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_window: Option<u32>,
+    /// New post-window size
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_window: Option<u32>,
+    /// New notify-context size
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notify_context: Option<u32>,
+    /// New description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Set or clear fire-once. Absent leaves it as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oneshot: Option<bool>,
 }
@@ -440,7 +477,9 @@ pub struct TriggersEditResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TriggersRemove {
+    /// Trigger ID to remove
     pub id: u32,
 }
 
@@ -454,9 +493,12 @@ pub struct TriggersRemoveResult {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracesRecent {
+    /// Max traces to return (default: 20)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+    /// Span filter DSL expression
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
 }
@@ -481,10 +523,14 @@ pub struct TracesRecentResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracesGet {
+    /// 32-character hex trace ID
     pub trace_id: String,
+    /// Include linked logs (default: true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_logs: Option<bool>,
+    /// Filter spans within the trace
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
 }
@@ -499,7 +545,9 @@ pub struct TracesGetResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracesSummary {
+    /// 32-character hex trace ID
     pub trace_id: String,
 }
 
@@ -524,11 +572,15 @@ pub struct TracesSummaryResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracesSlow {
+    /// Duration threshold in milliseconds (default: 100)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_duration_ms: Option<f64>,
+    /// Max results (default: 20)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+    /// Additional span filter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
     /// When set to `"name"`, results are aggregated into `groups`; otherwise
@@ -587,8 +639,11 @@ pub struct TracesSlowResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracesLogs {
+    /// 32-character hex trace ID
     pub trace_id: String,
+    /// Additional log filter DSL
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
 }
@@ -602,10 +657,14 @@ pub struct TracesLogsResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SpansContext {
+    /// Span sequence number
     pub seq: u64,
+    /// Spans before (default: 5)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<u64>,
+    /// Spans after (default: 5)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
 }
@@ -856,6 +915,7 @@ impl PathRow {
 /// guard and the wrong one for a liveness check, which is why every report
 /// carries the note saying so.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ThresholdSpec {
     /// `count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.
     ///
@@ -915,8 +975,12 @@ pub struct ThresholdInfo {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsAdd {
+    /// Collector name. Letters, digits, '_' and '-' only.
     pub name: String,
+    /// Span filter DSL. Matched against every span in the domain this session
+    /// is bound to *now*; the collector stays pinned to that domain afterwards.
     pub filter: String,
     /// `scalar`, `timing`, or `tree` (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -927,8 +991,11 @@ pub struct CollectorsAdd {
     /// strings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
+    /// Why this collector exists. Returned with every read, so a result found
+    /// later still carries its context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Per-collector retained-sample budget in bytes (default 64 MiB).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sample_bytes: Option<u64>,
     /// A rolling guard over this collector's matched spans (§8).
@@ -955,6 +1022,7 @@ pub struct CollectorsAddResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsList {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1008,18 +1076,24 @@ pub struct CollectorsListResult {
 /// schema, and a tool whose parameters nothing describes cannot be checked
 /// against the shim, generated from, or published in a manifest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsReset {
+    /// The collector to zero.
     pub name: String,
 }
 
 /// `collectors.remove` — disarm and delete, taking its recorded runs with it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsRemove {
+    /// The collector to remove.
     pub name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsGet {
+    /// The collector to read.
     pub name: String,
     /// Read a recorded snapshot by label instead of the live window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1030,8 +1104,10 @@ pub struct CollectorsGet {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = ["name", "group", "trace", "path", "none", "", null]))]
     pub group_by: Option<String>,
+    /// Exclude spans starting within this many ms of the first matched span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_warmup_ms: Option<f64>,
+    /// Rows returned in the breakdown (default 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u64>,
 }
@@ -1068,10 +1144,15 @@ pub struct CollectorsRemoveResult {
 /// window** and re-runs every gate `collectors.add` runs. Recorded snapshots
 /// are untouched and each keeps the definition it was taken under.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsEdit {
+    /// The collector to change.
     pub name: String,
+    /// Free — changes nothing about what is collected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Any of the fields below DISCARDS the live window. Recorded snapshots are
+    /// untouched and each keeps the definition it was taken under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
     /// `scalar`, `timing` or `tree`. Permitted in **both** directions: a `tree`
@@ -1081,8 +1162,12 @@ pub struct CollectorsEdit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = ["scalar", "timing", "tree", null]))]
     pub level: Option<String>,
+    /// Replace the declared group keys. A structural change: it zeroes the live
+    /// window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
+    /// Replace the per-collector sample budget. A structural change: it zeroes
+    /// the live window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_sample_bytes: Option<u64>,
     /// Re-pin to another domain. Only while the collector is zeroed, so a
@@ -1121,7 +1206,9 @@ pub struct CollectorsEditResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsSnapshot {
+    /// The collector to record.
     pub name: String,
     /// Unique per collector, `[A-Za-z0-9._-]`. Omitted → `snapshot-<n>`, and
     /// `n` never repeats over a collector's life even after eviction.
@@ -1139,8 +1226,13 @@ pub struct CollectorsSnapshot {
     /// point of a snapshot is usually to end one run and begin the next.
     #[serde(default)]
     pub reset: Option<bool>,
+    /// Keep the per-span-name breakdown in the recorded run. Default true. Per-
+    /// axis breakdowns are what a later comparison splits by, and they are
+    /// dropped on the way to disk when this is false — so the choice is made
+    /// here, once, and cannot be revisited from a recorded run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_name: Option<bool>,
+    /// Keep the per-group-key breakdown in the recorded run. Default true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_group: Option<bool>,
     /// Store the sample-derived figures. Computed now or never — the samples
@@ -1187,7 +1279,9 @@ pub struct SnapshotSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsHistory {
+    /// The collector whose recorded runs to list.
     pub name: String,
     /// Most recent N. Omitted → all retained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1241,8 +1335,12 @@ pub struct CollectorsHistoryResult {
 /// form is the only one that yields a run-to-run floor, which is what decides
 /// whether a delta is a result or scheduling noise.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsDiff {
+    /// Baseline arm: "<collector>" for the live window, "<collector>@<label>"
+    /// for one recorded run, or "<collector>@*" for every recorded run merged.
     pub a: String,
+    /// The arm to compare against the baseline, same syntax.
     pub b: String,
     /// `name` or `group`. Not `trace` or `path`: both are projected from
     /// per-span records, and a recorded run does not retain those. `none` and
@@ -1251,6 +1349,7 @@ pub struct CollectorsDiff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = ["name", "group", "none", "", null]))]
     pub group_by: Option<String>,
+    /// Rows returned in the breakdown (default 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u64>,
     /// Compare arms whose filters matched different populations.
@@ -1406,6 +1505,7 @@ pub struct CollectorsDiffResult {
 /// stored: the normal shape is to read the document, learn something, and
 /// regenerate it with `finding` filled in.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CollectorsDocument {
     /// The arms to document. The **first is the baseline**; every other one is
     /// compared against it. Same syntax as `collectors.diff`.
@@ -1441,12 +1541,19 @@ pub struct CollectorsDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = ["name", "group", "none", "", null]))]
     pub group_by: Option<String>,
+    /// Rows in the ranked table (default 15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u64>,
+    /// Document arms whose filters matched different populations. Off by
+    /// default: the comparison is then between different things.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_mismatch: Option<bool>,
+    /// Document arms whose ingest dropped spans. Off by default: the missing
+    /// spans are not random.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_lossy: Option<bool>,
+    /// Document arms whose sample tier hit its cap. Off by default: the tail is
+    /// the part that was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_truncated: Option<bool>,
 }
@@ -1470,7 +1577,9 @@ pub struct CollectorsDocumentResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracesProfile {
+    /// Span filter DSL. Default "ALL".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
     /// `name`, `group`, `trace`, or `path`; `none`, `""` or omitted for the
@@ -1479,10 +1588,13 @@ pub struct TracesProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = ["name", "group", "trace", "path", "none", "", null]))]
     pub group_by: Option<String>,
+    /// Span attributes to split by. Required for group_by "group".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
+    /// Exclude spans starting within this many ms of the first matched span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_warmup_ms: Option<f64>,
+    /// Rows returned in the breakdown (default 20).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u64>,
 }
@@ -1568,7 +1680,10 @@ pub struct ProfileResult {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BookmarksAdd {
+    /// Bookmark name (alphanumerics, '-', '_'; max 64 chars). Will be qualified
+    /// with the calling session's name automatically.
     pub name: String,
     /// Caller-chosen anchor seq. Defaults to the daemon's current seq counter
     /// (i.e., "right now") when omitted.
@@ -1577,6 +1692,7 @@ pub struct BookmarksAdd {
     /// Optional caller-supplied note retained for human display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// If true, overwrite an existing bookmark with the same qualified name.
     #[serde(default)]
     pub replace: bool,
 }
@@ -1590,7 +1706,9 @@ pub struct BookmarksAddResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BookmarksList {
+    /// Optional: filter to bookmarks created by this session name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
 }
@@ -1602,7 +1720,10 @@ pub struct BookmarksListResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BookmarksRemove {
+    /// Bare name (resolved against current session) or qualified
+    /// "session/name".
     pub name: String,
 }
 
@@ -1612,6 +1733,7 @@ pub struct BookmarksRemoveResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BookmarksClear {
     /// Defaults to the calling session when omitted.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1629,6 +1751,7 @@ pub struct BookmarksClearResult {
 // =============================================================================
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionList {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1637,7 +1760,9 @@ pub struct SessionListResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionDrop {
+    /// Name of the session to drop
     pub name: String,
 }
 
@@ -1647,6 +1772,7 @@ pub struct SessionDropResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatusGet {}
 
 /// Per-source receiver drop counts. Each field is the cumulative count of
@@ -1819,18 +1945,24 @@ pub struct DomainInfo {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainsCreate {
+    /// Domain name — the isolation key.
     pub name: String,
     /// GELF UDP+TCP port. Omitted → auto-allocate; `0` → disable GELF for this
     /// domain; otherwise bind exactly this port (error if held by another domain).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gelf_port: Option<u16>,
+    /// OTLP gRPC port. Omitted → auto-allocate; 0 → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_grpc_port: Option<u16>,
+    /// OTLP HTTP port. Omitted → auto-allocate; 0 → disable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_http_port: Option<u16>,
+    /// Log ring capacity (default: the daemon's configured size).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_buffer_size: Option<usize>,
+    /// Span ring capacity (default: the daemon's configured size).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_buffer_size: Option<usize>,
     /// `false` (default) → ephemeral (gone on restart). `true` → durable
@@ -1845,7 +1977,10 @@ pub struct DomainsCreate {
 pub type DomainsCreateResult = DomainInfo;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainsDelete {
+    /// Name of the domain to delete. Refuses config-declared domains (incl.
+    /// 'default').
     pub name: String,
 }
 
@@ -1856,6 +1991,7 @@ pub struct DomainsDeleteResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainsList {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -1864,7 +2000,9 @@ pub struct DomainsListResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainsUse {
+    /// Domain to bind this session to for subsequent queries and notifications.
     pub name: String,
 }
 
@@ -1887,6 +2025,7 @@ pub struct DomainsUseResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainsClear {}
 
 /// `session.rename` — re-key the calling session to a meaningful name
@@ -1894,7 +2033,10 @@ pub struct DomainsClear {}
 /// preserving all state. Errors with "already connected" when the target name
 /// is held by a LIVE session — the one-conversation-per-lane invariant.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionRename {
+    /// New session name: <Project>-Main-<short8> or <Project>-tN-<branch> ('/'
+    /// sanitized to '-'; alphanumerics, '-' and '_' only).
     pub name: String,
 }
 
@@ -1927,6 +2069,7 @@ pub struct DomainsClearResult {
 /// serialising a missing field as `null` would otherwise mean the opposite of
 /// what it sent. Erasure is `domain_data.remove`, never `value: null`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainDataEntry {
     /// A registry path — `/Build/commit`. A leading `@` scopes the fact to one
     /// case document instead of the domain, and is accepted only where a
@@ -1947,7 +2090,15 @@ pub struct DomainDataEntry {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainDataUpdate {
+    /// Entries to record. Each is `{path, value?, ttl?}`. **Value present** →
+    /// set it. **Value absent** → *validate*: confirm what is already there,
+    /// moving only its confirmation time. A key-only entry never creates —
+    /// recording a key with no value would be a guess. `ttl` is `30s` / `5m` /
+    /// `2h` / `7d` / `4w`, or `false` to clear one. Absent leaves any existing
+    /// lifetime alone, exactly as an absent value does, so restating a value
+    /// cannot silently drop its lifetime.
     pub entries: Vec<DomainDataEntry>,
 }
 
@@ -1987,6 +2138,7 @@ pub struct DomainDataUpdateResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainDataRemove {
     /// Prefix patterns, matched on **segment boundaries** — `/Versions` matches
     /// `/Versions/ht_server` but `/Ver` matches neither. There is no undo.
@@ -2011,6 +2163,7 @@ pub struct DomainDataRemoveResult {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DomainDataGet {
     /// Narrow to a subtree, on segment boundaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]

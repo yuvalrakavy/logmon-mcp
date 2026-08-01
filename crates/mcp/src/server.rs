@@ -74,6 +74,26 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
     let method = entry.method.clone();
     let hints = entry.cli.clone();
 
+    // The argument names this tool accepts, taken from the schema AFTER the
+    // local output path was added — that one is a real argument here even
+    // though the daemon has never heard of it. `None` when the schema declares
+    // no `properties`, which is a tool that takes nothing.
+    // The argument names this tool accepts, taken from the schema AFTER the
+    // local output path was added — that one is a real argument here even
+    // though the daemon has never heard of it.
+    //
+    // **Absent `properties` means "takes no arguments", not "unknown".**
+    // schemars omits the key entirely for a request type with no fields, so
+    // treating it as unknown would wave every argument through on exactly the
+    // tools that accept none — `list_collectors --nonsense` among them.
+    let declared: std::sync::Arc<std::collections::BTreeSet<String>> = std::sync::Arc::new(
+        schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default(),
+    );
+
     Some(ToolRoute::new_dyn(
         Tool::new(
             entry.name.clone(),
@@ -83,8 +103,44 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
         move |ctx: ToolCallContext<'_, GelfMcpServer>| {
             let method = method.clone();
             let hints = hints.clone();
+            let declared = declared.clone();
             Box::pin(async move {
                 let mut args = ctx.arguments.clone().unwrap_or_default();
+
+                // **A misspelled argument is an error, not something to
+                // forward.** The daemon reads most parameters by key, so an
+                // unrecognised one is silently ignored and the tool answers a
+                // different question than the one asked. Phase 0 closed this
+                // with `deny_unknown_fields` on 37 hand-written param structs;
+                // deleting those structs reopened it on all 45 tools, and the
+                // published `additionalProperties: false` only *declares* the
+                // rule for clients that validate. This enforces it.
+                //
+                // Key NAMES only. Values are the daemon's business — it reads
+                // them with full knowledge of the tool.
+                let unknown: Vec<&str> = args
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|k| !declared.contains(*k))
+                    .collect();
+                if !unknown.is_empty() {
+                    let accepts = if declared.is_empty() {
+                        "it takes no arguments".to_string()
+                    } else {
+                        format!(
+                            "it accepts: {}",
+                            declared
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Err(rmcp::ErrorData::invalid_params(
+                        format!("`{method}` got unknown argument(s) {unknown:?} — {accepts}"),
+                        None,
+                    ));
+                }
 
                 // Taken out before the call: the daemon does not describe it and
                 // would reject it, and it means nothing on the daemon's side of

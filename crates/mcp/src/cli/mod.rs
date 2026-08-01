@@ -35,6 +35,8 @@ pub struct Globals {
     pub json: bool,
     pub help: bool,
     pub version: bool,
+    /// A malformed global flag, reported before anything connects.
+    pub error: Option<String>,
 }
 
 /// Split argv into this process's flags and the command that follows.
@@ -58,12 +60,28 @@ pub fn split_globals(args: &[String]) -> (Globals, Vec<String>) {
         };
         match name.as_str() {
             "session" | "domain" => {
+                // **Must not swallow the next flag.** `--session --json …`
+                // otherwise connects with a persistent named session literally
+                // called `--json`, and `--json` never takes effect. A missing
+                // value at end-of-argv used to be silently absent too, which
+                // bound `default` without a word.
                 let value = match inline {
                     Some(v) => Some(v),
-                    None => {
-                        i += 1;
-                        args.get(i).cloned()
-                    }
+                    None => match args.get(i + 1) {
+                        Some(v) if !v.starts_with('-') => {
+                            i += 1;
+                            Some(v.clone())
+                        }
+                        other => {
+                            g.error = Some(match other {
+                                Some(v) => format!(
+                                    "`--{name}` was given no value — `{v}` looks like another flag"
+                                ),
+                                None => format!("`--{name}` was given no value"),
+                            });
+                            None
+                        }
+                    },
                 };
                 if name == "session" {
                     g.session = value;
@@ -99,8 +117,17 @@ pub fn split_globals(args: &[String]) -> (Globals, Vec<String>) {
 
 /// Top-level CLI dispatch. Returns the process exit code.
 pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
-    let session_name = globals.session.clone().unwrap_or_else(|| "cli".to_string());
     let json = globals.json;
+
+    // Reported before connecting: a bad `--session` would otherwise open a
+    // session under a nonsense name, and a bad `--domain` would bind `default`
+    // silently — both side effects that outlive the failed command.
+    if let Some(e) = &globals.error {
+        format::error(e, json);
+        return 1;
+    }
+
+    let session_name = globals.session.clone().unwrap_or_else(|| "cli".to_string());
 
     let broker = match connect::connect_cli(&session_name, &argv).await {
         Ok(b) => b,
@@ -214,6 +241,23 @@ mod tests {
             split(&["collectors", "list", "--json"]).1,
             ["collectors", "list"],
             "and is removed rather than forwarded"
+        );
+    }
+
+    /// `--session --json collectors list` used to connect with a persistent
+    /// named session literally called `--json`, and `--json` never took effect.
+    /// A missing value at end-of-argv silently bound `default`.
+    #[test]
+    fn a_global_flag_does_not_swallow_the_next_flag() {
+        let (g, _) = split(&["--session", "--json", "collectors", "list"]);
+        assert!(g.session.is_none(), "must not be named `--json`");
+        assert!(g.error.is_some(), "and must be reported: {:?}", g.error);
+        assert!(g.error.unwrap().contains("--json"));
+
+        let (g, _) = split(&["--domain"]);
+        assert!(
+            g.error.is_some(),
+            "a trailing --domain is an error, not `default`"
         );
     }
 
