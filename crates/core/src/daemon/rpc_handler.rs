@@ -873,10 +873,24 @@ impl RpcHandler {
         let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
+        let resolved = lower_seq_range(
+            resolved,
+            opt_u64(params, "from_seq")?,
+            opt_u64(params, "to_seq")?,
+        );
         let oldest_first = cursor_commit.is_some();
-        let (entries, stats) =
+        // Asked for one more than requested, so `capped` is a fact rather than
+        // an inference: "asked N, got N" is true both when the range was cut
+        // short and when exactly N existed, and §4.2 forbids calling a capped
+        // range complete. `recent_with_scanned` takes the FIRST `count`
+        // matching in whichever direction it walks, so taking one extra and
+        // dropping it returns the same entries either way.
+        let probe = count.saturating_add(1);
+        let (mut entries, stats) =
             d.pipeline
-                .recent_logs_with_stats(count, resolved.as_ref(), oldest_first);
+                .recent_logs_with_stats(probe, resolved.as_ref(), oldest_first);
+        let capped = entries.len() > count;
+        entries.truncate(count);
 
         let advanced_to = if let Some(commit) = cursor_commit {
             let max_seq = entries.iter().map(|e| e.seq).max();
@@ -905,6 +919,7 @@ impl RpcHandler {
             "buffer_newest_seq": stats.buffer_newest_seq,
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
+            "capped": capped,
         });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);
@@ -2907,6 +2922,62 @@ fn quantile_ms(sorted: &[f64], q: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // domain_data.* helpers
 // ---------------------------------------------------------------------------
+
+/// Fold an inclusive `from_seq`/`to_seq` range into the parsed filter.
+///
+/// **Lowered into the filter rather than carried beside it, and that is the
+/// whole point.** `evicted_before_window` reads its lower bound out of the
+/// *parsed filter*, via `resolved_lower_bound`, which matches only
+/// `Qualifier::SeqFilter { op: Gt }`. A range carried as a loose parameter
+/// would never reach it — so a window whose start had already rolled out of
+/// the ring would come back `truncated: false`, and a reader deciding whether
+/// that window is complete would be told it is. Silence about missing evidence
+/// is the one failure this surface exists to prevent.
+///
+/// Lowering also makes the range compose for free: `resolved_lower_bound` takes
+/// the **max** of every lower bound present, so a range alongside a bookmark
+/// bound resolves to the tighter of the two with no special case.
+///
+/// **Both ends are inclusive**, lowered to `Gt(from - 1)` and `Lt(to + 1)`,
+/// saturating so the adjustment cannot wrap at `0` or `u64::MAX`. `SeqOp` has
+/// only strict variants because bookmark semantics are strict; leaving the
+/// *parameter* strict as well would mean a window of "the anchor, plus none
+/// before and none after" excludes the anchor itself.
+fn lower_seq_range(
+    resolved: Option<crate::filter::parser::ParsedFilter>,
+    from_seq: Option<u64>,
+    to_seq: Option<u64>,
+) -> Option<crate::filter::parser::ParsedFilter> {
+    use crate::filter::parser::{ParsedFilter, Qualifier, SeqOp};
+
+    if from_seq.is_none() && to_seq.is_none() {
+        return resolved;
+    }
+    let mut bounds = Vec::new();
+    if let Some(from) = from_seq {
+        bounds.push(Qualifier::SeqFilter {
+            op: SeqOp::Gt,
+            value: from.saturating_sub(1),
+        });
+    }
+    if let Some(to) = to_seq {
+        bounds.push(Qualifier::SeqFilter {
+            op: SeqOp::Lt,
+            value: to.saturating_add(1),
+        });
+    }
+    match resolved {
+        // `None` matches nothing by construction. Narrowing it further would be
+        // a no-op, and turning it into a range would widen a filter the caller
+        // wrote to exclude everything.
+        Some(ParsedFilter::None) => Some(ParsedFilter::None),
+        Some(ParsedFilter::Qualifiers(mut qs)) => {
+            qs.extend(bounds);
+            Some(ParsedFilter::Qualifiers(qs))
+        }
+        None | Some(ParsedFilter::All) => Some(ParsedFilter::Qualifiers(bounds)),
+    }
+}
 
 /// Parse the `entries` array into registry entries plus any outcomes that could
 /// be decided before the registry saw them.

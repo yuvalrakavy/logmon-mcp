@@ -403,6 +403,24 @@
             "string",
             "null"
           ]
+        },
+        "from_seq": {
+          "description": "Lowest seq to export, **inclusive**. Composes with `filter`: a range and\na bookmark bound together resolve to the tighter of the two.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "to_seq": {
+          "description": "Highest seq to export, **inclusive**.\n\nInclusive on both ends because the alternative has an off-by-one at the\ncentre of every window: a range built as \"the anchor, plus 0 before and\n0 after\" must contain the anchor, and a strict bound would exclude the\none entry the caller was pointing at.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -473,6 +491,11 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "capped": {
+          "description": "`count` stopped this short of everything that matched the range.\n\nStated rather than left to be inferred, because it **cannot** be\ninferred: comparing what was asked for against what came back cannot\ntell a capped range apart from one where exactly that many existed. A\nreader deciding whether a window is complete needs that difference, and\n`truncated` will not supply it — that reports *eviction*, which is a\ndifferent kind of missing.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [

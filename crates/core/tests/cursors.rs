@@ -547,3 +547,177 @@ async fn cursor_persists_across_restart_returns_post_restart_records_only() {
         "post-restart cursor seq should exceed pre-restart seq"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §6.1 — a seq range on logs.export
+// ---------------------------------------------------------------------------
+
+/// Both ends are inclusive, and the single-seq range is the case that proves it.
+///
+/// `SeqOp` has only strict variants, so the range lowers to `Gt(from - 1)` and
+/// `Lt(to + 1)`. Had the parameter been left strict to match, a window of "the
+/// anchor, plus none before and none after" would exclude the anchor — a
+/// permanent off-by-one at the centre of every archived window.
+#[tokio::test]
+async fn a_seq_range_is_inclusive_at_both_ends() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    for i in 0..6 {
+        daemon.inject_log(Level::Info, &format!("range-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let all: LogsExportResult = client
+        .call("logs.export", json!({ "count": 100 }))
+        .await
+        .unwrap();
+    let seqs: Vec<u64> = all.logs.iter().map(|l| l.seq).collect();
+    assert_eq!(seqs.len(), 6, "six injected: {seqs:?}");
+    let (lo, hi) = (
+        seqs.iter().min().copied().unwrap(),
+        seqs.iter().max().copied().unwrap(),
+    );
+
+    // The whole span, named explicitly, must return every entry.
+    let whole: LogsExportResult = client
+        .call(
+            "logs.export",
+            json!({ "from_seq": lo, "to_seq": hi, "count": 100 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        whole.logs.len(),
+        6,
+        "an inclusive range must contain both ends"
+    );
+
+    // A range of one seq returns exactly that entry — the anchor case.
+    let one: LogsExportResult = client
+        .call(
+            "logs.export",
+            json!({ "from_seq": lo, "to_seq": lo, "count": 100 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(one.logs.len(), 1, "from == to must return that one entry");
+    assert_eq!(one.logs[0].seq, lo);
+}
+
+/// The range narrows, and it narrows from both directions.
+#[tokio::test]
+async fn a_seq_range_excludes_what_lies_outside_it() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    for i in 0..6 {
+        daemon.inject_log(Level::Info, &format!("edge-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let all: LogsExportResult = client
+        .call("logs.export", json!({ "count": 100 }))
+        .await
+        .unwrap();
+    let mut seqs: Vec<u64> = all.logs.iter().map(|l| l.seq).collect();
+    seqs.sort_unstable();
+
+    let inner: LogsExportResult = client
+        .call(
+            "logs.export",
+            json!({ "from_seq": seqs[1], "to_seq": seqs[4], "count": 100 }),
+        )
+        .await
+        .unwrap();
+    let got: Vec<u64> = {
+        let mut v: Vec<u64> = inner.logs.iter().map(|l| l.seq).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        got,
+        seqs[1..=4].to_vec(),
+        "four entries, endpoints included"
+    );
+}
+
+/// `capped` is a fact, not an inference.
+///
+/// "Asked for N, got N" is true both when the range was cut short and when
+/// exactly N existed, so a reader cannot tell them apart — and §4.2 forbids
+/// calling a capped range complete. The two cases are asserted side by side
+/// because it is the DIFFERENCE that carries the information.
+#[tokio::test]
+async fn capped_distinguishes_a_cut_range_from_one_that_fit_exactly() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    for i in 0..6 {
+        daemon.inject_log(Level::Info, &format!("cap-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let cut: LogsExportResult = client
+        .call("logs.export", json!({ "count": 4 }))
+        .await
+        .unwrap();
+    assert_eq!(cut.logs.len(), 4);
+    assert!(cut.capped, "four of six is capped: {cut:?}");
+
+    let exact: LogsExportResult = client
+        .call("logs.export", json!({ "count": 6 }))
+        .await
+        .unwrap();
+    assert_eq!(exact.logs.len(), 6);
+    assert!(
+        !exact.capped,
+        "six of six is not capped, and that is the case an inference gets wrong: {exact:?}"
+    );
+
+    let roomy: LogsExportResult = client
+        .call("logs.export", json!({ "count": 100 }))
+        .await
+        .unwrap();
+    assert!(!roomy.capped, "{roomy:?}");
+}
+
+/// The range reaches the eviction detector, which is the whole reason it is
+/// lowered into the filter instead of carried beside it.
+///
+/// `evicted_before_window` reads its lower bound out of the PARSED FILTER via
+/// `resolved_lower_bound`, matching only `Qualifier::SeqFilter { op: Gt }`. A
+/// `from_seq` carried as a loose parameter would never reach it, so a window
+/// starting below what the ring still holds would come back `truncated: false`
+/// — and a reader deciding whether that window is complete would be told it is.
+#[tokio::test]
+async fn a_range_starting_below_the_buffer_reports_eviction() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    for i in 0..4 {
+        daemon.inject_log(Level::Info, &format!("evict-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let all: LogsExportResult = client
+        .call("logs.export", json!({ "count": 100 }))
+        .await
+        .unwrap();
+    let oldest = all
+        .buffer_oldest_seq
+        .expect("a non-empty buffer has an oldest");
+
+    // Deliberately well below what the ring holds.
+    let below: LogsExportResult = client
+        .call(
+            "logs.export",
+            json!({ "from_seq": oldest.saturating_sub(50), "count": 100 }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        below.truncated,
+        "a window starting below the retained buffer is not complete: {below:?}"
+    );
+    assert!(
+        below.evicted_before_window.is_some(),
+        "and the gap must be named, not merely flagged: {below:?}"
+    );
+}

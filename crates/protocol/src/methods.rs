@@ -295,6 +295,18 @@ pub struct LogsExport {
     /// Optional DSL filter expression
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// Lowest seq to export, **inclusive**. Composes with `filter`: a range and
+    /// a bookmark bound together resolve to the tighter of the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_seq: Option<u64>,
+    /// Highest seq to export, **inclusive**.
+    ///
+    /// Inclusive on both ends because the alternative has an off-by-one at the
+    /// centre of every window: a range built as "the anchor, plus 0 before and
+    /// 0 after" must contain the anchor, and a strict bound would exclude the
+    /// one entry the caller was pointing at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -316,6 +328,16 @@ pub struct LogsExportResult {
     pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// `count` stopped this short of everything that matched the range.
+    ///
+    /// Stated rather than left to be inferred, because it **cannot** be
+    /// inferred: comparing what was asked for against what came back cannot
+    /// tell a capped range apart from one where exactly that many existed. A
+    /// reader deciding whether a window is complete needs that difference, and
+    /// `truncated` will not supply it — that reports *eviction*, which is a
+    /// different kind of missing.
+    #[serde(default)]
+    pub capped: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

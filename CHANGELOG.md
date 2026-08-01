@@ -125,6 +125,28 @@ is a second name to support forever.
   its caller never saw an outcome for. The reply carries `data_outcomes` only
   when there is something to report.
 
+- **`logs.export` takes a seq range.** `from_seq` and `to_seq`, both
+  **inclusive**, for reading a bounded window rather than the newest N.
+
+  Inclusive on both ends because the alternative has an off-by-one exactly where
+  it hurts: a window built as "this entry, plus none before and none after" must
+  contain that entry, and a strict bound would drop the one record the caller
+  was pointing at. Internally they lower to `Gt(from - 1)` and `Lt(to + 1)`,
+  saturating so the adjustment cannot wrap.
+
+  **The range is folded into the parsed filter rather than carried beside it**,
+  which is what makes it honest. `evicted_before_window` reads its lower bound
+  out of the parsed filter, so a range passed as a loose parameter would be
+  invisible to it — and a window whose start had already rolled out of the ring
+  would come back `truncated: false`, telling a reader the window was complete
+  when part of it was gone. Folding also makes the range compose with a bookmark
+  bound for free: the effective lower bound is the max of all of them.
+
+  **`capped` is new on the result**, stating whether `count` stopped the export
+  short of everything that matched. It cannot be inferred — "asked for N, got N"
+  is true both when a range was cut and when exactly N existed — and it is a
+  different kind of incompleteness from `truncated`, which reports eviction.
+
 ### Fixed
 
 - **A parameter of the wrong type is now an error, not a different answer.**
