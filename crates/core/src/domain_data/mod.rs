@@ -19,8 +19,8 @@ pub use entry::{parse_duration, render_duration, Entry, TtlParseError, TtlSpec};
 pub use map::DomainDataStore;
 pub use path::{Key, KeyError, MAX_KEYS, MAX_PATH_BYTES, MAX_SIGIL_KEYS, MAX_VALUE_BYTES};
 pub use store::{
-    partition_scoped, DataEntry, DataOutcome, Outcome, Registry, RegistryError, RejectReason,
-    RemoveOutcome, ScopedData, ScopedFact, UnknownCause,
+    is_scoped, partition_scoped, scope_one, DataEntry, DataOutcome, Outcome, Registry,
+    RegistryError, RejectReason, RemoveOutcome, ScopedData, ScopedFact, UnknownCause,
 };
 
 /// The recommended core keys (§3.6.1) — the set a document missing which

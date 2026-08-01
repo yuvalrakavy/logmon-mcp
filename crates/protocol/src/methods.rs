@@ -2372,3 +2372,116 @@ pub struct DomainDataGetResult {
     /// which of `/Build/commit`, `/Build/profile`, `/Action` are missing.
     pub missing_core: Vec<String>,
 }
+
+// =============================================================================
+// cases.*
+// =============================================================================
+
+/// Where a capture is centred — **tagged**, not one string the daemon sniffs.
+///
+/// Sniffing misfires on a bookmark named `12345` or one spelled as 32 hex
+/// characters, and the failure is silent: you get a document anchored somewhere
+/// else. The anchor entry's message is the document's headline, so a wrong
+/// anchor is a wrong document rather than a wrong parameter.
+///
+/// Exactly one field must be set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaseAnchor {
+    /// A stored entry's sequence number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// A bookmark name. Anchors on the first stored entry at or after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bookmark: Option<String>,
+    /// A trace id in hex. Anchors on the **earliest by seq** of its entries,
+    /// and the document says how many there were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CasesCreate {
+    /// Why this capture exists. Required: a manual case that cannot say why it
+    /// was taken has no provenance, and unlike a watch there is no filter
+    /// standing in for one.
+    pub reason: String,
+    pub anchor: CaseAnchor,
+    /// **Absolute** directory the three files are written to. A relative path
+    /// is rejected rather than resolved: the broker runs as a service, so it
+    /// would resolve against the broker's working directory rather than the
+    /// caller's.
+    ///
+    /// The daemon writes, rather than returning the archive over RPC, because a
+    /// case carries several hundred kilobytes of JSONL and returning it would
+    /// put the whole thing in the model's context — the outcome the
+    /// document/logdata split exists to prevent.
+    pub dir: String,
+    /// Filename prefix. Falls back to `/case-name` in the registry, then to the
+    /// domain name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Registry entries, exactly as `domain_data.update` takes them. A leading
+    /// `@` scopes a key to **this document** instead of the domain — how a
+    /// capturer records something true of this incident rather than of the
+    /// domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<DomainDataEntry>>,
+    /// Stored records to capture before the anchor. Counts of **records**, not
+    /// seq distances: one counter feeds both the log and span stores, so a
+    /// 200-seq range holds an unpredictable number of logs. Default 350, capped
+    /// at 5000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<u32>,
+    /// Stored records to capture after the anchor. Default 350, capped at 5000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u32>,
+}
+
+/// One written evidence file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CaseFile {
+    /// Data records, excluding the format header line.
+    pub records: u64,
+    /// File size including the header.
+    pub bytes: u64,
+}
+
+/// Something the caller should know that did not stop the capture.
+///
+/// Typed rather than a prose list, because capture gaps, provenance
+/// observations and write problems are three different things and a caller
+/// acting on them should not have to tell them apart by reading English.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CaseNote {
+    /// `capture_gap`, `provenance`, `truncated` or `write`.
+    pub kind: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CasesCreateResult {
+    /// `checkout-hang-260731-021530` — the stem all three files share.
+    pub stem: String,
+    /// What was actually written, document first. Not what was intended.
+    pub paths: Vec<String>,
+    /// The §4.2 verdict for the captured window, on the wire as well as in the
+    /// document — the document's most important correctness property must not
+    /// be reachable only by parsing markdown.
+    pub verdict: EvidenceVerdict,
+    /// The document is the artifact whose size can run away, so it is the one
+    /// that gets measured alongside the two that cannot.
+    pub document_bytes: u64,
+    pub logdata: CaseFile,
+    pub spandata: CaseFile,
+    pub notes: Vec<CaseNote>,
+    /// Per-entry outcomes for `data`, in the order sent — identical to what
+    /// `domain_data.update` returns, because it is the same call.
+    #[serde(default)]
+    pub data_outcomes: Vec<DomainDataOutcome>,
+    /// Set when the registry could not be made durable. The capture still
+    /// happened and the files are still on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_persist_error: Option<String>,
+}

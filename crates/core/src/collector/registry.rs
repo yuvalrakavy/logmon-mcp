@@ -114,6 +114,12 @@ pub struct ArmedCollector {
     /// number came from — the CLI and the shim are different sessions on the
     /// same domain.
     pub owner: SessionId,
+    /// Label and instant of the most recent recorded run, if any. §5.4 wants
+    /// each collector's current numbers **and any snapshot it holds**, and
+    /// `snapshot_count` alone cannot say when the last one was taken — which is
+    /// the part that tells a reader whether it predates the build they are
+    /// looking at.
+    pub latest_snapshot: Option<(String, chrono::DateTime<chrono::Utc>)>,
     /// Why the live window is empty, when there is a reason worth reporting.
     /// Lets a caller reading zero matches tell "nothing has happened yet" from
     /// "the run you were measuring did not survive the restart".
@@ -137,6 +143,11 @@ impl Entry {
             ingest_baseline: self.ingest_baseline,
             zeroed_by: self.zeroed_by,
             snapshot_count: self.history.len(),
+            latest_snapshot: self
+                .history
+                .all()
+                .last()
+                .map(|s| (s.label.clone(), s.taken_at)),
         }
     }
 

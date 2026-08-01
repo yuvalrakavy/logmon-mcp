@@ -32,8 +32,17 @@ pub enum Outcome {
     Created,
     Updated,
     Validated,
-    Unknown { cause: UnknownCause },
-    Rejected { reason: RejectReason },
+    /// A sigilled key (§3.9) that went to the document rather than the
+    /// registry. Its own outcome, because a caller reading `created` would be
+    /// told the domain now knows something it deliberately does not — and one
+    /// reading `rejected` would think the assertion was lost.
+    Scoped,
+    Unknown {
+        cause: UnknownCause,
+    },
+    Rejected {
+        reason: RejectReason,
+    },
 }
 
 /// Why a key-only entry found nothing.
@@ -90,6 +99,7 @@ impl Outcome {
             Self::Created => "created",
             Self::Updated => "updated",
             Self::Validated => "validated",
+            Self::Scoped => "scoped",
             Self::Unknown { .. } => "unknown",
             Self::Rejected { .. } => "rejected",
         }
@@ -417,60 +427,67 @@ pub fn partition_scoped(entries: &[DataEntry]) -> (Vec<DataEntry>, ScopedData, V
     let mut rejections = Vec::new();
 
     for e in entries {
-        if !e.path.starts_with(super::path::SIGIL) {
+        if !is_scoped(e) {
             registry.push(e.clone());
             continue;
         }
-        let reject = |reason| DataOutcome {
-            path: e.path.clone(),
-            outcome: Outcome::Rejected { reason },
-        };
-        let key = match Key::parse(&e.path, true) {
-            Ok(k) => k,
-            Err(KeyError::Malformed) => {
-                rejections.push(reject(RejectReason::MalformedPath));
-                continue;
-            }
-            Err(KeyError::TooLong) => {
-                rejections.push(reject(RejectReason::PathTooLong));
-                continue;
-            }
-            Err(KeyError::SigilNotAllowed) => {
-                rejections.push(reject(RejectReason::SigilNotAllowedHere));
-                continue;
-            }
-        };
-        // A sigil scopes a key; it does not launder the reservation.
-        if key.is_reserved() {
-            rejections.push(reject(RejectReason::ReservedPrefix));
-            continue;
-        }
-        let Some(value) = &e.value else {
-            // "Validate" is meaningless against a document that does not exist
-            // yet. A scoped key with no value has nothing to assert.
-            rejections.push(reject(RejectReason::MalformedPath));
-            continue;
-        };
-        if value.len() > MAX_VALUE_BYTES {
-            rejections.push(reject(RejectReason::ValueTooLong));
-            continue;
-        }
-        if scoped.facts.len() >= MAX_SIGIL_KEYS {
-            rejections.push(reject(RejectReason::RegistryFull));
-            continue;
-        }
-        let rendered = key.rendered();
-        // Last writer wins within one call, matching the registry's own
-        // semantics for a repeated key in a single batch.
-        match scoped.facts.iter_mut().find(|f| f.key == rendered) {
-            Some(existing) => existing.value = value.clone(),
-            None => scoped.facts.push(ScopedFact {
-                key: rendered,
-                value: value.clone(),
-            }),
+        match scope_one(e, &mut scoped) {
+            Ok(()) => {}
+            Err(rejection) => rejections.push(rejection),
         }
     }
     (registry, scoped, rejections)
+}
+
+/// Does this entry carry the `@` sigil — is it about one document rather than
+/// about the domain?
+pub fn is_scoped(e: &DataEntry) -> bool {
+    e.path.starts_with(super::path::SIGIL)
+}
+
+/// Admit one sigil-carrying entry into `scoped`, or say why it cannot be.
+///
+/// Split out of [`partition_scoped`] so a caller tracking the caller's original
+/// entry *indices* — which every per-entry outcome list must — can drive it one
+/// at a time without a second copy of these rules. The `MAX_SIGIL_KEYS` cap is
+/// checked against `scoped`, so it still bounds the call rather than the entry.
+pub fn scope_one(e: &DataEntry, scoped: &mut ScopedData) -> Result<(), DataOutcome> {
+    let reject = |reason| DataOutcome {
+        path: e.path.clone(),
+        outcome: Outcome::Rejected { reason },
+    };
+    let key = match Key::parse(&e.path, true) {
+        Ok(k) => k,
+        Err(KeyError::Malformed) => return Err(reject(RejectReason::MalformedPath)),
+        Err(KeyError::TooLong) => return Err(reject(RejectReason::PathTooLong)),
+        Err(KeyError::SigilNotAllowed) => return Err(reject(RejectReason::SigilNotAllowedHere)),
+    };
+    // A sigil scopes a key; it does not launder the reservation.
+    if key.is_reserved() {
+        return Err(reject(RejectReason::ReservedPrefix));
+    }
+    let Some(value) = &e.value else {
+        // "Validate" is meaningless against a document that does not exist yet.
+        // A scoped key with no value has nothing to assert.
+        return Err(reject(RejectReason::MalformedPath));
+    };
+    if value.len() > MAX_VALUE_BYTES {
+        return Err(reject(RejectReason::ValueTooLong));
+    }
+    if scoped.facts.len() >= MAX_SIGIL_KEYS {
+        return Err(reject(RejectReason::RegistryFull));
+    }
+    let rendered = key.rendered();
+    // Last writer wins within one call, matching the registry's own semantics
+    // for a repeated key in a single batch.
+    match scoped.facts.iter_mut().find(|f| f.key == rendered) {
+        Some(existing) => existing.value = value.clone(),
+        None => scoped.facts.push(ScopedFact {
+            key: rendered,
+            value: value.clone(),
+        }),
+    }
+    Ok(())
 }
 
 /// Parse a `ttl` field off the wire: a duration string, or `false` to clear.

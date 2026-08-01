@@ -2704,6 +2704,357 @@
         }
       }
     },
+    "CaseAnchor": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CaseAnchor",
+      "description": "Where a capture is centred — **tagged**, not one string the daemon sniffs.\n\nSniffing misfires on a bookmark named `12345` or one spelled as 32 hex\ncharacters, and the failure is silent: you get a document anchored somewhere\nelse. The anchor entry's message is the document's headline, so a wrong\nanchor is a wrong document rather than a wrong parameter.\n\nExactly one field must be set.",
+      "type": "object",
+      "properties": {
+        "seq": {
+          "description": "A stored entry's sequence number.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "bookmark": {
+          "description": "A bookmark name. Anchors on the first stored entry at or after it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trace_id": {
+          "description": "A trace id in hex. Anchors on the **earliest by seq** of its entries,\nand the document says how many there were.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CasesCreate": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CasesCreate",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "description": "Why this capture exists. Required: a manual case that cannot say why it\nwas taken has no provenance, and unlike a watch there is no filter\nstanding in for one.",
+          "type": "string"
+        },
+        "anchor": {
+          "$ref": "#/$defs/CaseAnchor"
+        },
+        "dir": {
+          "description": "**Absolute** directory the three files are written to. A relative path\nis rejected rather than resolved: the broker runs as a service, so it\nwould resolve against the broker's working directory rather than the\ncaller's.\n\nThe daemon writes, rather than returning the archive over RPC, because a\ncase carries several hundred kilobytes of JSONL and returning it would\nput the whole thing in the model's context — the outcome the\ndocument/logdata split exists to prevent.",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "Filename prefix. Falls back to `/case-name` in the registry, then to the\ndomain name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data": {
+          "description": "Registry entries, exactly as `domain_data.update` takes them. A leading\n`@` scopes a key to **this document** instead of the domain — how a\ncapturer records something true of this incident rather than of the\ndomain.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/DomainDataEntry"
+          }
+        },
+        "before": {
+          "description": "Stored records to capture before the anchor. Counts of **records**, not\nseq distances: one counter feeds both the log and span stores, so a\n200-seq range holds an unpredictable number of logs. Default 350, capped\nat 5000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "after": {
+          "description": "Stored records to capture after the anchor. Default 350, capped at 5000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "anchor",
+        "dir"
+      ],
+      "$defs": {
+        "CaseAnchor": {
+          "description": "Where a capture is centred — **tagged**, not one string the daemon sniffs.\n\nSniffing misfires on a bookmark named `12345` or one spelled as 32 hex\ncharacters, and the failure is silent: you get a document anchored somewhere\nelse. The anchor entry's message is the document's headline, so a wrong\nanchor is a wrong document rather than a wrong parameter.\n\nExactly one field must be set.",
+          "type": "object",
+          "properties": {
+            "seq": {
+              "description": "A stored entry's sequence number.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "bookmark": {
+              "description": "A bookmark name. Anchors on the first stored entry at or after it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "trace_id": {
+              "description": "A trace id in hex. Anchors on the **earliest by seq** of its entries,\nand the document says how many there were.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "DomainDataEntry": {
+          "description": "One requested change to the registry.\n\n**Absent ≡ `null` ≡ unchanged, for both `value` and `ttl`**, and the two\nshare one rule deliberately: two optional fields on one object with opposite\nabsent semantics is the footgun this surface exists to avoid, and a client\nserialising a missing field as `null` would otherwise mean the opposite of\nwhat it sent. Erasure is `domain_data.remove`, never `value: null`.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "A registry path — `/Build/commit`. A leading `@` scopes the fact to one\ncase document instead of the domain, and is accepted only where a\ndocument exists to receive it.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Present → set. Absent → validate only, which never creates.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ttl": {
+              "description": "A duration literal (`30s`, `5m`, `2h`, `7d`, `4w`), or `false` to clear\none in place. Absent leaves any existing lifetime untouched.\n\n`false` rather than `null` carries the clear because `null` is already\nspoken for above. This is the opposite convention to\n`CollectorsEdit.threshold`, where `null` removes — noted because the two\nlive in one daemon and the difference is deliberate rather than drift."
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    "CasesCreateResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CasesCreateResult",
+      "type": "object",
+      "properties": {
+        "stem": {
+          "description": "`checkout-hang-260731-021530` — the stem all three files share.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "What was actually written, document first. Not what was intended.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verdict": {
+          "description": "The §4.2 verdict for the captured window, on the wire as well as in the\ndocument — the document's most important correctness property must not\nbe reachable only by parsing markdown.",
+          "$ref": "#/$defs/EvidenceVerdict"
+        },
+        "document_bytes": {
+          "description": "The document is the artifact whose size can run away, so it is the one\nthat gets measured alongside the two that cannot.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "logdata": {
+          "$ref": "#/$defs/CaseFile"
+        },
+        "spandata": {
+          "$ref": "#/$defs/CaseFile"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CaseNote"
+          }
+        },
+        "data_outcomes": {
+          "description": "Per-entry outcomes for `data`, in the order sent — identical to what\n`domain_data.update` returns, because it is the same call.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainDataOutcome"
+          },
+          "default": []
+        },
+        "data_persist_error": {
+          "description": "Set when the registry could not be made durable. The capture still\nhappened and the files are still on disk.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "stem",
+        "paths",
+        "verdict",
+        "document_bytes",
+        "logdata",
+        "spandata",
+        "notes"
+      ],
+      "$defs": {
+        "EvidenceVerdict": {
+          "description": "How much of an exported window the daemon can vouch for.\n\nThe reason this exists: storage is conditional, so \"nothing appeared before\nthe error\" is ambiguous between *absence of cause* and *absence of\nrecording*. Only a record of the storage policy over time can separate them,\nand without one a window shaped by another session's filter reads as\ncomplete.",
+          "oneOf": [
+            {
+              "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs is in the reply.",
+              "type": "string",
+              "const": "complete"
+            },
+            {
+              "description": "The ring dropped part of the window; `evicted_before_window` bounds how\nmuch.",
+              "type": "string",
+              "const": "evicted"
+            },
+            {
+              "description": "A session filter was narrowing the store over part of the window. See\n`narrowed_by` for which filters, and over which seqs.",
+              "type": "string",
+              "const": "filtered"
+            },
+            {
+              "description": "No claim can be made: the store is empty, or the window predates what\nthe daemon still records about its own storage policy (including a\nwindow carried over from a previous daemon run), or the read was capped\nshort of what matched.\n\nThe default, deliberately — see [`LogsExportResult::verdict`].",
+              "type": "string",
+              "const": "cannot_verify"
+            }
+          ]
+        },
+        "CaseFile": {
+          "description": "One written evidence file.",
+          "type": "object",
+          "properties": {
+            "records": {
+              "description": "Data records, excluding the format header line.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "bytes": {
+              "description": "File size including the header.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "records",
+            "bytes"
+          ]
+        },
+        "CaseNote": {
+          "description": "Something the caller should know that did not stop the capture.\n\nTyped rather than a prose list, because capture gaps, provenance\nobservations and write problems are three different things and a caller\nacting on them should not have to tell them apart by reading English.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "description": "`capture_gap`, `provenance`, `truncated` or `write`.",
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "detail"
+          ]
+        },
+        "DomainDataOutcome": {
+          "description": "What happened to one entry.\n\n`outcome` is one of `created`, `updated`, `validated`, `unknown`,\n`rejected`. The last two carry a discriminant rather than prose, so a caller\ncan branch instead of string-matching a sentence.",
+          "type": "object",
+          "properties": {
+            "path": {
+              "description": "The key as the caller spelled it, sigil included.",
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "cause": {
+              "description": "`never_set` | `no_registry` | `undetermined` — present on `unknown`.\n\nThree, not two: `/logmon/first_seen` is written identically for a\nbrand-new domain and for one whose file was lost, so from the registry\nalone those are not distinguishable. `undetermined` is the honest\ndefault and `no_registry` is claimed only with a quarantine artifact.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reason": {
+              "description": "`malformed_path` | `path_too_long` | `value_too_long` |\n`reserved_prefix` | `sigil_not_allowed_here` | `malformed_ttl` |\n`registry_full` — present on `rejected`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "path",
+            "outcome"
+          ]
+        }
+      }
+    },
+    "CaseFile": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CaseFile",
+      "description": "One written evidence file.",
+      "type": "object",
+      "properties": {
+        "records": {
+          "description": "Data records, excluding the format header line.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "bytes": {
+          "description": "File size including the header.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "records",
+        "bytes"
+      ]
+    },
+    "CaseNote": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CaseNote",
+      "description": "Something the caller should know that did not stop the capture.\n\nTyped rather than a prose list, because capture gaps, provenance\nobservations and write problems are three different things and a caller\nacting on them should not have to tell them apart by reading English.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "`capture_gap`, `provenance`, `truncated` or `write`.",
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "detail"
+      ]
+    },
     "BookmarksAdd": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "BookmarksAdd",

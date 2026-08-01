@@ -428,6 +428,12 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli::PLAIN,
     },
     Tool {
+        name: "create_case",
+        method: "cases.create",
+        description: "Capture a window of logs and spans around an anchor as three files on disk: a markdown document you read to decide whether this is your bug, and two JSONL evidence files you consult once you have decided it is. Requires an absolute dir and a reason. The anchor is tagged — {seq}, {bookmark} or {trace_id} — and an unresolvable one is an error rather than a document with no headline. The document leads with what could NOT be captured: whether a session filter was narrowing what got stored over that window, whether the ring had evicted part of it, and which provenance keys are missing. Pass data to record provenance in the same call; a key with a leading @ is asserted about this capture alone and never enters the domain registry.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "get_trace_logs",
         method: "traces.logs",
         description: "Get all logs linked to a trace",
@@ -1055,7 +1061,7 @@ mod tests {
     fn every_pair_is_well_formed_and_unique() {
         // Pinned so a tool cannot be added here without also being added to the
         // shim — the source-scan test in `mcp/src/server.rs` is the other half.
-        assert_eq!(TOOLS.len(), 46);
+        assert_eq!(TOOLS.len(), 47);
         for Tool {
             name: tool, method, ..
         } in TOOLS

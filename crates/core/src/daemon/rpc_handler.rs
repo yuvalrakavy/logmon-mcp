@@ -9,6 +9,8 @@ use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::{SessionId, SessionRegistry};
+use crate::domain_data::ScopedData;
+use crate::gelf::message::LogEntry;
 use crate::span::types::SlowGroupBy;
 use chrono::Utc;
 use logmon_broker_protocol::*;
@@ -210,6 +212,7 @@ impl RpcHandler {
             "traces.logs" => self.handle_traces_logs(session_id, &request.params),
             "spans.context" => self.handle_spans_context(session_id, &request.params),
             "spans.export" => self.handle_spans_export(session_id, &request.params),
+            "cases.create" => self.handle_cases_create(session_id, &request.params),
             "bookmarks.add" => self.handle_bookmarks_add(session_id, &request.params),
             "bookmarks.list" => self.handle_bookmarks_list(session_id, &request.params),
             "bookmarks.remove" => self.handle_bookmarks_remove(session_id, &request.params),
@@ -614,6 +617,65 @@ impl RpcHandler {
         // positionally must not have to reconcile two lists.
         let outcomes = merge_outcomes(applied, indices, rejected);
         Ok((outcomes.iter().map(wire_outcome).collect(), saved.err()))
+    }
+
+    /// [`Self::apply_data_entries`], plus the one thing `cases.create` can do
+    /// that the other two callers cannot: keep a sigilled key (§3.9).
+    ///
+    /// The split happens **before** the registry sees anything. The registry is
+    /// long-lived and shared; a capture's assertions are not, and letting them
+    /// in would mean the next case on this domain silently inherits the last
+    /// one's seed — laundering one incident's fact into another's document.
+    ///
+    /// `data` may be absent here, unlike `domain_data.update`'s `entries`: a
+    /// capture that records nothing new is ordinary.
+    fn apply_case_data_entries(
+        &self,
+        session_id: &SessionId,
+        raw: Option<&Value>,
+    ) -> Result<(Vec<DomainDataOutcome>, Option<String>, ScopedData), String> {
+        if raw.is_none() {
+            return Ok((Vec::new(), None, ScopedData::default()));
+        }
+        let (_, reg) = self.resolve_domain_data(session_id)?;
+        let (indexed, mut rejected) = parse_data_entries(raw)?;
+
+        // Partitioned here rather than through `partition_scoped`, because every
+        // outcome has to keep the caller's original index — a caller matching
+        // results to inputs positionally must not have to reconcile two lists.
+        // The per-entry rules are still `scope_one`'s, not a second copy.
+        let mut scoped = ScopedData::default();
+        let mut for_registry = Vec::new();
+        for (i, entry) in indexed {
+            if !crate::domain_data::is_scoped(&entry) {
+                for_registry.push((i, entry));
+                continue;
+            }
+            match crate::domain_data::scope_one(&entry, &mut scoped) {
+                Ok(()) => rejected.push((
+                    i,
+                    crate::domain_data::DataOutcome {
+                        path: entry.path.clone(),
+                        outcome: crate::domain_data::Outcome::Scoped,
+                    },
+                )),
+                Err(rejection) => rejected.push((i, rejection)),
+            }
+        }
+
+        let (indices, entries): (Vec<usize>, Vec<_>) = for_registry.into_iter().unzip();
+        let now = chrono::Utc::now();
+        let (applied, saved) = if entries.is_empty() {
+            (Vec::new(), Ok(()))
+        } else {
+            reg.mutate(|r| r.update(&entries, now))
+        };
+        let outcomes = merge_outcomes(applied, indices, rejected);
+        Ok((
+            outcomes.iter().map(wire_outcome).collect(),
+            saved.err(),
+            scoped,
+        ))
     }
 
     fn handle_domain_data_update(
@@ -1540,6 +1602,368 @@ impl RpcHandler {
 
         let spans = d.span_store.context_by_seq(seq, before, after);
         Ok(json!({ "spans": spans, "count": spans.len() }))
+    }
+
+    // -----------------------------------------------------------------------
+    // cases.*
+    // -----------------------------------------------------------------------
+
+    /// Capture a window as three files on disk — spec §5.
+    ///
+    /// The daemon writes, rather than returning the archive over RPC: a case
+    /// carries several hundred kilobytes of JSONL, and handing that back through
+    /// a tool result puts the whole thing in the model's context, which is the
+    /// outcome §5.2's document/logdata split exists to prevent.
+    fn handle_cases_create(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        use crate::cases::document as doc;
+
+        let d = self.resolve_domain(session_id)?;
+        let captured_at = chrono::Utc::now();
+
+        let reason = req_str(params, "reason")?.trim().to_string();
+        if reason.is_empty() {
+            return Err(
+                "`reason` must not be empty: a manual case that cannot say why it was \
+                        taken has no provenance, and unlike a watch there is no filter standing \
+                        in for one"
+                    .to_string(),
+            );
+        }
+
+        // §5.1: rejected, never resolved. The broker runs as a service, so a
+        // relative path would resolve against ITS working directory rather than
+        // the caller's — and silently writing the archive somewhere nobody
+        // looks is the failure mode.
+        let dir_raw = req_str(params, "dir")?;
+        let dir = std::path::Path::new(dir_raw);
+        if !dir.is_absolute() {
+            return Err(format!(
+                "`dir` must be an absolute path, and `{dir_raw}` is not. The broker runs as a \
+                 service, so a relative path would resolve against the broker's working \
+                 directory rather than yours."
+            ));
+        }
+
+        let before = window_count(params, "before")?;
+        let after = window_count(params, "after")?;
+        let clamped = before.clamped || after.clamped;
+
+        // Registry writes happen BEFORE the copy is rendered, so a key the
+        // capturer supplies appears in *this* document rather than landing one
+        // document late.
+        let (data_outcomes, data_persist_error, scoped) =
+            self.apply_case_data_entries(session_id, params.get("data"))?;
+
+        let anchor = self.resolve_case_anchor(&d, params.get("anchor"))?;
+
+        // §5.1: counts of stored RECORDS, not seq distances — one counter feeds
+        // both stores, so a 200-seq range holds an unpredictable number of logs.
+        let logs = d
+            .pipeline
+            .context_by_seq(anchor.seq, before.value, after.value);
+        let (from, to) = match (logs.first(), logs.last()) {
+            (Some(f), Some(l)) => (f.seq, l.seq),
+            // `resolve_case_anchor` already proved the anchor is stored, so an
+            // empty neighbourhood means it was evicted between the two reads.
+            _ => {
+                return Err(format!(
+                    "the anchor entry at seq {} was evicted while the capture was being taken",
+                    anchor.seq
+                ))
+            }
+        };
+
+        // The verdict over the window actually captured. `capped` is false here
+        // by construction: `context_by_seq` returns a contiguous run, so nothing
+        // inside [from, to] was cut. What `before`/`after` limited is the
+        // window's WIDTH, which the front-matter reports separately.
+        let coverage = d.pipeline.epochs().coverage(from, to);
+        let log_evicted = crate::filter::parser::evicted_below(from, d.pipeline.oldest_log_seq());
+        let verdict =
+            crate::engine::epoch::evidence_verdict(Some(&coverage), log_evicted.is_some(), false);
+
+        // Spans over the SAME resolved range, so the two files describe one
+        // interval by construction rather than by two window parameters that
+        // could disagree.
+        let span_filter = lower_seq_range(None, Some(from), Some(to));
+        let mut spans = Vec::new();
+        d.span_store.for_each_matching(span_filter.as_ref(), |s| {
+            spans.push(s.clone());
+        });
+        let span_evicted = crate::filter::parser::evicted_below(from, d.span_store.oldest_seq());
+
+        let domain_name = d.config.name.to_string();
+        let (registry, incarnation, case_name) = self.case_registry_copy(session_id, captured_at);
+        let collectors = self.case_collector_lines(&d.config.name);
+
+        let prefix = crate::cases::resolve_prefix(
+            opt_str(params, "prefix")?,
+            case_name.as_deref(),
+            &domain_name,
+        );
+        let files = crate::cases::claim(dir, &prefix, captured_at).map_err(|e| e.to_string())?;
+        let names = crate::cases::file_names(&files.stem);
+
+        let anchor_seq = anchor.seq;
+        let input = doc::CaseInput {
+            stem: files.stem.clone(),
+            captured_at,
+            domain: domain_name.clone(),
+            incarnation,
+            reason,
+            anchor,
+            window: doc::Window {
+                from,
+                to,
+                verdict,
+                narrowed_by: coverage
+                    .narrowed
+                    .iter()
+                    .map(|n| NarrowedRange {
+                        from_seq: n.from_seq,
+                        to_seq: n.to_seq,
+                        filters: n.filters.clone(),
+                    })
+                    .collect(),
+                capped: clamped,
+                evicted_before_window: log_evicted,
+                spans_evicted_before_window: span_evicted,
+            },
+            logdata: doc::FilePointer {
+                file: names[1].clone(),
+                records: logs.len() as u64,
+            },
+            spandata: doc::FilePointer {
+                file: names[2].clone(),
+                records: spans.len() as u64,
+            },
+            registry,
+            asserted: scoped.facts,
+            neighbours: neighbourhood(&logs, anchor_seq),
+            spans: spans.clone(),
+            collectors,
+        };
+
+        // Bulk first: if a logdata write fails the document must not point at a
+        // file that is not there.
+        let logdata =
+            crate::cases::write_jsonl(files.logdata, &files.paths[1], "logdata", logs.iter())
+                .map_err(|e| e.to_string())?;
+        let spandata =
+            crate::cases::write_jsonl(files.spandata, &files.paths[2], "spandata", spans.iter())
+                .map_err(|e| e.to_string())?;
+
+        let rendered = doc::render(&input);
+        let document_bytes =
+            crate::cases::write_document(files.document, &files.paths[0], &rendered.body)
+                .map_err(|e| e.to_string())?;
+
+        let mut notes: Vec<CaseNote> = rendered
+            .notes
+            .iter()
+            .map(|n| CaseNote {
+                kind: n.kind.to_string(),
+                detail: n.detail.clone(),
+            })
+            .collect();
+        if clamped {
+            notes.push(CaseNote {
+                kind: doc::NOTE_TRUNCATED.to_string(),
+                detail: format!(
+                    "before/after were clamped to {}; the window is narrower than requested",
+                    MAX_CASE_WINDOW
+                ),
+            });
+        }
+        if let Some(err) = &data_persist_error {
+            // The capture happened and the files are on disk; the registry just
+            // could not be made durable. Reported, never fatal.
+            notes.push(CaseNote {
+                kind: "write".to_string(),
+                detail: format!("the domain registry could not be persisted: {err}"),
+            });
+        }
+
+        serde_json::to_value(CasesCreateResult {
+            stem: files.stem,
+            paths: files
+                .paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            verdict,
+            document_bytes,
+            logdata: CaseFile {
+                records: logdata.records,
+                bytes: logdata.bytes,
+            },
+            spandata: CaseFile {
+                records: spandata.records,
+                bytes: spandata.bytes,
+            },
+            notes,
+            data_outcomes,
+            data_persist_error,
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    /// Resolve the tagged anchor to a **stored** entry.
+    ///
+    /// §5.1: an unresolvable anchor is an error, not a degraded document. The
+    /// anchor entry's message is the headline, and a document whose headline
+    /// cannot identify the incident fails the one test §5.2 sets for a headline.
+    fn resolve_case_anchor(
+        &self,
+        d: &std::sync::Arc<crate::daemon::domain::Domain>,
+        raw: Option<&Value>,
+    ) -> Result<crate::cases::document::Anchor, String> {
+        use crate::cases::document::Anchor;
+        let raw = raw.ok_or(
+            "`anchor` is required: it is `{seq}`, `{bookmark}` or `{trace_id}`, tagged rather \
+             than one string the daemon guesses at",
+        )?;
+        let seq = opt_u64(raw, "seq")?;
+        let bookmark = opt_str(raw, "bookmark")?;
+        let trace_id = opt_str(raw, "trace_id")?;
+        let given = [seq.is_some(), bookmark.is_some(), trace_id.is_some()]
+            .iter()
+            .filter(|b| **b)
+            .count();
+        if given != 1 {
+            return Err(format!(
+                "`anchor` takes exactly one of `seq`, `bookmark` or `trace_id`, and {given} were \
+                 given. It is tagged rather than sniffed because a bookmark named `12345` and a \
+                 seq are indistinguishable as strings, and the failure would be a document \
+                 anchored somewhere else."
+            ));
+        }
+
+        let entry_at = |seq: u64| d.pipeline.context_by_seq(seq, 0, 0).into_iter().next();
+
+        let (kind, label, entry, of_many) = if let Some(s) = seq {
+            let e = entry_at(s).ok_or_else(|| {
+                format!("no stored log entry has seq {s}, so there is nothing to anchor on")
+            })?;
+            ("seq", s.to_string(), e, None)
+        } else if let Some(name) = bookmark {
+            let qualified = crate::store::bookmarks::qualify(name, "");
+            let b = d
+                .bookmarks
+                .get(&qualified)
+                .or_else(|| d.bookmarks.list().into_iter().find(|b| b.name == name))
+                .ok_or_else(|| format!("no bookmark named `{name}` on this domain"))?;
+            // A bookmark marks a BOUNDARY, not a record: `b>=name` selects
+            // `seq > bookmark.seq`, strictly. So the anchor is the first stored
+            // entry after the mark — the same entry `b>=name` would hand back
+            // first, rather than an off-by-one only this call would have.
+            let after = crate::filter::parser::ParsedFilter::Qualifiers(vec![
+                crate::filter::parser::Qualifier::SeqFilter {
+                    op: crate::filter::parser::SeqOp::Gt,
+                    value: b.seq,
+                },
+            ]);
+            let (found, _) = d.pipeline.recent_logs_with_stats(1, Some(&after), true);
+            let e = found.into_iter().next().ok_or_else(|| {
+                format!(
+                    "bookmark `{name}` is at seq {}, and no stored entry follows it",
+                    b.seq
+                )
+            })?;
+            ("bookmark", name.to_string(), e, None)
+        } else {
+            let hex = trace_id.expect("checked above");
+            let tid = u128::from_str_radix(hex, 16)
+                .map_err(|_| format!("`{hex}` is not a hexadecimal trace id"))?;
+            let entries = d.pipeline.logs_by_trace_id(tid);
+            let n = entries.len();
+            // Earliest by seq — `logs_by_trace_id` returns stored order, which
+            // is seq-ascending — and the document says how many there were.
+            let e = entries
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("no stored log entry carries trace id `{hex}`"))?;
+            ("trace_id", hex.to_string(), e, (n > 1).then_some(n))
+        };
+
+        Ok(Anchor {
+            kind,
+            label,
+            seq: entry.seq,
+            at: entry.timestamp,
+            message: entry.message.clone(),
+            of_many,
+        })
+    }
+
+    /// The registry as of `now`, plus `/logmon/incarnation` and `/case-name`.
+    ///
+    /// The `/logmon/` namespace is left out of the copy: it is the daemon's own
+    /// bookkeeping, `incarnation` is already in front-matter, and a document
+    /// listing `/logmon/first_seen` beside `/Build/commit` would present the two
+    /// as the same kind of claim. A broker with no config dir returns an empty
+    /// copy, which the document then states rather than omits.
+    fn case_registry_copy(
+        &self,
+        session_id: &SessionId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (
+        Vec<crate::cases::document::RegistryFact>,
+        Option<String>,
+        Option<String>,
+    ) {
+        let Ok((_, reg)) = self.resolve_domain_data(session_id) else {
+            return (Vec::new(), None, None);
+        };
+        reg.read(|r| {
+            let incarnation = r.get("/logmon/incarnation").map(|e| e.value.clone());
+            let case_name = r
+                .get(crate::domain_data::CASE_NAME_KEY)
+                .map(|e| e.value.clone());
+            let facts = r
+                .entries()
+                .iter()
+                .filter(|(path, _)| !crate::domain_data::path::is_reserved(path))
+                .map(|(path, e)| crate::cases::document::RegistryFact {
+                    path: path.clone(),
+                    value: e.value.clone(),
+                    created_at: e.created_at,
+                    validated_at: e.validated_at,
+                    ttl_secs: e.ttl_secs,
+                    expired: e.is_expired(now),
+                })
+                .collect();
+            (facts, incarnation, case_name)
+        })
+    }
+
+    /// Collectors measuring this domain, whoever armed them (§5.4).
+    ///
+    /// Projection is deliberately not computed: `snapshot()` reads counters,
+    /// and the sorting of every retained duration that a full projection does
+    /// belongs nowhere near a registry lock the ingest path takes.
+    fn case_collector_lines(
+        &self,
+        domain: &crate::daemon::domain::DomainId,
+    ) -> Vec<crate::cases::document::CollectorLine> {
+        let mut lines: Vec<_> = self
+            .collectors
+            .list_for_domain(domain)
+            .into_iter()
+            .map(|a| {
+                let snap = a.collector.snapshot();
+                crate::cases::document::CollectorLine {
+                    name: a.collector.def().name.clone(),
+                    owner: a.owner.to_string(),
+                    matched: snap.total.count,
+                    snapshots: a.snapshot_count,
+                    latest_snapshot: a.latest_snapshot,
+                    zeroed_by: a.zeroed_by,
+                }
+            })
+            .collect();
+        lines.sort_by(|a, b| a.name.cmp(&b.name));
+        lines
     }
 
     /// `spans.export` — every span whose seq lies in an inclusive range (§6.2).
@@ -3093,6 +3517,50 @@ fn lower_seq_range(
 /// place instead of teaching the registry about wire types.
 type IndexedEntry = (usize, crate::domain_data::DataEntry);
 type IndexedOutcome = (usize, crate::domain_data::DataOutcome);
+
+/// Stored records captured either side of the anchor when the caller says
+/// nothing. Wide enough to hold the shape of a failure, narrow enough that the
+/// transport is not carrying a buffer dump.
+const DEFAULT_CASE_WINDOW: usize = 350;
+
+/// Ceiling on `before` and `after`, separately.
+///
+/// The transport buffers the whole capture, and `logs.export`'s own `count`
+/// already defaults to unbounded — so this is the only thing between a typo and
+/// a multi-megabyte RPC.
+const MAX_CASE_WINDOW: usize = 5_000;
+
+struct WindowCount {
+    value: usize,
+    /// The request exceeded [`MAX_CASE_WINDOW`] and was cut down to it. Reported
+    /// rather than applied silently: the window is narrower than asked for, and
+    /// a reader who assumes otherwise draws conclusions over seqs nobody read.
+    clamped: bool,
+}
+
+fn window_count(params: &Value, key: &str) -> Result<WindowCount, String> {
+    let requested = opt_usize(params, key)?.unwrap_or(DEFAULT_CASE_WINDOW);
+    Ok(WindowCount {
+        value: requested.min(MAX_CASE_WINDOW),
+        clamped: requested > MAX_CASE_WINDOW,
+    })
+}
+
+/// The anchor and its ten neighbours either side, out of the full window.
+///
+/// §5.2: the document shows this much and the logdata holds the rest. Ten is
+/// load-bearing — with only the anchor every reader must open the logdata to
+/// learn anything and the document stops being a triage surface; with hundreds,
+/// the caveats above get scrolled past.
+fn neighbourhood(logs: &[LogEntry], anchor_seq: u64) -> Vec<LogEntry> {
+    let w = crate::cases::document::NEIGHBOUR_WINDOW;
+    let Some(idx) = logs.iter().position(|e| e.seq == anchor_seq) else {
+        return Vec::new();
+    };
+    let start = idx.saturating_sub(w);
+    let end = (idx + w + 1).min(logs.len());
+    logs[start..end].to_vec()
+}
 
 fn parse_data_entries(
     raw: Option<&Value>,

@@ -222,6 +222,64 @@ is a second name to support forever.
   Nothing changes for spans: they are stored unconditionally, so `spans.export`'s
   own eviction reporting is already the whole answer for that store.
 
+- **`cases.create` — capture a window as three files on disk.** New tool
+  `create_case`. A markdown **document** you read to decide whether this is your
+  bug, and two JSONL **evidence** files you consult once you have decided it is:
+
+  ```
+  checkout-hang-260731-021530.md
+  checkout-hang-260731-021530.logdata.jsonl     ← log entries
+  checkout-hang-260731-021530.spandata.jsonl    ← spans
+  ```
+
+  **The daemon writes, so `dir` is required and must be absolute.** A case
+  carries several hundred kilobytes of JSONL; returning that through a tool
+  result would put the whole archive into the model's context, which is the
+  outcome the document/logdata split exists to prevent. A relative path is
+  **rejected rather than resolved** — the broker runs as a service, so it would
+  resolve against the broker's working directory rather than yours.
+
+  **The anchor is tagged** — `{seq}`, `{bookmark}` or `{trace_id}` — never one
+  string the daemon sniffs: a bookmark named `12345` and a seq are
+  indistinguishable as strings, and the failure would be a document anchored
+  somewhere else. An unresolvable anchor is an **error**, not a document with no
+  headline. A `trace_id` matching several entries anchors on the earliest by seq
+  and says so.
+
+  **The document leads with what could *not* be captured.** Headline, then
+  Evidence — the verdict, the span line, provenance with ages — then what to do
+  next, and only then the bulk. That ordering is load-bearing: a caveat reached
+  after 400 lines has already failed, and a reader who acts on the suggestions
+  before reading the verdict has been misled by layout.
+
+  Staleness is reported as **age**, never as a verdict. *"last validated 34 days
+  ago"* is a fact; *"provenance is current"* is a judgement logmon cannot make.
+  The one exception is a key carrying its own `ttl`, where the caller stated the
+  lifetime and the document only reports whether it elapsed.
+
+  **`data` is `domain_data.update`**, exactly as on `collectors.add` — same
+  validation, same per-entry outcomes, same `/logmon/` guard. It is applied
+  *before* the registry copy is rendered, so a key the capturer supplies appears
+  in **that** document rather than landing one document late. A key with a
+  leading `@` is asserted about **this capture alone**: it reaches the document,
+  keeps its sigil there, and never enters the registry — otherwise the next case
+  on the domain would silently inherit the last one's seed. Its outcome is
+  `scoped`, which is neither `created` (the domain does not know it) nor
+  `rejected` (it was not lost).
+
+  Filenames are `<prefix>-<yymmdd>-<hhmmss>[-<id>]` in **UTC**, so lexicographic
+  order is chronological order and `ls` answers "what happened around then" over
+  an archive nothing indexes. The prefix falls back parameter → `/case-name` →
+  domain name. Collisions are resolved by `create_new` across all three paths
+  with a re-rolled id, not check-then-write: two captures in the same second must
+  not overwrite each other, and in an archive nothing deletes from, the loser's
+  evidence would be gone with no error anywhere.
+
+  Each JSONL file opens with `{"logmon_format":1,"kind":…}`. Nothing indexes this
+  archive, so the format *is* the contract a reader has years later. A file with
+  no records is still written, with its header: absent cannot be told from "we
+  captured none".
+
 ### Fixed
 
 - **A parameter of the wrong type is now an error, not a different answer.**

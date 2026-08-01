@@ -796,6 +796,20 @@ pub fn resolved_seq_range(filter: Option<&ParsedFilter>) -> (Option<u64>, Option
     (lo, hi)
 }
 
+/// Records lost off the front of an **inclusive** window starting at `from`:
+/// `oldest - from` when the ring no longer reaches back that far, else `None`.
+///
+/// Takes the inclusive bound directly, so a window starting exactly at the
+/// oldest retained record reports nothing missing — which it is.
+/// [`evicted_before_window`] answers the same question from a *strict* `Gt`
+/// value and is off by one against this; see #17.
+pub fn evicted_below(from: u64, buffer_oldest_seq: Option<u64>) -> Option<u64> {
+    match buffer_oldest_seq {
+        Some(oldest) if oldest > from => Some(oldest - from),
+        _ => None,
+    }
+}
+
 /// B5: `Some(gap)` when the query's lower bound predates the retained buffer
 /// (records were evicted from the window), else `None`. `gap = oldest - lb` is
 /// the number of seqs between the window start and the oldest retained record —

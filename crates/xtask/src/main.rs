@@ -102,6 +102,12 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "SpansContextResult":    schema_for!(SpansContextResult),
             "SpansExport":           schema_for!(SpansExport),
             "SpansExportResult":     schema_for!(SpansExportResult),
+            // cases.* — the archive contract
+            "CaseAnchor":            schema_for!(CaseAnchor),
+            "CasesCreate":           schema_for!(CasesCreate),
+            "CasesCreateResult":     schema_for!(CasesCreateResult),
+            "CaseFile":              schema_for!(CaseFile),
+            "CaseNote":              schema_for!(CaseNote),
             "BookmarksAdd":          schema_for!(BookmarksAdd),
             "BookmarksAddResult":    schema_for!(BookmarksAddResult),
             "BookmarksList":         schema_for!(BookmarksList),
