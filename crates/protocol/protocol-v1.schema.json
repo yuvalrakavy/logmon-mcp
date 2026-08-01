@@ -3580,13 +3580,61 @@
             "variadic": {
               "type": "boolean"
             },
-            "output_path_param": {
+            "file_output": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FileOutputHints"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "FileOutputHints": {
+          "description": "[`FileOutput`] as it crosses the wire.",
+          "type": "object",
+          "properties": {
+            "path_param": {
+              "type": "string"
+            },
+            "content_field": {
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "sidecar": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidecarHints"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
-          }
+          },
+          "required": [
+            "path_param"
+          ]
+        },
+        "SidecarHints": {
+          "description": "[`Sidecar`] as it crosses the wire.",
+          "type": "object",
+          "properties": {
+            "name_field": {
+              "type": "string"
+            },
+            "content_field": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name_field",
+            "content_field"
+          ]
         }
       }
     },
@@ -3633,13 +3681,61 @@
             "variadic": {
               "type": "boolean"
             },
-            "output_path_param": {
+            "file_output": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FileOutputHints"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "FileOutputHints": {
+          "description": "[`FileOutput`] as it crosses the wire.",
+          "type": "object",
+          "properties": {
+            "path_param": {
+              "type": "string"
+            },
+            "content_field": {
               "type": [
                 "string",
                 "null"
               ]
+            },
+            "sidecar": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidecarHints"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
-          }
+          },
+          "required": [
+            "path_param"
+          ]
+        },
+        "SidecarHints": {
+          "description": "[`Sidecar`] as it crosses the wire.",
+          "type": "object",
+          "properties": {
+            "name_field": {
+              "type": "string"
+            },
+            "content_field": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name_field",
+            "content_field"
+          ]
         }
       }
     },
@@ -3658,10 +3754,60 @@
         "variadic": {
           "type": "boolean"
         },
-        "output_path_param": {
-          "type": [
-            "string",
-            "null"
+        "file_output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileOutputHints"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "$defs": {
+        "FileOutputHints": {
+          "description": "[`FileOutput`] as it crosses the wire.",
+          "type": "object",
+          "properties": {
+            "path_param": {
+              "type": "string"
+            },
+            "content_field": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sidecar": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SidecarHints"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "path_param"
+          ]
+        },
+        "SidecarHints": {
+          "description": "[`Sidecar`] as it crosses the wire.",
+          "type": "object",
+          "properties": {
+            "name_field": {
+              "type": "string"
+            },
+            "content_field": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name_field",
+            "content_field"
           ]
         }
       }

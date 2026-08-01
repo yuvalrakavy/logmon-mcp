@@ -1,17 +1,19 @@
-//! The agent-facing surface: which MCP tool maps to which RPC method.
+//! The agent-facing surface: every tool, what it calls, and how to offer it.
 //!
-//! One list, in the crate both sides already depend on. The daemon reads it to
-//! state what a shim of this version exposes (`status.get`'s `broker_tools`);
-//! the shim reads it to diff that against what it actually has.
+//! **This list IS the surface — it stopped being a mirror of one on
+//! 2026-08-01.** It used to describe 45 `#[rmcp::tool]` attributes on
+//! `GelfMcpServer`, held honest by a test that compared the two. Those
+//! attributes are gone: the shim now builds both its MCP router and its CLI
+//! from [`manifest()`], which is built from here. There is one place a tool is
+//! declared, so there is nothing left for it to drift from.
 //!
-//! It does **not** build the shim's tools — those are `#[rmcp::tool]` attributes
-//! on `GelfMcpServer`. This list is a mirror of them, held honest by a test that
-//! compares it against the router those attributes generate. The pairing is the
-//! unit: a tool cannot appear here without the method it calls, so the two names
-//! cannot drift apart from each other.
+//! That is what lets a broker gain a tool without its clients being rebuilt,
+//! and it is why this module carries more than names: a description an agent
+//! reads to choose, a parameter schema with its `$ref`s resolved, and the few
+//! command-line facts ([`Cli`]) that a JSON Schema cannot express.
 //!
-//! Why the daemon needs *tool* names rather than its own method names: an agent
-//! holds tool names, and the two vocabularies do not correspond
+//! Why clients need *tool* names rather than the daemon's method names: an
+//! agent holds tool names, and the two vocabularies do not correspond
 //! (`traces.slow` is `get_slow_spans`, `collectors.reset` is `reset_collector`
 //! but `collectors.document` is `document_collectors`). Asking an agent to map
 //! between them yields both false negatives and false positives.
@@ -35,11 +37,9 @@ pub const SCHEMA_JSON: &str = include_str!("../protocol-v1.schema.json");
 /// One agent-facing tool: its MCP name, the RPC method it calls, and the
 /// description an agent reads to decide whether to call it.
 ///
-/// The description lives here rather than only on the shim's `#[rmcp::tool]`
-/// attribute because the DAEMON has to be able to serve it: a shim that
-/// registers its tools from the daemon needs the text from somewhere the daemon
-/// links, and the daemon does not link the shim. Held honest against the
-/// attributes by a test in `crates/mcp/src/server.rs`.
+/// The description lives here because the DAEMON has to serve it: a client that
+/// registers its tools from the daemon needs the text from a crate the daemon
+/// links, and the daemon does not link its clients.
 pub struct Tool {
     pub name: &'static str,
     pub method: &'static str,
@@ -62,14 +62,43 @@ pub struct Cli {
     pub positional: &'static [&'static str],
     /// Whether the final positional absorbs every remaining argument.
     pub variadic: bool,
-    /// A parameter naming a **local** path the front-end writes the reply to,
-    /// rather than forwarding to the daemon.
+    /// How this tool's reply becomes a local file, if it does.
+    pub file_output: Option<FileOutput>,
+}
+
+/// A reply the client writes to disk rather than printing.
+///
+/// **The daemon returns bytes and the client writes them**, because a daemon
+/// resolves a relative path against its own working directory rather than the
+/// caller's. What a generic front-end needs to know is *which* parameter names
+/// the file and *which* field of the reply is its body — both stated here, so
+/// no front-end has to know that `logs.export` or `collectors.document` behave
+/// this way.
+#[derive(Debug, Clone, Copy)]
+pub struct FileOutput {
+    /// The parameter naming the local path. Consumed by the client, never sent.
+    pub path_param: &'static str,
+    /// Which field of the reply is the file body.
     ///
-    /// A daemon resolves a relative path against its own working directory, not
-    /// the caller's, so the write has to happen client-side. Naming the
-    /// parameter here is what lets a generic front-end do it without knowing
-    /// that `export_logs` in particular behaves this way.
-    pub output_path_param: Option<&'static str>,
+    /// A string field is written verbatim — `collectors.document` returns
+    /// markdown, and JSON-encoding it would put `\n` through the whole file.
+    /// Any other field is written as pretty JSON. `None` writes the whole reply.
+    pub content_field: Option<&'static str>,
+    /// A companion file written beside the first.
+    pub sidecar: Option<Sidecar>,
+}
+
+/// A second file written next to the first, under a name the reply chooses.
+///
+/// `collectors.document` produces one: the document's own front-matter refers
+/// to it by name, so the two must land in the same directory to be reunited
+/// after being moved or mailed on.
+#[derive(Debug, Clone, Copy)]
+pub struct Sidecar {
+    /// Reply field holding the companion's file name.
+    pub name_field: &'static str,
+    /// Reply field holding its content.
+    pub content_field: &'static str,
 }
 
 impl Cli {
@@ -77,7 +106,7 @@ impl Cli {
     pub const PLAIN: Cli = Cli {
         positional: &[],
         variadic: false,
-        output_path_param: None,
+        file_output: None,
     };
 }
 
@@ -90,7 +119,24 @@ pub struct CliHints {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub variadic: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_path_param: Option<String>,
+    pub file_output: Option<FileOutputHints>,
+}
+
+/// [`FileOutput`] as it crosses the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct FileOutputHints {
+    pub path_param: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<SidecarHints>,
+}
+
+/// [`Sidecar`] as it crosses the wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SidecarHints {
+    pub name_field: String,
+    pub content_field: String,
 }
 
 impl From<Cli> for CliHints {
@@ -98,7 +144,14 @@ impl From<Cli> for CliHints {
         CliHints {
             positional: c.positional.iter().map(|s| (*s).to_string()).collect(),
             variadic: c.variadic,
-            output_path_param: c.output_path_param.map(str::to_string),
+            file_output: c.file_output.map(|f| FileOutputHints {
+                path_param: f.path_param.to_string(),
+                content_field: f.content_field.map(str::to_string),
+                sidecar: f.sidecar.map(|s| SidecarHints {
+                    name_field: s.name_field.to_string(),
+                    content_field: s.content_field.to_string(),
+                }),
+            }),
         }
     }
 }
@@ -155,7 +208,14 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli {
             positional: &[],
             variadic: false,
-            output_path_param: Some("path"),
+            file_output: Some(FileOutput {
+                path_param: "path",
+                // The entries, not the envelope. `scanned` and `buffer_total`
+                // say whether the export is complete; they belong in the reply
+                // the caller reads, not in the file they asked for logs in.
+                content_field: Some("logs"),
+                sidecar: None,
+            }),
         },
     },
     Tool {
@@ -304,7 +364,7 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli {
             positional: &["a", "b"],
             variadic: false,
-            output_path_param: None,
+            file_output: None,
         },
     },
     Tool {
@@ -328,7 +388,16 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli {
             positional: &["names"],
             variadic: true,
-            output_path_param: None,
+            file_output: Some(FileOutput {
+                path_param: "path",
+                // Markdown, written verbatim. JSON-encoding it would put a
+                // literal `\n` through every line of the document.
+                content_field: Some("content"),
+                sidecar: Some(Sidecar {
+                    name_field: "sidecar_name",
+                    content_field: "sidecar_content",
+                }),
+            }),
         },
     },
     Tool {
@@ -576,6 +645,70 @@ pub struct ToolsManifestResult {
     pub tools: Vec<ManifestEntry>,
 }
 
+/// One file a client is to write, resolved from a reply.
+pub struct PendingFile {
+    pub path: std::path::PathBuf,
+    pub body: String,
+}
+
+/// Resolve a reply into the files a client should write.
+///
+/// Shared by every front-end deliberately: the CLI and the MCP surface writing
+/// *different* files for the same tool is exactly the divergence that put a
+/// sidecar on disk from one and not the other. Returns an empty list when the
+/// tool produces no file or the caller named no path.
+///
+/// A string field is written verbatim; anything else is pretty JSON. The
+/// sidecar lands in the same directory as the main file, because the document's
+/// own front-matter refers to it by bare name.
+pub fn files_to_write(
+    hints: &CliHints,
+    reply: &serde_json::Value,
+    path: Option<&str>,
+) -> Vec<PendingFile> {
+    let (Some(out), Some(path)) = (&hints.file_output, path) else {
+        return Vec::new();
+    };
+
+    let render = |v: &serde_json::Value| match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    };
+
+    let body = match &out.content_field {
+        Some(field) => match reply.get(field) {
+            Some(v) => render(v),
+            // The named field is absent: write nothing rather than an empty
+            // file, which would read as "the tool produced nothing".
+            None => return Vec::new(),
+        },
+        None => render(reply),
+    };
+
+    let main = std::path::PathBuf::from(path);
+    let mut files = vec![PendingFile {
+        path: main.clone(),
+        body,
+    }];
+
+    if let Some(side) = &out.sidecar {
+        if let (Some(name), Some(content)) = (
+            reply.get(&side.name_field).and_then(|v| v.as_str()),
+            reply.get(&side.content_field),
+        ) {
+            let dir = main
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf();
+            files.push(PendingFile {
+                path: dir.join(name),
+                body: render(content),
+            });
+        }
+    }
+    files
+}
+
 /// Every tool this protocol version defines, with its parameter schema resolved.
 ///
 /// Built at call time rather than as a `const`, because resolving a definition
@@ -727,23 +860,125 @@ mod manifest_tests {
             "`names` is a list, so the last positional must absorb the rest"
         );
 
+        let export = by("export_logs").cli.file_output.expect("writes a file");
         assert_eq!(
-            by("export_logs").cli.output_path_param.as_deref(),
-            Some("path"),
+            export.path_param, "path",
             "a daemon resolves a relative path against its own cwd; the write is client-side"
         );
+        assert_eq!(
+            export.content_field.as_deref(),
+            Some("logs"),
+            "the entries, not the envelope"
+        );
+
+        // `collectors.document` produces TWO files, and the second is the one a
+        // generic front-end would silently drop: the document's front-matter
+        // names it, so losing it leaves a reference to a file nobody wrote.
+        let doc = by("document_collectors")
+            .cli
+            .file_output
+            .expect("writes files");
+        assert_eq!(doc.content_field.as_deref(), Some("content"));
+        let side = doc.sidecar.expect("and a companion beside it");
+        assert_eq!(side.name_field, "sidecar_name");
+        assert_eq!(side.content_field, "sidecar_content");
 
         // Everything else is plain, and says so rather than staying silent.
         let plain = m
             .iter()
             .filter(|e| {
-                e.cli.positional.is_empty() && !e.cli.variadic && e.cli.output_path_param.is_none()
+                e.cli.positional.is_empty() && !e.cli.variadic && e.cli.file_output.is_none()
             })
             .count();
         assert_eq!(
             plain,
             TOOLS.len() - 3,
             "only three tools have a special shape"
+        );
+    }
+
+    /// The regression this replaced: one "write the reply to this path" hint
+    /// wrote the whole envelope and no companion file, so `collectors document`
+    /// produced neither the markdown nor its sidecar.
+    #[test]
+    fn a_document_reply_resolves_to_both_files() {
+        let doc = manifest()
+            .into_iter()
+            .find(|e| e.name == "document_collectors")
+            .expect("present");
+        let reply = serde_json::json!({
+            "content": "# Title\n\nbody\n",
+            "bytes": 16,
+            "sidecar_name": "run-logdata.json",
+            "sidecar_content": { "runs": [1, 2] },
+            "warnings": [],
+        });
+
+        let files = files_to_write(&doc.cli, &reply, Some("/tmp/out/report.md"));
+        assert_eq!(files.len(), 2, "the companion file must not be dropped");
+
+        assert_eq!(
+            files[0].path,
+            std::path::PathBuf::from("/tmp/out/report.md")
+        );
+        assert_eq!(
+            files[0].body, "# Title\n\nbody\n",
+            "markdown is written verbatim; JSON-encoding it would put a literal \\n \
+             through every line"
+        );
+
+        assert_eq!(
+            files[1].path,
+            std::path::PathBuf::from("/tmp/out/run-logdata.json"),
+            "beside the document, because its front-matter names it without a directory"
+        );
+        assert!(files[1].body.contains("runs"));
+    }
+
+    /// No path means no files — and specifically not an empty one, which would
+    /// read as "the tool produced nothing".
+    #[test]
+    fn nothing_is_written_without_a_path_or_a_body() {
+        let doc = manifest()
+            .into_iter()
+            .find(|e| e.name == "document_collectors")
+            .expect("present");
+        let reply = serde_json::json!({ "content": "x" });
+        assert!(files_to_write(&doc.cli, &reply, None).is_empty());
+
+        // Named content field absent from the reply.
+        assert!(files_to_write(&doc.cli, &serde_json::json!({}), Some("/tmp/x")).is_empty());
+
+        // A tool that writes no files never does, path or not.
+        let plain = manifest()
+            .into_iter()
+            .find(|e| e.name == "list_collectors")
+            .expect("present");
+        assert!(files_to_write(&plain.cli, &reply, Some("/tmp/x")).is_empty());
+    }
+
+    /// `logs.export` writes the entries. The envelope's `scanned` and
+    /// `buffer_total` say whether the export is complete; they belong in the
+    /// reply the caller reads, not in the file they asked for logs in.
+    #[test]
+    fn an_export_writes_entries_not_the_envelope() {
+        let ex = manifest()
+            .into_iter()
+            .find(|e| e.name == "export_logs")
+            .expect("present");
+        let reply = serde_json::json!({
+            "logs": [{ "message": "boom" }],
+            "count": 1,
+            "scanned": 40,
+            "buffer_total": 100,
+        });
+        let files = files_to_write(&ex.cli, &reply, Some("/tmp/x.json"));
+        assert_eq!(files.len(), 1);
+        assert!(files[0].body.contains("boom"));
+        assert!(
+            !files[0].body.contains("buffer_total"),
+            "the envelope must not land in the file: {}",
+            files[0].body
         );
     }
 

@@ -51,7 +51,7 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
     // here — but it must still be *offered*, or the caller has no way to say
     // where the file goes. Added to the published schema, removed from the
     // arguments before they are forwarded.
-    if let Some(key) = &entry.cli.output_path_param {
+    if let Some(key) = entry.cli.file_output.as_ref().map(|f| &f.path_param) {
         // Into `properties`, not the schema root. A key at the root is not a
         // parameter — it is a sibling of `type` and `required`, and an MCP
         // client looking for arguments never sees it.
@@ -72,7 +72,7 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
     }
 
     let method = entry.method.clone();
-    let output_path_param = entry.cli.output_path_param.clone();
+    let hints = entry.cli.clone();
 
     Some(ToolRoute::new_dyn(
         Tool::new(
@@ -82,16 +82,17 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
         ),
         move |ctx: ToolCallContext<'_, GelfMcpServer>| {
             let method = method.clone();
-            let output_path_param = output_path_param.clone();
+            let hints = hints.clone();
             Box::pin(async move {
                 let mut args = ctx.arguments.clone().unwrap_or_default();
 
                 // Taken out before the call: the daemon does not describe it and
                 // would reject it, and it means nothing on the daemon's side of
                 // the filesystem anyway.
-                let out_path = output_path_param
+                let out_path = hints
+                    .file_output
                     .as_ref()
-                    .and_then(|k| args.remove(k.as_str()))
+                    .and_then(|f| args.remove(f.path_param.as_str()))
                     .and_then(|v| v.as_str().map(str::to_string));
 
                 let result = ctx
@@ -101,27 +102,35 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                     .await
                     .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
-                let body = serde_json::to_string_pretty(&result)
-                    .unwrap_or_else(|e| format!("unserialisable reply: {e}"));
-
-                match out_path {
-                    Some(path) => {
-                        std::fs::write(&path, &body).map_err(|e| {
-                            rmcp::ErrorData::internal_error(
-                                format!("failed to write {path}: {e}"),
-                                None,
-                            )
-                        })?;
-                        // The count comes from the reply rather than from a
-                        // hardcoded field name: whatever the daemon called it,
-                        // the caller can read it in the JSON it just wrote.
-                        Ok(CallToolResult::success(vec![Content::text(format!(
-                            "wrote {} bytes to {path}",
-                            body.len()
-                        ))]))
-                    }
-                    None => Ok(CallToolResult::success(vec![Content::text(body)])),
+                // Which files, and what goes in them, is the protocol's answer
+                // rather than this function's — so the CLI and this surface
+                // cannot write different files for the same tool.
+                let files = logmon_broker_protocol::mcp_tools::files_to_write(
+                    &hints,
+                    &result,
+                    out_path.as_deref(),
+                );
+                if files.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string_pretty(&result)
+                            .unwrap_or_else(|e| format!("unserialisable reply: {e}")),
+                    )]));
                 }
+
+                let mut wrote = Vec::new();
+                for f in files {
+                    std::fs::write(&f.path, &f.body).map_err(|e| {
+                        rmcp::ErrorData::internal_error(
+                            format!("failed to write {}: {e}", f.path.display()),
+                            None,
+                        )
+                    })?;
+                    wrote.push(format!("{} ({} bytes)", f.path.display(), f.body.len()));
+                }
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "wrote {}",
+                    wrote.join(", ")
+                ))]))
             })
         },
     ))
@@ -301,7 +310,14 @@ mod forwarding_route_tests {
     #[test]
     fn a_local_output_path_is_offered_even_though_the_daemon_has_no_such_parameter() {
         let entry = real("export_logs");
-        assert_eq!(entry.cli.output_path_param.as_deref(), Some("path"));
+        assert_eq!(
+            entry
+                .cli
+                .file_output
+                .as_ref()
+                .map(|f| f.path_param.as_str()),
+            Some("path")
+        );
 
         let listed = router_with(&entry).list_all();
         let props = listed[0].input_schema["properties"]

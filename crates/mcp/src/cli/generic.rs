@@ -177,8 +177,17 @@ fn coerce(raw: &str, node: Option<&Value>) -> Result<Value, String> {
 }
 
 /// Insert, accumulating repeats into an array.
-fn insert(out: &mut Map<String, Value>, key: &str, value: Value) {
+///
+/// `is_list` comes from the schema, and it is what makes a **single** value for
+/// an array parameter arrive as `["a"]` rather than `"a"`. Accumulating only on
+/// the second occurrence looks right and is wrong for every one-element list —
+/// `--group-keys a` and `document a@base` both hit it, and the daemon rejects
+/// them with "must be an array of strings, not a string".
+fn insert(out: &mut Map<String, Value>, key: &str, value: Value, is_list: bool) {
     match out.remove(key) {
+        None if is_list => {
+            out.insert(key.to_string(), Value::Array(vec![value]));
+        }
         None => {
             out.insert(key.to_string(), value);
         }
@@ -192,6 +201,11 @@ fn insert(out: &mut Map<String, Value>, key: &str, value: Value) {
     }
 }
 
+/// Whether the schema says this parameter is a list.
+fn is_list(node: Option<&Value>) -> bool {
+    node.and_then(json_type).as_deref() == Some("array")
+}
+
 /// `--threshold.metric avg_ms` builds `{"threshold": {"metric": "avg_ms"}}`.
 ///
 /// **Without this, an object parameter is unreachable.** `add_collector`'s
@@ -199,12 +213,12 @@ fn insert(out: &mut Map<String, Value>, key: &str, value: Value) {
 /// can express neither the name nor the fields. The hand-written CLI solved it
 /// by inventing `--threshold-metric` and friends — knowledge of the tool baked
 /// into the front-end, which is exactly what is being removed.
-fn insert_nested(out: &mut Map<String, Value>, path: &[&str], value: Value) {
+fn insert_nested(out: &mut Map<String, Value>, path: &[&str], value: Value, is_list: bool) {
     let Some((head, tail)) = path.split_first() else {
         return;
     };
     if tail.is_empty() {
-        insert(out, head, value);
+        insert(out, head, value, is_list);
         return;
     }
     let slot = out
@@ -217,6 +231,7 @@ fn insert_nested(out: &mut Map<String, Value>, path: &[&str], value: Value) {
         slot.as_object_mut().expect("just made an object"),
         tail,
         value,
+        is_list,
     );
 }
 
@@ -251,7 +266,7 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
             };
             let is_last = positional_taken + 1 == hints.positional.len();
             let node = node_for(schema, &[name.as_str()]);
-            insert(&mut out, name, coerce(arg, node)?);
+            insert(&mut out, name, coerce(arg, node)?, is_list(node));
             // A variadic tail keeps absorbing into the same key rather than
             // advancing, so `document a b c` fills one list.
             if !(is_last && hints.variadic) {
@@ -276,9 +291,9 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
         // Without this it is rejected as unknown before it can be honoured.
         let is_output_path = entry
             .cli
-            .output_path_param
-            .as_deref()
-            .is_some_and(|k| path.len() == 1 && path[0] == k);
+            .file_output
+            .as_ref()
+            .is_some_and(|f| path.len() == 1 && path[0] == f.path_param);
 
         let node = node_for(schema, &path);
         if node.is_none() && !is_output_path {
@@ -294,7 +309,7 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
                 let is_bool = node.and_then(json_type).as_deref() == Some("boolean");
                 if is_bool && next_is_flag {
                     // A bare `--flag` on a boolean means true.
-                    insert_nested(&mut out, &path, Value::Bool(true));
+                    insert_nested(&mut out, &path, Value::Bool(true), false);
                     i += 1;
                     continue;
                 }
@@ -308,7 +323,7 @@ pub fn build_params(args: &[String], entry: &ManifestEntry) -> Result<Map<String
             }
         };
         i += 1;
-        insert_nested(&mut out, &path, coerce(&raw, node)?);
+        insert_nested(&mut out, &path, coerce(&raw, node)?, is_list(node));
     }
     Ok(out)
 }
@@ -402,10 +417,15 @@ pub fn help_command(entry: &ManifestEntry) -> String {
         ));
     }
 
-    if let Some(p) = &entry.cli.output_path_param {
+    if let Some(f) = &entry.cli.file_output {
+        let extra = if f.sidecar.is_some() {
+            " (and its companion file beside it)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "\n  {:<22} local file to write the reply to (never sent to the daemon)\n",
-            dashed(p)
+            "\n  {:<22} local file to write the result to{extra} — never sent to the daemon\n",
+            dashed(&f.path_param)
         ));
     }
 
@@ -548,9 +568,9 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
     let out_path = m
         .entry
         .cli
-        .output_path_param
+        .file_output
         .as_ref()
-        .and_then(|k| params.remove(k.as_str()))
+        .and_then(|f| params.remove(f.path_param.as_str()))
         .and_then(|v| v.as_str().map(str::to_string));
 
     let reply = match broker.call(&m.entry.method, Value::Object(params)).await {
@@ -561,20 +581,80 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
         }
     };
 
-    match out_path {
-        Some(path) => {
-            let body = serde_json::to_string_pretty(&reply).unwrap_or_default();
-            if let Err(e) = std::fs::write(&path, body) {
-                format::error(&format!("failed to write {path}: {e}"), json);
-                return 1;
-            }
-            if !json {
-                println!("wrote {path}");
+    // `--json` asks for the reply, not for a side effect on disk.
+    if json {
+        emit(&reply, true);
+        return 0;
+    }
+
+    let files = logmon_broker_protocol::mcp_tools::files_to_write(
+        &m.entry.cli,
+        &reply,
+        out_path.as_deref(),
+    );
+    if files.is_empty() {
+        // A tool that CAN write a file but was given no path prints its body
+        // rather than the envelope — `collectors document` with no `--path` is
+        // meant to show you the document.
+        if let Some(field) = m
+            .entry
+            .cli
+            .file_output
+            .as_ref()
+            .and_then(|f| f.content_field.as_ref())
+        {
+            if let Some(v) = reply.get(field) {
+                match v.as_str() {
+                    Some(s) => println!("{s}"),
+                    None => emit(v, false),
+                }
+                warn_about_unwritten_sidecar(m.entry, &reply);
+                return 0;
             }
         }
-        None => emit(&reply, json),
+        emit(&reply, false);
+        return 0;
+    }
+
+    for f in files {
+        if let Err(e) = std::fs::write(&f.path, &f.body) {
+            format::error(&format!("failed to write {}: {e}", f.path.display()), json);
+            return 1;
+        }
+        println!("wrote {} ({} bytes)", f.path.display(), f.body.len());
     }
     0
+}
+
+/// A companion file was produced and thrown away because no path was given.
+///
+/// Silence here is what makes a sidecar go missing without anyone noticing —
+/// the document's front-matter still refers to a file that was never written.
+fn warn_about_unwritten_sidecar(entry: &ManifestEntry, reply: &Value) {
+    let Some(side) = entry
+        .cli
+        .file_output
+        .as_ref()
+        .and_then(|f| f.sidecar.as_ref())
+    else {
+        return;
+    };
+    if reply
+        .get(&side.name_field)
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        let path_param = entry
+            .cli
+            .file_output
+            .as_ref()
+            .map(|f| f.path_param.as_str())
+            .unwrap_or("path");
+        eprintln!(
+            "note: a companion file was produced but not written — pass --{} to write both",
+            path_param.replace('_', "-")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -686,6 +766,31 @@ mod tests {
     fn an_integer_does_not_go_out_as_a_float() {
         let p = parse("get_recent_logs", &["--count", "3"]);
         assert_eq!(serde_json::to_string(&p["count"]).unwrap(), "3");
+    }
+
+    /// The bug: accumulating only on the SECOND occurrence looks right and is
+    /// wrong for every one-element list. A live daemon refused both of these
+    /// with "must be an array of strings, not a string" — the unit tests all
+    /// passed two values, so none of them could see it.
+    #[test]
+    fn a_single_value_for_a_list_parameter_is_still_a_list() {
+        let p = parse(
+            "add_collector",
+            &["--name", "c", "--filter", "ALL", "--group-keys", "x"],
+        );
+        assert_eq!(p["group_keys"], serde_json::json!(["x"]));
+
+        // Same for a variadic positional given exactly one arm.
+        let d = parse("document_collectors", &["a@base"]);
+        assert_eq!(d["names"], serde_json::json!(["a@base"]));
+    }
+
+    /// And a scalar parameter must NOT be wrapped just because it appears once.
+    #[test]
+    fn a_scalar_parameter_is_not_wrapped_in_a_list() {
+        let p = parse("add_collector", &["--name", "c", "--filter", "ALL"]);
+        assert_eq!(p["name"], serde_json::json!("c"));
+        assert!(!p["name"].is_array());
     }
 
     #[test]
