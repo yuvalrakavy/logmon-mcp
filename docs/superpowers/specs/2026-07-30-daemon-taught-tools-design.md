@@ -1115,6 +1115,57 @@ call of the same function, so it detects **version** skew at parameter resolutio
 raw, and the repo says so in its own words at `crates/core/tests/trigger_window_defaults.rs:34-36`.
 Phase 0 item 1 narrows that gap; nothing here closes it.
 
+### 11.4.1 Delivered, 2026-08-01 — and the assertion is clean
+
+`tools.manifest` serves `{protocol_version, broker_version, tools[]}`, each entry carrying
+`name`, `method`, `description` and `input_schema`. `TOOLS` became a `Tool` struct holding
+the description, and `Tool::definition_name` moved the `collectors.edit` → `CollectorsEdit`
+derivation into the protocol crate so both sides resolve parameters by one rule.
+
+**The assertion is clean, and it is four tests rather than one** — each half of a manifest
+entry checked against the thing it claims to describe:
+
+| Manifest field | Checked against | Test |
+|---|---|---|
+| `name` | the router rmcp generates | `the_shared_tool_table_matches_the_router…` |
+| `method` | the RPC literal in each tool body | `every_tool_calls_the_method…` |
+| `description` | the text rmcp publishes | `every_description_in_the_table…` |
+| `input_schema` | the daemon's request type | `param_drift_tests` |
+
+**Descriptions are a deliberate duplicate.** rmcp 1.2 parses `description` as a literal and
+rejects a const path — *probed, not assumed*: pointing one tool at a protocol const gives
+`error: Unexpected type path`, even though the macro's field is typed `Option<Expr>`. The
+attribute therefore cannot reference the protocol crate's copy, and the daemon must serve
+text from a crate it links. The duplicate dissolves in Phase C, when the attributes go away.
+
+### 11.4.2 What Phase C actually costs, measured
+
+A generic forwarder can only replace a tool whose body *is* a forward. Counted over
+`server.rs`: **36 of 45 are plain forwarders.** Of the nine that are not, **only two carry
+genuinely client-side behaviour**:
+
+| Tool | Why it cannot be generic |
+|---|---|
+| `export_logs` | writes the file itself — a daemon resolves a relative path against its own cwd, not the caller's |
+| `get_status` | appends the version-skew note, which is a statement about the shim, not the daemon |
+
+The other seven (`edit_collector`, `document_collectors`, `add_collector`,
+`get_log_context`, `snapshot_collector`, `edit_trigger`, `diff_collectors`) are long only
+because they build parameters **conditionally** — the very thing daemon-side validation
+makes unnecessary, now that absent and null are read as the same thing
+(`fix(core): a wrong-typed parameter is an error`). They forward once that conditional
+building is dropped.
+
+**So Phase C is: 43 tools become one generic forwarder, 2 keep bespoke handlers.** That the
+two exceptions are exactly the two legitimately client-side concerns is the strongest
+evidence so far that the split is in the right place.
+
+**Registration happens once, at startup — no `ArcSwap`.** The shim fetches the manifest
+before `serve(self)` and builds its router from it. A live-swapping router would only be
+needed to gain a tool *without restarting the shim*, and the goal is to gain one without
+**reinstalling** it; a restart is not a rebuild. `notifications/tools/list_changed` is the
+refinement that would lift that, and it is not required here.
+
 ## 11.5 Phase C — the shim registers from the manifest, and D is a separate decision
 
 **C.** `tool_router` becomes a shared handle so registration can happen after `serve()`,

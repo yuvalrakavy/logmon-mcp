@@ -13,6 +13,68 @@ pub struct GelfMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// Build a route that forwards a manifest-declared tool straight to the daemon,
+/// knowing nothing about it but its name, its method and its schema.
+///
+/// **This is the shim's whole job, for 43 of its 45 tools.** A tool the daemon
+/// declares can be exposed by a shim that was never compiled with it, which is
+/// what makes "enhance the daemon without reinstalling the shim" true rather
+/// than aspirational. The two that cannot go through here are the two with
+/// genuinely client-side behaviour — `export_logs` writes the file itself,
+/// because a daemon resolves a relative path against its own working directory,
+/// and `get_status` appends the skew note, which is a statement about the shim.
+///
+/// Validation is deliberately absent. The daemon reads these parameters with
+/// full knowledge of the tool; a second, shallower check here could only ever
+/// reject things the daemon would have accepted.
+///
+/// Returns `None` when the entry carries no schema — a tool nothing describes
+/// cannot be offered honestly, and offering it with an empty schema would
+/// advertise "takes no arguments" for one that takes several.
+///
+/// **Not yet on the startup path.** The 45 `#[rmcp::tool]` attributes still
+/// build the router; this is the seam they will be replaced by, proven against
+/// the real manifest by the tests below rather than left as a claim in a
+/// design document. Wiring it in is the rest of Phase C.
+#[allow(dead_code)]
+pub fn forwarding_route(
+    entry: &logmon_broker_protocol::mcp_tools::ManifestEntry,
+) -> Option<rmcp::handler::server::router::tool::ToolRoute<GelfMcpServer>> {
+    use rmcp::handler::server::router::tool::ToolRoute;
+
+    let mut schema = entry.input_schema.as_ref()?.as_object()?.clone();
+    // `$schema` and `title` come from the generator describing a Rust type; an
+    // MCP client wants the argument shape, not the provenance of the file it
+    // was cut from.
+    schema.remove("$schema");
+    schema.remove("title");
+
+    let method = entry.method.clone();
+    Some(ToolRoute::new_dyn(
+        Tool::new(
+            entry.name.clone(),
+            entry.description.clone(),
+            std::sync::Arc::new(schema),
+        ),
+        move |ctx: rmcp::handler::server::tool::ToolCallContext<'_, GelfMcpServer>| {
+            let method = method.clone();
+            Box::pin(async move {
+                let args = ctx.arguments.clone().unwrap_or_default();
+                let result = ctx
+                    .service
+                    .broker
+                    .call(&method, serde_json::Value::Object(args))
+                    .await
+                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                Ok(CallToolResult::success(vec![Content::text(
+                    serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|e| format!("unserialisable reply: {e}")),
+                )]))
+            })
+        },
+    ))
+}
+
 impl GelfMcpServer {
     pub fn new(broker: Broker) -> Self {
         Self {
@@ -1977,6 +2039,94 @@ mod tests {
             assert_eq!(after.get(k), Some(v), "annotation altered `{k}`");
         }
         assert!(after.get("shim_note").is_some());
+    }
+}
+
+#[cfg(test)]
+mod forwarding_route_tests {
+    use super::forwarding_route;
+    use logmon_broker_protocol::mcp_tools;
+
+    /// The claim this whole architecture rests on: a route built from nothing
+    /// but a manifest entry is a usable tool.
+    ///
+    /// Registered through the router's own API rather than inspected directly,
+    /// so what is asserted is what a client would actually be served.
+    #[test]
+    fn a_manifest_entry_alone_is_enough_to_register_a_working_tool() {
+        let manifest = mcp_tools::manifest();
+        let entry = manifest
+            .iter()
+            .find(|e| e.name == "add_collector")
+            .expect("add_collector is in the manifest");
+
+        let mut router: rmcp::handler::server::tool::ToolRouter<super::GelfMcpServer> =
+            Default::default();
+        router.add_route(forwarding_route(entry).expect("a schema-carrying entry"));
+
+        let listed = router.list_all();
+        assert_eq!(listed.len(), 1);
+        let tool = &listed[0];
+        assert_eq!(tool.name, "add_collector");
+        assert_eq!(
+            tool.description.as_deref(),
+            Some(entry.description.as_str()),
+            "an agent must read the same sentence the manifest carried"
+        );
+
+        // The parameters reach the client, closed sets and all — this is what
+        // lets a shim offer a tool correctly without knowing what it does.
+        let props = tool.input_schema["properties"]
+            .as_object()
+            .expect("parameters are described");
+        assert!(props.contains_key("filter"));
+        assert!(
+            props["level"]["enum"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x == "tree")),
+            "Phase A's accepted values must survive the trip: {}",
+            props["level"]
+        );
+    }
+
+    /// `$schema` and `title` describe the file the definition was cut from, not
+    /// the arguments. Leaving them in makes every tool claim to be titled after
+    /// a Rust type.
+    #[test]
+    fn generator_provenance_is_stripped_from_the_published_schema() {
+        let manifest = mcp_tools::manifest();
+        let entry = &manifest[0];
+        let route = forwarding_route(entry).expect("a schema");
+        let mut router: rmcp::handler::server::tool::ToolRouter<super::GelfMcpServer> =
+            Default::default();
+        router.add_route(route);
+
+        let listed = router.list_all();
+        let schema = &listed[0].input_schema;
+        assert!(
+            !schema.contains_key("$schema"),
+            "provenance leaked: {schema:?}"
+        );
+        assert!(
+            !schema.contains_key("title"),
+            "type name leaked: {schema:?}"
+        );
+    }
+
+    /// Every tool the manifest describes must be buildable, or the migration
+    /// would silently offer a smaller surface than the daemon has.
+    #[test]
+    fn every_manifest_entry_yields_a_route() {
+        let manifest = mcp_tools::manifest();
+        let unbuildable: Vec<&str> = manifest
+            .iter()
+            .filter(|e| forwarding_route(e).is_none())
+            .map(|e| e.name.as_str())
+            .collect();
+        assert!(
+            unbuildable.is_empty(),
+            "a generic shim could not build: {unbuildable:?}"
+        );
     }
 }
 
