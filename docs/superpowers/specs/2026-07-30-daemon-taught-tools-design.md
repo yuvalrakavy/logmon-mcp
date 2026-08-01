@@ -1200,6 +1200,53 @@ Net: four guards retire, and the risk they covered lands on `capability_skew`, w
 therefore keep probing **every** row — it already asserts exactly that, and asserts the
 probe connection did not die mid-loop, which is what stops it going quietly vacuous.
 
+### 11.5.2 Phase D, remeasured 2026-08-01 — generation loses again, and the goal is met another way
+
+Phase A was supposed to be what made CLI generation viable. **Remeasured against §10.2's own
+four criteria, it moved one of them:**
+
+| §10.2's criterion | When §10.2 was killed | After Phase A |
+|---|---|---|
+| `enum` on a request parameter | 0 | **7** |
+| `"default"` declared | 0 | 5 |
+| `dependentRequired` | 0 | **0** |
+| booleans plainly typed | 2 of 16 | 3 of 16 |
+
+Two of the nine enum declarations do not appear because they sit on the nested
+`ThresholdSpec` rather than a request's own properties. So the schema is richer, but three of
+the four gaps are where they were — and the CLI still hand-writes six `requires`/
+`conflicts_with` relations that `dependentRequired` would have had to supply.
+
+**The decisive measurement is a different one.** Split the 2 713-line CLI by what a schema
+could possibly produce:
+
+| Part | Lines | Can a schema generate it? |
+|---|---|---|
+| argument declaration (`#[arg]`, `#[command]`, derives) | **158** | yes |
+| human rendering (`println!`, `format::`, `push_str`) | **315** | **no** |
+| dispatch, plumbing, comments | 2 253 | no |
+
+**Generation replaces 158 lines — 5.8% — and puts the 315 at risk.** The CLI's value is
+mostly that it renders results for a human ("leads with the headline number, then names
+anything the result could not answer"); a generated CLI prints JSON. Trading opinionated
+output for 158 lines of `#[arg]` is a bad trade, and it is the same shape of finding that
+killed §10.2: the mechanism was chosen before anyone counted what it would move.
+
+**But the goal was never line count.** It is that a new daemon tool must not require touching
+`crates/mcp`. Measured against *that*, the CLI fails today and full generation is not needed
+to fix it:
+
+> **A generic pass-through verb.** `logmon-mcp call <tool> --param value …` builds its
+> arguments from the manifest at runtime and prints the reply as JSON. Any tool the daemon
+> declares is reachable from the CLI immediately, with no rebuild — including one this binary
+> has never heard of.
+
+The thirteen hand-written command groups stay exactly as they are, keeping their rendering.
+`call` is the floor, not the ceiling: a tool gets a bespoke group when someone wants nice
+output for it, and is usable from the moment the daemon declares it. That satisfies §11.0
+without paying for it in the one part of the CLI that is genuinely worth its hand-written
+lines, and it needs nothing from the schema that the schema does not already have.
+
 **D — generating the CLI. As specified in §10.2 it is dead; as a phase it is back in scope,
 on a different basis** (decided 2026-08-01, because "finish the shim" means the CLI too —
 a shim that is daemon-taught for MCP and hand-written for CLI still drags every new daemon

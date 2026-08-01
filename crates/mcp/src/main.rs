@@ -58,6 +58,12 @@ enum Subcommand {
     Domains(cli::domains::DomainsCmd),
     /// Print broker status (uptime, receivers, store stats).
     Status,
+    /// Call any tool the daemon declares, including ones this build predates.
+    ///
+    /// Arguments and types come from the daemon's manifest at runtime, so a
+    /// tool added to the broker is reachable here with no reinstall. Output is
+    /// JSON; the named command groups above are the ones with human rendering.
+    Call(cli::call::CallCmd),
 }
 
 #[tokio::main]
