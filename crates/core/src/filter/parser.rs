@@ -799,10 +799,8 @@ pub fn resolved_seq_range(filter: Option<&ParsedFilter>) -> (Option<u64>, Option
 /// Records lost off the front of an **inclusive** window starting at `from`:
 /// `oldest - from` when the ring no longer reaches back that far, else `None`.
 ///
-/// Takes the inclusive bound directly, so a window starting exactly at the
-/// oldest retained record reports nothing missing — which it is.
-/// [`evicted_before_window`] answers the same question from a *strict* `Gt`
-/// value and is off by one against this; see #17.
+/// Takes the **inclusive** bound, so a window starting exactly at the oldest
+/// retained record reports nothing missing — which it is.
 pub fn evicted_below(from: u64, buffer_oldest_seq: Option<u64>) -> Option<u64> {
     match buffer_oldest_seq {
         Some(oldest) if oldest > from => Some(oldest - from),
@@ -810,15 +808,20 @@ pub fn evicted_below(from: u64, buffer_oldest_seq: Option<u64>) -> Option<u64> {
     }
 }
 
-/// B5: `Some(gap)` when the query's lower bound predates the retained buffer
-/// (records were evicted from the window), else `None`. `gap = oldest - lb` is
-/// the number of seqs between the window start and the oldest retained record —
-/// an upper bound on missed records (logs and spans share the seq axis).
+/// B5: `Some(gap)` when the query's window starts before the retained buffer
+/// (records were evicted from it), else `None`. `gap` is the number of seqs
+/// between the window's first admitted record and the oldest retained one — an
+/// upper bound on missed records, since logs and spans share the seq axis.
+///
+/// **The bound is converted before it is compared.** `resolved_lower_bound`
+/// returns the *strict* `Gt` value, so the window actually begins at `lb + 1`;
+/// comparing `lb` itself reported eviction whenever the window started exactly
+/// at `buffer_oldest_seq`, and overstated the gap by one everywhere it fired.
+/// One implementation, in [`evicted_below`], so the case-document path and this
+/// one cannot drift.
 pub fn evicted_before_window(filter: &ParsedFilter, buffer_oldest_seq: Option<u64>) -> Option<u64> {
-    match (resolved_lower_bound(filter), buffer_oldest_seq) {
-        (Some(lb), Some(oldest)) if lb < oldest => Some(oldest - lb),
-        _ => None,
-    }
+    let lb = resolved_lower_bound(filter)?;
+    evicted_below(lb.saturating_add(1), buffer_oldest_seq)
 }
 
 #[cfg(test)]
@@ -974,14 +977,36 @@ mod truncation_tests {
 
     #[test]
     fn flags_window_older_than_buffer() {
-        // window starts after seq 5; oldest retained is 10 → seqs (5,10] rolled off
-        assert_eq!(evicted_before_window(&gt(5), Some(10)), Some(5));
+        // `Gt(5)` admits seq 6 upward, and the oldest retained is 10 — so seqs
+        // 6, 7, 8 and 9 rolled off. FOUR, not five: the bound is strict, and
+        // counting from `lb` itself instead of from the first seq the window
+        // admits is where the old off-by-one lived.
+        assert_eq!(evicted_before_window(&gt(5), Some(10)), Some(4));
     }
 
     #[test]
     fn none_when_window_within_buffer() {
         assert_eq!(evicted_before_window(&gt(10), Some(5)), None);
         assert_eq!(evicted_before_window(&gt(10), Some(10)), None); // equal → not truncated
+                                                                    // The boundary the old form got wrong: `Gt(9)` starts the window at
+                                                                    // seq 10, which is exactly the oldest retained record. Nothing is
+                                                                    // missing, and reporting `truncated` here made `complete` unreachable
+                                                                    // for any window anchored at the start of the buffer.
+        assert_eq!(evicted_before_window(&gt(9), Some(10)), None);
+    }
+
+    #[test]
+    fn the_inclusive_form_is_the_one_implementation() {
+        // `evicted_before_window` is `evicted_below` with the strict bound
+        // converted, so the case-document path and the export path cannot
+        // disagree about what "evicted" means.
+        assert_eq!(evicted_below(10, Some(10)), None);
+        assert_eq!(evicted_below(6, Some(10)), Some(4));
+        assert_eq!(evicted_below(6, None), None);
+        assert_eq!(
+            evicted_before_window(&gt(5), Some(10)),
+            evicted_below(6, Some(10))
+        );
     }
 
     #[test]
@@ -1041,6 +1066,6 @@ mod truncation_tests {
                 value: 50,
             },
         ]);
-        assert_eq!(evicted_before_window(&both_evicted, Some(100)), Some(50));
+        assert_eq!(evicted_before_window(&both_evicted, Some(100)), Some(49));
     }
 }

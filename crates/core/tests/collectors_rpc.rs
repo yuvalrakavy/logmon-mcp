@@ -3504,6 +3504,11 @@ fn spans_export_reports_capping_with_the_true_total() {
 #[test]
 fn spans_export_reports_the_span_rings_own_retention() {
     let h = harness();
+    // A domain whose counter resumed at 500, so there ARE seqs below the ring
+    // to ask about. With a fresh counter the oldest span is seq 1 and no window
+    // can start below it — which is why the earlier version of this test only
+    // appeared to pass, on `evicted_before_window`'s off-by-one.
+    h.domains.insert(make_domain_at("default", 500));
     let sid = h.sessions.create_named("A").unwrap();
     let d = h.domains.get(&DomainId::default_domain()).unwrap();
     for i in 1..=4 {
@@ -3514,23 +3519,32 @@ fn spans_export_reports_the_span_rings_own_retention() {
     let oldest = all["buffer_oldest_seq"]
         .as_u64()
         .expect("a non-empty span ring has an oldest seq");
+    assert_eq!(oldest, 501, "the counter resumed: {all}");
     assert!(all["buffer_newest_seq"].as_u64().is_some(), "{all}");
 
     // A window starting below what the ring still holds is not complete.
     let below = h
-        .call(
-            &sid,
-            "spans.export",
-            json!({ "from_seq": oldest.saturating_sub(50) }),
-        )
+        .call(&sid, "spans.export", json!({ "from_seq": 400 }))
         .unwrap();
     assert_eq!(
         below["truncated"], true,
         "a window starting below the span ring is not complete: {below}"
     );
+    assert_eq!(
+        below["evicted_before_window"], 101,
+        "and the gap is named, not merely flagged — seqs 400..=500: {below}"
+    );
+
+    // Starting EXACTLY at the oldest retained span is not eviction. Nothing is
+    // missing, and reporting one here would make `complete` unreachable for any
+    // window anchored at the start of the ring.
+    let at_the_edge = h
+        .call(&sid, "spans.export", json!({ "from_seq": oldest }))
+        .unwrap();
+    assert_eq!(at_the_edge["truncated"], false, "{at_the_edge}");
     assert!(
-        below["evicted_before_window"].as_u64().is_some(),
-        "and the gap must be named, not merely flagged: {below}"
+        at_the_edge["evicted_before_window"].is_null(),
+        "{at_the_edge}"
     );
 }
 

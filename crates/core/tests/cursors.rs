@@ -692,7 +692,16 @@ async fn a_range_starting_below_the_buffer_reports_eviction() {
     let daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_anon().await;
     for i in 0..4 {
-        daemon.inject_log(Level::Info, &format!("evict-{i}")).await;
+        daemon.inject_log(Level::Info, &format!("gone-{i}")).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Clear, then log again: seqs keep climbing while the store no longer
+    // reaches back to the first four. That is what "evicted" means, and it is
+    // reachable in a test where filling a 10 000-entry ring is not.
+    let _: serde_json::Value = client.call("logs.clear", json!({})).await.unwrap();
+    for i in 0..4 {
+        daemon.inject_log(Level::Info, &format!("kept-{i}")).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -703,21 +712,29 @@ async fn a_range_starting_below_the_buffer_reports_eviction() {
     let oldest = all
         .buffer_oldest_seq
         .expect("a non-empty buffer has an oldest");
+    assert!(oldest > 1, "the cleared seqs are below the ring: {all:?}");
 
-    // Deliberately well below what the ring holds.
     let below: LogsExportResult = client
-        .call(
-            "logs.export",
-            json!({ "from_seq": oldest.saturating_sub(50), "count": 100 }),
-        )
+        .call("logs.export", json!({ "from_seq": 1, "count": 100 }))
         .await
         .unwrap();
     assert!(
         below.truncated,
         "a window starting below the retained buffer is not complete: {below:?}"
     );
-    assert!(
-        below.evicted_before_window.is_some(),
-        "and the gap must be named, not merely flagged: {below:?}"
+    assert_eq!(
+        below.evicted_before_window,
+        Some(oldest - 1),
+        "and the gap is named, not merely flagged: {below:?}"
     );
+
+    // The other side of the same boundary: a window starting EXACTLY at the
+    // oldest retained record has lost nothing, and saying otherwise would make
+    // `complete` unreachable for any window anchored at the start of the ring.
+    let at_the_edge: LogsExportResult = client
+        .call("logs.export", json!({ "from_seq": oldest, "count": 100 }))
+        .await
+        .unwrap();
+    assert!(!at_the_edge.truncated, "{at_the_edge:?}");
+    assert_eq!(at_the_edge.evicted_before_window, None, "{at_the_edge:?}");
 }

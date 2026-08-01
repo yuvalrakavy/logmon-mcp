@@ -282,6 +282,26 @@ is a second name to support forever.
 
 ### Fixed
 
+- **`evicted_before_window` was off by one, and false-positived at the
+  boundary.** It compared the *strict* `Gt` value against `buffer_oldest_seq`,
+  but the window actually begins at `lb + 1` — so a window starting exactly at
+  the oldest retained record reported `truncated: true` with a gap of 1 when
+  nothing was missing, and every gap it did report was one too large.
+
+  The boundary case is the one that mattered: `truncated` is a claim that
+  something is gone, and it made `complete` unreachable for any window anchored
+  at the start of the ring — which is exactly the window a capture takes when the
+  incident sits near the beginning of what the buffer still holds. `logs.export`,
+  `spans.export` and `logs.recent` all reported it.
+
+  There is now one implementation, `evicted_below`, taking the **inclusive**
+  bound, so the case-document path and the export path cannot drift.
+
+  Two tests moved with it, and both had been passing for the wrong reason: each
+  asked for a window at `oldest.saturating_sub(50)` on a store whose oldest seq
+  was 1, so the window began at seq 1 — exactly the oldest record — and only the
+  off-by-one made it read as truncated. They now drive real eviction.
+
 - **A parameter of the wrong type is now an error, not a different answer.**
   Every RPC parameter was read with `params.get(k).and_then(|v| v.as_TYPE())`,
   and `as_TYPE` returns `None` both when a key is **absent** and when it is
