@@ -5,6 +5,8 @@
 //! shapes a client actually sees — parameter parsing, admission, error text —
 //! rather than the projection layer, which has its own unit tests.
 
+use logmon_broker_core::collector::diff::DiffGroupBy;
+use logmon_broker_core::collector::project::GroupBy;
 use logmon_broker_core::collector::state::DEFAULT_MAX_SAMPLE_BYTES;
 use logmon_broker_core::daemon::domain::{
     Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
@@ -16,6 +18,7 @@ use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
 use logmon_broker_core::receiver::ReceiverMetrics;
 use logmon_broker_core::span::store::SpanStore;
+use logmon_broker_core::span::types::SlowGroupBy;
 use logmon_broker_core::span::types::{SpanEntry, SpanKind, SpanStatus};
 use logmon_broker_core::store::bookmarks::BookmarkStore;
 use logmon_broker_protocol::RpcRequest;
@@ -307,7 +310,7 @@ fn dropping_a_session_hands_back_its_sample_reservation() {
     .expect("armed");
     assert!(h.collectors.reserved_bytes() > 0);
 
-    // `session.drop` refuses a connected session, and a named session keeps its
+    // `sessions.drop` refuses a connected session, and a named session keeps its
     // collectors across a disconnect on purpose — that IS the arm, run, read
     // workflow. So the disconnect first, and the budget must survive it.
     h.sessions.disconnect(&sid);
@@ -317,7 +320,7 @@ fn dropping_a_session_hands_back_its_sample_reservation() {
     );
 
     let dropped = h
-        .call(&sid, "session.drop", json!({ "name": "doomed" }))
+        .call(&sid, "sessions.drop", json!({ "name": "doomed" }))
         .expect("dropped");
     assert_eq!(dropped["collectors_released"], 1, "and it says how many");
     assert_eq!(
@@ -1057,7 +1060,7 @@ fn an_absurd_warmup_does_not_silently_become_a_no_op() {
 fn a_rename_carries_its_collectors_and_does_not_inherit_a_displaced_session_s() {
     // Two defects at once. Leaving Entry::owner behind orphaned the renaming
     // session's own collectors: invisible to its owner-scoped list, unreachable
-    // by session.drop, never swept, still holding the reservation. And a
+    // by sessions.drop, never swept, still holding the reservation. And a
     // DISPLACED holder's collectors — window and full history — became readable
     // and removable by whoever took the name.
     let h = harness();
@@ -1080,7 +1083,7 @@ fn a_rename_carries_its_collectors_and_does_not_inherit_a_displaced_session_s() 
     )
     .unwrap();
 
-    h.call(&alpha, "session.rename", json!({ "name": "beta" }))
+    h.call(&alpha, "sessions.rename", json!({ "name": "beta" }))
         .expect("renamed, displacing the stale holder");
 
     let now = SessionId::Named("beta".into());
@@ -1172,7 +1175,7 @@ fn dropping_a_session_reclaims_collectors_even_when_the_session_is_already_gone(
     assert!(h.collectors.reserved_bytes() > 0);
 
     let caller = h.sessions.create_named("live").unwrap();
-    h.call(&caller, "session.drop", json!({ "name": "ghost" }))
+    h.call(&caller, "sessions.drop", json!({ "name": "ghost" }))
         .expect("must succeed: there were collectors to reclaim");
     assert_eq!(
         h.collectors.reserved_bytes(),
@@ -1994,6 +1997,54 @@ fn the_ungrouped_arm_still_returns_the_slowest_n_above_the_floor() {
         .unwrap();
     assert_eq!(got["count"], 5);
     assert_eq!(got["spans"][0]["duration_ms"], 500.0);
+}
+
+/// A typo is refused instead of quietly answering a different question (#7).
+///
+/// `traces.slow` used to take any string and let anything other than `"name"`
+/// select the ungrouped arm. So `group_by: "nmae"` returned a full, plausible,
+/// ungrouped result to a caller who had asked for grouping — no error, no
+/// warning, nothing in the response to say the parameter was not understood.
+#[test]
+fn traces_slow_refuses_a_group_by_it_does_not_understand() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=5 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
+
+    let err = h
+        .call(&sid, "traces.slow", json!({ "group_by": "nmae" }))
+        .expect_err("a transposed `name` is a typo, not a request to ungroup");
+    for spelling in SlowGroupBy::ALL.map(SlowGroupBy::as_str) {
+        assert!(
+            err.contains(&format!("`{spelling}`")),
+            "the refusal must name `{spelling}`: {err}"
+        );
+    }
+
+    // The other half: closing the set must not have cost anyone the ungrouped
+    // read. All three spellings still reach it, which is the whole reason this
+    // could close without rejecting a valid call.
+    for params in [
+        json!({}),
+        json!({ "group_by": "none" }),
+        json!({ "group_by": "" }),
+    ] {
+        let got = h
+            .call(&sid, "traces.slow", params.clone())
+            .unwrap_or_else(|e| panic!("{params} must still mean ungrouped: {e}"));
+        assert!(
+            got.get("spans").is_some(),
+            "{params} must return the ungrouped shape: {got}"
+        );
+    }
+
+    let grouped = h
+        .call(&sid, "traces.slow", json!({ "group_by": "name" }))
+        .expect("and grouping still groups");
+    assert_eq!(grouped["grouped_by"], "name");
 }
 
 // ---------------------------------------------------------------------------
@@ -3281,5 +3332,67 @@ fn a_snapshot_read_invents_no_suppression_for_options_that_were_not_asked_for() 
             suppressed_field(&r, "excluded_by_warmup").is_none(),
             "no warm-up cut was requested by {params}: {r}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a rejection is allowed to leave out
+// ---------------------------------------------------------------------------
+
+/// A rejected `group_by` must name every value its own parser accepts.
+///
+/// Four of the five were named. The missing one was `none` — the only spelling
+/// for "the overall, ungrouped figures" — so a caller who trusted the error
+/// could not reach the ungrouped read from the very message refusing them. The
+/// schema had it right the whole time, which is why nothing else contradicted
+/// the text and it survived to be found by hand.
+///
+/// Aliases stay out on purpose: `""` is `none` sent by a client with an empty
+/// field, not a distinct option, and naming it in prose helps no one.
+#[test]
+fn a_rejected_group_by_names_every_value_its_parser_accepts() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    armed(&h, &sid, "cache");
+    run_and_snapshot(&h, &sid, "cache", "before", 4, 10.0);
+    run_and_snapshot(&h, &sid, "cache", "after", 4, 5.0);
+
+    // Uppercase so the offending value cannot itself contain a spelling and
+    // pass the assertion for free.
+    let bad = "NAME";
+
+    for (method, params) in [
+        (
+            "collectors.get",
+            json!({ "name": "cache", "group_by": bad }),
+        ),
+        ("traces.profile", json!({ "group_by": bad })),
+    ] {
+        let err = h.call(&sid, method, params).expect_err("refused");
+        for spelling in GroupBy::ALL.map(GroupBy::as_str) {
+            assert!(
+                err.contains(&format!("`{spelling}`")),
+                "{method} refused a group_by without naming `{spelling}`: {err}"
+            );
+        }
+    }
+
+    for (method, params) in [
+        (
+            "collectors.diff",
+            json!({ "a": "cache@before", "b": "cache@after", "group_by": bad }),
+        ),
+        (
+            "collectors.document",
+            json!({ "names": ["cache@before", "cache@after"], "group_by": bad }),
+        ),
+    ] {
+        let err = h.call(&sid, method, params).expect_err("refused");
+        for spelling in DiffGroupBy::ALL.map(DiffGroupBy::as_str) {
+            assert!(
+                err.contains(&format!("`{spelling}`")),
+                "{method} refused a group_by without naming `{spelling}`: {err}"
+            );
+        }
     }
 }

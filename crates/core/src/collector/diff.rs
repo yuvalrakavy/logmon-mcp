@@ -64,12 +64,24 @@ pub enum DiffGroupBy {
 }
 
 impl DiffGroupBy {
+    /// Every axis a diff can group by. See [`GroupBy::ALL`] — same contract:
+    /// one enumeration, read by the rejection message and by the schema
+    /// agreement test alike.
+    ///
+    /// [`GroupBy::ALL`]: crate::collector::project::GroupBy::ALL
+    pub const ALL: [DiffGroupBy; 3] = [DiffGroupBy::None, DiffGroupBy::Name, DiffGroupBy::Group];
+
     pub fn as_str(self) -> &'static str {
         match self {
             DiffGroupBy::None => "none",
             DiffGroupBy::Name => "name",
             DiffGroupBy::Group => "group",
         }
+    }
+
+    /// What a rejection should say it expected.
+    pub fn accepted() -> String {
+        crate::rejection::one_of(&Self::ALL.map(Self::as_str))
     }
 
     pub fn parse(s: &str) -> Option<Self> {

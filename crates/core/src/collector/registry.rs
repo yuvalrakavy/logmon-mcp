@@ -817,7 +817,7 @@ impl CollectorRegistry {
     ///
     /// A rename that left `Entry::owner` behind would orphan the session's own
     /// collectors: invisible to its owner-scoped `list`, unreachable by
-    /// `session.drop` (the old name no longer resolves), and untouched by the
+    /// `sessions.drop` (the old name no longer resolves), and untouched by the
     /// TTL sweep (it iterates the session map) — while still holding their
     /// share of a daemon-wide reservation that only four collectors fit inside.
     pub fn rename_owner(&self, old: &SessionId, new: &SessionId) -> usize {
@@ -872,7 +872,7 @@ impl CollectorRegistry {
     /// reach. A collector file is written through on `add`, but a named session
     /// only reaches `state.json` on graceful shutdown — so after a `kill -9` the
     /// collectors come back and their owner does not, leaving them invisible to
-    /// an owner-scoped `list`, unreachable by `session.drop`, and untouched by
+    /// an owner-scoped `list`, unreachable by `sessions.drop`, and untouched by
     /// the TTL sweep, while still holding their share of the reservation.
     pub fn owners(&self) -> Vec<SessionId> {
         let g = self.entries.read().expect("registry lock poisoned");

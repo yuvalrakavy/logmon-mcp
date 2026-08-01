@@ -1,13 +1,13 @@
 //! Integration tests for the `client_info` field on `session.start`.
 //!
 //! Verifies that:
-//! 1. A caller-supplied `client_info` blob round-trips through `session.list`.
+//! 1. A caller-supplied `client_info` blob round-trips through `sessions.list`.
 //! 2. Payloads exceeding 4 KB serialized are rejected with `-32602`.
 //! 3. `client_info` for a named session survives a daemon restart.
 #![cfg(feature = "test-support")]
 
 use logmon_broker_core::test_support::*;
-use logmon_broker_protocol::SessionListResult;
+use logmon_broker_protocol::SessionsListResult;
 use serde_json::json;
 
 #[tokio::test]
@@ -24,7 +24,7 @@ async fn client_info_round_trip() {
         )
         .await;
 
-    let list: SessionListResult = client.call("session.list", json!({})).await.unwrap();
+    let list: SessionsListResult = client.call("sessions.list", json!({})).await.unwrap();
     let session = list
         .sessions
         .iter()
@@ -74,7 +74,7 @@ async fn client_info_persists_across_restart() {
     daemon.restart().await;
 
     let mut client = daemon.connect_named("persist_test", None).await;
-    let list: SessionListResult = client.call("session.list", json!({})).await.unwrap();
+    let list: SessionsListResult = client.call("sessions.list", json!({})).await.unwrap();
     let session = list
         .sessions
         .iter()

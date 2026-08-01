@@ -172,7 +172,7 @@ pub struct TriggerInfo {
     pub post_remaining: u32,
 }
 
-/// One entry in a `session.list` or `status.get` response.
+/// One entry in a `sessions.list` or `status.get` response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     pub id: String,
@@ -583,14 +583,17 @@ pub struct TracesSlow {
     /// Additional span filter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
-    /// When set to `"name"`, results are aggregated into `groups`; otherwise
-    /// individual spans are returned in `spans`.
+    /// `"name"` aggregates results into `groups`; `"none"` (or `""`, or
+    /// omitting this) returns individual spans in `spans`.
     ///
-    /// **Deliberately not an enum, unlike every other `group_by`.** This one
-    /// accepts any string: anything that is not `"name"` selects the ungrouped
-    /// arm rather than failing (`rpc_handler.rs:1320`). Declaring `["name"]`
-    /// here would reject every valid call that means "do not group".
+    /// **This was the one `group_by` that accepted any string**, with anything
+    /// other than `"name"` quietly selecting the ungrouped arm — so a typo
+    /// returned a different answer than the one asked for, silently. The
+    /// argument for that was that a closed set would reject every valid call
+    /// meaning "do not group", which held only while no spelling for it
+    /// existed. `none` is that spelling, so the set closes (#7).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["name", "none", "", null]))]
     pub group_by: Option<String>,
 }
 
@@ -1100,7 +1103,7 @@ pub struct CollectorsGet {
     pub snapshot: Option<String>,
     /// `name`, `group`, `trace`, or `path`. `none` and `""` are also accepted
     /// and mean the ungrouped overall figures — the same as omitting it
-    /// (`project.rs:74`); the error message names only the four axes.
+    /// (`project.rs:74`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(extend("enum" = ["name", "group", "trace", "path", "none", "", null]))]
     pub group_by: Option<String>,
@@ -1752,22 +1755,22 @@ pub struct BookmarksClearResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SessionList {}
+pub struct SessionsList {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct SessionListResult {
+pub struct SessionsListResult {
     pub sessions: Vec<SessionInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SessionDrop {
+pub struct SessionsDrop {
     /// Name of the session to drop
     pub name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct SessionDropResult {
+pub struct SessionsDropResult {
     pub dropped: String,
 }
 
@@ -2028,20 +2031,20 @@ pub struct DomainsUseResult {
 #[serde(deny_unknown_fields)]
 pub struct DomainsClear {}
 
-/// `session.rename` — re-key the calling session to a meaningful name
+/// `sessions.rename` — re-key the calling session to a meaningful name
 /// (`<Project>-Main-<short8>` / `<Project>-tN-<branch>`, spec 2026-07-17),
 /// preserving all state. Errors with "already connected" when the target name
 /// is held by a LIVE session — the one-conversation-per-lane invariant.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct SessionRename {
+pub struct SessionsRename {
     /// New session name: <Project>-Main-<short8> or <Project>-tN-<branch> ('/'
     /// sanitized to '-'; alphanumerics, '-' and '_' only).
     pub name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct SessionRenameResult {
+pub struct SessionsRenameResult {
     /// The session's new name (echoed; the connection re-keys itself on it).
     pub name: String,
     /// Set when a stale (disconnected) holder of this name was displaced.

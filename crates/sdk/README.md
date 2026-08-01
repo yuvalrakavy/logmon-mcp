@@ -225,8 +225,8 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `bookmarks_list` | `BookmarksList` | `BookmarksListResult` |
 | `bookmarks_remove` | `BookmarksRemove` | `BookmarksRemoveResult` |
 | `bookmarks_clear` | `BookmarksClear` | `BookmarksClearResult` |
-| `session_list` | `SessionList` | `SessionListResult` |
-| `session_drop` | `SessionDrop` | `SessionDropResult` |
+| `sessions_list` | `SessionsList` | `SessionsListResult` |
+| `sessions_drop` | `SessionsDrop` | `SessionsDropResult` |
 | `status_get` | `StatusGet` | `StatusGetResult` |
 | `domains_create` | `DomainsCreate` | `DomainsCreateResult` |
 | `domains_delete` | `DomainsDelete` | `DomainsDeleteResult` |

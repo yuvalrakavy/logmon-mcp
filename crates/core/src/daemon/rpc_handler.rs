@@ -9,6 +9,7 @@ use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
 use crate::daemon::session::{SessionId, SessionRegistry};
+use crate::span::types::SlowGroupBy;
 use chrono::Utc;
 use logmon_broker_protocol::*;
 use serde_json::{json, Value};
@@ -184,8 +185,8 @@ impl RpcHandler {
             "triggers.add" => self.handle_triggers_add(session_id, &request.params),
             "triggers.edit" => self.handle_triggers_edit(session_id, &request.params),
             "triggers.remove" => self.handle_triggers_remove(session_id, &request.params),
-            "session.list" => self.handle_session_list(),
-            "session.drop" => self.handle_session_drop(&request.params),
+            "sessions.list" => self.handle_sessions_list(),
+            "sessions.drop" => self.handle_sessions_drop(&request.params),
             // `domains.create` is async (it binds ports) and is dispatched by
             // `handle_async`, never here. An explicit arm gives a clear error if a
             // future caller ever routes a create through the sync path by mistake,
@@ -197,7 +198,7 @@ impl RpcHandler {
             "domains.delete" => self.handle_domains_delete(&request.params),
             "domains.list" => self.handle_domains_list(),
             "domains.use" => self.handle_domains_use(session_id, &request.params),
-            "session.rename" => self.handle_session_rename(session_id, &request.params),
+            "sessions.rename" => self.handle_sessions_rename(session_id, &request.params),
             "domains.clear" => self.handle_domains_clear(session_id),
             "domain_data.update" => self.handle_domain_data_update(session_id, &request.params),
             "domain_data.remove" => self.handle_domain_data_remove(session_id, &request.params),
@@ -448,13 +449,13 @@ impl RpcHandler {
     /// lane invariant ("another conversation is working this lane"); a stale
     /// disconnected holder is displaced (its cross-domain bookmarks cleared).
     /// The connection loop re-keys its local session id off the echoed name.
-    fn handle_session_rename(
+    fn handle_sessions_rename(
         &self,
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let req: SessionRename = serde_json::from_value(params.clone())
-            .map_err(|e| format!("invalid session.rename params: {e}"))?;
+        let req: SessionsRename = serde_json::from_value(params.clone())
+            .map_err(|e| format!("invalid sessions.rename params: {e}"))?;
         let (new_id, displaced) = self
             .sessions
             .rename(session_id, &req.name)
@@ -487,12 +488,12 @@ impl RpcHandler {
         };
         // The renaming session keeps its OWN collectors: their owner moves with
         // it. Without this they are orphaned under a name nothing resolves —
-        // invisible to an owner-scoped list, unreachable by session.drop, and
+        // invisible to an owner-scoped list, unreachable by sessions.drop, and
         // never swept, while still holding their share of the reservation.
         let moved = self.collectors.rename_owner(session_id, &new_id);
         tracing::info!(old = %session_id, new = %new_id, collectors_moved = moved,
             "session renamed");
-        serde_json::to_value(SessionRenameResult {
+        serde_json::to_value(SessionsRenameResult {
             name: req.name,
             displaced_stale_holder,
         })
@@ -1333,10 +1334,20 @@ impl RpcHandler {
         if cursor_commit.is_some() {
             return Err("cursor qualifier not permitted in traces.slow".to_string());
         }
-        // An unrecognised STRING still selects the ungrouped arm — that is the
-        // documented contract (`protocol/src/methods.rs:534`), not an accident,
-        // so only the wrong-TYPE case changes here.
-        let group_by = opt_str(params, "group_by")?;
+        // An unrecognised string used to select the ungrouped arm silently.
+        // That was the documented contract, and it is gone: a typo returning a
+        // different answer than the one asked for is the failure the strict
+        // readers on this surface exist to close, and read-only does not make a
+        // wrong answer safe (#7).
+        let group_by = match opt_str(params, "group_by")? {
+            None => SlowGroupBy::None,
+            Some(s) => SlowGroupBy::parse(s).ok_or_else(|| {
+                format!(
+                    "unknown group_by `{s}`: expected {}",
+                    SlowGroupBy::accepted()
+                )
+            })?,
+        };
 
         match group_by {
             // §1.1: the grouped arm aggregates the FULL matching population.
@@ -1346,7 +1357,7 @@ impl RpcHandler {
             // average for that span name. `min_duration_ms` is now a display
             // floor applied after aggregation, and it selects which names to
             // show rather than which spans to count.
-            Some("name") => {
+            SlowGroupBy::Name => {
                 let groups = d.span_store.duration_by_name(resolved.as_ref());
                 let population: usize = groups.values().map(|v| v.len()).sum();
                 let mut result: Vec<Value> = groups
@@ -1387,7 +1398,7 @@ impl RpcHandler {
                     "display_floor_ms": min_duration,
                 }))
             }
-            _ => {
+            SlowGroupBy::None => {
                 let slow = d
                     .span_store
                     .slow_spans(min_duration, count, resolved.as_ref());
@@ -1454,7 +1465,7 @@ impl RpcHandler {
     // Session methods intentionally span domains — config is global, only data
     // is partitioned (spec §2). They resolve no domain.
 
-    fn handle_session_list(&self) -> Result<Value, String> {
+    fn handle_sessions_list(&self) -> Result<Value, String> {
         let sessions = self.sessions.list();
         let items: Vec<Value> = sessions
             .iter()
@@ -1474,7 +1485,7 @@ impl RpcHandler {
         Ok(json!({ "sessions": items }))
     }
 
-    fn handle_session_drop(&self, params: &Value) -> Result<Value, String> {
+    fn handle_sessions_drop(&self, params: &Value) -> Result<Value, String> {
         let name = req_str(params, "name")?;
         // Collectors first, and unconditionally. They are owned by the session
         // and hold a slice of a daemon-wide reservation that only four
@@ -1613,7 +1624,7 @@ impl RpcHandler {
     /// the whole point of the feature, and a CLI invocation disconnects between
     /// every one of those steps. Named sessions therefore keep their collectors
     /// exactly as they keep their bookmarks; the TTL sweep and an explicit
-    /// `session.drop` are what bound the reservation.
+    /// `sessions.drop` are what bound the reservation.
     pub fn clear_session_collectors(&self, session_id: &SessionId) -> usize {
         self.collectors.drop_session(session_id)
     }
@@ -2049,9 +2060,10 @@ impl RpcHandler {
             None => DiffGroupBy::None,
             Some(s) => DiffGroupBy::parse(s).ok_or_else(|| {
                 format!(
-                    "unknown group_by `{s}` for a diff: expected `name` or `group`. `trace` \
-                     and `path` are projected from per-span records, which a recorded run \
-                     does not retain, so there is nothing to compare"
+                    "unknown group_by `{s}` for a diff: expected {}. `trace` and `path` are \
+                     projected from per-span records, which a recorded run does not retain, \
+                     so there is nothing to compare",
+                    DiffGroupBy::accepted()
                 )
             })?,
         };
@@ -2110,8 +2122,12 @@ impl RpcHandler {
         };
         let group_by = match opt_str(params, "group_by")? {
             None => DiffGroupBy::Name,
-            Some(s) => DiffGroupBy::parse(s)
-                .ok_or_else(|| format!("unknown group_by `{s}`: expected `name` or `group`"))?,
+            Some(s) => DiffGroupBy::parse(s).ok_or_else(|| {
+                format!(
+                    "unknown group_by `{s}`: expected {}",
+                    DiffGroupBy::accepted()
+                )
+            })?,
         };
         // The prose fields are the point of a document. Dropping a wrong-typed
         // `finding` silently would publish a measurement with the conclusion
@@ -2334,7 +2350,7 @@ impl RpcHandler {
         let group_by = match opt_str(params, "group_by")? {
             None => GroupBy::None,
             Some(s) => GroupBy::parse(s).ok_or_else(|| {
-                format!("unknown group_by `{s}`: expected `name`, `group`, `trace` or `path`")
+                format!("unknown group_by `{s}`: expected {}", GroupBy::accepted())
             })?,
         };
         Ok(ProfileOptions {

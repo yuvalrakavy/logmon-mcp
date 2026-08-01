@@ -1660,10 +1660,16 @@
           ]
         },
         "group_by": {
-          "description": "When set to `\"name\"`, results are aggregated into `groups`; otherwise\nindividual spans are returned in `spans`.\n\n**Deliberately not an enum, unlike every other `group_by`.** This one\naccepts any string: anything that is not `\"name\"` selects the ungrouped\narm rather than failing (`rpc_handler.rs:1320`). Declaring `[\"name\"]`\nhere would reject every valid call that means \"do not group\".",
+          "description": "`\"name\"` aggregates results into `groups`; `\"none\"` (or `\"\"`, or\nomitting this) returns individual spans in `spans`.\n\n**This was the one `group_by` that accepted any string**, with anything\nother than `\"name\"` quietly selecting the ungrouped arm — so a typo\nreturned a different answer than the one asked for, silently. The\nargument for that was that a closed set would reject every valid call\nmeaning \"do not group\", which held only while no spelling for it\nexisted. `none` is that spelling, so the set closes (#7).",
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "name",
+            "none",
+            "",
+            null
           ]
         }
       },
@@ -2482,15 +2488,15 @@
         "session"
       ]
     },
-    "SessionList": {
+    "SessionsList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "SessionList",
+      "title": "SessionsList",
       "type": "object",
       "additionalProperties": false
     },
-    "SessionListResult": {
+    "SessionsListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "SessionListResult",
+      "title": "SessionsListResult",
       "type": "object",
       "properties": {
         "sessions": {
@@ -2505,7 +2511,7 @@
       ],
       "$defs": {
         "SessionInfo": {
-          "description": "One entry in a `session.list` or `status.get` response.",
+          "description": "One entry in a `sessions.list` or `status.get` response.",
           "type": "object",
           "properties": {
             "id": {
@@ -2555,9 +2561,9 @@
         }
       }
     },
-    "SessionDrop": {
+    "SessionsDrop": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "SessionDrop",
+      "title": "SessionsDrop",
       "type": "object",
       "properties": {
         "name": {
@@ -2570,9 +2576,9 @@
         "name"
       ]
     },
-    "SessionDropResult": {
+    "SessionsDropResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "SessionDropResult",
+      "title": "SessionsDropResult",
       "type": "object",
       "properties": {
         "dropped": {
@@ -2677,7 +2683,7 @@
       ],
       "$defs": {
         "SessionInfo": {
-          "description": "One entry in a `session.list` or `status.get` response.",
+          "description": "One entry in a `sessions.list` or `status.get` response.",
           "type": "object",
           "properties": {
             "id": {
@@ -3436,10 +3442,10 @@
         "name"
       ]
     },
-    "SessionRename": {
+    "SessionsRename": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "SessionRename",
-      "description": "`session.rename` — re-key the calling session to a meaningful name\n(`<Project>-Main-<short8>` / `<Project>-tN-<branch>`, spec 2026-07-17),\npreserving all state. Errors with \"already connected\" when the target name\nis held by a LIVE session — the one-conversation-per-lane invariant.",
+      "title": "SessionsRename",
+      "description": "`sessions.rename` — re-key the calling session to a meaningful name\n(`<Project>-Main-<short8>` / `<Project>-tN-<branch>`, spec 2026-07-17),\npreserving all state. Errors with \"already connected\" when the target name\nis held by a LIVE session — the one-conversation-per-lane invariant.",
       "type": "object",
       "properties": {
         "name": {
@@ -3452,9 +3458,9 @@
         "name"
       ]
     },
-    "SessionRenameResult": {
+    "SessionsRenameResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "SessionRenameResult",
+      "title": "SessionsRenameResult",
       "type": "object",
       "properties": {
         "name": {
@@ -5529,7 +5535,7 @@
           ]
         },
         "group_by": {
-          "description": "`name`, `group`, `trace`, or `path`. `none` and `\"\"` are also accepted\nand mean the ungrouped overall figures — the same as omitting it\n(`project.rs:74`); the error message names only the four axes.",
+          "description": "`name`, `group`, `trace`, or `path`. `none` and `\"\"` are also accepted\nand mean the ungrouped overall figures — the same as omitting it\n(`project.rs:74`).",
           "type": [
             "string",
             "null"
@@ -9457,7 +9463,7 @@
     "SessionInfo": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "SessionInfo",
-      "description": "One entry in a `session.list` or `status.get` response.",
+      "description": "One entry in a `sessions.list` or `status.get` response.",
       "type": "object",
       "properties": {
         "id": {

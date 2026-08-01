@@ -539,7 +539,7 @@ pub async fn run_with_overrides(
         // Collector files are write-through on `add`, but a named session only
         // reaches `state.json` on graceful shutdown — so after a `kill -9` the
         // collectors come back and their owner does not, leaving them invisible
-        // to an owner-scoped `collectors.list`, unreachable by `session.drop`,
+        // to an owner-scoped `collectors.list`, unreachable by `sessions.drop`,
         // and untouched by the TTL sweep, while still holding their share of a
         // reservation that only four collectors fit inside. Registering the
         // owner as a disconnected named session puts them back inside the
@@ -984,11 +984,11 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     Ok(Some(request)) => {
                         let response = handler.handle_async(&session_id, &request).await;
                         write_message(&mut writer, &response).await?;
-                        // A successful `session.rename` re-keyed the registry
+                        // A successful `sessions.rename` re-keyed the registry
                         // entry; this connection must address the session by
                         // its NEW id from here on (event filtering, domain
                         // lookups, disconnect handling all key off it).
-                        if request.method == "session.rename" {
+                        if request.method == "sessions.rename" {
                             if let Some(new_name) = response
                                 .result
                                 .as_ref()

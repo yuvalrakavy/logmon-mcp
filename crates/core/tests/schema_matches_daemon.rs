@@ -26,6 +26,7 @@ use logmon_broker_core::collector::document::Format;
 use logmon_broker_core::collector::project::GroupBy;
 use logmon_broker_core::collector::sample::Level;
 use logmon_broker_core::collector::threshold::{Metric, Op};
+use logmon_broker_core::span::types::SlowGroupBy;
 
 use logmon_broker_protocol::mcp_tools::SCHEMA_JSON as SCHEMA;
 
@@ -82,36 +83,21 @@ fn agrees(
     );
 }
 
-/// Every `GroupBy` spelling. The match is exhaustive so adding a variant without
-/// declaring it in the schema is a compile error here rather than a silent gap.
+/// Every `GroupBy` spelling, read from the type's own list rather than
+/// transcribed here.
+///
+/// This file used to keep its own copy behind an exhaustive match, which caught
+/// a *new variant* but not a stale *message* — and a stale message is what
+/// actually shipped. `GroupBy::ALL` is now the single enumeration, so this test
+/// and the daemon's rejection text cannot disagree. The tripwire is unchanged
+/// in strength and better placed: adding a variant is still a compile error, at
+/// the exhaustive `as_str` one line below `ALL`.
 fn group_by_canonical() -> Vec<&'static str> {
-    let all = [
-        GroupBy::None,
-        GroupBy::Name,
-        GroupBy::Group,
-        GroupBy::Trace,
-        GroupBy::Path,
-    ];
-    all.iter()
-        .map(|g| match g {
-            GroupBy::None => "none",
-            GroupBy::Name => "name",
-            GroupBy::Group => "group",
-            GroupBy::Trace => "trace",
-            GroupBy::Path => "path",
-        })
-        .collect()
+    GroupBy::ALL.map(GroupBy::as_str).to_vec()
 }
 
 fn diff_group_by_canonical() -> Vec<&'static str> {
-    let all = [DiffGroupBy::None, DiffGroupBy::Name, DiffGroupBy::Group];
-    all.iter()
-        .map(|g| match g {
-            DiffGroupBy::None => "none",
-            DiffGroupBy::Name => "name",
-            DiffGroupBy::Group => "group",
-        })
-        .collect()
+    DiffGroupBy::ALL.map(DiffGroupBy::as_str).to_vec()
 }
 
 #[test]
@@ -197,22 +183,20 @@ fn document_format_agrees_with_the_daemon() {
     );
 }
 
-/// `traces.slow` is the one `group_by` that is NOT a closed set, and the schema
-/// must keep saying so. Anything that is not `"name"` selects the ungrouped arm
-/// instead of failing, so declaring an enum would reject every valid call that
-/// means "do not group".
+/// `traces.slow` was the one `group_by` that was NOT a closed set, and this
+/// test used to pin that open. It is closed now (#7): the argument for leaving
+/// it open was that an enum "would reject every valid call that means do not
+/// group", which held only while `traces.slow` had no spelling for that. It has
+/// one, so the exemption is gone and this field is checked like the rest.
 #[test]
-fn traces_slow_group_by_stays_an_open_set() {
-    let schema: serde_json::Value = serde_json::from_str(SCHEMA).unwrap();
-    let field = &schema["definitions"]["TracesSlow"]["properties"]["group_by"];
-    assert!(
-        field["enum"].is_null(),
-        "traces.slow accepts any string; an enum here would be a false positive: {field}"
-    );
-    assert!(
-        field["description"]
-            .as_str()
-            .is_some_and(|d| d.contains("not an enum")),
-        "and the reason must be stated where a reader will find it: {field}"
+fn traces_slow_group_by_agrees_with_the_daemon() {
+    agrees(
+        "TracesSlow",
+        "group_by",
+        &SlowGroupBy::ALL.map(SlowGroupBy::as_str),
+        |s| SlowGroupBy::parse(s).is_some(),
+        // The exact shape the old leniency swallowed: a transposed `name`,
+        // which used to come back as a full ungrouped result.
+        "nmae",
     );
 }

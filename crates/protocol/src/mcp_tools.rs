@@ -453,13 +453,13 @@ pub const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "get_sessions",
-        method: "session.list",
+        method: "sessions.list",
         description: "List all active sessions connected to the daemon.",
         cli: Cli::PLAIN,
     },
     Tool {
         name: "drop_session",
-        method: "session.drop",
+        method: "sessions.drop",
         description: "Drop (disconnect) a session by name.",
         cli: Cli::PLAIN,
     },
@@ -489,7 +489,7 @@ pub const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "rename_session",
-        method: "session.rename",
+        method: "sessions.rename",
         description: "Rename this logmon session to a meaningful name (convention: <Project>-Main-<short8> for a home/main conversation, <Project>-tN-<branch> after claiming a dev-track lane; sanitize '/' to '-'). Preserves all session state. ERRORS with 'already connected' when the target name is held by a LIVE session — that means another conversation is already working that dev-track: STOP rather than fight over it. A stale (disconnected) holder is displaced automatically.",
         cli: Cli::PLAIN,
     },

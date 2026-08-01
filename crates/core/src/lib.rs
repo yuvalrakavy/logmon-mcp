@@ -4,6 +4,7 @@ pub mod engine;
 pub mod filter;
 pub mod gelf;
 pub mod receiver;
+pub(crate) mod rejection;
 pub mod span;
 pub mod store;
 pub mod daemon {

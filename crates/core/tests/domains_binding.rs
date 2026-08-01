@@ -280,7 +280,7 @@ async fn a_cross_domain_rebind_warns_but_still_binds() {
 // Meaningful session names (spec docs/2026-07-17-meaningful-session-names-spec.md)
 // ---------------------------------------------------------------------------
 
-/// session.rename preserves ALL session state: the domain binding and a live
+/// sessions.rename preserves ALL session state: the domain binding and a live
 /// trigger survive the re-key, and the connection keeps working under the new
 /// identity (the loop re-keys itself off the echoed name).
 #[tokio::test]
@@ -302,7 +302,7 @@ async fn rename_preserves_binding_and_triggers() {
         .unwrap();
 
     let r: Value = client
-        .call("session.rename", json!({ "name": "Store-t3-feat-thing" }))
+        .call("sessions.rename", json!({ "name": "Store-t3-feat-thing" }))
         .await
         .expect("rename");
     assert_eq!(
@@ -324,7 +324,7 @@ async fn rename_preserves_binding_and_triggers() {
 
     // The registry lists the new name, and domains.list attributes the domain
     // to it (derived bound_sessions).
-    let sessions: Value = client.call("session.list", json!({})).await.unwrap();
+    let sessions: Value = client.call("sessions.list", json!({})).await.unwrap();
     let names: Vec<String> = sessions["sessions"]
         .as_array()
         .unwrap()
@@ -363,12 +363,12 @@ async fn rename_to_a_live_holder_errors_and_changes_nothing() {
     let mut challenger = daemon.connect_anon().await;
 
     let _: Value = holder
-        .call("session.rename", json!({ "name": "Store-t1-feat-x" }))
+        .call("sessions.rename", json!({ "name": "Store-t1-feat-x" }))
         .await
         .expect("holder takes the name");
 
     let result = challenger
-        .call::<Value>("session.rename", json!({ "name": "Store-t1-feat-x" }))
+        .call::<Value>("sessions.rename", json!({ "name": "Store-t1-feat-x" }))
         .await;
     let err = format!(
         "{:?}",
@@ -381,7 +381,7 @@ async fn rename_to_a_live_holder_errors_and_changes_nothing() {
 
     // The challenger still works under its old identity (a follow-up call
     // succeeds and the registry still shows exactly one session by that name).
-    let sessions: Value = challenger.call("session.list", json!({})).await.unwrap();
+    let sessions: Value = challenger.call("sessions.list", json!({})).await.unwrap();
     let named: Vec<&str> = sessions["sessions"]
         .as_array()
         .unwrap()
@@ -405,7 +405,7 @@ async fn rename_displaces_a_disconnected_holder() {
     {
         let mut doomed = daemon.connect_anon().await;
         let _: Value = doomed
-            .call("session.rename", json!({ "name": "Store-t2-feat-old" }))
+            .call("sessions.rename", json!({ "name": "Store-t2-feat-old" }))
             .await
             .unwrap();
         doomed.close().await.expect("close");
@@ -414,7 +414,7 @@ async fn rename_displaces_a_disconnected_holder() {
     let mut claimer = daemon.connect_anon().await;
     let mut disconnected = false;
     for _ in 0..40 {
-        let sessions: Value = claimer.call("session.list", json!({})).await.unwrap();
+        let sessions: Value = claimer.call("sessions.list", json!({})).await.unwrap();
         disconnected = sessions["sessions"]
             .as_array()
             .unwrap()
@@ -428,7 +428,7 @@ async fn rename_displaces_a_disconnected_holder() {
     assert!(disconnected, "the dropped holder must read disconnected");
 
     let r: Value = claimer
-        .call("session.rename", json!({ "name": "Store-t2-feat-old" }))
+        .call("sessions.rename", json!({ "name": "Store-t2-feat-old" }))
         .await
         .expect("a stale holder must be displaced, not block");
     assert_eq!(
@@ -438,7 +438,7 @@ async fn rename_displaces_a_disconnected_holder() {
     );
 
     // Exactly one session by that name, and it is connected (the claimer).
-    let sessions: Value = claimer.call("session.list", json!({})).await.unwrap();
+    let sessions: Value = claimer.call("sessions.list", json!({})).await.unwrap();
     let holders: Vec<&Value> = sessions["sessions"]
         .as_array()
         .unwrap()
@@ -457,7 +457,7 @@ async fn rename_rejects_invalid_names() {
     let mut client = daemon.connect_anon().await;
     for bad in ["Store-t1-feat/thing", "", "has space"] {
         let result = client
-            .call::<Value>("session.rename", json!({ "name": bad }))
+            .call::<Value>("sessions.rename", json!({ "name": bad }))
             .await;
         assert!(result.is_err(), "{bad:?} must be rejected");
     }

@@ -59,6 +59,21 @@ pub enum GroupBy {
 }
 
 impl GroupBy {
+    /// Every axis, in the order a caller-facing list should name them.
+    ///
+    /// The single enumeration in the codebase: the rejection message, the
+    /// schema agreement test, and anything else that has to say what is
+    /// accepted all read it, so none of them can drift from another. A new
+    /// variant cannot be added without editing the exhaustive match one line
+    /// below, which is where a reader meets this.
+    pub const ALL: [GroupBy; 5] = [
+        GroupBy::None,
+        GroupBy::Name,
+        GroupBy::Group,
+        GroupBy::Trace,
+        GroupBy::Path,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             GroupBy::None => "none",
@@ -67,6 +82,15 @@ impl GroupBy {
             GroupBy::Trace => "trace",
             GroupBy::Path => "path",
         }
+    }
+
+    /// What a rejection should say it expected.
+    ///
+    /// Derived rather than written out, because it was written out once and
+    /// omitted `none` — leaving the only spelling for "the overall figures"
+    /// undiscoverable from the very error that was refusing you.
+    pub fn accepted() -> String {
+        crate::rejection::one_of(&Self::ALL.map(Self::as_str))
     }
 
     pub fn parse(s: &str) -> Option<Self> {

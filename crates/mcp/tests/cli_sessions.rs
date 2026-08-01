@@ -7,7 +7,7 @@ async fn sessions_list_includes_cli_session() {
     let (_daemon, cli) = spawn_with_cli().await;
     let output = tokio::task::spawn_blocking(move || {
         cli.cmd()
-            .args(["session", "list", "--json"])
+            .args(["sessions", "list", "--json"])
             .output()
             .unwrap()
     })

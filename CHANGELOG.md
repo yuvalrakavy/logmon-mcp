@@ -18,11 +18,11 @@ The 45 `#[rmcp::tool]` attributes, the 37 parameter structs and the ten
 hand-written CLI command groups are gone.
 
 CLI commands are now **derived from RPC method names**, which renames a few
-things and surfaced one long-standing inconsistency:
+things. It also surfaced a long-standing naming inconsistency, fixed in its own
+entry below rather than absorbed here:
 
 | was | is |
 |---|---|
-| `sessions list` / `sessions drop` | `session list` / `session drop` (the method is `session.*`, singular) |
 | `collectors profile` | `traces profile` (the method is `traces.profile`) |
 | `--group-key a --group-key b` | `--group-keys a --group-keys b` |
 | `--threshold-metric` / `-op` / `-value` / `-window-ms` | `--threshold.metric` / `.op` / `.value` / `.window-ms` |
@@ -38,6 +38,32 @@ forcing 0/0/0 and `false`.
 Output is JSON unless the broker supplies a rendered form. The CLI's
 hand-written renderers went with the command groups; presentation now belongs
 to the broker.
+
+### Changed — `session.*` is now `sessions.*` (wire change)
+
+The one singular method group among ten plural ones, inconsistent since the
+methods were introduced together in March. It stayed invisible while the CLI
+carried a hand-written `sessions` alias; derivation removed the alias and put
+the asymmetry on the surface.
+
+`session.list` / `session.drop` / `session.rename` become `sessions.list` /
+`sessions.drop` / `sessions.rename`, and the protocol types follow
+(`SessionList` -> `SessionsList`, and so on) because the schema definition name
+is derived from the method. The SDK wrappers rename with them:
+`Broker::session_list` -> `Broker::sessions_list`.
+
+**The CLI is unaffected — that is the point.** `sessions list` and
+`sessions drop` are what they were before derivation; renaming the method is
+what keeps them that way. Fixing this after release would have meant renaming
+a command twice.
+
+**MCP tool names do not change.** `get_sessions`, `drop_session` and
+`rename_session` are independent of the method they call, and were already
+plural. Agents see nothing.
+
+Direct RPC and SDK callers must move. There is no alias: a shim and a broker
+are installed as a pair, and an alias kept for a transition nobody is running
+is a second name to support forever.
 
 ### Added
 
@@ -135,6 +161,43 @@ to the broker.
   worth its own change, but half a surface carrying a meaningful code is worse
   than a whole one carrying none — a client would start branching on a code that
   is only sometimes true.
+
+- **A rejected `group_by` now names every value it accepts.** It named four of
+  the five, and the one it left out was `none` — the only spelling for "the
+  overall, ungrouped figures". A caller who trusted the error could not reach
+  the ungrouped read from the very message refusing them, on `collectors.get`,
+  `traces.profile`, `collectors.diff` and `collectors.document` alike.
+
+  The schema was right the whole time, which is why nothing contradicted the
+  text and it survived to be found by hand: `protocol-v1.schema.json` declares
+  the full set and the agreement test checks it in both directions. The
+  sentence a human reads was the last hand-written copy, so it is now derived
+  from `GroupBy::ALL` / `DiffGroupBy::ALL` — which that test reads too. One
+  enumeration, three consumers, nothing left to drift.
+
+  Aliases stay out on purpose: `""` is `none` sent by a client with an empty
+  field, not a distinct option. The same rule leaves `>` out of the
+  threshold-op message and `markdown` out of the format one — both already
+  name every canonical value, and both are unchanged.
+
+- **`traces.slow` no longer swallows a `group_by` typo.** It accepted *any*
+  string, and anything that was not `"name"` selected the ungrouped arm. So
+  `--group-by nmae` returned a full, plausible, ungrouped result to a caller
+  who had asked for grouping — no error, no warning, and nothing in the
+  response to say the parameter had not been understood.
+
+  It was the only `group_by` on the surface that behaved this way, and the
+  leniency was deliberate: the stated reason was that a closed set *"would
+  reject every valid call that means do not group"*. That held only while
+  `traces.slow` had no spelling for "do not group". It has one now — `none`,
+  the same as every other `group_by` — so the set closes without rejecting
+  anything valid. Omitting the parameter, `none` and `""` all still mean
+  ungrouped.
+
+  This is a behaviour change for a caller currently sending an unrecognised
+  string to mean "ungrouped": that call now fails, naming what it accepts. Read-
+  only does not make a wrong answer safe, and a typo that silently changes the
+  question is the failure the strict readers on this surface exist to close.
 
 ## 0.9.0 — 2026-07-31
 

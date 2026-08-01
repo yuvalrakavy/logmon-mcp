@@ -20,8 +20,8 @@ use logmon_broker_protocol::{
     DomainsDeleteResult, DomainsList, DomainsListResult, DomainsUse, DomainsUseResult, FiltersAdd,
     FiltersAddResult, FiltersEdit, FiltersEditResult, FiltersList, FiltersListResult,
     FiltersRemove, FiltersRemoveResult, LogsClear, LogsClearResult, LogsContext, LogsContextResult,
-    LogsExport, LogsExportResult, LogsRecent, LogsRecentResult, ProfileResult, SessionDrop,
-    SessionDropResult, SessionList, SessionListResult, SnapshotSummary, SpansContext,
+    LogsExport, LogsExportResult, LogsRecent, LogsRecentResult, ProfileResult, SessionsDrop,
+    SessionsDropResult, SessionsList, SessionsListResult, SnapshotSummary, SpansContext,
     SpansContextResult, StatusGet, StatusGetResult, TracesGet, TracesGetResult, TracesLogs,
     TracesLogsResult, TracesProfile, TracesRecent, TracesRecentResult, TracesSlow,
     TracesSlowResult, TracesSummary, TracesSummaryResult, TriggersAdd, TriggersAddResult,
@@ -193,11 +193,11 @@ impl Broker {
     }
 
     // ---- session.* / status.* ----
-    pub async fn session_list(&self, p: SessionList) -> Result<SessionListResult, BrokerError> {
-        self.call_typed("session.list", p).await
+    pub async fn sessions_list(&self, p: SessionsList) -> Result<SessionsListResult, BrokerError> {
+        self.call_typed("sessions.list", p).await
     }
-    pub async fn session_drop(&self, p: SessionDrop) -> Result<SessionDropResult, BrokerError> {
-        self.call_typed("session.drop", p).await
+    pub async fn sessions_drop(&self, p: SessionsDrop) -> Result<SessionsDropResult, BrokerError> {
+        self.call_typed("sessions.drop", p).await
     }
     pub async fn status_get(&self, p: StatusGet) -> Result<StatusGetResult, BrokerError> {
         self.call_typed("status.get", p).await

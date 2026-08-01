@@ -734,7 +734,7 @@ fn a_present_but_wrong_typed_required_parameter_is_not_reported_as_missing() {
         ("traces.get", "trace_id", json!(7)),
         ("traces.summary", "trace_id", json!(7)),
         ("traces.logs", "trace_id", json!(7)),
-        ("session.drop", "name", json!(7)),
+        ("sessions.drop", "name", json!(7)),
         ("bookmarks.add", "name", json!(7)),
         ("bookmarks.remove", "name", json!(7)),
         ("collectors.add", "name", json!(7)),
