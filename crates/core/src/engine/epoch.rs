@@ -230,6 +230,12 @@ impl EpochLog {
         coverage
     }
 
+    /// The seq this incarnation started from — the lowest seq this log can say
+    /// anything about at all.
+    pub fn origin_seq(&self) -> u64 {
+        self.origin_seq
+    }
+
     /// The epochs currently retained, oldest first. Test/diagnostic surface.
     pub fn epochs(&self) -> Vec<Epoch> {
         self.epochs

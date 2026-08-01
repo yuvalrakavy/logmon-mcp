@@ -112,6 +112,15 @@ impl LogPipeline {
         &self.epochs
     }
 
+    /// The lowest seq the log store can still speak for; `0` when nothing has
+    /// ever left it. Not [`Self::oldest_log_seq`] — see
+    /// [`InMemoryStore::lost_below`].
+    ///
+    /// [`InMemoryStore::lost_below`]: crate::store::memory::InMemoryStore::lost_below
+    pub fn lost_below(&self) -> u64 {
+        self.store.lost_below()
+    }
+
     pub fn assign_seq(&self) -> u64 {
         self.seq_counter.next()
     }

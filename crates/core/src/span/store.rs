@@ -14,6 +14,15 @@ pub struct SpanStoreStats {
 pub struct SpanStore {
     inner: RwLock<SpanStoreInner>,
     seq_counter: Arc<SeqCounter>,
+    /// The lowest seq this ring can still speak for: spans below it were held
+    /// and are gone. `0` means nothing has ever left.
+    ///
+    /// **Not `oldest_seq()`.** One `SeqCounter` feeds this ring and the log
+    /// store, so an unfilled span ring's oldest seq is simply the first span it
+    /// ever received — every seq below it belonged to a log, or to nothing.
+    /// Reading that as an eviction boundary claims spans were lost on every
+    /// domain that logged before it traced.
+    lost_below: std::sync::atomic::AtomicU64,
 }
 
 struct SpanStoreInner {
@@ -33,7 +42,13 @@ impl SpanStore {
                 capacity,
             }),
             seq_counter,
+            lost_below: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The lowest seq this ring can still speak for — see [`Self::lost_below`].
+    pub fn lost_below(&self) -> u64 {
+        self.lost_below.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn insert(&self, mut span: SpanEntry) -> u64 {
@@ -49,6 +64,12 @@ impl SpanStore {
 
         if inner.buffer.len() >= inner.capacity {
             if let Some(evicted) = inner.buffer.pop_front() {
+                // The one place a span actually leaves, recorded under the same
+                // write guard that removes it.
+                self.lost_below.store(
+                    evicted.seq.saturating_add(1),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if let Some(seqs) = inner.trace_index.get_mut(&evicted.trace_id) {
                     seqs.retain(|&s| s != evicted.seq);
                     if seqs.is_empty() {
@@ -251,6 +272,13 @@ impl SpanStore {
     pub fn clear(&self) -> usize {
         let mut inner = self.inner.write().unwrap();
         let n = inner.buffer.len();
+        // A clear loses spans exactly as an eviction does.
+        if let Some(newest) = inner.buffer.back().map(|s| s.seq) {
+            self.lost_below.store(
+                newest.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         inner.buffer.clear();
         inner.trace_index.clear();
         n

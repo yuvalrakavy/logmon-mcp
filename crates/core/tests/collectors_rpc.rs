@@ -43,6 +43,13 @@ fn make_domain(name: &str) -> Arc<Domain> {
 /// A domain whose seq counter starts at `initial_seq` — how a restored domain
 /// comes back, resuming the counter the previous daemon run reached.
 fn make_domain_at(name: &str, initial_seq: u64) -> Arc<Domain> {
+    make_domain_sized(name, initial_seq, 1000)
+}
+
+/// A domain whose span ring holds `span_capacity` spans — small enough that a
+/// test can actually overflow it, which is the only way to produce a real
+/// eviction.
+fn make_domain_sized(name: &str, initial_seq: u64, span_capacity: usize) -> Arc<Domain> {
     let seq = Arc::new(SeqCounter::new_with_initial(initial_seq));
     Arc::new(Domain::from_parts(
         DomainConfig {
@@ -51,11 +58,11 @@ fn make_domain_at(name: &str, initial_seq: u64) -> Arc<Domain> {
             otlp_grpc_port: 0,
             otlp_http_port: 0,
             log_buffer_size: 1000,
-            span_buffer_size: 1000,
+            span_buffer_size: span_capacity,
             source: DomainSource::Config,
         },
         Arc::new(LogPipeline::new_with_seq_counter(1000, seq.clone())),
-        Arc::new(SpanStore::new(1000, seq)),
+        Arc::new(SpanStore::new(span_capacity, seq)),
         Arc::new(BookmarkStore::new()),
         Arc::new(ReceiverMetrics::new()),
     ))
@@ -3504,38 +3511,53 @@ fn spans_export_reports_capping_with_the_true_total() {
 #[test]
 fn spans_export_reports_the_span_rings_own_retention() {
     let h = harness();
-    // A domain whose counter resumed at 500, so there ARE seqs below the ring
-    // to ask about. With a fresh counter the oldest span is seq 1 and no window
-    // can start below it — which is why the earlier version of this test only
-    // appeared to pass, on `evicted_before_window`'s off-by-one.
-    h.domains.insert(make_domain_at("default", 500));
+    // A ring small enough to actually overflow. An earlier version used a
+    // counter resumed at 500 against a ring holding 4 of 1000 — so "below the
+    // oldest retained span" meant seqs belonging to a previous incarnation, not
+    // spans this ring ever dropped. It asserted eviction where there had been
+    // none, and only the old premise (oldest-retained AS the boundary) made it
+    // pass.
+    h.domains.insert(make_domain_sized("default", 0, 8));
     let sid = h.sessions.create_named("A").unwrap();
     let d = h.domains.get(&DomainId::default_domain()).unwrap();
+
+    // Under capacity: nothing has left, so no window is missing anything —
+    // however far back it asks.
     for i in 1..=4 {
         d.span_store.insert(span("svc", "op", i as f64 * 10.0));
     }
+    let young = h
+        .call(&sid, "spans.export", json!({ "from_seq": 1 }))
+        .unwrap();
+    assert_eq!(
+        young["truncated"], false,
+        "a ring that has never filled has evicted nothing: {young}"
+    );
 
+    // Now overflow it: spans 1..=4 are genuinely gone.
+    for i in 5..=12 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
     let all = h.call(&sid, "spans.export", json!({})).unwrap();
     let oldest = all["buffer_oldest_seq"]
         .as_u64()
         .expect("a non-empty span ring has an oldest seq");
-    assert_eq!(oldest, 501, "the counter resumed: {all}");
+    assert_eq!(oldest, 5, "eight of twelve survive: {all}");
     assert!(all["buffer_newest_seq"].as_u64().is_some(), "{all}");
 
-    // A window starting below what the ring still holds is not complete.
     let below = h
-        .call(&sid, "spans.export", json!({ "from_seq": 400 }))
+        .call(&sid, "spans.export", json!({ "from_seq": 1 }))
         .unwrap();
     assert_eq!(
         below["truncated"], true,
-        "a window starting below the span ring is not complete: {below}"
+        "a window reaching into what the ring dropped is not complete: {below}"
     );
     assert_eq!(
-        below["evicted_before_window"], 101,
-        "and the gap is named, not merely flagged — seqs 400..=500: {below}"
+        below["evicted_before_window"], 4,
+        "and the gap is named, not merely flagged — spans 1..=4: {below}"
     );
 
-    // Starting EXACTLY at the oldest retained span is not eviction. Nothing is
+    // Starting EXACTLY at the oldest surviving span is not eviction. Nothing is
     // missing, and reporting one here would make `complete` unreachable for any
     // window anchored at the start of the ring.
     let at_the_edge = h

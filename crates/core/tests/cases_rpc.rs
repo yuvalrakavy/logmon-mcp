@@ -31,6 +31,19 @@ struct Harness {
 }
 
 fn make_domain(name: &str) -> Arc<Domain> {
+    make_domain_with(name, 1000)
+}
+
+fn make_domain_with(name: &str, log_capacity: usize) -> Arc<Domain> {
+    make_domain_sized(name, log_capacity, 1000)
+}
+
+/// A domain whose span ring is small enough for a test to overflow.
+fn make_domain_spans(name: &str, span_capacity: usize) -> Arc<Domain> {
+    make_domain_sized(name, 1000, span_capacity)
+}
+
+fn make_domain_sized(name: &str, log_capacity: usize, span_capacity: usize) -> Arc<Domain> {
     let seq = Arc::new(SeqCounter::new());
     Arc::new(Domain::from_parts(
         DomainConfig {
@@ -38,22 +51,47 @@ fn make_domain(name: &str) -> Arc<Domain> {
             gelf_port: 0,
             otlp_grpc_port: 0,
             otlp_http_port: 0,
-            log_buffer_size: 1000,
-            span_buffer_size: 1000,
+            log_buffer_size: log_capacity,
+            span_buffer_size: span_capacity,
             source: DomainSource::Config,
         },
-        Arc::new(LogPipeline::new_with_seq_counter(1000, seq.clone())),
-        Arc::new(SpanStore::new(1000, seq)),
+        Arc::new(LogPipeline::new_with_seq_counter(log_capacity, seq.clone())),
+        Arc::new(SpanStore::new(span_capacity, seq)),
         Arc::new(BookmarkStore::new()),
         Arc::new(ReceiverMetrics::new()),
     ))
 }
 
+/// A span the store will stamp with the next shared seq.
+fn a_span() -> logmon_broker_core::span::types::SpanEntry {
+    use logmon_broker_core::span::types::{SpanEntry, SpanKind, SpanStatus};
+    let base = chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000);
+    SpanEntry {
+        seq: 0, // assigned by the store from the shared counter
+        trace_id: 7,
+        span_id: 1,
+        parent_span_id: None,
+        start_time: base,
+        end_time: base + chrono::Duration::milliseconds(10),
+        duration_ms: 10.0,
+        name: "op".into(),
+        kind: SpanKind::Internal,
+        service_name: "svc".into(),
+        status: SpanStatus::Ok,
+        attributes: Default::default(),
+        events: Vec::new(),
+    }
+}
+
 fn harness() -> Harness {
+    harness_with_log_capacity(1000)
+}
+
+fn harness_with_log_capacity(log_capacity: usize) -> Harness {
     let config = tempfile::tempdir().expect("tempdir");
     let archive = tempfile::tempdir().expect("tempdir");
     let domains = Arc::new(DomainRegistry::new());
-    domains.insert(make_domain("default"));
+    domains.insert(make_domain_with("default", log_capacity));
     let sessions = Arc::new(SessionRegistry::new());
     let session = sessions.create_named("capturer").expect("valid name");
     let collectors = Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new());
@@ -514,6 +552,376 @@ fn a_second_capture_in_the_same_second_does_not_overwrite_the_first() {
         6,
         "three files each, none clobbered"
     );
+}
+
+/// The gate found `EvidenceVerdict::Evicted` structurally unreachable here: the
+/// window's lower end comes from `context_by_seq`, which only returns STORED
+/// entries, so it could never sit below the oldest one. A capture that asked for
+/// 100 records of context and got 29 reported `complete`.
+#[test]
+fn a_window_the_ring_has_eaten_reports_evicted_not_complete() {
+    let h = harness_with_log_capacity(30);
+    for i in 1..=200 {
+        h.feed(Level::Info, &format!("entry {i}"));
+    }
+    let anchor = h.feed(Level::Info, "anchor");
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 100, "after": 5 }))
+        .unwrap();
+
+    assert_eq!(
+        r["verdict"], "evicted",
+        "100 records of context were asked for and the ring had already dropped most of \
+         them: {r}"
+    );
+    let doc = document_of(&r);
+    assert!(doc.contains("**narrower than requested**"), "{doc}");
+    assert!(doc.contains("**gone** rather than absent"), "{doc}");
+    assert!(
+        doc.contains("Raise the domain's `log_buffer_size`"),
+        "{doc}"
+    );
+    assert!(
+        r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["kind"] == "capture_gap"),
+        "{r}"
+    );
+}
+
+/// The mirror, and the reason `lost_below` exists rather than `oldest_seq`: a
+/// young domain has not lost anything, however far its first record sits above
+/// seq 1. One counter feeds both stores, so the seqs below a span ring's oldest
+/// entry belonged to logs — reporting them as evicted spans is a claim about
+/// records that never existed.
+#[test]
+fn a_young_domain_is_not_reported_as_having_lost_anything() {
+    let h = harness();
+    // Spans first, so the span ring's oldest seq is well above 1 with nothing
+    // ever evicted.
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=5 {
+        h.feed(Level::Info, &format!("log {i}"));
+    }
+    let anchor = h.feed(Level::Error, "boom");
+    d.span_store.insert(a_span());
+
+    let r = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
+    assert_eq!(r["verdict"], "complete", "{r}");
+
+    let doc = document_of(&r);
+    assert!(
+        !doc.contains("are gone"),
+        "nothing was ever dropped, so nothing may be reported gone:\n{doc}"
+    );
+    assert!(doc.contains("dropped nothing below seq"), "{doc}");
+}
+
+/// Bookmarks are session-scoped, and `b>=name` resolves them that way. A bare
+/// name that scanned across sessions would silently anchor the document on
+/// another session's stale mark — and since the anchor's message becomes the
+/// headline, that is a wrong document rather than a wrong parameter.
+#[test]
+fn a_bookmark_anchor_does_not_reach_another_sessions_mark() {
+    let h = harness();
+    h.feed(Level::Info, "first");
+    // Another session's `boom`, at a much later position.
+    let other = h.sessions.create_named("cli").unwrap();
+    let req = RpcRequest::new(1, "bookmarks.add", json!({ "name": "boom" }));
+    h.handler.handle(&other, &req);
+    h.feed(Level::Info, "second");
+
+    let err = h
+        .capture(json!({ "anchor": { "bookmark": "boom" } }))
+        .expect_err("this session has no bookmark by that name");
+    assert!(err.contains("capturer/boom"), "{err}");
+    assert!(
+        err.contains("session-scoped"),
+        "and it says how to reach another session's: {err}"
+    );
+
+    // Explicitly qualified, it resolves — to the first entry after `cli`'s
+    // mark, which was placed when only "first" had arrived.
+    let r = h
+        .capture(json!({ "anchor": { "bookmark": "cli/boom" } }))
+        .unwrap();
+    assert!(document_of(&r).contains("# second"), "{r}");
+}
+
+/// An empty optional array is not an error, and losing the evidence over one
+/// would be absurd.
+#[test]
+fn an_empty_data_list_does_not_abort_the_capture() {
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "data": [] }))
+        .unwrap();
+    assert_eq!(r["data_outcomes"].as_array().unwrap().len(), 0, "{r}");
+    assert!(std::path::Path::new(r["paths"][0].as_str().unwrap()).exists());
+}
+
+/// `data` is a durable side effect on a shared store. A capture that fails must
+/// not leave it applied with no document written and the caller never told.
+#[test]
+fn a_failed_capture_does_not_commit_data_to_the_registry() {
+    let h = harness();
+    h.feed(Level::Info, "something");
+
+    let err = h
+        .capture(json!({
+            "anchor": { "seq": 99_999 },
+            "data": [{ "path": "/Action", "value": "reproducing the hang" }],
+        }))
+        .expect_err("the anchor does not resolve");
+    assert!(err.contains("99999"), "{err}");
+
+    let got = h.call("domain_data.get", json!({})).unwrap();
+    let paths: Vec<&str> = got["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        !paths.contains(&"/Action"),
+        "the registry must be untouched by a capture that never happened: {got}"
+    );
+    assert_eq!(
+        std::fs::read_dir(h.archive.path()).unwrap().count(),
+        0,
+        "and no stem is burned"
+    );
+}
+
+/// §5.4's selection, which had no test at all: returning an empty list, or
+/// dropping the domain filter so collectors from *every* domain appear, both
+/// passed the whole suite.
+#[test]
+fn collector_state_is_selected_by_domain_across_owners() {
+    let h = harness();
+    h.domains.insert(make_domain("other"));
+    let anchor = h.feed(Level::Error, "boom");
+
+    // Armed by a DIFFERENT session than the one capturing — the CLI and the
+    // shim are different sessions on one domain, which is why the selection is
+    // across owners.
+    let cli = h.sessions.create_named("cli").unwrap();
+    let req = RpcRequest::new(
+        1,
+        "collectors.add",
+        json!({ "name": "checkout", "filter": "sv=svc" }),
+    );
+    assert!(h.handler.handle(&cli, &req).error.is_none());
+
+    // And one pinned to another domain, which must NOT appear.
+    let elsewhere = h.sessions.create_named("elsewhere").unwrap();
+    h.handler.handle(
+        &elsewhere,
+        &RpcRequest::new(1, "domains.use", json!({ "name": "other" })),
+    );
+    let req = RpcRequest::new(
+        1,
+        "collectors.add",
+        json!({ "name": "faraway", "filter": "sv=svc" }),
+    );
+    assert!(h.handler.handle(&elsewhere, &req).error.is_none());
+
+    let doc = document_of(&h.capture(json!({ "anchor": { "seq": anchor } })).unwrap());
+    assert!(doc.contains("| `checkout` | `cli` |"), "{doc}");
+    assert!(
+        !doc.contains("faraway"),
+        "a collector pinned to another domain is not this domain's state: {doc}"
+    );
+    assert!(
+        !doc.contains("No collectors were armed"),
+        "the empty branch must not be the one every test takes: {doc}"
+    );
+}
+
+/// A recorded run's label and age reach the document — `snapshot_count` alone
+/// cannot say whether the measurement predates the build being investigated.
+#[test]
+fn a_collectors_latest_run_reaches_the_document() {
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    h.call(
+        "collectors.add",
+        json!({ "name": "checkout", "filter": "sv=svc" }),
+    )
+    .unwrap();
+    h.call(
+        "collectors.snapshot",
+        json!({ "name": "checkout", "label": "before" }),
+    )
+    .unwrap();
+
+    let doc = document_of(&h.capture(json!({ "anchor": { "seq": anchor } })).unwrap());
+    assert!(doc.contains("`before`,"), "the run's label: {doc}");
+    assert!(doc.contains("ago |"), "and its age: {doc}");
+}
+
+/// Every earlier test asserted `spandata.records == 0`, so deleting the span
+/// gather entirely passed the suite — while the test comment claimed the two
+/// files "describe one interval by construction".
+#[test]
+fn spans_over_the_resolved_range_land_in_the_spandata_file() {
+    let h = harness();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    h.feed(Level::Info, "before");
+    d.span_store.insert(a_span());
+    d.span_store.insert(a_span());
+    let anchor = h.feed(Level::Error, "boom");
+    // Outside the resolved LOG range: no log follows it, so the window's upper
+    // end is the anchor's seq. Spans are scoped by the log range rather than by
+    // a second window parameter, which is what makes the two files describe one
+    // interval — and this span is the proof, by being excluded.
+    d.span_store.insert(a_span());
+
+    let r = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
+    assert_eq!(
+        r["spandata"]["records"], 2,
+        "the two spans inside the resolved log range, not the one beyond it: {r}"
+    );
+
+    let text = std::fs::read_to_string(r["paths"][2].as_str().unwrap()).unwrap();
+    assert_eq!(
+        text.lines().count() as u64 - 1,
+        2,
+        "and they are on disk, not merely counted"
+    );
+    assert!(text.contains(r#""service_name":"svc""#), "{text}");
+    assert!(document_of(&r).contains("Slowest spans"), "and summarised");
+}
+
+/// The span ring's own retention reaches the document, and the note.
+#[test]
+fn a_span_ring_that_dropped_spans_says_so_in_the_document() {
+    let h = harness();
+    h.domains.insert(make_domain_spans("default", 4));
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    h.feed(Level::Info, "first");
+    for _ in 0..10 {
+        d.span_store.insert(a_span());
+    }
+    let anchor = h.feed(Level::Error, "boom");
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 50 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("**had** evicted below seq"),
+        "the span ring's own loss, separate from the log verdict: {doc}"
+    );
+    assert!(
+        doc.contains("The log verdict above does not cover this"),
+        "{doc}"
+    );
+    assert!(
+        r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["detail"].as_str().unwrap().contains("span ring")),
+        "{r}"
+    );
+}
+
+/// The document shows the anchor and ten neighbours; the logdata holds the rest.
+///
+/// The earlier version of this used a 6-record window against a 10-record
+/// neighbourhood, so "show ten either side" and "show everything" were the same
+/// hypothesis on that input — both `NEIGHBOUR_WINDOW = 0` and "return the whole
+/// window" passed it.
+#[test]
+fn the_document_shows_the_neighbourhood_and_the_logdata_holds_the_window() {
+    let h = harness();
+    for i in 1..=80 {
+        h.feed(Level::Info, &format!("entry {i}"));
+    }
+    let anchor = h.feed(Level::Info, "anchor");
+    for i in 1..=80 {
+        h.feed(Level::Info, &format!("after {i}"));
+    }
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 60, "after": 60 }))
+        .unwrap();
+    assert_eq!(r["logdata"]["records"], 121, "the full window: {r}");
+
+    let doc = document_of(&r);
+    let fenced = doc
+        .split("```")
+        .nth(1)
+        .expect("the neighbours block is fenced");
+    assert_eq!(
+        fenced
+            .lines()
+            .filter(|l| l.contains("  entry ") || l.contains("  after ") || l.contains("  anchor"))
+            .count(),
+        21,
+        "ten either side of the anchor, not the whole window and not only the anchor:\n{fenced}"
+    );
+}
+
+/// The 5000 ceiling is the only thing between a typo and a multi-megabyte RPC,
+/// and it had no test — removing the clamp entirely passed the suite.
+#[test]
+fn an_over_wide_request_is_clamped_and_said_to_be() {
+    let h = harness();
+    for i in 1..=20 {
+        h.feed(Level::Info, &format!("entry {i}"));
+    }
+    let anchor = h.feed(Level::Info, "anchor");
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 999_999 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(doc.contains("clamped: true"), "{doc}");
+    assert!(doc.contains("clamped to the maximum"), "{doc}");
+    assert!(
+        r["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["kind"] == "truncated"),
+        "{r}"
+    );
+    // And it must not contradict the verdict — the defect this replaces put
+    // "nothing was capped" and "the read was capped" in one document.
+    assert_eq!(r["verdict"], "complete", "{r}");
+    assert!(!doc.contains("nothing was capped"), "{doc}");
+}
+
+/// `/logmon/*` is the daemon's own bookkeeping and stays out of the rendered
+/// registry copy — `incarnation` is already in front matter, and listing
+/// `/logmon/first_seen` beside `/Build/commit` presents the two as one kind of
+/// claim.
+#[test]
+fn the_reserved_namespace_stays_out_of_the_registry_copy() {
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    h.call(
+        "domain_data.update",
+        json!({ "entries": [{ "path": "/Build/commit", "value": "9f2a1c4" }] }),
+    )
+    .unwrap();
+
+    let r = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
+    let doc = document_of(&r);
+    let provenance = doc.split("## 5. Provenance").nth(1).unwrap();
+    assert!(provenance.contains("/Build/commit"), "{provenance}");
+    assert!(
+        !provenance.contains("/logmon/"),
+        "the daemon's own bookkeeping is not the capturer's provenance: {provenance}"
+    );
+    // But the incarnation IS carried, once, where a tool can read it.
+    assert!(doc.contains("incarnation: \"1\""), "{doc}");
 }
 
 /// §5.3: the prefix falls back parameter → `/case-name` → domain name.

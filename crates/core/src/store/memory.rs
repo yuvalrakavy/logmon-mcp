@@ -27,6 +27,17 @@ pub struct InMemoryStore {
     total_stored: AtomicU64,
     total_received: AtomicU64,
     malformed_count: AtomicU64,
+    /// The lowest seq this store can still speak for: records below it were
+    /// held and are now gone. `0` means nothing has ever left.
+    ///
+    /// **This is not `oldest_seq()`, and confusing the two is a wrong answer,
+    /// not a rounding error.** A ring that has never filled has an oldest seq
+    /// equal to the first record it ever received — and since one `SeqCounter`
+    /// feeds both this store and the span store, the seqs below that belonged
+    /// to spans, or to nothing at all. Reading `oldest_seq` as an eviction
+    /// boundary reports loss on any domain that logged before it traced, which
+    /// is the ordinary shape rather than an edge case.
+    lost_below: AtomicU64,
 }
 
 impl InMemoryStore {
@@ -44,7 +55,15 @@ impl InMemoryStore {
             total_stored: AtomicU64::new(0),
             total_received: AtomicU64::new(0),
             malformed_count: AtomicU64::new(0),
+            lost_below: AtomicU64::new(0),
         }
+    }
+
+    /// The lowest seq this store can still speak for — see [`Self::lost_below`].
+    /// `0` when nothing has ever been dropped, which is the only value that
+    /// licenses a completeness claim down to the start of the axis.
+    pub fn lost_below(&self) -> u64 {
+        self.lost_below.load(Ordering::Relaxed)
     }
 
     pub fn increment_malformed(&self) {
@@ -121,6 +140,11 @@ impl LogStore for InMemoryStore {
         if inner.entries.len() >= self.max_capacity {
             if let Some(evicted) = inner.entries.pop_front() {
                 inner.seq_set.remove(&evicted.seq);
+                // The one place a record actually leaves. Recorded under the
+                // same write guard that removes it, so the boundary and the
+                // removal cannot be observed out of step.
+                self.lost_below
+                    .store(evicted.seq.saturating_add(1), Ordering::Relaxed);
                 if let Some(evicted_trace) = evicted.trace_id {
                     if let Some(seqs) = inner.trace_index.get_mut(&evicted_trace) {
                         seqs.retain(|&s| s != evicted.seq);
@@ -209,6 +233,12 @@ impl LogStore for InMemoryStore {
 
     fn clear(&self) {
         let mut inner = self.inner.write().unwrap();
+        // A clear loses records exactly as an eviction does, and a capture taken
+        // afterwards must not read the emptied range as never-having-existed.
+        if let Some(newest) = inner.entries.back().map(|e| e.seq) {
+            self.lost_below
+                .store(newest.saturating_add(1), Ordering::Relaxed);
+        }
         inner.entries.clear();
         inner.seq_set.clear();
         inner.trace_index.clear();

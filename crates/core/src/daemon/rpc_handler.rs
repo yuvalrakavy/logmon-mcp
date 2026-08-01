@@ -634,7 +634,12 @@ impl RpcHandler {
         session_id: &SessionId,
         raw: Option<&Value>,
     ) -> Result<(Vec<DomainDataOutcome>, Option<String>, ScopedData), String> {
-        if raw.is_none() {
+        // Absent and empty are the same request here, and neither is an error:
+        // a capture that records nothing new is ordinary, and losing the
+        // evidence over an empty optional array would be absurd. `entries` on
+        // `domain_data.update` still rejects empty, because there the list IS
+        // the request.
+        if raw.is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())) {
             return Ok((Vec::new(), None, ScopedData::default()));
         }
         let (_, reg) = self.resolve_domain_data(session_id)?;
@@ -903,7 +908,7 @@ impl RpcHandler {
 
         let evicted_before_window = resolved
             .as_ref()
-            .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.buffer_oldest_seq));
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, d.pipeline.lost_below()));
 
         let mut result = json!({
             "logs": entries,
@@ -970,28 +975,30 @@ impl RpcHandler {
 
         let evicted_before_window = resolved
             .as_ref()
-            .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.buffer_oldest_seq));
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, d.pipeline.lost_below()));
 
         // How much of this window the daemon can vouch for (§4.2).
         //
         // The window is the caller's range where it gave one. Where it did not,
-        // the upper end is the newest seq ASSIGNED, not the newest stored: a
-        // filter that dropped everything since seq N leaves `buffer_newest_seq`
-        // below N, and taking that as the window would put the filtered tail
-        // outside it and report the remainder `complete` — the reader's "I have
-        // everything" is exactly what would be wrong.
+        // **neither end comes from the store's extent** — that was the original
+        // mistake and it has two halves, one at each end. A filter that dropped
+        // everything since seq N leaves `buffer_newest_seq` below N; a filter
+        // that dropped everything before seq M leaves `buffer_oldest_seq` above
+        // M. Taking either as the window puts the filtered stretch OUTSIDE it
+        // and reports the remainder `complete`, which is the reader's "I have
+        // everything" being exactly what is wrong.
         //
-        // An empty store gets no window at all, and so no claim. It satisfies
-        // every clause of `complete` vacuously — nothing evicted, nothing
-        // capped, nothing narrowed — which is why §4.2 makes emptiness a
-        // verdict of its own rather than a remark under the table.
+        // So an unbounded export describes the whole axis this incarnation is
+        // responsible for: from where the epoch log opens, to the newest seq
+        // ASSIGNED — read after the query, so the window is guaranteed to
+        // contain every seq the query could have returned.
+        //
+        // An empty store still gets no window and so no claim: it satisfies
+        // every clause of `complete` vacuously, which is why §4.2 makes
+        // emptiness a verdict of its own rather than a remark under the table.
         let (lo, hi) = crate::filter::parser::resolved_seq_range(resolved.as_ref());
-        let window = stats.buffer_oldest_seq.and_then(|oldest| {
-            let from = lo.unwrap_or(oldest);
-            // Read AFTER the query, so the window is guaranteed to contain every
-            // seq the query could have returned. Reading it first would leave an
-            // entry that arrived mid-query outside the window the verdict is
-            // about.
+        let window = stats.buffer_oldest_seq.and_then(|_| {
+            let from = lo.unwrap_or_else(|| d.pipeline.epochs().origin_seq().saturating_add(1));
             let to = hi.unwrap_or_else(|| d.pipeline.current_seq());
             (from <= to).then_some((from, to))
         });
@@ -1648,13 +1655,7 @@ impl RpcHandler {
         let after = window_count(params, "after")?;
         let clamped = before.clamped || after.clamped;
 
-        // Registry writes happen BEFORE the copy is rendered, so a key the
-        // capturer supplies appears in *this* document rather than landing one
-        // document late.
-        let (data_outcomes, data_persist_error, scoped) =
-            self.apply_case_data_entries(session_id, params.get("data"))?;
-
-        let anchor = self.resolve_case_anchor(&d, params.get("anchor"))?;
+        let anchor = self.resolve_case_anchor(&d, session_id, params.get("anchor"))?;
 
         // §5.1: counts of stored RECORDS, not seq distances — one counter feeds
         // both stores, so a 200-seq range holds an unpredictable number of logs.
@@ -1673,14 +1674,44 @@ impl RpcHandler {
             }
         };
 
-        // The verdict over the window actually captured. `capped` is false here
-        // by construction: `context_by_seq` returns a contiguous run, so nothing
-        // inside [from, to] was cut. What `before`/`after` limited is the
-        // window's WIDTH, which the front-matter reports separately.
+        // How much of what was ASKED for came back.
+        //
+        // `context_by_seq` returns a contiguous run of stored entries, so the
+        // window `[from, to]` is never internally cut — but it can be narrower
+        // at either end than the caller requested, and the two reasons for that
+        // are not the same fact. The ring having dropped records is a LOSS; the
+        // domain simply not having that much history yet is not. Only
+        // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
+        // would call the second one eviction on every young domain.
+        let at_anchor = logs
+            .iter()
+            .position(|e| e.seq == anchor.seq)
+            .unwrap_or(logs.len());
+        let short_before = before.value.saturating_sub(at_anchor);
+        let short_after = after
+            .value
+            .saturating_sub(logs.len().saturating_sub(at_anchor + 1));
+        // The window was cut at the bottom AND records really have left: the
+        // shortfall is eviction rather than an empty past.
+        //
+        // The gap is the SHORTFALL, not `lost_below - from`. Those two are equal
+        // by construction here — `from` is the first surviving seq and so is
+        // `lost_below` — which is exactly why measuring from the window's own
+        // lower end could never fire, and why `Evicted` was unreachable from a
+        // capture until this was written the other way round.
+        let log_evicted =
+            (short_before > 0 && d.pipeline.lost_below() > 0).then_some(short_before as u64);
+
         let coverage = d.pipeline.epochs().coverage(from, to);
-        let log_evicted = crate::filter::parser::evicted_below(from, d.pipeline.oldest_log_seq());
-        let verdict =
-            crate::engine::epoch::evidence_verdict(Some(&coverage), log_evicted.is_some(), false);
+        let verdict = crate::engine::epoch::evidence_verdict(
+            Some(&coverage),
+            log_evicted.is_some(),
+            // Nothing inside `[from, to]` was cut, so the window is not capped
+            // in the sense the verdict means. A clamped `before`/`after` made
+            // the window NARROWER, which is a different fact and is reported as
+            // one — see `Window::clamped`.
+            false,
+        );
 
         // Spans over the SAME resolved range, so the two files describe one
         // interval by construction rather than by two window parameters that
@@ -1690,19 +1721,37 @@ impl RpcHandler {
         d.span_store.for_each_matching(span_filter.as_ref(), |s| {
             spans.push(s.clone());
         });
-        let span_evicted = crate::filter::parser::evicted_below(from, d.span_store.oldest_seq());
+        let span_evicted = crate::filter::parser::evicted_below(from, d.span_store.lost_below());
 
         let domain_name = d.config.name.to_string();
-        let (registry, incarnation, case_name) = self.case_registry_copy(session_id, captured_at);
         let collectors = self.case_collector_lines(&d.config.name);
 
+        // Claim the files BEFORE touching the registry. `data` is a durable
+        // side effect on a shared, long-lived store, and everything above it
+        // here can fail — an unresolvable anchor used to leave `/Action` set on
+        // the domain with no document written and the caller never told.
+        let prefix_param = opt_str(params, "prefix")?.map(str::to_string);
+        let case_name_now = self.case_name_for(session_id);
         let prefix = crate::cases::resolve_prefix(
-            opt_str(params, "prefix")?,
-            case_name.as_deref(),
+            prefix_param.as_deref(),
+            case_name_now.as_deref(),
             &domain_name,
         );
         let files = crate::cases::claim(dir, &prefix, captured_at).map_err(|e| e.to_string())?;
         let names = crate::cases::file_names(&files.stem);
+
+        // Registry writes still happen BEFORE the copy is rendered, so a key the
+        // capturer supplies appears in *this* document rather than landing one
+        // document late.
+        let (data_outcomes, data_persist_error, scoped) =
+            match self.apply_case_data_entries(session_id, params.get("data")) {
+                Ok(v) => v,
+                Err(e) => {
+                    discard_claim(&files.paths);
+                    return Err(e);
+                }
+            };
+        let (registry, incarnation) = self.case_registry_copy(session_id, captured_at);
 
         let anchor_seq = anchor.seq;
         let input = doc::CaseInput {
@@ -1725,7 +1774,9 @@ impl RpcHandler {
                         filters: n.filters.clone(),
                     })
                     .collect(),
-                capped: clamped,
+                clamped,
+                short_before,
+                short_after,
                 evicted_before_window: log_evicted,
                 spans_evicted_before_window: span_evicted,
             },
@@ -1745,18 +1796,30 @@ impl RpcHandler {
         };
 
         // Bulk first: if a logdata write fails the document must not point at a
-        // file that is not there.
-        let logdata =
-            crate::cases::write_jsonl(files.logdata, &files.paths[1], "logdata", logs.iter())
-                .map_err(|e| e.to_string())?;
-        let spandata =
-            crate::cases::write_jsonl(files.spandata, &files.paths[2], "spandata", spans.iter())
-                .map_err(|e| e.to_string())?;
-
-        let rendered = doc::render(&input);
-        let document_bytes =
-            crate::cases::write_document(files.document, &files.paths[0], &rendered.body)
-                .map_err(|e| e.to_string())?;
+        // file that is not there. A failure anywhere in here takes the whole
+        // claim down with it — an archive nothing ever deletes from must not
+        // accumulate empty `.md` files under stems no retry can reuse.
+        let write = (|| {
+            let logdata =
+                crate::cases::write_jsonl(files.logdata, &files.paths[1], "logdata", logs.iter())?;
+            let spandata = crate::cases::write_jsonl(
+                files.spandata,
+                &files.paths[2],
+                "spandata",
+                spans.iter(),
+            )?;
+            let rendered = doc::render(&input);
+            let document_bytes =
+                crate::cases::write_document(files.document, &files.paths[0], &rendered.body)?;
+            Ok::<_, crate::cases::CaseWriteError>((logdata, spandata, rendered, document_bytes))
+        })();
+        let (logdata, spandata, rendered, document_bytes) = match write {
+            Ok(v) => v,
+            Err(e) => {
+                discard_claim(&files.paths);
+                return Err(e.to_string());
+            }
+        };
 
         let mut notes: Vec<CaseNote> = rendered
             .notes
@@ -1770,8 +1833,8 @@ impl RpcHandler {
             notes.push(CaseNote {
                 kind: doc::NOTE_TRUNCATED.to_string(),
                 detail: format!(
-                    "before/after were clamped to {}; the window is narrower than requested",
-                    MAX_CASE_WINDOW
+                    "`before`/`after` were clamped to {MAX_CASE_WINDOW}, the maximum; a larger \
+                     value would not widen the window"
                 ),
             });
         }
@@ -1816,6 +1879,7 @@ impl RpcHandler {
     fn resolve_case_anchor(
         &self,
         d: &std::sync::Arc<crate::daemon::domain::Domain>,
+        session_id: &SessionId,
         raw: Option<&Value>,
     ) -> Result<crate::cases::document::Anchor, String> {
         use crate::cases::document::Anchor;
@@ -1847,12 +1911,20 @@ impl RpcHandler {
             })?;
             ("seq", s.to_string(), e, None)
         } else if let Some(name) = bookmark {
-            let qualified = crate::store::bookmarks::qualify(name, "");
-            let b = d
-                .bookmarks
-                .get(&qualified)
-                .or_else(|| d.bookmarks.list().into_iter().find(|b| b.name == name))
-                .ok_or_else(|| format!("no bookmark named `{name}` on this domain"))?;
+            // Qualified against the CALLING session, exactly as `b>=name`
+            // resolves it. A bare-name scan across sessions would silently
+            // anchor on some other session's stale mark of the same name — and
+            // since the anchor's message becomes the headline, that is a wrong
+            // document rather than a wrong parameter. An explicit
+            // `other-session/name` still works, because `qualify` passes a name
+            // that already carries a session through unchanged.
+            let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
+            let b = d.bookmarks.get(&qualified).ok_or_else(|| {
+                format!(
+                    "no bookmark `{qualified}` on this domain. Bookmarks are session-scoped: use \
+                     `<session>/{name}` to anchor on another session's mark."
+                )
+            })?;
             // A bookmark marks a BOUNDARY, not a record: `b>=name` selects
             // `seq > bookmark.seq`, strictly. So the anchor is the first stored
             // entry after the mark — the same entry `b>=name` would hand back
@@ -1903,23 +1975,27 @@ impl RpcHandler {
     /// listing `/logmon/first_seen` beside `/Build/commit` would present the two
     /// as the same kind of claim. A broker with no config dir returns an empty
     /// copy, which the document then states rather than omits.
+    /// This domain's `/case-name`, if it has one — the middle level of §5.3's
+    /// prefix fallback. Read before `data` is applied, since the stem has to be
+    /// claimed before anything durable happens.
+    fn case_name_for(&self, session_id: &SessionId) -> Option<String> {
+        let (_, reg) = self.resolve_domain_data(session_id).ok()?;
+        reg.read(|r| {
+            r.get(crate::domain_data::CASE_NAME_KEY)
+                .map(|e| e.value.clone())
+        })
+    }
+
     fn case_registry_copy(
         &self,
         session_id: &SessionId,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> (
-        Vec<crate::cases::document::RegistryFact>,
-        Option<String>,
-        Option<String>,
-    ) {
+    ) -> (Vec<crate::cases::document::RegistryFact>, Option<String>) {
         let Ok((_, reg)) = self.resolve_domain_data(session_id) else {
-            return (Vec::new(), None, None);
+            return (Vec::new(), None);
         };
         reg.read(|r| {
             let incarnation = r.get("/logmon/incarnation").map(|e| e.value.clone());
-            let case_name = r
-                .get(crate::domain_data::CASE_NAME_KEY)
-                .map(|e| e.value.clone());
             let facts = r
                 .entries()
                 .iter()
@@ -1933,7 +2009,7 @@ impl RpcHandler {
                     expired: e.is_expired(now),
                 })
                 .collect();
-            (facts, incarnation, case_name)
+            (facts, incarnation)
         })
     }
 
@@ -2007,9 +2083,9 @@ impl RpcHandler {
         });
 
         let oldest = d.span_store.oldest_seq();
-        let evicted_before_window = resolved
-            .as_ref()
-            .and_then(|f| crate::filter::parser::evicted_before_window(f, oldest));
+        let evicted_before_window = resolved.as_ref().and_then(|f| {
+            crate::filter::parser::evicted_before_window(f, d.span_store.lost_below())
+        });
 
         Ok(json!({
             "spans": spans,
@@ -2195,9 +2271,8 @@ impl RpcHandler {
     }
 
     fn sweep_bookmarks(&self, d: &Domain) {
-        let oldest_log = d.pipeline.oldest_log_seq();
-        let oldest_span = d.span_store.oldest_seq();
-        d.bookmarks.sweep(oldest_log, oldest_span);
+        d.bookmarks
+            .sweep(d.pipeline.lost_below(), d.span_store.lost_below());
     }
 
     // -----------------------------------------------------------------------
@@ -3544,6 +3619,18 @@ fn window_count(params: &Value, key: &str) -> Result<WindowCount, String> {
         value: requested.min(MAX_CASE_WINDOW),
         clamped: requested > MAX_CASE_WINDOW,
     })
+}
+
+/// Give back a claimed stem when the capture cannot be completed.
+///
+/// Every path here was created moments earlier by this call's own
+/// `create_new`, so ownership is not in question — and the alternative is an
+/// archive that never deletes accumulating empty `.md` files under stems no
+/// retry can take.
+fn discard_claim(paths: &[std::path::PathBuf]) {
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// The anchor and its ten neighbours either side, out of the full window.

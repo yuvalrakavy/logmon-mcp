@@ -13,6 +13,7 @@ It's a single binary you start once. Your apps emit GELF or OTLP. Your assistant
 - **Multi-session by design.** Several Claude Code / Cursor / Windsurf sessions can attach to the same broker simultaneously. Each session has its own triggers and filters; the buffer is shared.
 - **Survives reconnects.** Named sessions persist filters, triggers, and bookmarks across daemon restarts. Disconnected sessions queue notifications.
 - **Backpressure-aware.** UDP gets an 8 MB receive buffer; OTLP returns 429 / UNAVAILABLE at ~80% channel fill; per-source drop counts surface in `status.get`. A misbehaving producer can't take the broker down.
+- **Says what it could not record.** Storage is conditional — a filter held by any session narrows what is kept — so every range read carries a verdict telling absence of *cause* from absence of *recording*. `create_case` freezes a window to disk with that verdict at the top of the document, before anything it qualifies.
 - **Same surface from MCP, CLI, and Rust.** The `logmon-mcp` binary doubles as a shell-friendly CLI (`logmon-mcp logs recent --json`). The `logmon-broker-sdk` crate gives Rust consumers a typed client. Other languages can codegen from `crates/protocol/protocol-v1.schema.json`.
 
 ## Architecture
@@ -272,7 +273,10 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 |---|---|
 | `get_recent_logs` | Fetch recent logs, optionally filtered or scoped to a `trace_id`. |
 | `get_log_context` | Get logs surrounding a specific entry by `seq`. |
-| `export_logs` | Save logs to a file (json or text). |
+| `export_logs` | Save logs to a file (json or text). `from_seq`/`to_seq` bound an **inclusive** window and compose with a bookmark bound. Every reply carries a **`verdict`** — `complete` / `filtered` / `evicted` / `cannot_verify` — saying how much of that window the daemon can vouch for, with `narrowed_by` naming any session filter that was narrowing what got stored, and over which seqs. See [Evidence verdicts](#evidence-verdicts). |
+| `export_spans` | The same inclusive seq range over the span ring, for pairing spans with the logs of one window. Reports its **own** retention: the two stores share a seq axis but evict independently, so a complete log window says nothing about whether its spans survived. |
+| `create_case` | Capture a window as three files on disk — a markdown document you read to decide whether this is your bug, and two JSONL evidence files you consult once you have decided it is. `dir` is required and must be **absolute**; the anchor is tagged (`{seq}` / `{bookmark}` / `{trace_id}`) rather than sniffed, and an unresolvable one is an error rather than a document with no headline. `data` is `update_domain_data` in the same call; a key with a leading `@` is asserted about **this capture alone** and never enters the domain registry. |
+| `update_domain_data` / `get_domain_data` / `remove_domain_data` | A per-domain key/value registry recording what was true of the project while the logs were produced — the commit, the build profile, the scenario. Two timestamps per key, never one: set six days ago and never revisited is a guess, the same value confirmed five minutes ago is evidence. Staleness is reported as **age**, never as a verdict. |
 | `clear_logs` | Clear the shared log buffer. |
 | `get_recent_traces` | List recent traces with timing and error info. |
 | `get_trace` | Full span tree for a trace; `include_logs` (default `true`) interleaves linked logs. |
@@ -388,6 +392,45 @@ Bookmarks are global, qualified by the creating session (`session/name`). A bare
 Bookmarks auto-evict when both the log and span buffers have rolled past their `seq`.
 
 `b>=`, `b<=`, and `c>=` are query-only — they're rejected by `add_filter` and `add_trigger`.
+
+## Evidence verdicts
+
+Storage is **conditional**. When any session bound to a domain holds a filter, only
+matching entries are kept — so *"nothing appeared before the error"* is ambiguous between
+**absence of cause** and **absence of recording**, and only the first is a conclusion.
+
+Nothing a reader can see in the returned entries resolves that. `LogEntry.source` explains
+why a **kept** entry was kept; no stored entry can testify about an absent one. Nor can
+reading the live filter set at query time: filters are time-extended and that read is a
+point. An anonymous session is removed on disconnect and takes its filters with it, so a
+query minutes after the run sees nothing and would assert that nothing was narrowing a
+window that recorded a tenth of it.
+
+So the daemon keeps a **per-domain epoch log** — the first seq decided under each storage
+policy, plus that policy — and `export_logs` reports against it:
+
+| `verdict` | Means |
+|---|---|
+| `complete` | the window lay wholly inside one unfiltered epoch, nothing was evicted from it, and nothing was capped |
+| `filtered` | a session filter was narrowing the store over part of it; **`narrowed_by`** names which filters, over which seqs |
+| `evicted` | the ring dropped part of the window; `evicted_before_window` bounds how much |
+| `cannot_verify` | no claim is possible — the store is empty, the window predates this daemon run, or the read was capped short of what matched |
+
+Three properties worth knowing:
+
+- **`cannot_verify` is the default when the field is absent**, so a reply from a broker too
+  old to send it never reads as a clean bill of health.
+- **The epoch records filter *strings*, not a boolean.** `edit_filter` replaces a condition
+  in place and never moves a boolean, so a flag-only marker would report the new filter
+  string over the old range — wrong information rather than missing information.
+- **A disconnected named session's filters still narrow the store**, until the TTL sweep
+  retires it. The verdict reflects that, which is precisely the case you cannot see by
+  asking what filters *you* hold.
+
+A daemon restart forces `cannot_verify` for a window carried over from the previous run:
+the epoch log opens at the seq this incarnation started from, so a restored domain cannot
+speak for its predecessor's seqs. Nothing detects the restart — the property falls out of
+the log being per-process.
 
 ## Triggers
 

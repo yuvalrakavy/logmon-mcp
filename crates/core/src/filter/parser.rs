@@ -799,29 +799,33 @@ pub fn resolved_seq_range(filter: Option<&ParsedFilter>) -> (Option<u64>, Option
 /// Records lost off the front of an **inclusive** window starting at `from`:
 /// `oldest - from` when the ring no longer reaches back that far, else `None`.
 ///
-/// Takes the **inclusive** bound, so a window starting exactly at the oldest
-/// retained record reports nothing missing — which it is.
-pub fn evicted_below(from: u64, buffer_oldest_seq: Option<u64>) -> Option<u64> {
-    match buffer_oldest_seq {
-        Some(oldest) if oldest > from => Some(oldest - from),
-        _ => None,
-    }
+/// Records lost off the front of an **inclusive** window starting at `from`.
+///
+/// `lost_below` is the store's own [`lost_below`] — the lowest seq it can still
+/// speak for, `0` when nothing has ever left it. **Deliberately not the oldest
+/// *retained* seq**: one `SeqCounter` feeds both the log and span stores, so a
+/// ring that has never filled has an oldest seq equal to the first record it
+/// ever received, and every seq beneath it belonged to the other store or to
+/// nothing. Measuring from there reports loss on any domain that logged before
+/// it traced — a claim that something is gone, about records that never existed.
+///
+/// [`lost_below`]: crate::store::memory::InMemoryStore::lost_below
+pub fn evicted_below(from: u64, lost_below: u64) -> Option<u64> {
+    (lost_below > from).then(|| lost_below - from)
 }
 
-/// B5: `Some(gap)` when the query's window starts before the retained buffer
-/// (records were evicted from it), else `None`. `gap` is the number of seqs
-/// between the window's first admitted record and the oldest retained one — an
-/// upper bound on missed records, since logs and spans share the seq axis.
+/// B5: `Some(gap)` when records the query's window asked for have actually left
+/// the store, else `None`. `gap` is an upper bound on how many.
 ///
 /// **The bound is converted before it is compared.** `resolved_lower_bound`
 /// returns the *strict* `Gt` value, so the window actually begins at `lb + 1`;
 /// comparing `lb` itself reported eviction whenever the window started exactly
-/// at `buffer_oldest_seq`, and overstated the gap by one everywhere it fired.
-/// One implementation, in [`evicted_below`], so the case-document path and this
-/// one cannot drift.
-pub fn evicted_before_window(filter: &ParsedFilter, buffer_oldest_seq: Option<u64>) -> Option<u64> {
+/// at the boundary, and overstated the gap by one everywhere it fired. One
+/// implementation, in [`evicted_below`], so the case-document path and this one
+/// cannot drift.
+pub fn evicted_before_window(filter: &ParsedFilter, lost_below: u64) -> Option<u64> {
     let lb = resolved_lower_bound(filter)?;
-    evicted_below(lb.saturating_add(1), buffer_oldest_seq)
+    evicted_below(lb.saturating_add(1), lost_below)
 }
 
 #[cfg(test)]
@@ -981,18 +985,18 @@ mod truncation_tests {
         // 6, 7, 8 and 9 rolled off. FOUR, not five: the bound is strict, and
         // counting from `lb` itself instead of from the first seq the window
         // admits is where the old off-by-one lived.
-        assert_eq!(evicted_before_window(&gt(5), Some(10)), Some(4));
+        assert_eq!(evicted_before_window(&gt(5), 10), Some(4));
     }
 
     #[test]
     fn none_when_window_within_buffer() {
-        assert_eq!(evicted_before_window(&gt(10), Some(5)), None);
-        assert_eq!(evicted_before_window(&gt(10), Some(10)), None); // equal → not truncated
-                                                                    // The boundary the old form got wrong: `Gt(9)` starts the window at
-                                                                    // seq 10, which is exactly the oldest retained record. Nothing is
-                                                                    // missing, and reporting `truncated` here made `complete` unreachable
-                                                                    // for any window anchored at the start of the buffer.
-        assert_eq!(evicted_before_window(&gt(9), Some(10)), None);
+        assert_eq!(evicted_before_window(&gt(10), 5), None);
+        assert_eq!(evicted_before_window(&gt(10), 10), None); // equal → not truncated
+                                                              // The boundary the old form got wrong: `Gt(9)` starts the window at
+                                                              // seq 10, which is exactly the oldest retained record. Nothing is
+                                                              // missing, and reporting `truncated` here made `complete` unreachable
+                                                              // for any window anchored at the start of the buffer.
+        assert_eq!(evicted_before_window(&gt(9), 10), None);
     }
 
     #[test]
@@ -1000,31 +1004,28 @@ mod truncation_tests {
         // `evicted_before_window` is `evicted_below` with the strict bound
         // converted, so the case-document path and the export path cannot
         // disagree about what "evicted" means.
-        assert_eq!(evicted_below(10, Some(10)), None);
-        assert_eq!(evicted_below(6, Some(10)), Some(4));
-        assert_eq!(evicted_below(6, None), None);
-        assert_eq!(
-            evicted_before_window(&gt(5), Some(10)),
-            evicted_below(6, Some(10))
-        );
+        assert_eq!(evicted_below(10, 10), None);
+        assert_eq!(evicted_below(6, 10), Some(4));
+        assert_eq!(evicted_below(6, 0), None);
+        assert_eq!(evicted_before_window(&gt(5), 10), evicted_below(6, 10));
     }
 
     #[test]
     fn none_on_empty_buffer() {
-        assert_eq!(evicted_before_window(&gt(5), None), None);
+        assert_eq!(evicted_before_window(&gt(5), 0), None);
     }
 
     #[test]
     fn none_without_a_lower_bound() {
         let bare =
             ParsedFilter::Qualifiers(vec![Qualifier::BarePattern(Pattern::Substring("x".into()))]);
-        assert_eq!(evicted_before_window(&bare, Some(100)), None);
+        assert_eq!(evicted_before_window(&bare, 100), None);
         // b<= (upper bound → SeqOp::Lt) is NOT a lower bound
         let lt = ParsedFilter::Qualifiers(vec![Qualifier::SeqFilter {
             op: SeqOp::Lt,
             value: 5,
         }]);
-        assert_eq!(evicted_before_window(&lt, Some(100)), None);
+        assert_eq!(evicted_before_window(&lt, 100), None);
     }
 
     #[test]
@@ -1042,7 +1043,7 @@ mod truncation_tests {
                 value: 300,
             },
         ]);
-        assert_eq!(evicted_before_window(&old_then_new, Some(100)), None);
+        assert_eq!(evicted_before_window(&old_then_new, 100), None);
         // And order-independent (AND is commutative; the field must be too).
         let new_then_old = ParsedFilter::Qualifiers(vec![
             Qualifier::SeqFilter {
@@ -1054,7 +1055,7 @@ mod truncation_tests {
                 value: 10,
             },
         ]);
-        assert_eq!(evicted_before_window(&new_then_old, Some(100)), None);
+        assert_eq!(evicted_before_window(&new_then_old, 100), None);
         // When the MAX bound is genuinely evicted, report the gap against IT.
         let both_evicted = ParsedFilter::Qualifiers(vec![
             Qualifier::SeqFilter {
@@ -1066,6 +1067,6 @@ mod truncation_tests {
                 value: 50,
             },
         ]);
-        assert_eq!(evicted_before_window(&both_evicted, Some(100)), Some(49));
+        assert_eq!(evicted_before_window(&both_evicted, 100), Some(49));
     }
 }

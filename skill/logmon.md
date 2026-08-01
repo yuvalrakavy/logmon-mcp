@@ -49,6 +49,8 @@ Skip it (and say so) when:
 | Get notified when X happens later | `add_trigger(filter=…, pre_window=…, post_window=…)` |
 | Record what this run was built from | `update_domain_data([{path:"/Build/commit", value:…}, …])` |
 | Check whether the provenance has gone stale | `get_domain_data(validated_before_secs=…)` |
+| Preserve an incident before the buffer rolls | `create_case(reason=…, anchor={seq:N}, dir=…)` |
+| Know whether a window is missing anything | any `export_logs` reply — read `verdict` |
 | See the daemon's health | `get_status` |
 
 ## Quick commands (Claude Code slash-command UX)
@@ -95,8 +97,29 @@ Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_book
 
 - **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=50`.
 - **`get_log_context(seq, before?, after?)`** — logs around a specific entry. Use this when you have a `seq` from another query.
-- **`export_logs(path, count?, filter?, format?)`** — write matching logs to a file (`json` or `text`).
+- **`export_logs(path, count?, filter?, from_seq?, to_seq?, format?)`** — write matching logs to a file (`json` or `text`). `from_seq`/`to_seq` are **inclusive** and compose with a bookmark bound. The reply carries a **`verdict`** — see below.
+- **`export_spans(from_seq?, to_seq?, count?, filter?)`** — the same inclusive range over the span ring, for pairing spans with the logs of one window. Its retention is reported separately: the two stores share a seq axis but evict independently.
 - **`clear_logs()`** — clear the in-memory buffer. **Shared across all sessions.** Prefer bookmarks for "see only what happens next" — see below.
+
+#### `verdict` — how much of a window logmon can vouch for
+
+Storage is **conditional**: when any session bound to a domain holds a filter, only
+matching entries are kept. So *"nothing appeared before the error"* is ambiguous between
+**absence of cause** and **absence of recording**, and only the first is a conclusion.
+`export_logs` answers that directly:
+
+| `verdict` | Means |
+|---|---|
+| `complete` | the window lay wholly inside one unfiltered epoch, nothing was evicted, nothing was capped |
+| `filtered` | a session filter was narrowing the store over part of it — `narrowed_by` names **which filters, over which seqs** |
+| `evicted` | the ring dropped part of the window; `evicted_before_window` bounds how much |
+| `cannot_verify` | no claim is possible: the store is empty, the window predates this daemon run, or the read was capped |
+
+**`cannot_verify` is the default when the field is absent**, so a reply from an older
+broker never reads as a clean bill of health. And note the filter that narrowed your
+window may belong to **another session, possibly a disconnected one** — its filters go on
+shaping storage until the TTL sweep retires it. That is precisely the case you cannot see
+by asking what filters *you* hold.
 
 ### Filters (per-session, shape what gets stored)
 
@@ -365,7 +388,8 @@ every other project on this machine.
 
 One per entry, in the order you sent them. `created` is news. `updated` means the value
 changed — worth noticing if you did not expect it to. `validated` is confirmation.
-`rejected` carries a `reason`. `unknown` means a key-only entry found nothing, with a
+`scoped` means the key carried an `@` and went to a case document instead of the registry
+(see below). `rejected` carries a `reason`. `unknown` means a key-only entry found nothing, with a
 `cause`: `never_set` (the registry is there, that key is not) or `undetermined` (no
 registry at all, and nothing establishes why — which may mean it was lost). If you see
 `undetermined` where you expected a populated registry, check `/logmon/first_seen` and
@@ -379,6 +403,61 @@ Optional, per key, as `30s` / `5m` / `2h` / `7d` / `4w`. `ttl: false` clears one
 Set it where you know the answer rots on a clock: `/Action` in minutes, `/Versions/*` in
 days. **Leave it off and the reader gets an age and no verdict** — which is correct and
 deliberate: without a stated lifetime, logmon will not tell anyone a value is current.
+
+### Case documents (`create_case`)
+
+Everything in the buffer is **in memory and rolling**. The moment you decide something is
+worth understanding later, capture it — a restart, a `clear_logs` by another session, or
+simply enough traffic, and the evidence is gone with no error anywhere.
+
+```
+create_case(
+  reason:  "checkout hangs at 20/20, reproducibly",   # required
+  anchor:  {seq: 41022},                              # or {bookmark: …} / {trace_id: …}
+  dir:     "/abs/path/to/docs/cases",                 # required, ABSOLUTE
+  prefix:  "checkout-hang",                           # optional
+  before:  350, after: 350,                           # stored RECORDS either side
+  data:    [{path: "/Env/host", value: "ci-7"},       # → the registry
+            {path: "@/Data/seed", value: "8814"}],    # → this document only
+)
+```
+
+**Three files, sharing one stem:**
+
+```
+checkout-hang-260731-021530.md               ← read this to triage
+checkout-hang-260731-021530.logdata.jsonl    ← the log records
+checkout-hang-260731-021530.spandata.jsonl   ← the spans
+```
+
+The document is what you read to decide **whether this is your bug**; the logdata is the
+evidence you consult once you have decided it is. The document leads with what could
+**not** be captured — the `verdict`, the span line, which core provenance keys are missing
+— before anything it qualifies.
+
+**The things that bite:**
+
+- **`dir` must be absolute.** The broker is a service; a relative path would resolve
+  against *its* working directory, so it is rejected rather than resolved.
+- **The anchor is tagged.** `{seq}` / `{bookmark}` / `{trace_id}`, exactly one. Not one
+  string logmon guesses at — a bookmark named `12345` and a seq are indistinguishable, and
+  since the anchor's message becomes the headline, a wrong anchor is a wrong document.
+  A `trace_id` matching several entries anchors on the earliest and says so.
+- **An unresolvable anchor is an error**, not a document with an empty headline.
+- **`before`/`after` count stored RECORDS, not seqs** — one counter feeds both the log and
+  span stores, so a 200-*seq* range holds an unpredictable number of logs. Default 350
+  each, capped at 5000.
+- **`@` scopes a key to this capture.** It reaches the document, keeps its sigil there, and
+  **never enters the registry** — otherwise the next case on this domain would silently
+  inherit the last one's seed. Use it for what is true of *this incident*: a seed, an
+  iteration number, a hypothesis. Use a plain key for what is true of the *domain*.
+- **`data` is `update_domain_data`**, applied before the registry copy is rendered — so a
+  key you supply appears in *this* document rather than landing one document late.
+
+**Capture before you investigate, not after.** The document records both instants and
+renders the gap, so a fact you record twenty minutes later is visibly a fact about
+twenty minutes later. That is honest, and it is also weaker evidence than the same fact
+recorded at the time.
 
 ## Filter DSL
 
@@ -556,6 +635,30 @@ get_log_context(seq=r.logs[0].seq, before=20, after=10)
 # Returns 20 entries before and 10 after, regardless of level/filter —
 # the full unfiltered run-up to and recovery from the error.
 ```
+
+### Pattern: preserve an incident you will want in six months
+
+The buffer is in memory and rolling. Capture at the moment you decide it matters, not
+after you have finished investigating.
+
+```
+r = get_recent_logs(filter="l>=ERROR", count=5)
+create_case(
+  reason: "checkout hangs at 20/20 under the new lock ordering",
+  anchor: {seq: r.logs[0].seq},
+  dir:    "/abs/path/to/docs/cases",
+  prefix: "checkout-hang",
+  data:   [{path: "/Build/commit", value: "<git rev-parse HEAD>"},
+           {path: "@/Data/seed",   value: "8814"}],
+)
+```
+
+Then **read the returned `verdict` before you conclude anything.** `complete` means the
+window holds everything that reached the daemon over those seqs. `filtered` means a
+session filter — possibly another session's, possibly a disconnected one's — was
+narrowing what got stored, and `narrowed_by` names it: over that range, "nothing appeared
+before the stall" is not a supported conclusion, and no later read can recover what was
+never stored. Clear the filter and reproduce.
 
 ### Pattern: comparing two test attempts
 

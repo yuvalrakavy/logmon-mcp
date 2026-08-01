@@ -28,7 +28,7 @@ fn fact(path: &str, value: &str, validated: &str) -> RegistryFact {
 /// against this.
 fn base() -> CaseInput {
     CaseInput {
-        stem: "checkout-hang-260731-021530".into(),
+        stem: "checkout-hang-260731-141530".into(),
         captured_at: t("2026-07-31T14:15:30Z"),
         domain: "t3".into(),
         incarnation: Some("2".into()),
@@ -46,16 +46,18 @@ fn base() -> CaseInput {
             to: 41372,
             verdict: EvidenceVerdict::Complete,
             narrowed_by: Vec::new(),
-            capped: false,
+            clamped: false,
+            short_before: 0,
+            short_after: 0,
             evicted_before_window: None,
             spans_evicted_before_window: None,
         },
         logdata: FilePointer {
-            file: "checkout-hang-260731-021530.logdata.jsonl".into(),
+            file: "checkout-hang-260731-141530.logdata.jsonl".into(),
             records: 700,
         },
         spandata: FilePointer {
-            file: "checkout-hang-260731-021530.spandata.jsonl".into(),
+            file: "checkout-hang-260731-141530.spandata.jsonl".into(),
             records: 168,
         },
         registry: CORE_KEYS
@@ -108,7 +110,10 @@ fn front_matter_is_fixed_schema_and_carries_the_index_fields() {
     assert!(fm.contains("logmon_format: 1"), "{fm}");
     assert!(fm.contains("verdict: complete"), "{fm}");
     assert!(
-        fm.contains("seq_range: {from: 40672, to: 41372, capped: false}"),
+        fm.contains(
+            "seq_range: {from: 40672, to: 41372, requested_before_missing: 0, \
+             requested_after_missing: 0, clamped: false}"
+        ),
         "{fm}"
     );
     // Small: the index surface must not become the document.
@@ -268,7 +273,11 @@ fn an_oversized_registry_is_capped_with_a_count_and_a_pointer() {
             );
             // Newest-validated first is the render order, so make the order
             // observable.
-            f.validated_at = t("2026-07-31T14:03:11Z") - chrono::Duration::seconds(n);
+            // OLDEST first in insertion order, so "renders in insertion order"
+            // and "renders newest-validated first" are distinguishable. The
+            // earlier fixture had them coincide, which made the sort — and
+            // therefore the render cap's whole meaning — unfalsifiable.
+            f.validated_at = t("2026-07-31T14:03:11Z") - chrono::Duration::seconds(399 - n);
             f
         })
         .collect();
@@ -293,9 +302,14 @@ fn an_oversized_registry_is_capped_with_a_count_and_a_pointer() {
         "{:?}",
         r.notes
     );
-    // Newest-validated survives the cut; oldest is what falls off.
-    assert!(table.contains("/Big/key0000"), "{}", &table[..2000]);
-    assert!(!table.contains("/Big/key0399"), "the oldest should be cut");
+    // Newest-validated survives the cut; the stalest is what falls off. Without
+    // the sort the cap drops an arbitrary subset instead of the least useful
+    // one, which is what gives the cap its meaning.
+    assert!(table.contains("/Big/key0399"), "{}", &table[..2000]);
+    assert!(
+        !table.contains("/Big/key0000"),
+        "the stalest key should be cut, not whichever happened to be last"
+    );
 }
 
 /// The sigil stays in the key, so a reader grepping for `/Data/seed` and one
@@ -359,8 +373,12 @@ fn collector_state_names_the_owner_and_says_so_when_there_are_none() {
 fn the_span_line_reports_the_span_rings_own_retention() {
     let out = render(&base()).body;
     assert!(
-        out.contains("Spans: 168 captured; the span ring had not evicted below seq 40672"),
+        out.contains("Spans: 168 captured, and the span ring had dropped nothing below seq 40672"),
         "{out}"
+    );
+    assert!(
+        out.contains("Session filters never narrow spans"),
+        "a reader cannot otherwise tell whether the filter applied to spans too: {out}"
     );
 
     let mut i = base();
@@ -407,19 +425,82 @@ fn a_many_matched_anchor_says_which_one_it_took() {
     assert!(out.contains("anchor: {kind: trace_id"), "{out}");
 }
 
-/// A capped read is stated in the document, not left to be inferred from the
-/// record count.
+/// A window narrower than requested is stated — and the document must say
+/// **why**, because "the ring dropped them" and "the domain has no more history"
+/// are opposite conclusions.
 #[test]
-fn a_capped_read_is_stated_and_becomes_a_suggestion() {
-    let mut i = base();
-    i.window.capped = true;
-    let out = render(&i).body;
-    assert!(out.contains("**capped**"), "{out}");
+fn a_short_window_says_whether_the_shortfall_is_a_loss() {
+    // Short, and records really did leave.
+    let mut lost = base();
+    lost.window.short_before = 321;
+    lost.window.evicted_before_window = Some(170);
+    lost.window.verdict = EvidenceVerdict::Evicted;
+    let out = render(&lost).body;
+    assert!(out.contains("**narrower than requested**"), "{out}");
+    assert!(out.contains("321 record(s) short"), "{out}");
+    assert!(out.contains("at least 170"), "{out}");
+    assert!(out.contains("**gone** rather than absent"), "{out}");
     assert!(
-        out.contains("seq_range: {from: 40672, to: 41372, capped: true}"),
+        out.contains("Raise the domain's `log_buffer_size`"),
+        "and the remedy is the one that would help: {out}"
+    );
+
+    // Short, but nothing ever left — a young domain, not a gap.
+    let mut young = base();
+    young.window.short_before = 321;
+    let out = render(&young).body;
+    assert!(out.contains("**narrower than requested**"), "{out}");
+    assert!(
+        out.contains("empty past rather than a loss"),
+        "a domain with no more history has lost nothing: {out}"
+    );
+    assert!(
+        !out.contains("gone"),
+        "and must not be described as loss: {out}"
+    );
+}
+
+/// The clamp is its own fact, and — the defect this replaces — it must not
+/// contradict `complete` four lines above it.
+#[test]
+fn a_clamped_request_never_contradicts_the_verdict() {
+    let mut i = base();
+    i.window.clamped = true;
+    let out = render(&i).body;
+
+    assert_eq!(i.window.verdict, EvidenceVerdict::Complete);
+    assert!(out.contains("**`complete`**"), "{out}");
+    assert!(out.contains("clamped to the maximum"), "{out}");
+    assert!(
+        !out.contains("nothing was capped"),
+        "the `complete` paragraph must not claim something the next one denies: {out}"
+    );
+    assert!(
+        !out.contains("The read was **capped**"),
+        "nothing inside the window was cut, so it was not capped: {out}"
+    );
+    // The old remedy was impossible to follow: the clamp is hard.
+    assert!(
+        !out.contains("larger `before`/`after` to see the rest"),
         "{out}"
     );
-    assert!(out.contains("larger `before`/`after`"), "{out}");
+    assert!(out.contains("will not widen this window"), "{out}");
+    assert!(
+        out.contains("clamped: true"),
+        "and front matter carries it under its own name: {out}"
+    );
+}
+
+/// §4.2's own trap, rendered: one counter numbers both stores, so a range of N
+/// seqs holding fewer than N log records is normal. A reader who cannot tell
+/// that from a gap will read the arithmetic as loss.
+#[test]
+fn the_complete_paragraph_explains_why_records_can_be_fewer_than_seqs() {
+    let out = render(&base()).body;
+    assert!(
+        out.contains("one counter numbers both"),
+        "701 seqs and 700 records must be reconcilable from the document alone: {out}"
+    );
 }
 
 /// `partial` was cut in §9.4. A removed verdict that a renderer still emits is
@@ -480,7 +561,7 @@ fn a_hostile_value_survives_both_rendering_contexts() {
     assert!(row.contains("a \\| b"), "{row}");
     assert_eq!(
         row.matches('|').count() - 1,
-        6,
+        7,
         "the row kept its shape: {row}"
     );
 }

@@ -627,7 +627,7 @@
           "description": "How much of an exported window the daemon can vouch for.\n\nThe reason this exists: storage is conditional, so \"nothing appeared before\nthe error\" is ambiguous between *absence of cause* and *absence of\nrecording*. Only a record of the storage policy over time can separate them,\nand without one a window shaped by another session's filter reads as\ncomplete.",
           "oneOf": [
             {
-              "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs is in the reply.",
+              "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs **was stored**.\n\nIt does *not* say everything stored is in this reply: your own `filter`\nstill selects, and `count` still limits. The verdict is about the\ndaemon's storage policy over the range — which is the only thing a later\nread cannot recover — not about what this particular call returned.",
               "type": "string",
               "const": "complete"
             },
@@ -685,7 +685,7 @@
       "description": "How much of an exported window the daemon can vouch for.\n\nThe reason this exists: storage is conditional, so \"nothing appeared before\nthe error\" is ambiguous between *absence of cause* and *absence of\nrecording*. Only a record of the storage policy over time can separate them,\nand without one a window shaped by another session's filter reads as\ncomplete.",
       "oneOf": [
         {
-          "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs is in the reply.",
+          "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs **was stored**.\n\nIt does *not* say everything stored is in this reply: your own `filter`\nstill selects, and `count` still limits. The verdict is about the\ndaemon's storage policy over the range — which is the only thing a later\nread cannot recover — not about what this particular call returned.",
           "type": "string",
           "const": "complete"
         },
@@ -2720,7 +2720,7 @@
           "minimum": 0
         },
         "bookmark": {
-          "description": "A bookmark name. Anchors on the first stored entry at or after it.",
+          "description": "A bookmark name, resolved against the **calling session** exactly as\n`b>=name` resolves it — use `<session>/<name>` for another session's.\nAnchors on the first stored entry **strictly after** the mark, since a\nbookmark marks a boundary rather than a record.",
           "type": [
             "string",
             "null"
@@ -2809,7 +2809,7 @@
               "minimum": 0
             },
             "bookmark": {
-              "description": "A bookmark name. Anchors on the first stored entry at or after it.",
+              "description": "A bookmark name, resolved against the **calling session** exactly as\n`b>=name` resolves it — use `<session>/<name>` for another session's.\nAnchors on the first stored entry **strictly after** the mark, since a\nbookmark marks a boundary rather than a record.",
               "type": [
                 "string",
                 "null"
@@ -2890,7 +2890,7 @@
           }
         },
         "data_outcomes": {
-          "description": "Per-entry outcomes for `data`, in the order sent — identical to what\n`domain_data.update` returns, because it is the same call.",
+          "description": "Per-entry outcomes for `data`, in the order sent — the same call as\n`domain_data.update`, with **one value it never emits**: `scoped`, for a\nkey carrying the `@` sigil, which went to this document instead of the\nregistry. A closed-set reader written against `domain_data.update` needs\nthat arm added.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/DomainDataOutcome"
@@ -2919,7 +2919,7 @@
           "description": "How much of an exported window the daemon can vouch for.\n\nThe reason this exists: storage is conditional, so \"nothing appeared before\nthe error\" is ambiguous between *absence of cause* and *absence of\nrecording*. Only a record of the storage policy over time can separate them,\nand without one a window shaped by another session's filter reads as\ncomplete.",
           "oneOf": [
             {
-              "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs is in the reply.",
+              "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs **was stored**.\n\nIt does *not* say everything stored is in this reply: your own `filter`\nstill selects, and `count` still limits. The verdict is about the\ndaemon's storage policy over the range — which is the only thing a later\nread cannot recover — not about what this particular call returned.",
               "type": "string",
               "const": "complete"
             },

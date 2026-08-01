@@ -82,7 +82,21 @@ pub struct Window {
     pub to: u64,
     pub verdict: EvidenceVerdict,
     pub narrowed_by: Vec<NarrowedRange>,
-    pub capped: bool,
+    /// The caller's `before`/`after` exceeded the maximum and were cut down to
+    /// it.
+    ///
+    /// **Not `capped`.** Nothing inside `[from, to]` was omitted — the window
+    /// is narrower than requested, not incomplete — and calling it capped put
+    /// "nothing was capped" and "the read was **capped**" four lines apart in
+    /// one document, which is the wrong-information failure this whole feature
+    /// exists to prevent.
+    pub clamped: bool,
+    /// Requested-but-absent records below and above the window. Reported
+    /// because a window narrower than asked for is a fact a reader needs, and
+    /// separately from `evicted_before_window`, which says whether the shortfall
+    /// was a LOSS or simply an empty past.
+    pub short_before: usize,
+    pub short_after: usize,
     pub evicted_before_window: Option<u64>,
     /// The SPAN ring's own eviction. Separate because the two stores share a
     /// seq axis but evict independently, and one verdict cannot honestly speak
@@ -283,8 +297,9 @@ fn front_matter(s: &mut String, i: &CaseInput) {
     let _ = writeln!(s, "verdict: {}", verdict_str(i.window.verdict));
     let _ = writeln!(
         s,
-        "seq_range: {{from: {}, to: {}, capped: {}}}",
-        i.window.from, i.window.to, i.window.capped
+        "seq_range: {{from: {}, to: {}, requested_before_missing: {}, \
+         requested_after_missing: {}, clamped: {}}}",
+        i.window.from, i.window.to, i.window.short_before, i.window.short_after, i.window.clamped
     );
     let _ = writeln!(
         s,
@@ -332,13 +347,31 @@ fn verdict_str(v: EvidenceVerdict) -> &'static str {
 
 fn headline(s: &mut String, i: &CaseInput) {
     let _ = writeln!(s, "# {}\n", flatten(&i.anchor.message));
+    // Numbered, because the body's other headings are — a document that opens
+    // at "## 2." reads as one whose first section was lost.
+    let _ = writeln!(s, "## 1. What this is\n");
     let _ = writeln!(
         s,
-        "`{}` on domain `{}` at {} — {}\n",
+        "A **case**: one window of a running system, frozen to disk by `logmon`, a log and \
+         trace broker. It was captured by a person or an agent who thought it worth keeping; \
+         the reason they gave is below. Nothing here is a diagnosis.\n"
+    );
+    let _ = writeln!(
+        s,
+        "`{}` on **domain** `{}` — a logmon domain is one isolated stream of logs and traces, \
+         normally one per project or test run — at {}, because: {}\n",
         i.stem,
         flatten(&i.domain),
         i.anchor.at.to_rfc3339(),
         flatten(&i.reason)
+    );
+    let _ = writeln!(
+        s,
+        "A **seq** is a per-domain counter stamped on every record as it arrives, and it is \
+         the only ordering this archive has — timestamps can tie. One counter numbers both \
+         logs and spans, so consecutive seqs are not consecutive log records. The \
+         **incarnation** is which run of the daemon assigned them: seqs are comparable only \
+         within one, which is why it is in the front matter.\n"
     );
     if let Some(n) = i.anchor.of_many {
         let _ = writeln!(
@@ -367,7 +400,20 @@ fn headline(s: &mut String, i: &CaseInput) {
 // ---------------------------------------------------------------------------
 
 fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
-    let _ = writeln!(s, "## 2. Evidence\n");
+    let _ = writeln!(
+        s,
+        "## 2. Evidence — what this capture can and cannot show\n"
+    );
+    // The verdict grades the CAPTURE, not the incident. In front matter it sits
+    // under `headline:` in a field called `verdict`, which everywhere else means
+    // the finding — so the axis is established here, before the value.
+    let _ = writeln!(
+        s,
+        "The verdict below grades **how much of this window logmon can vouch for**. It is not \
+         a finding about the incident. Storage is conditional — a filter held by any session \
+         on this domain narrows what gets kept — so it exists to tell *absence of cause* from \
+         *absence of recording*.\n"
+    );
     let w = &i.window;
     let span = w.to.saturating_sub(w.from).saturating_add(1);
 
@@ -376,8 +422,10 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
             let _ = writeln!(
                 s,
                 "**`complete`** — seqs {}–{} lay wholly inside one unfiltered epoch, nothing \
-                 was evicted from the window and nothing was capped. Everything that reached \
-                 the daemon over this range is in the logdata.\n",
+                 was evicted from it. Everything the daemon stored over these seqs is in the \
+                 logdata.\n\n\
+                 Fewer records than seqs is normal and not a gap: one counter numbers both \
+                 logs and spans, so a span consumes a seq no log will ever occupy.\n",
                 w.from, w.to
             );
         }
@@ -445,12 +493,35 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
         }
     }
 
-    if w.capped {
+    // The window can be narrower than the caller asked for, and the two reasons
+    // for that are different facts. Records that LEFT are a gap; a domain that
+    // never had that much history is not.
+    if w.short_before > 0 || w.short_after > 0 {
+        let cause = match w.evicted_before_window {
+            Some(gap) => format!(
+                "The log ring had already dropped records below seq {}, so at least {gap} of \
+                 them are **gone** rather than absent",
+                w.from
+            ),
+            None => format!(
+                "Seq {} is as far back as this store has ever held, so the shortfall is an \
+                 empty past rather than a loss",
+                w.from
+            ),
+        };
         let _ = writeln!(
             s,
-            "The read was **capped**: `before`/`after` stopped it short of everything that \
-             matched the range, so what is absent from the logdata is unknown rather than \
-             absent.\n"
+            "The window is **narrower than requested**: {} record(s) short before the anchor \
+             and {} after. {cause}.\n",
+            w.short_before, w.short_after
+        );
+    }
+    if w.clamped {
+        let _ = writeln!(
+            s,
+            "`before`/`after` were **clamped to the maximum**, so this window is as wide as a \
+             capture can be. What lies beyond it was not read, and is neither present nor \
+             ruled out.\n"
         );
     }
 
@@ -460,7 +531,10 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
         None => {
             let _ = writeln!(
                 s,
-                "Spans: {} captured; the span ring had not evicted below seq {}.\n",
+                "Spans: {} captured, and the span ring had dropped nothing below seq {}. \
+                 **Session filters never narrow spans** — they are stored unconditionally — so \
+                 whatever the verdict above says about the logs, the spans over this range are \
+                 all of them.\n",
                 i.spandata.records, w.from
             );
         }
@@ -627,11 +701,19 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
         ),
         EvidenceVerdict::Complete => {}
     }
-    if i.window.capped {
+    if i.window.evicted_before_window.is_some() {
         item(
             s,
-            "**The read was capped.** Re-capture with larger `before`/`after` to see the rest \
-             of what matched."
+            "**Records below this window had already been dropped.** Raise the domain's \
+             `log_buffer_size`, or capture sooner after the event — nothing can recover them \
+             now."
+                .into(),
+        );
+    } else if i.window.clamped {
+        item(
+            s,
+            "**`before`/`after` hit the maximum.** A larger value will not widen this window; \
+             capture a second case anchored further out if you need more."
                 .into(),
         );
     }
@@ -676,10 +758,23 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
 // ---------------------------------------------------------------------------
 
 fn neighbours(s: &mut String, i: &CaseInput) {
+    let _ = writeln!(s, "## 4. Anchor entry and neighbours\n");
+    // §2's caveat is repeated HERE because this is where the trap is. A reader
+    // who scrolled past it now sees a tidy run of consecutive lines and a
+    // pointer to "the full window", and both are true only of what was STORED.
+    if !i.window.narrowed_by.is_empty() {
+        let _ = writeln!(
+            s,
+            "**These are the entries that were stored, not the entries that occurred.** A \
+             filter was narrowing this domain over part of this range (§2), so the run below \
+             can look continuous while entries between these seqs were never recorded. The \
+             logdata file holds the full window *as stored*, which is the same qualification.\n"
+        );
+    }
     let _ = writeln!(
         s,
-        "## 4. Anchor entry and neighbours\n\n\
-         The anchor is marked `>`. The full window is in the logdata file (§7).\n"
+        "The anchor is marked `>`. Columns are seq, timestamp, level, message. The full \
+         stored window is in the logdata file (§7).\n"
     );
     if i.neighbours.is_empty() {
         let _ = writeln!(
@@ -762,7 +857,15 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
     let mut facts: Vec<&RegistryFact> = i.registry.iter().collect();
     facts.sort_by_key(|f| std::cmp::Reverse(f.validated_at));
 
-    let header = "| key | value | age | in force since | lifetime |\n|---|---|---|---|---|\n";
+    let _ = writeln!(
+        s,
+        "**core** marks the three keys a case cannot be acted on without — `{}` — graded in \
+         the front matter's `provenance` line. Everything else is contextual and is named \
+         rather than counted, since it is an open set.\n",
+        CORE_KEYS.join("`, `")
+    );
+    let header =
+        "| key | kind | value | age | in force since | lifetime |\n|---|---|---|---|---|---|\n";
     s.push_str(header);
     let start = s.len();
     let mut rendered = 0usize;
@@ -773,8 +876,13 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
             (None, _) => "—".to_string(),
         };
         let row = format!(
-            "| `{}` | {} | {} | {} | {} |\n",
+            "| `{}` | {} | {} | {} | {} | {} |\n",
             cell(&f.path),
+            if CORE_KEYS.contains(&f.path.as_str()) {
+                "core"
+            } else {
+                "contextual"
+            },
             cell(&f.value),
             age_of(i.captured_at, f.validated_at),
             age_of(i.captured_at, f.created_at),
@@ -824,7 +932,12 @@ fn collectors(s: &mut String, i: &CaseInput) {
     }
     let _ = writeln!(
         s,
-        "Every collector pinned to `{}`, whoever armed it.\n",
+        "A **collector** is a standing measurement: a filter armed against this domain that \
+         accumulates span timings until someone reads or resets it. Every one pinned to `{}` \
+         is listed, whoever armed it — `armed by` is the session that did.\n\n\
+         **`matched` counts the collector's whole live window, not this capture's seqs**, and \
+         `latest run` is a recorded snapshot which may predate the incident entirely. Read \
+         both against their own ages, not against the window above.\n",
         i.domain
     );
     let _ = writeln!(s, "| collector | armed by | matched | runs | latest run |");
@@ -857,20 +970,36 @@ fn collectors(s: &mut String, i: &CaseInput) {
 
 fn pointers(s: &mut String, i: &CaseInput) {
     let _ = writeln!(s, "## 7. Evidence files\n");
+    let _ = writeln!(s, "| file | records | first line |");
+    let _ = writeln!(s, "|---|---|---|");
     let _ = writeln!(
         s,
-        "Two files, because logs and spans are different shapes with different consumers and \
-         wanting one without the other is the common case. Both are JSONL whose first line is \
-         a format header — `{{\"logmon_format\":{FORMAT_VERSION}, …}}` — which is the contract, \
-         since nothing indexes this archive.\n"
+        "| `{}` | {} | `{{\"logmon_format\":{FORMAT_VERSION},\"kind\":\"logdata\"}}` |",
+        i.logdata.file, i.logdata.records
     );
-    let _ = writeln!(s, "| file | records |");
-    let _ = writeln!(s, "|---|---|");
-    let _ = writeln!(s, "| `{}` | {} |", i.logdata.file, i.logdata.records);
-    let _ = writeln!(s, "| `{}` | {} |", i.spandata.file, i.spandata.records);
     let _ = writeln!(
         s,
-        "\nA file with no records still exists, with its header: absent cannot be told from \
+        "| `{}` | {} | `{{\"logmon_format\":{FORMAT_VERSION},\"kind\":\"spandata\"}}` |",
+        i.spandata.file, i.spandata.records
+    );
+    // Printed in full, not elided. The sentence naming the header as the
+    // contract is the last place to hide it behind an ellipsis: nothing indexes
+    // this archive, so this line is what a reader years from now has.
+    let _ = writeln!(
+        s,
+        "\nEach file is JSONL. **The first line is a header, not a record**, and it is the \
+         format contract — `logmon_format` is the integer to branch on if the record shape \
+         ever changes. Every line after it is one record, and `records` above counts those \
+         alone.\n\n\
+         Logdata records are log entries: `seq`, `timestamp`, `level`, `message`, `host`, and \
+         optional `full_message`, `facility`, `file`, `line`, `trace_id`, `span_id`, plus a \
+         `source` saying which rule stored the entry and `matched_filters` naming any filter \
+         it matched. Spandata records are spans: `seq`, `trace_id`, `span_id`, \
+         `parent_span_id`, `start_time`, `end_time`, `duration_ms`, `name`, `kind`, \
+         `service_name`, `status`, `attributes`, `events`. Both are seq-ascending, and both \
+         number their seqs from the same counter — which is why a span and a log never share \
+         one.\n\n\
+         A file with no records still exists, with its header: absent cannot be told from \
          \"we captured none\"."
     );
 }

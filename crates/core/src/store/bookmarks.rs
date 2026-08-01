@@ -116,23 +116,24 @@ pub fn is_valid_bookmark_name(name: &str) -> bool {
 
 /// Predicate: should this bookmark be auto-evicted?
 ///
-/// True only when **both** stores have *positively confirmed* eviction past
-/// the bookmark's seq. A store "confirms eviction" when it has at least
-/// one entry AND its oldest entry's seq is greater than the bookmark's seq.
+/// True only when **both** stores have positively lost records past the
+/// bookmark's seq. A store that has never dropped anything confirms nothing,
+/// however far its oldest record sits above the bookmark — bookmarks cannot
+/// outlive their data, but they cannot be killed by absence of data either.
 ///
-/// An empty store does NOT confirm eviction — it could simply have not
-/// received any data yet. This means a bookmark created when both stores are
-/// empty stays alive until enough data has flowed through both stores to roll
-/// past it. This matches the spec intent: bookmarks cannot outlive their data,
-/// but cannot be killed by absence of data either.
-pub fn should_evict(
-    bookmark_seq: u64,
-    oldest_log_seq: Option<u64>,
-    oldest_span_seq: Option<u64>,
-) -> bool {
-    let log_evicted = oldest_log_seq.is_some_and(|s| s > bookmark_seq);
-    let span_evicted = oldest_span_seq.is_some_and(|s| s > bookmark_seq);
-    log_evicted && span_evicted
+/// Compared against each store's `lost_below` — the lowest seq it can still
+/// speak for — and **not** against its oldest retained seq. The two differ, and
+/// this is the same boundary `evicted_before_window` uses: a bookmark whose
+/// window an export would call complete must not be swept out from under that
+/// export, and a ring that has never dropped anything has not aged any bookmark
+/// out of relevance however far its oldest record sits above the bookmark.
+pub fn should_evict(bookmark_seq: u64, log_lost_below: u64, span_lost_below: u64) -> bool {
+    // `> bookmark_seq`, not `>= `: a bookmark marks a boundary and `b>=name`
+    // admits `seq > bookmark_seq`, so a store that has lost everything up to and
+    // including the bookmark's own seq has lost nothing the window asked for.
+    let log_gone = log_lost_below > bookmark_seq;
+    let span_gone = span_lost_below > bookmark_seq;
+    log_gone && span_gone
 }
 
 /// Resolve a name (bare or already-qualified) into a qualified name.
@@ -225,14 +226,14 @@ impl BookmarkStore {
     /// - Hold bookmarks write lock until AFTER `recently_evicted` is updated, so
     ///   a concurrent `cursor_read_and_advance` waiting on the bookmarks lock
     ///   observes the eviction signal atomically with the entry's removal.
-    pub fn sweep(&self, oldest_log_seq: Option<u64>, oldest_span_seq: Option<u64>) {
+    pub fn sweep(&self, log_lost_below: u64, span_lost_below: u64) {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         let evicted: Vec<String> = map
             .iter()
-            .filter(|(_, b)| should_evict(b.seq, oldest_log_seq, oldest_span_seq))
+            .filter(|(_, b)| should_evict(b.seq, log_lost_below, span_lost_below))
             .map(|(k, _)| k.clone())
             .collect();
-        map.retain(|_, b| !should_evict(b.seq, oldest_log_seq, oldest_span_seq));
+        map.retain(|_, b| !should_evict(b.seq, log_lost_below, span_lost_below));
 
         if !evicted.is_empty() {
             let mut recent = self
@@ -421,33 +422,33 @@ mod tests {
     #[test]
     fn should_evict_when_both_stores_past_seq() {
         // Bookmark at seq=10; both stores' oldest is past it.
-        assert!(should_evict(10, Some(50), Some(50)));
+        assert!(should_evict(10, 50, 50));
     }
 
     #[test]
     fn should_not_evict_when_log_store_still_covers() {
         // Bookmark at seq=60; log store still has older data (oldest=10).
-        assert!(!should_evict(60, Some(10), Some(120)));
+        assert!(!should_evict(60, 10, 120));
     }
 
     #[test]
     fn should_not_evict_when_span_store_still_covers() {
         // Bookmark at seq=60; span store still has older data (oldest=10).
-        assert!(!should_evict(60, Some(120), Some(10)));
+        assert!(!should_evict(60, 120, 10));
     }
 
     #[test]
     fn empty_stores_keep_bookmark_alive() {
         // Both stores empty: bookmark survives. The "no data yet" case must
         // not look like "data rolled past."
-        assert!(!should_evict(60, None, None));
+        assert!(!should_evict(60, 0, 0));
     }
 
     #[test]
     fn one_empty_store_keeps_bookmark_alive() {
         // Only the side that has data and rolled past is "confirmed gone."
         // If either side has no data, we can't confirm — keep alive.
-        assert!(!should_evict(60, Some(120), None));
+        assert!(!should_evict(60, 120, 0));
     }
 
     #[test]
@@ -456,7 +457,7 @@ mod tests {
         store.add("A", "old", 1, None, false).unwrap();
         store.add("A", "newer", 5, None, false).unwrap();
         // Both stores have advanced past every bookmark — wipe them all.
-        store.sweep(Some(100), Some(100));
+        store.sweep(100, 100);
         assert!(store.list().is_empty());
     }
 
@@ -465,7 +466,7 @@ mod tests {
         let store = BookmarkStore::new();
         let (b, _) = store.add("A", "x", 100, None, false).unwrap();
         // Oldest seq in stores is older than the bookmark — data still covers it.
-        store.sweep(Some(b.seq - 10), Some(b.seq - 10));
+        store.sweep(b.seq - 10, b.seq - 10);
         assert_eq!(store.list().len(), 1);
     }
 
@@ -531,7 +532,7 @@ mod tests {
         let store = BookmarkStore::new();
         store.add("s", "old", 10, None, false).unwrap();
         store.add("s", "new", 100, None, false).unwrap();
-        store.sweep(Some(50), Some(50));
+        store.sweep(50, 50);
         let remaining = store.list();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].seq, 100);
@@ -541,9 +542,9 @@ mod tests {
     fn evict_skips_when_either_store_empty() {
         let store = BookmarkStore::new();
         store.add("s", "x", 5, None, false).unwrap();
-        store.sweep(Some(100), None);
+        store.sweep(100, 0);
         assert_eq!(store.list().len(), 1);
-        store.sweep(None, Some(100));
+        store.sweep(0, 100);
         assert_eq!(store.list().len(), 1);
     }
 
@@ -604,7 +605,7 @@ mod tests {
         let store = BookmarkStore::new();
         let (_lower, commit) = store.cursor_read_and_advance("s", "c");
         // Simulate eviction sweep removing the entry between read-and-advance and commit.
-        store.sweep(Some(u64::MAX), Some(u64::MAX));
+        store.sweep(u64::MAX, u64::MAX);
         assert!(store.list().iter().all(|b| b.qualified_name != "s/c"));
         // Commit re-inserts at the high-water mark.
         commit.commit(200);
@@ -622,7 +623,7 @@ mod tests {
         let store = BookmarkStore::new();
         let _ = store.add("s", "evicted", 5, None, false).unwrap();
         // Sweep evicts the bookmark.
-        store.sweep(Some(u64::MAX), Some(u64::MAX));
+        store.sweep(u64::MAX, u64::MAX);
         // Subsequent c>= reference auto-recreates and should WARN.
         let (lower, _commit) = store.cursor_read_and_advance("s", "evicted");
         assert_eq!(lower, 0); // Recreated at seq=0

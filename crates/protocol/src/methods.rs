@@ -368,7 +368,12 @@ pub struct LogsExportResult {
 pub enum EvidenceVerdict {
     /// The window lies wholly inside one unfiltered epoch, nothing was evicted,
     /// and nothing was capped. Everything that reached the daemon over these
-    /// seqs is in the reply.
+    /// seqs **was stored**.
+    ///
+    /// It does *not* say everything stored is in this reply: your own `filter`
+    /// still selects, and `count` still limits. The verdict is about the
+    /// daemon's storage policy over the range — which is the only thing a later
+    /// read cannot recover — not about what this particular call returned.
     Complete,
     /// The ring dropped part of the window; `evicted_before_window` bounds how
     /// much.
@@ -2391,7 +2396,10 @@ pub struct CaseAnchor {
     /// A stored entry's sequence number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
-    /// A bookmark name. Anchors on the first stored entry at or after it.
+    /// A bookmark name, resolved against the **calling session** exactly as
+    /// `b>=name` resolves it — use `<session>/<name>` for another session's.
+    /// Anchors on the first stored entry **strictly after** the mark, since a
+    /// bookmark marks a boundary rather than a record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bookmark: Option<String>,
     /// A trace id in hex. Anchors on the **earliest by seq** of its entries,
@@ -2476,8 +2484,11 @@ pub struct CasesCreateResult {
     pub logdata: CaseFile,
     pub spandata: CaseFile,
     pub notes: Vec<CaseNote>,
-    /// Per-entry outcomes for `data`, in the order sent — identical to what
-    /// `domain_data.update` returns, because it is the same call.
+    /// Per-entry outcomes for `data`, in the order sent — the same call as
+    /// `domain_data.update`, with **one value it never emits**: `scoped`, for a
+    /// key carrying the `@` sigil, which went to this document instead of the
+    /// registry. A closed-set reader written against `domain_data.update` needs
+    /// that arm added.
     #[serde(default)]
     pub data_outcomes: Vec<DomainDataOutcome>,
     /// Set when the registry could not be made durable. The capture still
