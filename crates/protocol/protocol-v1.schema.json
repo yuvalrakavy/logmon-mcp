@@ -3553,7 +3553,12 @@
               "type": "string"
             },
             "input_schema": {
-              "description": "The JSON Schema for this tool's parameters.\n\n`None` means the schema has no definition under this tool's derived name\n— which is a **generator gap, not a tool without parameters**. The two\nare indistinguishable from the outside, so they must not be conflated:\nserving `{}` for a missing definition would advertise \"takes nothing\" for\na tool that takes several, and every call would then be rejected for\nunknown fields."
+              "description": "The JSON Schema for this tool's parameters.\n\n`None` means the schema has no definition under this tool's derived name\n— which is a **generator gap, not a tool without parameters**. The two\nare indistinguishable from the outside, so they must not be conflated:\nserving `{}` for a missing definition would advertise \"takes nothing\" for\na tool that takes several, and every call would then be rejected for\nunknown fields.\n\n**`$ref`s are resolved before it is served.** A client would otherwise\nhave to chase `#/$defs/ThresholdSpec` to discover that `threshold` is an\nobject with five fields — and a client that cannot see inside a nested\nparameter cannot offer it at all."
+            },
+            "cli": {
+              "description": "What a front-end needs beyond the schema to build a command line.",
+              "$ref": "#/$defs/CliHints",
+              "default": {}
             }
           },
           "required": [
@@ -3561,6 +3566,27 @@
             "method",
             "description"
           ]
+        },
+        "CliHints": {
+          "description": "[`Cli`] as it crosses the wire. `Cli` itself is `&'static` so it can live in\na `const`; this is the owned shape a client deserializes into.",
+          "type": "object",
+          "properties": {
+            "positional": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "variadic": {
+              "type": "boolean"
+            },
+            "output_path_param": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
         }
       }
     },
@@ -3580,14 +3606,65 @@
           "type": "string"
         },
         "input_schema": {
-          "description": "The JSON Schema for this tool's parameters.\n\n`None` means the schema has no definition under this tool's derived name\n— which is a **generator gap, not a tool without parameters**. The two\nare indistinguishable from the outside, so they must not be conflated:\nserving `{}` for a missing definition would advertise \"takes nothing\" for\na tool that takes several, and every call would then be rejected for\nunknown fields."
+          "description": "The JSON Schema for this tool's parameters.\n\n`None` means the schema has no definition under this tool's derived name\n— which is a **generator gap, not a tool without parameters**. The two\nare indistinguishable from the outside, so they must not be conflated:\nserving `{}` for a missing definition would advertise \"takes nothing\" for\na tool that takes several, and every call would then be rejected for\nunknown fields.\n\n**`$ref`s are resolved before it is served.** A client would otherwise\nhave to chase `#/$defs/ThresholdSpec` to discover that `threshold` is an\nobject with five fields — and a client that cannot see inside a nested\nparameter cannot offer it at all."
+        },
+        "cli": {
+          "description": "What a front-end needs beyond the schema to build a command line.",
+          "$ref": "#/$defs/CliHints",
+          "default": {}
         }
       },
       "required": [
         "name",
         "method",
         "description"
-      ]
+      ],
+      "$defs": {
+        "CliHints": {
+          "description": "[`Cli`] as it crosses the wire. `Cli` itself is `&'static` so it can live in\na `const`; this is the owned shape a client deserializes into.",
+          "type": "object",
+          "properties": {
+            "positional": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "variadic": {
+              "type": "boolean"
+            },
+            "output_path_param": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "CliHints": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CliHints",
+      "description": "[`Cli`] as it crosses the wire. `Cli` itself is `&'static` so it can live in\na `const`; this is the owned shape a client deserializes into.",
+      "type": "object",
+      "properties": {
+        "positional": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "variadic": {
+          "type": "boolean"
+        },
+        "output_path_param": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "DomainDataEntry": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

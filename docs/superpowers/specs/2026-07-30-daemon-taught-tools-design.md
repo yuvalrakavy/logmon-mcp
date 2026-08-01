@@ -1241,7 +1241,7 @@ to fix it:
 > declares is reachable from the CLI immediately, with no rebuild — including one this binary
 > has never heard of.
 
-The thirteen hand-written command groups stay exactly as they are, keeping their rendering.
+The ten hand-written command groups stay exactly as they are, keeping their rendering.
 `call` is the floor, not the ceiling: a tool gets a bespoke group when someone wants nice
 output for it, and is usable from the moment the daemon declares it. That satisfies §11.0
 without paying for it in the one part of the CLI that is genuinely worth its hand-written

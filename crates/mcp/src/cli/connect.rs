@@ -8,15 +8,28 @@ use anyhow::Result;
 use logmon_broker_sdk::Broker;
 use std::time::Duration;
 
-use crate::Subcommand;
+/// Open the CLI's connection, reporting what invoked it.
+///
+/// `argv` is the command path and its arguments. **Only the leading path
+/// segments are sent** as `client_info`: an argument value can carry a filter
+/// expression, a description or a bookmark name, and none of those belongs in a
+/// diagnostic field that other sessions can read.
+///
+/// This used to map a clap enum to a group name, which meant a new command
+/// needed a new arm here. The path is now derived from the command the user
+/// typed, so there is nothing to keep in step.
+pub async fn connect_cli(session: &str, argv: &[String]) -> Result<Broker> {
+    let path: Vec<&str> = argv
+        .iter()
+        .take_while(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect();
 
-pub async fn connect_cli(session: &str, cmd: &Subcommand) -> Result<Broker> {
-    let argv = subcommand_argv(cmd);
     let client_info = serde_json::json!({
         "name": "logmon-mcp",
         "version": env!("CARGO_PKG_VERSION"),
         "mode": "cli",
-        "argv": argv,
+        "argv": path,
     });
 
     Broker::connect()
@@ -33,22 +46,21 @@ pub async fn connect_cli(session: &str, cmd: &Subcommand) -> Result<Broker> {
         })
 }
 
-/// Extract the subcommand group for client_info. Group only — verb is
-/// intentionally omitted per the spec (extracting the verb requires
-/// pattern-matching the inner Cmd enum at the connect site, adds coupling
-/// for diagnostic value that isn't load-bearing for any feature).
-fn subcommand_argv(cmd: &Subcommand) -> Vec<&'static str> {
-    match cmd {
-        Subcommand::Logs(_) => vec!["logs"],
-        Subcommand::Bookmarks(_) => vec!["bookmarks"],
-        Subcommand::Triggers(_) => vec!["triggers"],
-        Subcommand::Filters(_) => vec!["filters"],
-        Subcommand::Traces(_) => vec!["traces"],
-        Subcommand::Spans(_) => vec!["spans"],
-        Subcommand::Collectors(_) => vec!["collectors"],
-        Subcommand::Sessions(_) => vec!["sessions"],
-        Subcommand::Domains(_) => vec!["domains"],
-        Subcommand::Status => vec!["status"],
-        Subcommand::Call(_) => vec!["call"],
+#[cfg(test)]
+mod tests {
+    /// A value must never reach client_info. `--filter` can carry anything the
+    /// user was searching for, and client_info is visible to other sessions.
+    #[test]
+    fn only_the_command_path_is_reported() {
+        let argv: Vec<String> = ["logs", "recent", "--filter", "secret-customer-id"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let path: Vec<&str> = argv
+            .iter()
+            .take_while(|a| !a.starts_with('-'))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(path, ["logs", "recent"]);
     }
 }

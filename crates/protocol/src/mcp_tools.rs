@@ -44,6 +44,63 @@ pub struct Tool {
     pub name: &'static str,
     pub method: &'static str,
     pub description: &'static str,
+    /// What a front-end needs to know beyond the schema. Almost always
+    /// [`Cli::PLAIN`] — the exceptions are listed on the few tools that have
+    /// them, rather than in a second table that could disagree with this one.
+    pub cli: Cli,
+}
+
+/// The parts of a command-line shape that a JSON Schema cannot express.
+///
+/// **This exists so the shim does not have to know.** Without it, "these two
+/// arguments may be given positionally" and "this parameter names a local file"
+/// are facts that live in hand-written command definitions — which is exactly
+/// the hardcoded knowledge a daemon-taught shim is supposed to be free of.
+#[derive(Debug, Clone, Copy)]
+pub struct Cli {
+    /// Parameters that may be given positionally, in this order.
+    pub positional: &'static [&'static str],
+    /// Whether the final positional absorbs every remaining argument.
+    pub variadic: bool,
+    /// A parameter naming a **local** path the front-end writes the reply to,
+    /// rather than forwarding to the daemon.
+    ///
+    /// A daemon resolves a relative path against its own working directory, not
+    /// the caller's, so the write has to happen client-side. Naming the
+    /// parameter here is what lets a generic front-end do it without knowing
+    /// that `export_logs` in particular behaves this way.
+    pub output_path_param: Option<&'static str>,
+}
+
+impl Cli {
+    /// Every parameter is a named `--flag`, and the reply goes to stdout.
+    pub const PLAIN: Cli = Cli {
+        positional: &[],
+        variadic: false,
+        output_path_param: None,
+    };
+}
+
+/// [`Cli`] as it crosses the wire. `Cli` itself is `&'static` so it can live in
+/// a `const`; this is the owned shape a client deserializes into.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CliHints {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub positional: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub variadic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path_param: Option<String>,
+}
+
+impl From<Cli> for CliHints {
+    fn from(c: Cli) -> Self {
+        CliHints {
+            positional: c.positional.iter().map(|s| (*s).to_string()).collect(),
+            variadic: c.variadic,
+            output_path_param: c.output_path_param.map(str::to_string),
+        }
+    }
 }
 
 impl Tool {
@@ -77,86 +134,107 @@ pub const TOOLS: &[Tool] = &[
         name: "get_status",
         method: "status.get",
         description: "Get current server status including buffer sizes, trigger counts, connection info, and message statistics",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_recent_logs",
         method: "logs.recent",
         description: "Get recent log entries from the buffer, newest first. Optionally filtered by a DSL expression. Response carries matched/scanned/buffer_total diagnostics (scanned=0 = empty buffer; matched=0 with scanned>0 = filter matched nothing while data flows) plus truncated/evicted_before_window when a bookmark/cursor window rolled off. Unknown-selector comparison typos like level>=WARN are rejected with a suggestion.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_log_context",
         method: "logs.context",
         description: "Get log entries surrounding a specific entry identified by seq number. Returns context before and after.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "export_logs",
         method: "logs.export",
         description: "Export log entries to a file. Supports json or text format.",
+        cli: Cli {
+            positional: &[],
+            variadic: false,
+            output_path_param: Some("path"),
+        },
     },
     Tool {
         name: "clear_logs",
         method: "logs.clear",
         description: "Clear all log entries from the in-memory buffer.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_filters",
         method: "filters.list",
         description: "List all buffer filters. Logs are stored only if they match at least one filter (OR semantics). If no filters are configured, all logs are stored.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "add_filter",
         method: "filters.add",
         description: "Add a new buffer filter. Logs matching this filter will be stored. Uses OR semantics with existing filters.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "edit_filter",
         method: "filters.edit",
         description: "Edit an existing buffer filter by ID.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "remove_filter",
         method: "filters.remove",
         description: "Remove a buffer filter by ID.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_triggers",
         method: "triggers.list",
         description: "List all triggers. Triggers capture a window of logs around matching entries and emit notifications.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "add_trigger",
         method: "triggers.add",
         description: "Add a new trigger. When a log matches the filter, the pre/post windows are captured and a notification is emitted.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "edit_trigger",
         method: "triggers.edit",
         description: "Edit an existing trigger by ID. Only the provided fields are updated.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "remove_trigger",
         method: "triggers.remove",
         description: "Remove a trigger by ID.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_recent_traces",
         method: "traces.recent",
         description: "List recent traces with timing and error info",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_trace",
         method: "traces.get",
         description: "Get full trace detail — span tree + linked logs",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_trace_summary",
         method: "traces.summary",
         description: "Compact timing breakdown highlighting bottlenecks",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_slow_spans",
         method: "traces.slow",
         description: "Find slow spans, optionally grouped by operation name",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "add_collector",
@@ -165,11 +243,13 @@ pub const TOOLS: &[Tool] = &[
                        (at tree level) self time for every span matching the filter, from now \
                        until reset or removed. Use for before/after measurement: arm, run the \
                        workload, read, reset, change one thing, run again.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "list_collectors",
         method: "collectors.list",
         description: "List this session's collectors and what each has matched so far",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_collector",
@@ -177,6 +257,7 @@ pub const TOOLS: &[Tool] = &[
         description: "Read a collector's numbers. Returns exact totals, sketch percentiles, \
                        and sample-derived figures separately — they cover different \
                        populations and any field that cannot be computed says why.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "edit_collector",
@@ -187,6 +268,7 @@ pub const TOOLS: &[Tool] = &[
                        definition describing it must not disagree. Recorded snapshots are \
                        never touched. Use it to re-pin a collector orphaned by a restart, or \
                        to drop a level when the sample budget runs out.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "snapshot_collector",
@@ -195,6 +277,7 @@ pub const TOOLS: &[Tool] = &[
                        is the between-runs move for a before/after comparison: arm, run A, \
                        snapshot, change one thing, run B, snapshot, then compare. Unlike \
                        reset_collector it KEEPS the run. Always pass a description.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_collector_history",
@@ -203,6 +286,7 @@ pub const TOOLS: &[Tool] = &[
                        definition it was taken under. With merge=true also combines them and \
                        reports the run-to-run spread — which is what tells you whether a \
                        difference between two runs is real or just noise.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "diff_collectors",
@@ -217,6 +301,11 @@ pub const TOOLS: &[Tool] = &[
                        delta — at or above 100% the error bar is wider than the delta. \
                        REFUSES rather than guessing when the arms are not comparable, and \
                        names the flag that would permit it.",
+        cli: Cli {
+            positional: &["a", "b"],
+            variadic: false,
+            output_path_param: None,
+        },
     },
     Tool {
         name: "reset_collector",
@@ -224,6 +313,7 @@ pub const TOOLS: &[Tool] = &[
         description: "Zero a collector and start a fresh window, keeping it armed. DISCARDS \
                        the run — use snapshot_collector if you want to keep it. Returns a \
                        summary of what was thrown away.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "document_collectors",
@@ -235,11 +325,17 @@ pub const TOOLS: &[Tool] = &[
                        generate it and `finding` on a second call once you have read it; \
                        regeneration is free and lossless. `format: folded` gives collapsed \
                        stacks for a flame graph, one arm at a time, level tree only.",
+        cli: Cli {
+            positional: &["names"],
+            variadic: true,
+            output_path_param: None,
+        },
     },
     Tool {
         name: "remove_collector",
         method: "collectors.remove",
         description: "Remove a collector and release its sample budget",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "profile_traces",
@@ -248,91 +344,109 @@ pub const TOOLS: &[Tool] = &[
                        numbers as get_collector but over what is stored now — use it to look \
                        back at a run that already happened, and a collector to measure one \
                        that has not started.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_span_context",
         method: "spans.context",
         description: "Get spans surrounding a specific span in time",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_trace_logs",
         method: "traces.logs",
         description: "Get all logs linked to a trace",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "add_bookmark",
         method: "bookmarks.add",
         description: "Set a named bookmark at the current moment. Bookmarks are timestamps usable in filter DSL via b>=name / b<=name. Use them to scope queries to a range without destructively clearing logs.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "list_bookmarks",
         method: "bookmarks.list",
         description: "List all live bookmarks across all sessions, newest first. Optionally filter by session name.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "remove_bookmark",
         method: "bookmarks.remove",
         description: "Remove a bookmark by name. Bare name resolves to the current session; use 'session/name' to remove a bookmark from another session.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "clear_bookmarks",
         method: "bookmarks.clear",
         description: "Clear all bookmarks for a session at once. Defaults to the calling session. Useful for iterative debugging workflows: wipe all bookmarks, re-add fresh ones, repeat. Pass an explicit session name to clear another session's bookmarks.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_sessions",
         method: "session.list",
         description: "List all active sessions connected to the daemon.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "drop_session",
         method: "session.drop",
         description: "Drop (disconnect) a session by name.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "create_domain",
         method: "domains.create",
         description: "Create (or idempotently ensure) an isolated domain — a full broker instance with its own log/span buffers, receivers, and triggers. Omitted ports are auto-allocated; a port of 0 disables that receiver. Ephemeral (gone on daemon restart).",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "delete_domain",
         method: "domains.delete",
         description: "Delete a domain and tear down its receivers. Refuses config-declared domains including 'default'.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "list_domains",
         method: "domains.list",
         description: "List all live domains with their ports, source (config/persistent/ephemeral), and log/span counts.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "use_domain",
         method: "domains.use",
         description: "Bind this session to a domain. Subsequent log/trace queries and trigger notifications target that domain until you switch again. Errors if the domain does not exist.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "rename_session",
         method: "session.rename",
         description: "Rename this logmon session to a meaningful name (convention: <Project>-Main-<short8> for a home/main conversation, <Project>-tN-<branch> after claiming a dev-track lane; sanitize '/' to '-'). Preserves all session state. ERRORS with 'already connected' when the target name is held by a LIVE session — that means another conversation is already working that dev-track: STOP rather than fight over it. A stale (disconnected) holder is displaced automatically.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "clear_domain",
         method: "domains.clear",
         description: "Dispose the bound domain's data — logs and spans — keeping the domain and its receivers alive. Sequence numbers stay monotonic. (logs.clear is the logs-only cousin.)",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "update_domain_data",
         method: "domain_data.update",
         description: "Record provenance for the bound domain — what was true of the project while these logs were produced. Logs without it are a dump; logs with it are evidence. Core keys: /Build/commit, /Build/profile, /Action. Also /Versions/<component>, /Env/host, /Data/seed (the one that turns \"fails 1 in 20\" into a reproduction). Send a value to set it, or a key alone to confirm what is already there. Returns one outcome per entry: created, updated, validated, unknown, or rejected.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "get_domain_data",
         method: "domain_data.get",
         description: "Read the bound domain's provenance registry. Each key carries its value, when that value came into force, when it was last confirmed, and its age. A key with a stated lifetime also carries an expiry verdict; a key without one carries an age and NO verdict, deliberately — absent means unknown, not fresh. Also reports which recommended core keys are missing.",
+        cli: Cli::PLAIN,
     },
     Tool {
         name: "remove_domain_data",
         method: "domain_data.remove",
         description: "Remove provenance keys by prefix, matched on segment boundaries (/Versions removes /Versions/*; /Ver removes nothing). Reports a count per pattern. THERE IS NO UNDO — and note that removing a key and setting it again resets when its value came into force, which turns a months-old confirmed fact into a fresh-looking one. To drop only a lifetime, send ttl: false to update_domain_data instead.",
+        cli: Cli::PLAIN,
     },
 ];
 
@@ -432,8 +546,62 @@ pub struct ManifestEntry {
     /// serving `{}` for a missing definition would advertise "takes nothing" for
     /// a tool that takes several, and every call would then be rejected for
     /// unknown fields.
+    ///
+    /// **`$ref`s are resolved before it is served.** A client would otherwise
+    /// have to chase `#/$defs/ThresholdSpec` to discover that `threshold` is an
+    /// object with five fields — and a client that cannot see inside a nested
+    /// parameter cannot offer it at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
+
+    /// What a front-end needs beyond the schema to build a command line.
+    #[serde(default)]
+    pub cli: CliHints,
+}
+
+/// Replace every `{"$ref": "#/$defs/X"}` with the definition it names.
+///
+/// Bounded by `depth` rather than by cycle detection: schemars emits `$defs`
+/// per definition, and a request type deep enough to exhaust this is a design
+/// problem worth noticing rather than a resolution problem worth solving. A
+/// `$ref` left unresolved at the bottom stays as it was, so the worst case is
+/// the behaviour before this existed.
+fn resolve_refs(node: &mut serde_json::Value, defs: &serde_json::Value, depth: u8) {
+    if depth == 0 {
+        return;
+    }
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(name) = map
+                .get("$ref")
+                .and_then(|r| r.as_str())
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+            {
+                if let Some(target) = defs.get(name) {
+                    let mut replacement = target.clone();
+                    resolve_refs(&mut replacement, defs, depth - 1);
+                    // The `$ref` site may carry its own `description`; schemars
+                    // puts the field's doc comment there and the type's on the
+                    // definition. Keeping the field's is the useful half.
+                    let described = map.get("description").cloned();
+                    *node = replacement;
+                    if let (Some(d), Some(obj)) = (described, node.as_object_mut()) {
+                        obj.insert("description".into(), d);
+                    }
+                    return;
+                }
+            }
+            for v in map.values_mut() {
+                resolve_refs(v, defs, depth - 1);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                resolve_refs(v, defs, depth - 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `tools.manifest` takes no parameters: the manifest describes the protocol,
@@ -466,13 +634,27 @@ pub fn manifest() -> Vec<ManifestEntry> {
 
     TOOLS
         .iter()
-        .map(|t| ManifestEntry {
-            name: t.name.to_string(),
-            method: t.method.to_string(),
-            description: t.description.to_string(),
-            input_schema: definitions
+        .map(|t| {
+            let input_schema = definitions
                 .and_then(|d| d.get(t.definition_name()))
-                .cloned(),
+                .cloned()
+                .map(|mut s| {
+                    // `$defs` is emitted per definition, so a ref resolves
+                    // against the entry's own copy and never a global one.
+                    let defs = s.get("$defs").cloned().unwrap_or(serde_json::Value::Null);
+                    resolve_refs(&mut s, &defs, 16);
+                    if let Some(obj) = s.as_object_mut() {
+                        obj.remove("$defs");
+                    }
+                    s
+                });
+            ManifestEntry {
+                name: t.name.to_string(),
+                method: t.method.to_string(),
+                description: t.description.to_string(),
+                input_schema,
+                cli: t.cli.into(),
+            }
         })
         .collect()
 }
@@ -516,6 +698,99 @@ mod manifest_tests {
         assert_eq!(
             by_name("get_span_context").definition_name(),
             "SpansContext"
+        );
+    }
+
+    /// The gap this closes: `threshold` is `{"$ref": "#/$defs/ThresholdSpec"}`,
+    /// so a client reading the raw definition sees a parameter it cannot
+    /// describe, cannot validate and therefore cannot offer. `add_collector`
+    /// could not arm a threshold through any generic front-end.
+    #[test]
+    fn a_nested_object_parameter_is_resolved_not_left_as_a_ref() {
+        let m = manifest();
+        let add = m
+            .iter()
+            .find(|e| e.name == "add_collector")
+            .expect("present");
+        let threshold = &add.input_schema.as_ref().expect("schema")["properties"]["threshold"];
+
+        let blob = serde_json::to_string(threshold).unwrap();
+        assert!(
+            !blob.contains("$ref"),
+            "a client cannot chase a ref it was not given the target of: {blob}"
+        );
+
+        // The five fields must be visible, or a front-end cannot build the object.
+        let inner = threshold["anyOf"]
+            .as_array()
+            .expect("Option<ThresholdSpec> renders as anyOf")
+            .iter()
+            .find_map(|a| a.get("properties"))
+            .expect("the object arm carries its properties");
+        for f in ["metric", "group", "op", "value", "window_ms"] {
+            assert!(inner.get(f).is_some(), "`{f}` is not reachable: {inner}");
+        }
+        // And the enums Phase A declared survive resolution.
+        assert!(
+            inner["op"]["enum"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x == "gte")),
+            "accepted values must survive: {}",
+            inner["op"]
+        );
+    }
+
+    /// `$defs` is scaffolding for resolution, not something a client should
+    /// have to understand once resolution has happened.
+    #[test]
+    fn resolution_leaves_no_defs_behind() {
+        for e in manifest() {
+            if let Some(s) = &e.input_schema {
+                assert!(s.get("$defs").is_none(), "{} still ships its $defs", e.name);
+                assert!(
+                    !serde_json::to_string(s).unwrap().contains("$ref"),
+                    "{} still contains an unresolved ref",
+                    e.name
+                );
+            }
+        }
+    }
+
+    /// The CLI facts a schema cannot carry. Without these the shim would need
+    /// to know that `collectors diff` takes two positional arms and that
+    /// `export_logs` writes a file — which is the hardcoded knowledge the
+    /// manifest exists to remove.
+    #[test]
+    fn cli_hints_reach_the_client() {
+        let m = manifest();
+        let by = |n: &str| m.iter().find(|e| e.name == n).expect("present").clone();
+
+        assert_eq!(by("diff_collectors").cli.positional, ["a", "b"]);
+        assert!(!by("diff_collectors").cli.variadic);
+
+        assert_eq!(by("document_collectors").cli.positional, ["names"]);
+        assert!(
+            by("document_collectors").cli.variadic,
+            "`names` is a list, so the last positional must absorb the rest"
+        );
+
+        assert_eq!(
+            by("export_logs").cli.output_path_param.as_deref(),
+            Some("path"),
+            "a daemon resolves a relative path against its own cwd; the write is client-side"
+        );
+
+        // Everything else is plain, and says so rather than staying silent.
+        let plain = m
+            .iter()
+            .filter(|e| {
+                e.cli.positional.is_empty() && !e.cli.variadic && e.cli.output_path_param.is_none()
+            })
+            .count();
+        assert_eq!(
+            plain,
+            TOOLS.len() - 3,
+            "only three tools have a special shape"
         );
     }
 

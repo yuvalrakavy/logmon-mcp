@@ -2155,6 +2155,7 @@ mod overlay_tests {
                 "type": "object",
                 "properties": { "target": { "type": "string" } }
             })),
+            cli: Default::default(),
         };
         let after = overlay_manifest(compiled(), &[invented]);
 
@@ -2216,6 +2217,7 @@ mod overlay_tests {
                 method: "nonsense.method".into(),
                 description: "REPLACED".into(),
                 input_schema: Some(serde_json::json!({"type": "object"})),
+                cli: Default::default(),
             })
             .collect();
 

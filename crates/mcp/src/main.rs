@@ -1,4 +1,3 @@
-use clap::{Parser, Subcommand as ClapSubcommand};
 use logmon_broker_sdk::Broker;
 use rmcp::ServiceExt;
 
@@ -7,92 +6,44 @@ mod cli;
 mod notifications;
 mod server;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "logmon-mcp",
-    version,
-    about = "logmon broker MCP shim and CLI tool"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Subcommand>,
-
-    /// Named session to attach to. Default for MCP stdio mode is anonymous.
-    /// Default for CLI mode is "cli".
-    #[arg(long, global = true)]
-    session: Option<String>,
-
-    /// Bind to an existing domain. MCP stdio mode: a connect-time bind, re-applied
-    /// on every reconnect when a named `--session` is used (durable; an anonymous
-    /// session fails loud on restart, never a silent `default`). CLI
-    /// mode: scopes this invocation (queries + `domains clear`; create/delete/list
-    /// ignore it). Falls back to the `LOGMON_DOMAIN` env var (set once per
-    /// worktree). Omitted → `default`. The domain must exist (fail-loud).
-    #[arg(long, global = true)]
-    domain: Option<String>,
-
-    /// Emit machine-readable JSON instead of human-readable text. CLI mode only.
-    #[arg(long, global = true)]
-    json: bool,
-}
-
-#[derive(ClapSubcommand, Debug)]
-enum Subcommand {
-    /// Query and clear log entries.
-    Logs(cli::logs::LogsCmd),
-    /// Manage bookmarks (named seq positions, also referenced as cursors via c>=).
-    Bookmarks(cli::bookmarks::BookmarksCmd),
-    /// Manage triggers (filter-driven notifications fired on log match).
-    Triggers(cli::triggers::TriggersCmd),
-    /// Manage buffer filters (per-session).
-    Filters(cli::filters::FiltersCmd),
-    /// Query traces and trace summaries.
-    Traces(cli::traces::TracesCmd),
-    /// Query span context.
-    Spans(cli::spans::SpansCmd),
-    /// Arm and read span time collectors, or profile spans already buffered.
-    Collectors(cli::collectors::CollectorsCmd),
-    /// List or drop sessions.
-    Sessions(cli::sessions::SessionsCmd),
-    /// Create, delete, list, or clear domains (isolated broker instances).
-    Domains(cli::domains::DomainsCmd),
-    /// Print broker status (uptime, receivers, store stats).
-    Status,
-    /// Call any tool the daemon declares, including ones this build predates.
-    ///
-    /// Arguments and types come from the daemon's manifest at runtime, so a
-    /// tool added to the broker is reachable here with no reinstall. Output is
-    /// JSON; the named command groups above are the ones with human rendering.
-    Call(cli::call::CallCmd),
-}
-
+/// Argument parsing is **not** done with clap.
+///
+/// clap builds its command tree before argv is parsed, and the tree is not
+/// known until the daemon has answered `tools.manifest`. A clap-shaped CLI
+/// would have to declare every command up front — which is precisely the
+/// hardcoded knowledge of the daemon that this shim is meant not to have.
+/// [`cli::split_globals`] separates this process's own flags; everything after
+/// them is the command, and the daemon describes it.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mut globals, argv) = cli::split_globals(&args);
+
+    if globals.version {
+        println!("logmon-mcp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     // `--domain` wins; else the `LOGMON_DOMAIN` env var, so a per-worktree MCP
     // config (or shell) can set the track's domain once and every session/CLI
     // call auto-binds it. An empty env var is treated as unset.
-    let domain = cli.domain.or_else(|| {
+    globals.domain = globals.domain.or_else(|| {
         std::env::var("LOGMON_DOMAIN")
             .ok()
             .filter(|s| !s.trim().is_empty())
     });
 
-    match cli.command {
-        Some(cmd) => {
-            // CLI mode — short-lived, fail-fast, route to subcommand handler.
-            // No tracing init: CLI is silent on stderr unless format::error()
-            // explicitly writes there. Stray RUST_LOG settings shouldn't leak
-            // SDK warnings into a CLI consumer's stderr stream.
-            let exit_code = cli::dispatch(cmd, cli.session, domain, cli.json).await;
-            std::process::exit(exit_code);
-        }
-        None => {
-            // MCP stdio mode.
-            run_mcp_stdio(cli.session, domain).await
-        }
+    // A command was named, or help was asked for -> CLI mode. Bare invocation
+    // with no arguments is MCP stdio mode, which is how an MCP client starts it.
+    if !argv.is_empty() || globals.help {
+        // No tracing init: CLI is silent on stderr unless format::error()
+        // explicitly writes there. Stray RUST_LOG settings shouldn't leak
+        // SDK warnings into a CLI consumer's stderr stream.
+        let exit_code = cli::dispatch(globals, argv).await;
+        std::process::exit(exit_code);
     }
+
+    run_mcp_stdio(globals.session, globals.domain).await
 }
 
 async fn run_mcp_stdio(session: Option<String>, domain: Option<String>) -> anyhow::Result<()> {
