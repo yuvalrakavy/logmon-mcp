@@ -1833,7 +1833,7 @@ fn floor_cv(f: &Option<RunToRunFloor>) -> String {
 ///
 /// Not a general YAML emitter: the schema here is fixed and every value is a
 /// name, a filter string, or caller text.
-fn yaml_str(s: &str) -> String {
+pub(crate) fn yaml_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -1847,6 +1847,14 @@ fn yaml_str(s: &str) -> String {
             c if (c as u32) < 0x20 || c as u32 == 0x7f => {
                 out.push_str(&format!("\\x{:02x}", c as u32));
             }
+            // The three line breaks YAML recognises beyond \n and \r. They are
+            // not C0, so the arm above misses them, and a raw one inside a
+            // double-quoted scalar ends the scalar for a conforming parser —
+            // the same break the C0 arm exists to prevent, arriving as a
+            // perfectly ordinary character from an app that logs Unicode.
+            '\u{85}' => out.push_str("\\N"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
             c => out.push(c),
         }
     }
@@ -1871,7 +1879,7 @@ fn yaml_unknown(v: &Option<String>) -> String {
 /// A filename fragment from an arm or collector label. Collector names are
 /// already `[A-Za-z0-9_-]`, but a spec carries `@` and possibly `*`, and the
 /// caller may write the result to disk.
-fn safe_name(s: &str) -> String {
+pub(crate) fn safe_name(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {

@@ -1,3 +1,4 @@
+pub mod cases;
 pub mod collector;
 pub mod domain_data;
 pub mod engine;
