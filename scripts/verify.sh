@@ -48,46 +48,39 @@ run() {
   [ "$status" = ok ] || echo "          log: $d/$name.log"
 }
 
+# WHERE THE WALL CLOCK GOES, and what did NOT fix it.
+#
 # Gatekeeper assesses every NEWLY LINKED executable on its FIRST execution:
-# ~20-40s apiece, at zero in-process CPU, cached per file forever after. The
-# workspace has ~71 test binaries and `cargo test` runs them ONE AT A TIME, so
-# those assessments serialise into the bulk of this script's wall clock — and
-# they are invisible in per-suite timings, which only start counting once a
-# test does. That is how "the tests take 18 seconds" and "the step takes 25
-# minutes" were both true, and why the first attempt to explain this blamed
-# compilation.
+# ~20-40s apiece, at zero in-process CPU, cached per file thereafter. This
+# workspace has 68 test harnesses, so any change to an upstream crate —
+# `crates/protocol` above all — relinks the lot and owes the assessment again.
+# It is invisible in per-suite timings, which start counting only once a test
+# does, which is how "the tests take 18 seconds" and "the step takes 25
+# minutes" were both true and the first explanation blamed compilation.
 #
-# They do parallelise. Measured on this machine, six freshly linked binaries:
-# 125s one after another, 27s all at once. So the first executions are bought
-# concurrently here, and `tests` below then finds every binary already cleared.
+# A pre-warm step that ran all 68 concurrently before `tests` was TRIED AND
+# REMOVED. It did not work, in two independent ways:
 #
-# Nothing is skipped and no security setting is changed — the same assessments
-# happen, just not in single file. `--list` loads and exits without running a
-# test, which is all it takes to spend the verdict.
+#   * No speedup at scale. Six binaries measured 125s serial against 27s
+#     concurrent, so 68 was expected to collapse. It took 44m00s — about 39s
+#     each, indistinguishable from serial. syspolicyd evidently does not
+#     parallelise beyond a handful, and extrapolating n=6 to n=68 was exactly
+#     the mistake of quoting a number measured in another context.
+#   * `tests` did not get cheaper anyway. It still took 8m45s with every
+#     binary already cleared, against 20.4s of actual execution — so clearing
+#     them is not what that step is waiting on either.
 #
-# `|| echo x` per child is deliberate. BSD xargs ABORTS the whole batch when a
-# child exits 255, so one unhappy binary silently leaves most of the set
-# unwarmed and the step looks like it ran. Every child now exits 0, the
-# failures are counted, and the step fails loudly if there were any.
-prewarm() {
-  local list="$d/prewarm.list" count fails
-  cargo test --workspace --all-features --no-run --message-format=json 2>/dev/null |
-    python3 scripts/prewarm-targets.py | sort -u >"$list"
-  count=$(wc -l <"$list" | tr -d ' ')
-  echo "clearing $count test harnesses"
-  fails=$(xargs -P 8 -I{} sh -c '"$1" --list >/dev/null 2>&1 || echo x' _ {} <"$list" |
-    wc -l | tr -d ' ')
-  [ "$fails" -eq 0 ] || {
-    echo "$fails of $count harnesses failed to run"
-    return 1
-  }
-}
-
+# Net: 62m57s with the pre-warm against 27m58s without. Recorded here rather
+# than deleted, so the next person reading these numbers does not re-derive it.
+#
+# The remedy that does work is a machine setting, not a script change:
+# System Settings -> Privacy & Security -> Developer Tools, listing whatever
+# application runs cargo. That exempts spawned processes from assessment
+# outright. It needs that app restarted before it takes effect.
 run fmt cargo fmt --all --check
 run schema cargo run -q -p xtask -- verify-schema
 run clippy cargo clippy --workspace --all-targets --all-features
 run build cargo test --workspace --all-features --no-run
-run prewarm prewarm
 run tests cargo test --workspace --all-features
 
 echo
