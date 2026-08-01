@@ -167,10 +167,26 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                     out_path.as_deref(),
                 );
                 if files.is_empty() {
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        serde_json::to_string_pretty(&result)
+                    // A tool that CAN write a file but was given no path
+                    // returns its BODY, not the envelope. `document_collectors`
+                    // produces markdown; handing an agent
+                    // `{"content":"# Title\n…"}` costs it a turn to unwrap and
+                    // JSON-escapes every line of the document it asked for.
+                    let body = hints
+                        .file_output
+                        .as_ref()
+                        .and_then(|f| f.content_field.as_ref())
+                        .and_then(|field| result.get(field))
+                        .map(|v| match v.as_str() {
+                            Some(s) => s.to_string(),
+                            None => serde_json::to_string_pretty(v).unwrap_or_default(),
+                        });
+                    let text = match body {
+                        Some(b) => format!("{b}{}", notes(&result)),
+                        None => serde_json::to_string_pretty(&result)
                             .unwrap_or_else(|e| format!("unserialisable reply: {e}")),
-                    )]));
+                    };
+                    return Ok(CallToolResult::success(vec![Content::text(text)]));
                 }
 
                 let mut wrote = Vec::new();
@@ -184,12 +200,35 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                     wrote.push(format!("{} ({} bytes)", f.path.display(), f.body.len()));
                 }
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "wrote {}",
-                    wrote.join(", ")
+                    "wrote {}{}",
+                    wrote.join(", "),
+                    notes(&result)
                 ))]))
             })
         },
     ))
+}
+
+/// Any `warnings` the reply carries, rendered for a reader.
+///
+/// **Warnings on a result are the part most worth not losing.** Every one of
+/// `collectors.document`'s describes a caveat attached to the number beside it
+/// — an arm whose ingest dropped spans, a sample tier that truncated. The old
+/// hand-written tools appended them; the generic path dropped them, so a
+/// document generated with caveats delivered none of them.
+///
+/// A convention rather than tool knowledge: `warnings` is the daemon's own
+/// name for this across every result type that has one.
+fn notes(reply: &serde_json::Value) -> String {
+    let Some(ws) = reply.get("warnings").and_then(|w| w.as_array()) else {
+        return String::new();
+    };
+    let lines: Vec<String> = ws
+        .iter()
+        .filter_map(|w| w.as_str())
+        .map(|w| format!("\n> NOTE: {w}"))
+        .collect();
+    lines.concat()
 }
 
 /// Assemble a router from what the daemon says it serves.

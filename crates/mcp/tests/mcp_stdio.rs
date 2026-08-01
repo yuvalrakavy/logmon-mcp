@@ -271,6 +271,43 @@ async fn a_tool_that_writes_a_local_file_writes_it() {
     .await;
 }
 
+/// With no path, a document tool returns the DOCUMENT, not an envelope.
+///
+/// Handing an agent `{"content":"# Title\n…","sidecar_content":{…}}` costs it a
+/// turn to unwrap and JSON-escapes every line of the markdown it asked for.
+/// The CLI got this in `d0d8b7e`; the MCP surface did not.
+#[tokio::test]
+async fn a_document_with_no_path_returns_markdown_not_an_envelope() {
+    with_mcp(|mcp, _| {
+        mcp.call(
+            "add_collector",
+            json!({ "name": "e", "filter": "ALL", "level": "tree" }),
+        )
+        .expect("armed");
+        mcp.call(
+            "snapshot_collector",
+            json!({ "name": "e", "label": "base" }),
+        )
+        .expect("snapshotted");
+
+        let text = mcp
+            .call("document_collectors", json!({ "names": ["e@base"] }))
+            .expect("documented");
+
+        assert!(
+            text.starts_with("---"),
+            "the markdown itself, not a JSON wrapper: {}",
+            &text[..text.len().min(90)]
+        );
+        assert!(
+            !text.contains("\\n"),
+            "and not JSON-escaped: {}",
+            &text[..text.len().min(90)]
+        );
+    })
+    .await;
+}
+
 /// `collectors document` produces a document AND a companion file beside it.
 /// The generic path wrote neither until `d0d8b7e`, and nothing would have
 /// caught it: this is the only test that runs the write.

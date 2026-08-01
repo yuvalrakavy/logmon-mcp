@@ -172,6 +172,20 @@ fn coerce(raw: &str, node: Option<&Value>) -> Result<Value, String> {
             let item = node.and_then(|n| unwrap_optional(n).get("items"));
             coerce(raw, item)
         }
+        // **A parameter that declares NO type is free-form, and the faithful
+        // reading of a JSON-shaped value is the JSON.** `collectors.snapshot`'s
+        // `meta` is a bare `Value`, so schemars emits a description and no
+        // `type`; falling through to the string default recorded the literal
+        // text `{"commit":"abc123"}` as a run's provenance, and anything later
+        // reading `meta.commit` found nothing. `domain_data`'s `ttl` is the
+        // other one: `false` must clear a lifetime, not set it to `"false"`.
+        //
+        // Only when the schema is silent. A declared `string` stays a string,
+        // so a filter like `sv=svc` is never reinterpreted.
+        None if node.is_some() => {
+            Ok(serde_json::from_str::<Value>(raw)
+                .unwrap_or_else(|_| Value::String(raw.to_string())))
+        }
         _ => Ok(Value::String(raw.to_string())),
     }
 }
@@ -618,17 +632,27 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
         }
     };
 
-    // `--json` asks for the reply, not for a side effect on disk.
-    if json {
-        emit(&reply, true);
-        return 0;
-    }
-
+    // `--json` selects the OUTPUT FORMAT; it does not cancel a file the caller
+    // asked for. Returning early here wrote nothing, said nothing and exited 0
+    // — the silent loss `warn_about_unwritten_sidecar` exists to prevent, in
+    // exactly the mode a script would use.
     let files = logmon_broker_protocol::mcp_tools::files_to_write(
         &m.entry.cli,
         &reply,
         out_path.as_deref(),
     );
+    for f in &files {
+        if let Err(e) = std::fs::write(&f.path, &f.body) {
+            format::error(&format!("failed to write {}: {e}", f.path.display()), json);
+            return 1;
+        }
+    }
+
+    if json {
+        emit(&reply, true);
+        return 0;
+    }
+
     if files.is_empty() {
         // A tool that CAN write a file but was given no path prints its body
         // rather than the envelope — `collectors document` with no `--path` is
@@ -646,6 +670,7 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
                     None => emit(v, false),
                 }
                 warn_about_unwritten_sidecar(m.entry, &reply);
+                print_notes(&reply);
                 return 0;
             }
         }
@@ -653,14 +678,26 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
         return 0;
     }
 
-    for f in files {
-        if let Err(e) = std::fs::write(&f.path, &f.body) {
-            format::error(&format!("failed to write {}: {e}", f.path.display()), json);
-            return 1;
-        }
+    for f in &files {
         println!("wrote {} ({} bytes)", f.path.display(), f.body.len());
     }
+    print_notes(&reply);
     0
+}
+
+/// Print any `warnings` the reply carries, to stderr.
+///
+/// **Every one of them qualifies a number that is about to be read.** The old
+/// hand-written commands printed these; the generic path dropped them, so a
+/// document generated with caveats delivered none of them. stderr, so a
+/// pipeline reading stdout still gets clean output.
+fn print_notes(reply: &Value) {
+    let Some(ws) = reply.get("warnings").and_then(|w| w.as_array()) else {
+        return;
+    };
+    for w in ws.iter().filter_map(|w| w.as_str()) {
+        eprintln!("note: {w}");
+    }
 }
 
 /// A companion file was produced and thrown away because no path was given.
@@ -866,6 +903,42 @@ mod tests {
             ],
         );
         assert_eq!(p["group_keys"], serde_json::json!(["a", "b"]));
+    }
+
+    /// `collectors.snapshot`'s `meta` is a bare `Value`, so the schema gives it
+    /// no `type`. Falling through to the string default recorded the literal
+    /// text `{"commit":"abc"}` as a run's provenance, and anything later
+    /// reading `meta.commit` found nothing. Malformed JSON was accepted too.
+    #[test]
+    fn an_untyped_parameter_takes_json_when_it_looks_like_json() {
+        let p = parse(
+            "snapshot_collector",
+            &[
+                "--name",
+                "c",
+                "--label",
+                "l",
+                "--meta",
+                r#"{"commit":"abc123"}"#,
+            ],
+        );
+        assert_eq!(
+            p["meta"]["commit"], "abc123",
+            "recorded as an object, not the text of one: {}",
+            p["meta"]
+        );
+
+        // Not JSON — still a string, so a plain note survives.
+        let p = parse(
+            "snapshot_collector",
+            &["--name", "c", "--label", "l", "--meta", "before the cache"],
+        );
+        assert_eq!(p["meta"], "before the cache");
+
+        // A DECLARED string is never reinterpreted, so a filter that happens to
+        // look like JSON stays the filter the user typed.
+        let p = parse("add_collector", &["--name", "c", "--filter", "123"]);
+        assert_eq!(p["filter"], "123", "a declared string stays a string");
     }
 
     #[test]
