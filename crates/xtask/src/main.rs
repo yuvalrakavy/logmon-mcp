@@ -68,6 +68,8 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "LogsContextResult":     schema_for!(LogsContextResult),
             "LogsExport":            schema_for!(LogsExport),
             "LogsExportResult":      schema_for!(LogsExportResult),
+            "EvidenceVerdict":       schema_for!(EvidenceVerdict),
+            "NarrowedRange":         schema_for!(NarrowedRange),
             "LogsClear":             schema_for!(LogsClear),
             "LogsClearResult":       schema_for!(LogsClearResult),
             "FiltersList":           schema_for!(FiltersList),

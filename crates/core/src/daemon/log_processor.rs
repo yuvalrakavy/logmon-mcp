@@ -173,11 +173,25 @@ pub fn process_entry_for_domain(
             pipeline.append_to_store(store_entry);
         } else {
             // Evaluate union of this domain's sessions' filters
-            let (should_store, matched_descriptions) =
-                sessions.evaluate_filters_for_domain(domain, entry);
-            if should_store {
+            let decision = sessions.evaluate_filters_for_domain(domain, entry);
+
+            // The epoch boundary is recorded HERE, from the policy that just
+            // made the decision — not stamped on the RPC thread beside the
+            // mutation that caused the flip. `entry.seq` was assigned at the
+            // top of this function, so a stamp taken over there would be
+            // approximate by whatever is in flight, and `complete` would end up
+            // claimed over entries the other policy actually judged.
+            //
+            // Only this branch observes, because only this branch lets the
+            // policy decide anything. An entry stored by a trigger or inside a
+            // post-window is in the store whatever the filters say, so a
+            // boundary that lands after a stretch of them mis-attributes
+            // entries that are all present — see `engine::epoch`.
+            pipeline.epochs().observe(entry.seq, &decision.policy);
+
+            if decision.should_store {
                 let mut store_entry = entry.clone();
-                store_entry.matched_filters = matched_descriptions;
+                store_entry.matched_filters = decision.matched_descriptions;
                 store_entry.source = LogSource::Filter;
                 pipeline.append_to_store(store_entry);
             }

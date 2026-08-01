@@ -11,11 +11,13 @@ use logmon_broker_core::collector::state::DEFAULT_MAX_SAMPLE_BYTES;
 use logmon_broker_core::daemon::domain::{
     Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
 };
+use logmon_broker_core::daemon::log_processor::process_entry_for_domain;
 use logmon_broker_core::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use logmon_broker_core::daemon::session::{SessionId, SessionRegistry};
 use logmon_broker_core::daemon::span_processor::process_span_for_domain;
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
+use logmon_broker_core::gelf::message::{Level, LogEntry};
 use logmon_broker_core::receiver::ReceiverMetrics;
 use logmon_broker_core::span::store::SpanStore;
 use logmon_broker_core::span::types::SlowGroupBy;
@@ -35,7 +37,13 @@ struct Harness {
 }
 
 fn make_domain(name: &str) -> Arc<Domain> {
-    let seq = Arc::new(SeqCounter::new());
+    make_domain_at(name, 0)
+}
+
+/// A domain whose seq counter starts at `initial_seq` — how a restored domain
+/// comes back, resuming the counter the previous daemon run reached.
+fn make_domain_at(name: &str, initial_seq: u64) -> Arc<Domain> {
+    let seq = Arc::new(SeqCounter::new_with_initial(initial_seq));
     Arc::new(Domain::from_parts(
         DomainConfig {
             name: DomainId::new(name).unwrap_or_else(|_| DomainId::default_domain()),
@@ -102,6 +110,17 @@ impl Harness {
             Some(e) => Err(e.message),
             None => Ok(resp.result.unwrap_or(Value::Null)),
         }
+    }
+
+    /// Feed a log through the real processor for `domain`, so the storage
+    /// decision — and therefore the epoch log — is taken exactly as the daemon
+    /// takes it. Returns the seq the pipeline assigned.
+    fn feed_log(&self, domain: &str, level: Level, message: &str) -> u64 {
+        let id = DomainId::new(domain).expect("valid domain name");
+        let d = self.domains.get(&id).expect("domain exists");
+        let mut entry = LogEntry::synthetic(level, message);
+        process_entry_for_domain(&mut entry, &d.pipeline, &self.sessions, &id);
+        entry.seq
     }
 
     /// Feed a span through the real ingest path for `domain`, so collectors see
@@ -3525,4 +3544,319 @@ fn spans_export_refuses_a_cursor_qualifier() {
         .call(&sid, "spans.export", json!({ "filter": "c>=somecursor" }))
         .expect_err("a read-and-advance cursor must not be usable for a capture");
     assert!(err.contains("cursor"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// §4.2 — the evidence verdict, and the per-domain epoch log behind it
+// ---------------------------------------------------------------------------
+
+/// The positive case, first and deliberately.
+///
+/// Every other assertion in this section is satisfied by a handler that returns
+/// `cannot_verify` unconditionally. This one is the only thing that makes them
+/// mean anything.
+#[test]
+fn export_reports_complete_for_an_unfiltered_uncapped_window() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for i in 1..=5 {
+        h.feed_log("default", Level::Info, &format!("entry {i}"));
+    }
+
+    let out = h.call(&sid, "logs.export", json!({})).unwrap();
+    assert_eq!(out["count"], 5);
+    assert_eq!(
+        out["verdict"], "complete",
+        "nothing narrowed, nothing evicted, nothing capped: {out}"
+    );
+    assert!(
+        out["narrowed_by"].as_array().is_none_or(|n| n.is_empty()),
+        "{out}"
+    );
+}
+
+/// §4.2's headline: a window another session was narrowing must not read as
+/// complete, and must say **which filters, over which seqs** — a bare flag
+/// would leave the reader unable to tell what they are missing.
+#[test]
+fn export_reports_filtered_and_names_the_filter_and_the_seqs() {
+    let h = harness();
+    let capturer = h.sessions.create_named("capturer").unwrap();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+
+    let unfiltered = h.feed_log("default", Level::Info, "before");
+
+    // Another session narrows the domain. The capturer never sees this happen.
+    h.sessions
+        .add_filter(&noisy, "l>=ERROR", Some("errors only"))
+        .unwrap();
+    h.feed_log("default", Level::Info, "never stored");
+    let kept = h.feed_log("default", Level::Error, "kept");
+
+    let out = h.call(&capturer, "logs.export", json!({})).unwrap();
+    assert_eq!(
+        out["count"], 2,
+        "the Info between them was dropped, which is the point: {out}"
+    );
+    assert_eq!(out["verdict"], "filtered", "{out}");
+
+    let narrowed = out["narrowed_by"]
+        .as_array()
+        .expect("named, not merely flagged");
+    assert_eq!(narrowed.len(), 1, "{out}");
+    assert_eq!(narrowed[0]["filters"], json!(["l>=ERROR"]));
+    assert_eq!(
+        narrowed[0]["from_seq"].as_u64().unwrap(),
+        unfiltered + 1,
+        "the epoch opens at the first entry the new policy decided: {out}"
+    );
+    assert_eq!(narrowed[0]["to_seq"].as_u64().unwrap(), kept);
+}
+
+/// H2's exact form. `evaluate_filters_for_domain` checks only `is_in_domain` —
+/// there is no `connected` check — so a **disconnected** named session's
+/// filters go on narrowing the store until the TTL sweep retires it.
+///
+/// A marker keyed on connected sessions would report this window as complete,
+/// which is why the policy is read from the same scan that decides storage
+/// rather than from a separate "who is live" question.
+#[test]
+fn a_disconnected_sessions_filters_still_narrow_the_verdict() {
+    let h = harness();
+    let capturer = h.sessions.create_named("capturer").unwrap();
+    let gone = h.sessions.create_named("gone").unwrap();
+    h.sessions.add_filter(&gone, "l>=ERROR", None).unwrap();
+    h.sessions.disconnect(&gone);
+    assert!(
+        !h.sessions.is_connected(&gone),
+        "the holder is disconnected"
+    );
+
+    h.feed_log("default", Level::Info, "never stored");
+    h.feed_log("default", Level::Error, "kept");
+
+    let out = h.call(&capturer, "logs.export", json!({})).unwrap();
+    assert_eq!(
+        out["count"], 1,
+        "the Info was dropped by a dead session: {out}"
+    );
+    assert_eq!(
+        out["verdict"], "filtered",
+        "a disconnected session's filters still narrow the store: {out}"
+    );
+    assert_eq!(out["narrowed_by"][0]["filters"], json!(["l>=ERROR"]));
+}
+
+/// `filters.edit` replaces the condition in place, so the *boolean* never
+/// moves: filtered before, filtered after. An epoch keyed on the boolean would
+/// report the NEW filter string over the OLD range — wrong information rather
+/// than missing information, which is the failure this whole feature exists to
+/// prevent.
+#[test]
+fn editing_a_filter_opens_an_epoch_so_the_old_range_keeps_the_old_string() {
+    let h = harness();
+    let capturer = h.sessions.create_named("capturer").unwrap();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+    // Both admit an Info entry, so both entries are stored AND both go through
+    // the branch where filters decide — which is where the epoch is recorded.
+    // An ERROR would be stored by the default `l>=ERROR` trigger instead and
+    // never reach it.
+    let fid = h.sessions.add_filter(&noisy, "l>=INFO", None).unwrap();
+
+    let under_info = h.feed_log("default", Level::Info, "first");
+    h.sessions
+        .edit_filter(&noisy, fid, Some("l>=DEBUG"), None)
+        .unwrap();
+    let under_debug = h.feed_log("default", Level::Info, "second");
+
+    // The old range is attributed to the old string, alone.
+    let old = h
+        .call(
+            &capturer,
+            "logs.export",
+            json!({ "from_seq": under_info, "to_seq": under_info }),
+        )
+        .unwrap();
+    assert_eq!(old["verdict"], "filtered", "{old}");
+    let narrowed = old["narrowed_by"].as_array().unwrap();
+    assert_eq!(narrowed.len(), 1, "{old}");
+    assert_eq!(
+        narrowed[0]["filters"],
+        json!(["l>=INFO"]),
+        "the edit must not reach back over the range it postdates: {old}"
+    );
+
+    // Over the whole span, both are reported, each against its own seqs.
+    let both = h
+        .call(
+            &capturer,
+            "logs.export",
+            json!({ "from_seq": under_info, "to_seq": under_debug }),
+        )
+        .unwrap();
+    let narrowed = both["narrowed_by"].as_array().unwrap();
+    assert_eq!(narrowed.len(), 2, "one epoch each side of the edit: {both}");
+    assert_eq!(narrowed[0]["filters"], json!(["l>=INFO"]));
+    assert_eq!(narrowed[0]["to_seq"].as_u64().unwrap(), under_info);
+    assert_eq!(narrowed[1]["filters"], json!(["l>=DEBUG"]));
+    assert_eq!(narrowed[1]["from_seq"].as_u64().unwrap(), under_debug);
+}
+
+/// The boundary is observed only where the policy decides something, so a
+/// stretch stored by a trigger — or by the 200-entry post-window a fire opens —
+/// pushes it late. That is sound rather than merely tolerable, and this is the
+/// case that shows why: every entry in the stretch is in the store whatever the
+/// filters said, so `complete` over it is *true*, not a false claim the late
+/// boundary happened to permit.
+#[test]
+fn a_trigger_stored_stretch_pushes_the_boundary_late_and_stays_honest() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+
+    h.feed_log("default", Level::Info, "quiet");
+    // A filter nothing can match: synthetic entries carry no facility.
+    h.sessions
+        .add_filter(&noisy, "fa=nonexistent", None)
+        .unwrap();
+    // The default `l>=ERROR` trigger stores this one and opens a post-window,
+    // so neither it nor the Info after it reaches the filter branch.
+    h.feed_log("default", Level::Error, "boom");
+    h.feed_log("default", Level::Info, "after the fire");
+
+    let out = h.call(&sid, "logs.export", json!({})).unwrap();
+    assert_eq!(
+        out["count"], 3,
+        "a filter that matches nothing dropped nothing, because the trigger \
+         path does not consult it: {out}"
+    );
+    assert_eq!(
+        out["verdict"], "complete",
+        "the epoch log still reads unfiltered here, and it is right to: every \
+         entry over this window is in the store: {out}"
+    );
+}
+
+/// An empty store satisfies every clause of the normative `complete` row —
+/// nothing was evicted, nothing was capped, no filter narrowed anything — which
+/// is exactly why `cannot_verify` has to be a verdict and not a paragraph.
+///
+/// Driven through `logs.clear` rather than a fresh harness, so the epoch log
+/// *does* hold an unfiltered epoch covering the range. A store that had never
+/// run would be refused for the weaker reason that nothing is recorded about it.
+#[test]
+fn an_empty_store_reports_cannot_verify_not_complete() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for i in 1..=3 {
+        h.feed_log("default", Level::Info, &format!("entry {i}"));
+    }
+    assert_eq!(
+        h.call(&sid, "logs.export", json!({})).unwrap()["verdict"],
+        "complete",
+        "precondition: this window was claimable before the clear"
+    );
+
+    h.call(&sid, "logs.clear", json!({})).unwrap();
+
+    let out = h.call(&sid, "logs.export", json!({})).unwrap();
+    assert_eq!(out["count"], 0);
+    assert_eq!(
+        out["verdict"], "cannot_verify",
+        "0 entries under an unfiltered epoch is not evidence of a quiet system: {out}"
+    );
+}
+
+/// A daemon restart is an epoch boundary on every domain, and the log is
+/// per-process: a restored domain resumes its predecessor's seq counter, so
+/// seqs below where this incarnation started belong to a run this process has
+/// no record of.
+///
+/// Nothing detects the restart. The property falls out of opening the log at
+/// the counter's origin instead of at zero.
+#[test]
+fn a_window_from_before_this_incarnation_reports_cannot_verify() {
+    let h = harness();
+    h.domains.insert(make_domain_at("default", 500));
+    let sid = h.sessions.create_named("A").unwrap();
+
+    let first = h.feed_log("default", Level::Info, "one");
+    assert_eq!(first, 501, "the counter resumed, it did not restart");
+    h.feed_log("default", Level::Info, "two");
+    let third = h.feed_log("default", Level::Info, "three");
+
+    let carried = h
+        .call(&sid, "logs.export", json!({ "from_seq": 400 }))
+        .unwrap();
+    assert_eq!(
+        carried["verdict"], "cannot_verify",
+        "a window straddling the restart cannot inherit this run's policy: {carried}"
+    );
+
+    // A window wholly inside this incarnation is claimable as usual.
+    let own = h
+        .call(&sid, "logs.export", json!({ "from_seq": third }))
+        .unwrap();
+    assert_eq!(own["verdict"], "complete", "{own}");
+}
+
+/// A capped read stopped short of what matched, so what it did not return is
+/// unknown rather than absent.
+///
+/// Driven by the explicit `capped` flag: comparing what was asked for against
+/// what came back cannot tell "cut short at N" from "exactly N existed", and
+/// the second of those is complete.
+#[test]
+fn a_capped_window_is_never_complete() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    for i in 1..=6 {
+        h.feed_log("default", Level::Info, &format!("entry {i}"));
+    }
+
+    let cut = h.call(&sid, "logs.export", json!({ "count": 4 })).unwrap();
+    assert_eq!(cut["capped"], true, "{cut}");
+    assert_eq!(cut["verdict"], "cannot_verify", "{cut}");
+
+    // Six of six is not capped — and that is the case an inference gets wrong.
+    let exact = h.call(&sid, "logs.export", json!({ "count": 6 })).unwrap();
+    assert_eq!(exact["capped"], false, "{exact}");
+    assert_eq!(exact["verdict"], "complete", "{exact}");
+}
+
+/// `partial` was cut (§9.4) because it was uncomputable and would have appeared
+/// on nearly every document. A removed verdict that a renderer still emits is
+/// the failure mode, so the closed set is asserted from both sides.
+#[test]
+fn the_verdict_set_is_closed_and_partial_is_not_in_it() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+
+    let mut seen = vec![h.call(&sid, "logs.export", json!({})).unwrap()["verdict"].clone()];
+    for i in 1..=4 {
+        h.feed_log("default", Level::Info, &format!("entry {i}"));
+    }
+    seen.push(h.call(&sid, "logs.export", json!({})).unwrap()["verdict"].clone());
+    seen.push(h.call(&sid, "logs.export", json!({ "count": 2 })).unwrap()["verdict"].clone());
+    h.sessions.add_filter(&noisy, "l>=ERROR", None).unwrap();
+    // An Info, not an Error: an Error would be stored by the default trigger
+    // without the filters ever being consulted, so the epoch would not flip —
+    // and `complete` would be the correct answer.
+    h.feed_log("default", Level::Info, "dropped");
+    seen.push(h.call(&sid, "logs.export", json!({})).unwrap()["verdict"].clone());
+
+    for v in &seen {
+        let v = v
+            .as_str()
+            .expect("a verdict is always present and a string");
+        assert!(
+            ["complete", "evicted", "filtered", "cannot_verify"].contains(&v),
+            "unknown verdict `{v}` in {seen:?}"
+        );
+    }
+    // And the set is actually exercised rather than one value repeating.
+    assert!(seen.iter().any(|v| v == "complete"), "{seen:?}");
+    assert!(seen.iter().any(|v| v == "filtered"), "{seen:?}");
+    assert!(seen.iter().any(|v| v == "cannot_verify"), "{seen:?}");
 }

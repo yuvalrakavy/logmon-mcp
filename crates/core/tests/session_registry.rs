@@ -170,10 +170,15 @@ fn test_evaluate_filters_union() {
 
     // Entry matching session A's filter
     let entry = make_entry(Level::Info, "mqtt msg", Some("app::mqtt"));
-    let (should_store, descs) =
-        registry.evaluate_filters_for_domain(&DomainId::default_domain(), &entry);
-    assert!(should_store);
-    assert!(descs.contains(&"MQTT".to_string()));
+    let decision = registry.evaluate_filters_for_domain(&DomainId::default_domain(), &entry);
+    assert!(decision.should_store);
+    assert!(decision.matched_descriptions.contains(&"MQTT".to_string()));
+
+    // The policy is the union of BOTH sessions' filters, not only the one that
+    // matched: either of them narrowing the store narrows it for everybody, and
+    // that is what an epoch records.
+    assert!(decision.policy.is_filtered());
+    assert_eq!(decision.policy.filters(), ["fa=mqtt", "l>=ERROR"]);
 }
 
 #[test]
@@ -182,9 +187,12 @@ fn test_no_filters_means_store_all() {
     registry.create_anonymous(); // session with no filters
 
     let entry = make_entry(Level::Debug, "debug", None);
-    let (should_store, _) =
-        registry.evaluate_filters_for_domain(&DomainId::default_domain(), &entry);
-    assert!(should_store); // no filters = implicit ALL
+    let decision = registry.evaluate_filters_for_domain(&DomainId::default_domain(), &entry);
+    assert!(decision.should_store); // no filters = implicit ALL
+    assert!(
+        !decision.policy.is_filtered(),
+        "an unfiltered domain is the epoch a range can be called complete inside"
+    );
 }
 
 #[test]

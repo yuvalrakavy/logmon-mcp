@@ -1,4 +1,5 @@
 use crate::daemon::domain::DomainId;
+use crate::engine::epoch::FilterPolicy;
 use crate::engine::pipeline::PipelineEvent;
 use crate::engine::trigger::{TriggerError, TriggerInfo, TriggerManager, TriggerMatch};
 use crate::filter::matcher::matches_entry;
@@ -58,6 +59,23 @@ pub struct FilterInfo {
     pub id: u32,
     pub filter_string: String,
     pub description: Option<String>,
+}
+
+/// What one entry's filter evaluation concluded, and the policy it concluded
+/// it under.
+///
+/// The policy travels with the decision rather than being read back separately
+/// because the epoch log records it: a second read could observe a different
+/// policy than the one that actually decided this entry, which would attribute
+/// the entry to the wrong epoch. See [`crate::engine::epoch`].
+pub struct StorageDecision {
+    pub should_store: bool,
+    /// Descriptions of the filters this entry matched — stamped onto the stored
+    /// entry so a reader can see why it was kept.
+    pub matched_descriptions: Vec<String>,
+    /// Every filter narrowing the domain, matching or not. This is what decides
+    /// whether the store was conditional at all.
+    pub policy: FilterPolicy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -892,12 +910,12 @@ impl SessionRegistry {
         &self,
         domain: &DomainId,
         entry: &LogEntry,
-    ) -> (bool, Vec<String>) {
+    ) -> StorageDecision {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
 
-        let mut any_filter_exists = false;
         let mut matched = false;
         let mut descriptions = Vec::new();
+        let mut policy = Vec::new();
 
         for state in sessions.values() {
             if !state.is_in_domain(domain) {
@@ -907,8 +925,12 @@ impl SessionRegistry {
             if filters.is_empty() {
                 continue;
             }
-            any_filter_exists = true;
             for f in filters.iter() {
+                // Collected unconditionally, and from inside the same guard
+                // that decides — this IS the policy that made this decision,
+                // not a re-read of the policy shortly afterwards. See
+                // `engine::epoch` for why the difference is the whole point.
+                policy.push(f.filter_string.clone());
                 if matches_entry(&f.condition, entry) {
                     matched = true;
                     if let Some(ref desc) = f.description {
@@ -918,12 +940,13 @@ impl SessionRegistry {
             }
         }
 
-        if !any_filter_exists {
-            // No filters defined in this domain => store everything
-            return (true, Vec::new());
+        let policy = FilterPolicy::new(policy);
+        StorageDecision {
+            // No filters in this domain => store everything.
+            should_store: matched || !policy.is_filtered(),
+            matched_descriptions: descriptions,
+            policy,
         }
-
-        (matched, descriptions)
     }
 
     /// Sessions bound to `domain` (connected + disconnected named), ordered by

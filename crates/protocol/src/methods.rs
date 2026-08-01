@@ -338,6 +338,66 @@ pub struct LogsExportResult {
     /// different kind of missing.
     #[serde(default)]
     pub capped: bool,
+    /// How much of this window the daemon can vouch for.
+    ///
+    /// Defaults to `cannot_verify`, which is the whole point of the default: a
+    /// reply from a broker too old to send the field must not be read as a
+    /// clean bill of health.
+    #[serde(default)]
+    pub verdict: EvidenceVerdict,
+    /// The stretches of the window over which a session filter was narrowing
+    /// what the daemon stored, and the filters doing it. Empty unless `verdict`
+    /// is `filtered`.
+    ///
+    /// Always emitted, including empty — a reader that sees `filtered` comes
+    /// here next, and "the field is absent" must not be one more state it has
+    /// to tell apart from "nothing narrowed anything".
+    #[serde(default)]
+    pub narrowed_by: Vec<NarrowedRange>,
+}
+
+/// How much of an exported window the daemon can vouch for.
+///
+/// The reason this exists: storage is conditional, so "nothing appeared before
+/// the error" is ambiguous between *absence of cause* and *absence of
+/// recording*. Only a record of the storage policy over time can separate them,
+/// and without one a window shaped by another session's filter reads as
+/// complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceVerdict {
+    /// The window lies wholly inside one unfiltered epoch, nothing was evicted,
+    /// and nothing was capped. Everything that reached the daemon over these
+    /// seqs is in the reply.
+    Complete,
+    /// The ring dropped part of the window; `evicted_before_window` bounds how
+    /// much.
+    Evicted,
+    /// A session filter was narrowing the store over part of the window. See
+    /// `narrowed_by` for which filters, and over which seqs.
+    Filtered,
+    /// No claim can be made: the store is empty, or the window predates what
+    /// the daemon still records about its own storage policy (including a
+    /// window carried over from a previous daemon run), or the read was capped
+    /// short of what matched.
+    ///
+    /// The default, deliberately — see [`LogsExportResult::verdict`].
+    #[default]
+    CannotVerify,
+}
+
+/// One stretch of an exported window over which a session filter was narrowing
+/// what the daemon stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct NarrowedRange {
+    /// Clamped to the window that was asked for, so these are the caller's own
+    /// seqs rather than wherever the epoch happened to begin.
+    pub from_seq: u64,
+    pub to_seq: u64,
+    /// The filter strings in force over this stretch — the union across every
+    /// session bound to the domain, since any one of them narrowing the store
+    /// narrows it for everybody.
+    pub filters: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

@@ -761,6 +761,41 @@ fn resolved_lower_bound(filter: &ParsedFilter) -> Option<u64> {
     }
 }
 
+/// The **inclusive** seq window a resolved query selects: `(lowest, highest)`,
+/// each `None` when the query is unbounded in that direction.
+///
+/// The internal ops are strict (`SeqOp` has only `Gt` and `Lt`, because
+/// bookmark semantics are strict by design), so this converts: `Gt(v)` admits
+/// `v + 1` upward, `Lt(v)` admits `v - 1` downward. With several bounds the
+/// effective window is the tightest — max of the lower, min of the upper —
+/// since the matcher AND-combines qualifiers.
+///
+/// Distinct from [`evicted_before_window`]'s use of the lower bound, which
+/// wants the raw strict value to measure a gap from. This one is the window a
+/// caller asked about, which is what a completeness claim has to be about.
+pub fn resolved_seq_range(filter: Option<&ParsedFilter>) -> (Option<u64>, Option<u64>) {
+    let Some(ParsedFilter::Qualifiers(qs)) = filter else {
+        return (None, None);
+    };
+    let mut lo: Option<u64> = None;
+    let mut hi: Option<u64> = None;
+    for q in qs {
+        if let Qualifier::SeqFilter { op, value } = q {
+            match op {
+                SeqOp::Gt => {
+                    let bound = value.saturating_add(1);
+                    lo = Some(lo.map_or(bound, |cur: u64| cur.max(bound)));
+                }
+                SeqOp::Lt => {
+                    let bound = value.saturating_sub(1);
+                    hi = Some(hi.map_or(bound, |cur: u64| cur.min(bound)));
+                }
+            }
+        }
+    }
+    (lo, hi)
+}
+
 /// B5: `Some(gap)` when the query's lower bound predates the retained buffer
 /// (records were evicted from the window), else `None`. `gap = oldest - lb` is
 /// the number of seqs between the window start and the oldest retained record —

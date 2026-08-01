@@ -910,6 +910,51 @@ impl RpcHandler {
             .as_ref()
             .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.buffer_oldest_seq));
 
+        // How much of this window the daemon can vouch for (§4.2).
+        //
+        // The window is the caller's range where it gave one. Where it did not,
+        // the upper end is the newest seq ASSIGNED, not the newest stored: a
+        // filter that dropped everything since seq N leaves `buffer_newest_seq`
+        // below N, and taking that as the window would put the filtered tail
+        // outside it and report the remainder `complete` — the reader's "I have
+        // everything" is exactly what would be wrong.
+        //
+        // An empty store gets no window at all, and so no claim. It satisfies
+        // every clause of `complete` vacuously — nothing evicted, nothing
+        // capped, nothing narrowed — which is why §4.2 makes emptiness a
+        // verdict of its own rather than a remark under the table.
+        let (lo, hi) = crate::filter::parser::resolved_seq_range(resolved.as_ref());
+        let window = stats.buffer_oldest_seq.and_then(|oldest| {
+            let from = lo.unwrap_or(oldest);
+            // Read AFTER the query, so the window is guaranteed to contain every
+            // seq the query could have returned. Reading it first would leave an
+            // entry that arrived mid-query outside the window the verdict is
+            // about.
+            let to = hi.unwrap_or_else(|| d.pipeline.current_seq());
+            (from <= to).then_some((from, to))
+        });
+        let coverage = window.map(|(from, to)| d.pipeline.epochs().coverage(from, to));
+        let verdict = crate::engine::epoch::evidence_verdict(
+            coverage.as_ref(),
+            evicted_before_window.is_some(),
+            capped,
+        );
+        let narrowed_by: Vec<Value> = coverage
+            .as_ref()
+            .map(|c| {
+                c.narrowed
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "from_seq": n.from_seq,
+                            "to_seq": n.to_seq,
+                            "filters": n.filters,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut result = json!({
             "logs": entries,
             "count": entries.len(),
@@ -921,6 +966,8 @@ impl RpcHandler {
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
             "capped": capped,
+            "verdict": verdict,
+            "narrowed_by": narrowed_by,
         });
         if let Some(s) = advanced_to {
             result["cursor_advanced_to"] = json!(s);

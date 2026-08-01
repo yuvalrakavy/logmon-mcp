@@ -1,3 +1,4 @@
+use crate::engine::epoch::EpochLog;
 use crate::engine::pre_buffer::PreTriggerBuffer;
 use crate::engine::seq_counter::SeqCounter;
 use crate::filter::parser::ParsedFilter;
@@ -59,6 +60,11 @@ pub struct LogPipeline {
     pre_buffer: PreTriggerBuffer,
     seq_counter: Arc<SeqCounter>,
     event_sender: broadcast::Sender<PipelineEvent>,
+    /// What storage policy governed each stretch of this pipeline's seq axis.
+    /// Lives here rather than on `Domain` because it is indexed by *this*
+    /// counter and answers questions about *this* store — and because it must
+    /// reach the log processor, which is handed the pipeline and nothing else.
+    epochs: EpochLog,
 }
 
 /// Buffer/scan statistics returned alongside a `recent_logs_with_stats` query,
@@ -73,33 +79,37 @@ pub struct RecentStats {
 
 impl LogPipeline {
     pub fn new(store_capacity: usize) -> Self {
-        let (event_sender, _) = broadcast::channel(100);
-        Self {
-            store: InMemoryStore::new(store_capacity),
-            pre_buffer: PreTriggerBuffer::new(0),
-            seq_counter: Arc::new(SeqCounter::new()),
-            event_sender,
-        }
+        Self::new_with_seq_counter(store_capacity, Arc::new(SeqCounter::new()))
     }
 
     pub fn new_with_seq(store_capacity: usize, initial_seq: u64) -> Self {
-        let (event_sender, _) = broadcast::channel(100);
-        Self {
-            store: InMemoryStore::new(store_capacity),
-            pre_buffer: PreTriggerBuffer::new(0),
-            seq_counter: Arc::new(SeqCounter::new_with_initial(initial_seq)),
-            event_sender,
-        }
+        Self::new_with_seq_counter(
+            store_capacity,
+            Arc::new(SeqCounter::new_with_initial(initial_seq)),
+        )
     }
 
     pub fn new_with_seq_counter(store_capacity: usize, seq_counter: Arc<SeqCounter>) -> Self {
         let (event_sender, _) = broadcast::channel(100);
+        // The epoch log opens at wherever this counter starts. For a restored
+        // domain that is the seq the previous incarnation reached, so a window
+        // carried over from that run falls below the log and reports
+        // `cannot_verify` rather than inheriting this run's policy.
+        let epochs = EpochLog::new(seq_counter.current());
         Self {
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(0),
             seq_counter,
             event_sender,
+            epochs,
         }
+    }
+
+    /// This pipeline's record of the storage policy over its seq axis — see
+    /// [`EpochLog`]. Written by the log processor as it decides storage; read
+    /// by `logs.export` to say how much of a window it can vouch for.
+    pub fn epochs(&self) -> &EpochLog {
+        &self.epochs
     }
 
     pub fn assign_seq(&self) -> u64 {

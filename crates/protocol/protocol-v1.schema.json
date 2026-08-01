@@ -496,6 +496,19 @@
           "description": "`count` stopped this short of everything that matched the range.\n\nStated rather than left to be inferred, because it **cannot** be\ninferred: comparing what was asked for against what came back cannot\ntell a capped range apart from one where exactly that many existed. A\nreader deciding whether a window is complete needs that difference, and\n`truncated` will not supply it — that reports *eviction*, which is a\ndifferent kind of missing.",
           "type": "boolean",
           "default": false
+        },
+        "verdict": {
+          "description": "How much of this window the daemon can vouch for.\n\nDefaults to `cannot_verify`, which is the whole point of the default: a\nreply from a broker too old to send the field must not be read as a\nclean bill of health.",
+          "$ref": "#/$defs/EvidenceVerdict",
+          "default": "cannot_verify"
+        },
+        "narrowed_by": {
+          "description": "The stretches of the window over which a session filter was narrowing\nwhat the daemon stored, and the filters doing it. Empty unless `verdict`\nis `filtered`.\n\nAlways emitted, including empty — a reader that sees `filtered` comes\nhere next, and \"the field is absent\" must not be one more state it has\nto tell apart from \"nothing narrowed anything\".",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NarrowedRange"
+          },
+          "default": []
         }
       },
       "required": [
@@ -609,8 +622,120 @@
             "PreTrigger",
             "PostTrigger"
           ]
+        },
+        "EvidenceVerdict": {
+          "description": "How much of an exported window the daemon can vouch for.\n\nThe reason this exists: storage is conditional, so \"nothing appeared before\nthe error\" is ambiguous between *absence of cause* and *absence of\nrecording*. Only a record of the storage policy over time can separate them,\nand without one a window shaped by another session's filter reads as\ncomplete.",
+          "oneOf": [
+            {
+              "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs is in the reply.",
+              "type": "string",
+              "const": "complete"
+            },
+            {
+              "description": "The ring dropped part of the window; `evicted_before_window` bounds how\nmuch.",
+              "type": "string",
+              "const": "evicted"
+            },
+            {
+              "description": "A session filter was narrowing the store over part of the window. See\n`narrowed_by` for which filters, and over which seqs.",
+              "type": "string",
+              "const": "filtered"
+            },
+            {
+              "description": "No claim can be made: the store is empty, or the window predates what\nthe daemon still records about its own storage policy (including a\nwindow carried over from a previous daemon run), or the read was capped\nshort of what matched.\n\nThe default, deliberately — see [`LogsExportResult::verdict`].",
+              "type": "string",
+              "const": "cannot_verify"
+            }
+          ]
+        },
+        "NarrowedRange": {
+          "description": "One stretch of an exported window over which a session filter was narrowing\nwhat the daemon stored.",
+          "type": "object",
+          "properties": {
+            "from_seq": {
+              "description": "Clamped to the window that was asked for, so these are the caller's own\nseqs rather than wherever the epoch happened to begin.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "to_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "filters": {
+              "description": "The filter strings in force over this stretch — the union across every\nsession bound to the domain, since any one of them narrowing the store\nnarrows it for everybody.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "from_seq",
+            "to_seq",
+            "filters"
+          ]
         }
       }
+    },
+    "EvidenceVerdict": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "EvidenceVerdict",
+      "description": "How much of an exported window the daemon can vouch for.\n\nThe reason this exists: storage is conditional, so \"nothing appeared before\nthe error\" is ambiguous between *absence of cause* and *absence of\nrecording*. Only a record of the storage policy over time can separate them,\nand without one a window shaped by another session's filter reads as\ncomplete.",
+      "oneOf": [
+        {
+          "description": "The window lies wholly inside one unfiltered epoch, nothing was evicted,\nand nothing was capped. Everything that reached the daemon over these\nseqs is in the reply.",
+          "type": "string",
+          "const": "complete"
+        },
+        {
+          "description": "The ring dropped part of the window; `evicted_before_window` bounds how\nmuch.",
+          "type": "string",
+          "const": "evicted"
+        },
+        {
+          "description": "A session filter was narrowing the store over part of the window. See\n`narrowed_by` for which filters, and over which seqs.",
+          "type": "string",
+          "const": "filtered"
+        },
+        {
+          "description": "No claim can be made: the store is empty, or the window predates what\nthe daemon still records about its own storage policy (including a\nwindow carried over from a previous daemon run), or the read was capped\nshort of what matched.\n\nThe default, deliberately — see [`LogsExportResult::verdict`].",
+          "type": "string",
+          "const": "cannot_verify"
+        }
+      ]
+    },
+    "NarrowedRange": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "NarrowedRange",
+      "description": "One stretch of an exported window over which a session filter was narrowing\nwhat the daemon stored.",
+      "type": "object",
+      "properties": {
+        "from_seq": {
+          "description": "Clamped to the window that was asked for, so these are the caller's own\nseqs rather than wherever the epoch happened to begin.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "to_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filters": {
+          "description": "The filter strings in force over this stretch — the union across every\nsession bound to the domain, since any one of them narrowing the store\nnarrows it for everybody.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "from_seq",
+        "to_seq",
+        "filters"
+      ]
     },
     "LogsClear": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

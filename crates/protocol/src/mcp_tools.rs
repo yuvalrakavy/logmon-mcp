@@ -204,7 +204,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "export_logs",
         method: "logs.export",
-        description: "Export log entries to a file. Supports json or text format.",
+        description: "Export log entries to a file. Supports json or text format. Takes an inclusive from_seq/to_seq range for a bounded window, which composes with a bookmark bound. The reply carries a verdict for that window — complete, evicted, filtered or cannot_verify — with narrowed_by naming any session filter that was narrowing what the daemon stored over those seqs, so 'nothing appeared before the error' can be told apart from 'nothing was recorded'.",
         cli: Cli {
             positional: &[],
             variadic: false,

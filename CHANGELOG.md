@@ -172,6 +172,56 @@ is a second name to support forever.
   how much it fell short. A cursor qualifier is refused — it is read-and-advance,
   and gathering evidence must not move the caller's read position.
 
+- **`logs.export` says how much of the window it can vouch for.** Two new
+  fields: `verdict`, one of `complete` / `evicted` / `filtered` /
+  `cannot_verify`, and `narrowed_by`, which names the filters and the seqs when
+  the answer is `filtered`.
+
+  The problem it solves: storage is conditional. When any session bound to a
+  domain holds a filter, only matching entries are kept — so *"nothing appeared
+  before the error"* is ambiguous between **absence of cause** and **absence of
+  recording**, and only the first is a conclusion. Until now nothing on the wire
+  could tell them apart, and the reading a caller would naturally take is the
+  wrong one.
+
+  Reading the live filter set at export time cannot answer it either, because
+  filters are time-extended and the read is a point. An anonymous session is
+  removed on disconnect and takes its filters with it, so a capture taken
+  minutes after the run sees nothing and would assert that nothing was
+  narrowing a window that recorded a tenth of it.
+
+  So the daemon now keeps a **per-domain epoch log**: the first seq decided
+  under each storage policy, plus that policy. A window is `complete` only when
+  it lies wholly inside one unfiltered epoch, with nothing evicted and nothing
+  capped.
+
+  Three things about it are worth knowing:
+
+  - **It records the filter *strings*, not a boolean.** `filters.edit` replaces
+    a condition in place and never moves a boolean, so a flag-only marker would
+    report the new filter string over the old range — wrong information rather
+    than missing information, which is the failure the whole feature exists to
+    prevent.
+  - **The boundary is stamped by the processor, from the policy that decided
+    the entry** — not beside the mutation that caused the flip. The seq is
+    assigned at the top of the processing loop and storage is decided at the
+    bottom, so a stamp taken elsewhere would be approximate by whatever is in
+    flight, and `complete` would be claimed over entries the other policy
+    actually judged.
+  - **A disconnected named session's filters still narrow the store**, and the
+    verdict reflects that, because the policy is read from the same scan that
+    decides storage rather than from a separate "who is live" question.
+
+  `cannot_verify` is a verdict rather than a caveat, and it is the **default**
+  when the field is absent: an empty store satisfies every clause of `complete`
+  vacuously, and so does a reply from a broker too old to send the field. A
+  window carried over from a previous daemon run reports it too — the log opens
+  at the seq this incarnation started from, so a restored domain cannot speak
+  for its predecessor's seqs.
+
+  Nothing changes for spans: they are stored unconditionally, so `spans.export`'s
+  own eviction reporting is already the whole answer for that store.
+
 ### Fixed
 
 - **A parameter of the wrong type is now an error, not a different answer.**
