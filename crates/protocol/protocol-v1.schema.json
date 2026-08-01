@@ -1609,7 +1609,7 @@
           ]
         },
         "group_by": {
-          "description": "When set to `\"name\"`, results are aggregated into `groups`; otherwise\nindividual spans are returned in `spans`.",
+          "description": "When set to `\"name\"`, results are aggregated into `groups`; otherwise\nindividual spans are returned in `spans`.\n\n**Deliberately not an enum, unlike every other `group_by`.** This one\naccepts any string: anything that is not `\"name\"` selects the ungrouped\narm rather than failing (`rpc_handler.rs:1320`). Declaring `[\"name\"]`\nhere would reject every valid call that means \"do not group\".",
           "type": [
             "string",
             "null"
@@ -4581,6 +4581,12 @@
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "scalar",
+            "timing",
+            "tree",
+            null
           ]
         },
         "group_keys": {
@@ -4630,7 +4636,14 @@
           "properties": {
             "metric": {
               "description": "`count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.\n\n**Percentiles are deliberately absent.** A rolling percentile needs a\nduration sketch per bucket, and this design's per-collector memory is\nbounded precisely so a collector cannot grow without limit. Use `avg_ms`\nfor the guard and read the real percentiles with `collectors.get`.",
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "count",
+                "total_ms",
+                "avg_ms",
+                "error_count",
+                "error_rate_pct"
+              ]
             },
             "group": {
               "description": "Restrict to one group value. Requires the collector to declare\n`group_keys`.",
@@ -4640,8 +4653,18 @@
               ]
             },
             "op": {
-              "description": "`gt`, `gte`, `lt` or `lte`.",
-              "type": "string"
+              "description": "`gt`, `gte`, `lt` or `lte` — and the symbolic spellings `>`, `>=`, `<`\nand `<=`, which the parser has always accepted (`threshold.rs:120`) and\nthis doc comment used to omit. The word forms are canonical; the symbols\nare listed because a schema narrower than the daemon rejects calls the\ndaemon would have served.",
+              "type": "string",
+              "enum": [
+                "gt",
+                ">",
+                "gte",
+                ">=",
+                "lt",
+                "<",
+                "lte",
+                "<="
+              ]
             },
             "value": {
               "type": "number",
@@ -5096,10 +5119,19 @@
           ]
         },
         "group_by": {
-          "description": "`name`, `group`, `trace`, or `path`.",
+          "description": "`name`, `group`, `trace`, or `path`. `none` and `\"\"` are also accepted\nand mean the ungrouped overall figures — the same as omitting it\n(`project.rs:74`); the error message names only the four axes.",
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "name",
+            "group",
+            "trace",
+            "path",
+            "none",
+            "",
+            null
           ]
         },
         "skip_warmup_ms": {
@@ -5252,9 +5284,19 @@
           ]
         },
         "group_by": {
+          "description": "`name`, `group`, `trace`, or `path`; `none`, `\"\"` or omitted for the\nungrouped figures. The same axes `collectors.get` takes — both read\nthrough `profile_options` (`rpc_handler.rs:2314`), so they cannot drift.",
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "name",
+            "group",
+            "trace",
+            "path",
+            "none",
+            "",
+            null
           ]
         },
         "group_keys": {
@@ -5309,6 +5351,12 @@
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "scalar",
+            "timing",
+            "tree",
+            null
           ]
         },
         "group_keys": {
@@ -5357,7 +5405,14 @@
           "properties": {
             "metric": {
               "description": "`count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.\n\n**Percentiles are deliberately absent.** A rolling percentile needs a\nduration sketch per bucket, and this design's per-collector memory is\nbounded precisely so a collector cannot grow without limit. Use `avg_ms`\nfor the guard and read the real percentiles with `collectors.get`.",
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "count",
+                "total_ms",
+                "avg_ms",
+                "error_count",
+                "error_rate_pct"
+              ]
             },
             "group": {
               "description": "Restrict to one group value. Requires the collector to declare\n`group_keys`.",
@@ -5367,8 +5422,18 @@
               ]
             },
             "op": {
-              "description": "`gt`, `gte`, `lt` or `lte`.",
-              "type": "string"
+              "description": "`gt`, `gte`, `lt` or `lte` — and the symbolic spellings `>`, `>=`, `<`\nand `<=`, which the parser has always accepted (`threshold.rs:120`) and\nthis doc comment used to omit. The word forms are canonical; the symbols\nare listed because a schema narrower than the daemon rejects calls the\ndaemon would have served.",
+              "type": "string",
+              "enum": [
+                "gt",
+                ">",
+                "gte",
+                ">=",
+                "lt",
+                "<",
+                "lte",
+                "<="
+              ]
             },
             "value": {
               "type": "number",
@@ -6471,10 +6536,17 @@
           "type": "string"
         },
         "group_by": {
-          "description": "`name` or `group`. Not `trace` or `path`: both are projected from\nper-span records, and a recorded run does not retain those.",
+          "description": "`name` or `group`. Not `trace` or `path`: both are projected from\nper-span records, and a recorded run does not retain those. `none` and\n`\"\"` are accepted for the ungrouped comparison, which is also the\ndefault when this is omitted (`diff.rs:77`).",
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "name",
+            "group",
+            "none",
+            "",
+            null
           ]
         },
         "top_n": {
@@ -7416,7 +7488,14 @@
       "properties": {
         "metric": {
           "description": "`count`, `total_ms`, `avg_ms`, `error_count` or `error_rate_pct`.\n\n**Percentiles are deliberately absent.** A rolling percentile needs a\nduration sketch per bucket, and this design's per-collector memory is\nbounded precisely so a collector cannot grow without limit. Use `avg_ms`\nfor the guard and read the real percentiles with `collectors.get`.",
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "count",
+            "total_ms",
+            "avg_ms",
+            "error_count",
+            "error_rate_pct"
+          ]
         },
         "group": {
           "description": "Restrict to one group value. Requires the collector to declare\n`group_keys`.",
@@ -7426,8 +7505,18 @@
           ]
         },
         "op": {
-          "description": "`gt`, `gte`, `lt` or `lte`.",
-          "type": "string"
+          "description": "`gt`, `gte`, `lt` or `lte` — and the symbolic spellings `>`, `>=`, `<`\nand `<=`, which the parser has always accepted (`threshold.rs:120`) and\nthis doc comment used to omit. The word forms are canonical; the symbols\nare listed because a schema narrower than the daemon rejects calls the\ndaemon would have served.",
+          "type": "string",
+          "enum": [
+            "gt",
+            ">",
+            "gte",
+            ">=",
+            "lt",
+            "<",
+            "lte",
+            "<="
+          ]
         },
         "value": {
           "type": "number",
@@ -7532,10 +7621,19 @@
           }
         },
         "format": {
-          "description": "`md` (default), `json`, or `folded`.",
+          "description": "`md` (default), `json`, or `folded`. `markdown` and `\"\"` are accepted\nfor `md`, and `collapsed` for `folded` (`document.rs:57`) — aliases the\nerror message does not name but the parser has always taken.",
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "md",
+            "markdown",
+            "",
+            "json",
+            "folded",
+            "collapsed",
+            null
           ]
         },
         "question": {
@@ -7567,10 +7665,17 @@
           ]
         },
         "group_by": {
-          "description": "`name` (default) or `group`.",
+          "description": "`name` (default) or `group`. `none` and `\"\"` are accepted for the\nungrouped document (`diff.rs:77`). Note the default differs from\n`collectors.diff`: omitting it here means `name`, not ungrouped.",
           "type": [
             "string",
             "null"
+          ],
+          "enum": [
+            "name",
+            "group",
+            "none",
+            "",
+            null
           ]
         },
         "top_n": {

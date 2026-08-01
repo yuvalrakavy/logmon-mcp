@@ -533,6 +533,11 @@ pub struct TracesSlow {
     pub filter: Option<String>,
     /// When set to `"name"`, results are aggregated into `groups`; otherwise
     /// individual spans are returned in `spans`.
+    ///
+    /// **Deliberately not an enum, unlike every other `group_by`.** This one
+    /// accepts any string: anything that is not `"name"` selects the ungrouped
+    /// arm rather than failing (`rpc_handler.rs:1320`). Declaring `["name"]`
+    /// here would reject every valid call that means "do not group".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_by: Option<String>,
 }
@@ -858,12 +863,20 @@ pub struct ThresholdSpec {
     /// duration sketch per bucket, and this design's per-collector memory is
     /// bounded precisely so a collector cannot grow without limit. Use `avg_ms`
     /// for the guard and read the real percentiles with `collectors.get`.
+    #[schemars(extend(
+        "enum" = ["count", "total_ms", "avg_ms", "error_count", "error_rate_pct"]
+    ))]
     pub metric: String,
     /// Restrict to one group value. Requires the collector to declare
     /// `group_keys`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// `gt`, `gte`, `lt` or `lte`.
+    /// `gt`, `gte`, `lt` or `lte` — and the symbolic spellings `>`, `>=`, `<`
+    /// and `<=`, which the parser has always accepted (`threshold.rs:120`) and
+    /// this doc comment used to omit. The word forms are canonical; the symbols
+    /// are listed because a schema narrower than the daemon rejects calls the
+    /// daemon would have served.
+    #[schemars(extend("enum" = ["gt", ">", "gte", ">=", "lt", "<", "lte", "<="]))]
     pub op: String,
     pub value: f64,
     pub window_ms: u64,
@@ -907,6 +920,7 @@ pub struct CollectorsAdd {
     pub filter: String,
     /// `scalar`, `timing`, or `tree` (default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["scalar", "timing", "tree", null]))]
     pub level: Option<String>,
     /// Span attributes to split the numbers by. Values are read directly, so
     /// booleans and numbers work — unlike the filter path, which only sees
@@ -1010,8 +1024,11 @@ pub struct CollectorsGet {
     /// Read a recorded snapshot by label instead of the live window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
-    /// `name`, `group`, `trace`, or `path`.
+    /// `name`, `group`, `trace`, or `path`. `none` and `""` are also accepted
+    /// and mean the ungrouped overall figures — the same as omitting it
+    /// (`project.rs:74`); the error message names only the four axes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["name", "group", "trace", "path", "none", "", null]))]
     pub group_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_warmup_ms: Option<f64>,
@@ -1062,6 +1079,7 @@ pub struct CollectorsEdit {
     /// 2.5× the records, which is the only remedy left once the daemon-wide
     /// reservation is exhausted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["scalar", "timing", "tree", null]))]
     pub level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
@@ -1227,8 +1245,11 @@ pub struct CollectorsDiff {
     pub a: String,
     pub b: String,
     /// `name` or `group`. Not `trace` or `path`: both are projected from
-    /// per-span records, and a recorded run does not retain those.
+    /// per-span records, and a recorded run does not retain those. `none` and
+    /// `""` are accepted for the ungrouped comparison, which is also the
+    /// default when this is omitted (`diff.rs:77`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["name", "group", "none", "", null]))]
     pub group_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u64>,
@@ -1389,8 +1410,13 @@ pub struct CollectorsDocument {
     /// The arms to document. The **first is the baseline**; every other one is
     /// compared against it. Same syntax as `collectors.diff`.
     pub names: Vec<String>,
-    /// `md` (default), `json`, or `folded`.
+    /// `md` (default), `json`, or `folded`. `markdown` and `""` are accepted
+    /// for `md`, and `collapsed` for `folded` (`document.rs:57`) — aliases the
+    /// error message does not name but the parser has always taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend(
+        "enum" = ["md", "markdown", "", "json", "folded", "collapsed", null]
+    ))]
     pub format: Option<String>,
     /// What you were trying to find out. Carries most of the triage weight when
     /// this is read months later, which is why it is asked for.
@@ -1409,8 +1435,11 @@ pub struct CollectorsDocument {
     /// silence — so the field is always present and defaults to `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correctness_evidence: Option<String>,
-    /// `name` (default) or `group`.
+    /// `name` (default) or `group`. `none` and `""` are accepted for the
+    /// ungrouped document (`diff.rs:77`). Note the default differs from
+    /// `collectors.diff`: omitting it here means `name`, not ungrouped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["name", "group", "none", "", null]))]
     pub group_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u64>,
@@ -1444,7 +1473,11 @@ pub struct CollectorsDocumentResult {
 pub struct TracesProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// `name`, `group`, `trace`, or `path`; `none`, `""` or omitted for the
+    /// ungrouped figures. The same axes `collectors.get` takes — both read
+    /// through `profile_options` (`rpc_handler.rs:2314`), so they cannot drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = ["name", "group", "trace", "path", "none", "", null]))]
     pub group_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
