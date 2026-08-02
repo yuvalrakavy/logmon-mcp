@@ -54,11 +54,17 @@ The workspace has four crates that ship as one project:
 ```bash
 git clone https://github.com/yuvalrakavy/logmon-mcp.git
 cd logmon-mcp
-cargo install --path crates/broker
-cargo install --path crates/mcp
+cargo install --path crates/broker --locked
+cargo install --path crates/mcp --locked
 ```
 
 This puts `logmon-broker` and `logmon-mcp` on your PATH (`~/.cargo/bin` by default).
+
+**`--locked` is not optional.** `cargo install` ignores `Cargo.lock` without it and
+re-resolves every dependency to the newest semver-compatible release — which is how
+a build that passes `cargo test --workspace` fails at install time with a macro
+error, on the same commit. The shim's MCP layer is the one that bites: it pins a
+version whose derive macros changed shape in a later minor.
 
 ### Run the broker as a service (recommended)
 
@@ -84,7 +90,7 @@ Install the bundled Claude Code plugin from the `claude-tools` marketplace. One 
 
 The marketplace lives in [yuvalrakavy/claude-tools](https://github.com/yuvalrakavy/claude-tools) and hosts every Claude Code plugin in this author's stack — you only add it once, then install whichever plugins you want from it.
 
-Prerequisite: the `logmon-mcp` binary must already be on your `PATH` (`cargo install --path crates/broker` then `cargo install --path crates/mcp`, or once published, `cargo install logmon-mcp`). The plugin manifest references the binary; it doesn't bundle it.
+Prerequisite: the `logmon-mcp` binary must already be on your `PATH` (`cargo install --path crates/broker --locked` then `cargo install --path crates/mcp --locked`, or once published, `cargo install logmon-mcp --locked`). The plugin manifest references the binary; it doesn't bundle it.
 
 To update later: `/plugin marketplace update claude-tools`. To remove: `/plugin uninstall logmon-mcp@claude-tools`.
 
@@ -652,7 +658,7 @@ and nothing else, without first performing the upgrade the notice recommends.
 To upgrade both:
 
 ```bash
-cargo install --path crates/broker && cargo install --path crates/mcp
+cargo install --path crates/broker --locked && cargo install --path crates/mcp --locked
 ```
 
 then restart the broker service and your MCP client. Reinstalling the binary does not
