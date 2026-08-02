@@ -452,7 +452,11 @@ evidence you consult once you have decided it is. The document leads with what c
   inherit the last one's seed. Use it for what is true of *this incident*: a seed, an
   iteration number, a hypothesis. Use a plain key for what is true of the *domain*.
 - **`data` is `update_domain_data`**, applied before the registry copy is rendered — so a
-  key you supply appears in *this* document rather than landing one document late.
+  key you supply appears in *this* document rather than landing one document late. The one
+  exception is **`/case-name`, which names the next capture, not this one**: the filename
+  is claimed before anything durable happens, so a `/case-name` sent in the same call shows
+  up in this document's registry copy while the stem still comes from `prefix`, or from
+  whatever `/case-name` already held. Set it in its own call first if you want it to bite.
 
 **Capture before you investigate, not after.** The document records both instants and
 renders the gap, so a fact you record twenty minutes later is visibly a fact about

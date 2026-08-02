@@ -988,17 +988,37 @@ impl RpcHandler {
         // and reports the remainder `complete`, which is the reader's "I have
         // everything" being exactly what is wrong.
         //
-        // So an unbounded export describes the whole axis this incarnation is
-        // responsible for: from where the epoch log opens, to the newest seq
-        // ASSIGNED — read after the query, so the window is guaranteed to
-        // contain every seq the query could have returned.
+        // So an unbounded export describes the axis this incarnation can still
+        // ANSWER for: from the later of where the epoch log opens and the
+        // store's own floor, to the newest seq ASSIGNED — read after the query,
+        // so the window is guaranteed to contain every seq the query could have
+        // returned.
+        //
+        // `lost_below` belongs in that lower end, and leaving it out was the
+        // third face of the same mistake. A window opening at `origin + 1` over
+        // a ring that has rolled claims an extent the store cannot speak for,
+        // so `logs.export {}` came back `complete` about the very range that
+        // `logs.export {from_seq: 1}` — the identical window, asked for
+        // explicitly — came back `evicted` about. The difference between those
+        // two calls is real, but it belongs where it is true: an explicit
+        // `from_seq` names a floor that records have fallen through, while an
+        // unbounded request has no floor to fall short of. Narrowing the window
+        // makes `complete` a claim about a range that exists, and keeps the
+        // 1024-entry epoch log from pinning a long-lived domain at
+        // `cannot_verify` for flips whose records left long ago.
         //
         // An empty store still gets no window and so no claim: it satisfies
         // every clause of `complete` vacuously, which is why §4.2 makes
         // emptiness a verdict of its own rather than a remark under the table.
         let (lo, hi) = crate::filter::parser::resolved_seq_range(resolved.as_ref());
         let window = stats.buffer_oldest_seq.and_then(|_| {
-            let from = lo.unwrap_or_else(|| d.pipeline.epochs().origin_seq().saturating_add(1));
+            let from = lo.unwrap_or_else(|| {
+                d.pipeline
+                    .epochs()
+                    .origin_seq()
+                    .saturating_add(1)
+                    .max(d.pipeline.lost_below())
+            });
             let to = hi.unwrap_or_else(|| d.pipeline.current_seq());
             (from <= to).then_some((from, to))
         });
@@ -1694,18 +1714,21 @@ impl RpcHandler {
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //
-        // The gap is the SHORTFALL, not `lost_below - from`. Those two are equal
-        // by construction here — `from` is the first surviving seq and so is
-        // `lost_below` — which is exactly why measuring from the window's own
-        // lower end could never fire, and why `Evicted` was unreachable from a
-        // capture until this was written the other way round.
-        let log_evicted =
-            (short_before > 0 && d.pipeline.lost_below() > 0).then_some(short_before as u64);
+        // **No count travels with this.** `lost_below - from` is zero by
+        // construction — `from` is the first surviving seq and so is
+        // `lost_below`, which is exactly why measuring from the window's own
+        // lower end could never fire — and `short_before` is bounded by
+        // `before`, not by what the ring dropped. Passing the shortfall off as
+        // records-lost made a ring of 30 that had ever received 32 records
+        // report 71 of them gone. The document gets both numbers and multiplies
+        // neither into the other.
+        let log_lost_below = d.pipeline.lost_below();
+        let log_evicted = short_before > 0 && log_lost_below > 0;
 
         let coverage = d.pipeline.epochs().coverage(from, to);
         let verdict = crate::engine::epoch::evidence_verdict(
             Some(&coverage),
-            log_evicted.is_some(),
+            log_evicted,
             // Nothing inside `[from, to]` was cut, so the window is not capped
             // in the sense the verdict means. A clamped `before`/`after` made
             // the window NARROWER, which is a different fact and is reported as
@@ -1777,7 +1800,7 @@ impl RpcHandler {
                 clamped,
                 short_before,
                 short_after,
-                evicted_before_window: log_evicted,
+                log_lost_below,
                 spans_evicted_before_window: span_evicted,
             },
             logdata: doc::FilePointer {
@@ -1968,16 +1991,14 @@ impl RpcHandler {
         })
     }
 
-    /// The registry as of `now`, plus `/logmon/incarnation` and `/case-name`.
-    ///
-    /// The `/logmon/` namespace is left out of the copy: it is the daemon's own
-    /// bookkeeping, `incarnation` is already in front-matter, and a document
-    /// listing `/logmon/first_seen` beside `/Build/commit` would present the two
-    /// as the same kind of claim. A broker with no config dir returns an empty
-    /// copy, which the document then states rather than omits.
     /// This domain's `/case-name`, if it has one — the middle level of §5.3's
-    /// prefix fallback. Read before `data` is applied, since the stem has to be
-    /// claimed before anything durable happens.
+    /// prefix fallback.
+    ///
+    /// **Read before `data` is applied**, because the stem has to be claimed
+    /// before anything durable happens. So a `/case-name` supplied in the same
+    /// `cases.create` call names the domain for the NEXT capture, not this one:
+    /// it appears in this document's registry copy while the stem still comes
+    /// from whatever `/case-name` held on entry.
     fn case_name_for(&self, session_id: &SessionId) -> Option<String> {
         let (_, reg) = self.resolve_domain_data(session_id).ok()?;
         reg.read(|r| {
@@ -1986,6 +2007,13 @@ impl RpcHandler {
         })
     }
 
+    /// The registry as of `now`, and this domain's `/logmon/incarnation`.
+    ///
+    /// The `/logmon/` namespace is left out of the copy: it is the daemon's own
+    /// bookkeeping, `incarnation` is already in front-matter, and a document
+    /// listing `/logmon/first_seen` beside `/Build/commit` would present the two
+    /// as the same kind of claim. A broker with no config dir returns an empty
+    /// copy, which the document then states rather than omits.
     fn case_registry_copy(
         &self,
         session_id: &SessionId,
@@ -2082,10 +2110,21 @@ impl RpcHandler {
             }
         });
 
+        // The floor this store can answer for. `lost_below` alone misses a
+        // RESTORED incarnation: seqs resume above where the previous run left
+        // off, nothing has been evicted this run, and a window reaching down
+        // into the old numbering would be called intact. `spans.export` carries
+        // no verdict or coverage, so this is its only signal that the range
+        // below it belongs to a run whose spans are not here — the log path
+        // gets the same guarantee from the epoch log's origin.
+        let floor = d
+            .span_store
+            .lost_below()
+            .max(d.pipeline.epochs().origin_seq().saturating_add(1));
         let oldest = d.span_store.oldest_seq();
-        let evicted_before_window = resolved.as_ref().and_then(|f| {
-            crate::filter::parser::evicted_before_window(f, d.span_store.lost_below())
-        });
+        let evicted_before_window = resolved
+            .as_ref()
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, floor));
 
         Ok(json!({
             "spans": spans,

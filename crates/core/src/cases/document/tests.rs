@@ -49,7 +49,7 @@ fn base() -> CaseInput {
             clamped: false,
             short_before: 0,
             short_after: 0,
-            evicted_before_window: None,
+            log_lost_below: 0,
             spans_evicted_before_window: None,
         },
         logdata: FilePointer {
@@ -433,13 +433,16 @@ fn a_short_window_says_whether_the_shortfall_is_a_loss() {
     // Short, and records really did leave.
     let mut lost = base();
     lost.window.short_before = 321;
-    lost.window.evicted_before_window = Some(170);
+    // In practice `from` and the floor coincide here: `from` is the first
+    // SURVIVING record, so a window short at the bottom starts exactly where
+    // the ring's floor is.
+    lost.window.log_lost_below = 40672;
     lost.window.verdict = EvidenceVerdict::Evicted;
     let out = render(&lost).body;
     assert!(out.contains("**narrower than requested**"), "{out}");
     assert!(out.contains("321 record(s) short"), "{out}");
-    assert!(out.contains("at least 170"), "{out}");
-    assert!(out.contains("**gone** rather than absent"), "{out}");
+    assert!(out.contains("dropped everything under seq 40672"), "{out}");
+    assert!(out.contains("**gone** rather than never recorded"), "{out}");
     assert!(
         out.contains("Raise the domain's `log_buffer_size`"),
         "and the remedy is the one that would help: {out}"
@@ -460,6 +463,99 @@ fn a_short_window_says_whether_the_shortfall_is_a_loss() {
     );
 }
 
+/// The shortfall has two ends and they mean opposite things. A window short only
+/// at the TOP asked for more future than had happened; nothing was lost, and the
+/// document must not explain it with a sentence about how far back the store
+/// reaches.
+///
+/// The defect: the cause line was gated on `short_before > 0 || short_after > 0`
+/// while saying only "seq N is as far back as this store has ever held" — a
+/// claim about the bottom, printed for a shortfall at the top, and false
+/// whenever the window's bottom is simply where `before` ran out.
+#[test]
+fn a_shortfall_after_the_anchor_is_not_explained_by_the_stores_floor() {
+    let mut i = base();
+    i.window.short_after = 400;
+    let out = render(&i).body;
+    assert!(out.contains("400 after"), "{out}");
+    assert!(
+        out.contains("history that had not happened yet"),
+        "a ring evicts from the bottom, so a shortfall above the anchor is never a loss: {out}"
+    );
+    assert!(
+        !out.contains("as far back as this store has ever held"),
+        "and nothing about the BOTTOM belongs in the explanation: {out}"
+    );
+    assert!(
+        !out.contains("empty past"),
+        "which is the bottom's phrasing, not the top's: {out}"
+    );
+
+    // Both ends short: each gets its own sentence, neither borrows the other's.
+    let mut both = base();
+    both.window.short_before = 12;
+    both.window.short_after = 400;
+    let out = render(&both).body;
+    assert!(out.contains("empty past rather than a loss"), "{out}");
+    assert!(out.contains("history that had not happened yet"), "{out}");
+}
+
+/// `evicted` names the store's floor and the caller's shortfall as two separate
+/// numbers, and **claims no count of what was lost**.
+///
+/// The defect: `short_before` — bounded by `before`, not by what the ring
+/// dropped — was rendered as records-lost. A ring of 30 that had ever received
+/// 32 records, asked for 100 of context, reported "at least 71 records are
+/// gone" from a domain whose entire history was 32.
+#[test]
+fn the_evicted_verdict_claims_no_count_of_lost_records() {
+    let mut i = base();
+    i.window.verdict = EvidenceVerdict::Evicted;
+    i.window.from = 3;
+    i.window.short_before = 71;
+    i.window.log_lost_below = 3;
+    let r = render(&i);
+
+    assert!(
+        r.body.contains("It starts at seq 3, the ring has dropped everything below that"),
+        "the store fact — a seq: {}",
+        r.body
+    );
+    assert!(
+        r.body.contains("71 record(s) short before the anchor"),
+        "the request fact — a count of what did not come back: {}",
+        r.body
+    );
+    assert!(
+        r.body
+            .contains("bounded by what was REQUESTED, not by what was lost"),
+        "and the verdict says outright why the number below is not a loss count: {}",
+        r.body
+    );
+    assert!(
+        r.body.contains("not knowable from here"),
+        "and that the split between the two is unrecoverable: {}",
+        r.body
+    );
+    for claim in ["71 records are gone", "up to 71", "at least 71"] {
+        assert!(
+            !r.body.contains(claim),
+            "a shortfall bounded by `before` must never be rendered as records lost ({claim}): {}",
+            r.body
+        );
+    }
+    let note = r
+        .notes
+        .iter()
+        .find(|n| n.kind == NOTE_CAPTURE_GAP)
+        .expect("evicted raises a capture-gap note");
+    assert!(
+        !note.detail.contains("up to 71") && !note.detail.contains("71 records are gone"),
+        "and the note carries the same two facts, not a fabricated count: {}",
+        note.detail
+    );
+}
+
 /// The clamp is its own fact, and — the defect this replaces — it must not
 /// contradict `complete` four lines above it.
 #[test]
@@ -471,19 +567,18 @@ fn a_clamped_request_never_contradicts_the_verdict() {
     assert_eq!(i.window.verdict, EvidenceVerdict::Complete);
     assert!(out.contains("**`complete`**"), "{out}");
     assert!(out.contains("clamped to the maximum"), "{out}");
+    // Structural, not literal. Three negative assertions used to name the exact
+    // sentences the old renderer emitted — strings that exist nowhere in the
+    // crate now, so no plausible edit could make them fire again. This one can:
+    // a clamped window is not a capped one, in ANY wording, and "clamped" does
+    // not contain "capped".
     assert!(
-        !out.contains("nothing was capped"),
-        "the `complete` paragraph must not claim something the next one denies: {out}"
+        !out.contains("capped"),
+        "nothing inside the window was cut, so no sentence may call this read \
+         capped while the verdict above says complete: {out}"
     );
-    assert!(
-        !out.contains("The read was **capped**"),
-        "nothing inside the window was cut, so it was not capped: {out}"
-    );
-    // The old remedy was impossible to follow: the clamp is hard.
-    assert!(
-        !out.contains("larger `before`/`after` to see the rest"),
-        "{out}"
-    );
+    // And the remedy must be one a caller can act on: the clamp is hard, so
+    // "ask for more" is not it.
     assert!(out.contains("will not widen this window"), "{out}");
     assert!(
         out.contains("clamped: true"),
@@ -500,6 +595,69 @@ fn the_complete_paragraph_explains_why_records_can_be_fewer_than_seqs() {
     assert!(
         out.contains("one counter numbers both"),
         "701 seqs and 700 records must be reconcilable from the document alone: {out}"
+    );
+}
+
+/// The provenance table grades each key, and the grade must come from the key —
+/// hard-wiring the column to either value renders a table that reads as
+/// authoritative and is uniformly wrong.
+#[test]
+fn the_provenance_table_grades_each_key_from_the_core_set() {
+    let mut i = base();
+    i.registry.push(fact("/Data/seed", "8814", "2026-07-31T14:03:11Z"));
+    let out = render(&i).body;
+
+    let rows: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("| `/") && l.contains(" | "))
+        .collect();
+    assert!(rows.len() > CORE_KEYS.len(), "{out}");
+    for row in &rows {
+        let kind = row.split('|').nth(2).expect("a kind column").trim();
+        let key = row.split('`').nth(1).expect("a key");
+        let expected = if CORE_KEYS.contains(&key) {
+            "core"
+        } else {
+            "contextual"
+        };
+        assert_eq!(kind, expected, "`{key}` is graded {kind}: {row}");
+    }
+    // Both values are actually present, so a hard-wired column cannot pass by
+    // matching a fixture that happens to be all of one kind.
+    assert!(rows.iter().any(|r| r.contains("| core |")), "{out}");
+    assert!(rows.iter().any(|r| r.contains("| contextual |")), "{out}");
+}
+
+/// §2's caveat is repeated in §4 because §2 is where the caveat is and §4 is
+/// where the trap is: a reader who scrolled past it sees a tidy run of
+/// consecutive lines and a pointer to "the full window", both of which are true
+/// only of what was STORED. Deleting the repeat leaves §4 reading as
+/// reassurance.
+#[test]
+fn the_filter_caveat_is_repeated_where_the_trap_is() {
+    let plain = render(&base()).body;
+    let section_4 = |body: &str| body.split("## 4. ").nth(1).unwrap_or("").to_string();
+    assert!(
+        !section_4(&plain).contains("not the entries that occurred"),
+        "an unfiltered window has no such caveat to make: {plain}"
+    );
+
+    let mut narrowed = base();
+    narrowed.window.verdict = EvidenceVerdict::Filtered;
+    narrowed.window.narrowed_by = vec![NarrowedRange {
+        from_seq: 40672,
+        to_seq: 40800,
+        filters: vec!["l>=ERROR".into()],
+    }];
+    let body = render(&narrowed).body;
+    assert!(
+        section_4(&body).contains("not the entries that occurred"),
+        "the caveat belongs where the neighbour run is, not only in §2: {body}"
+    );
+    assert!(
+        body.matches("not the entries that occurred").count() >= 1
+            && section_4(&body).contains("as stored"),
+        "and it qualifies the logdata pointer that sits beside it: {body}"
     );
 }
 

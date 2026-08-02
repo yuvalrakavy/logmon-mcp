@@ -632,7 +632,7 @@
               "const": "complete"
             },
             {
-              "description": "The ring dropped part of the window; `evicted_before_window` bounds how\nmuch.",
+              "description": "The ring dropped part of the window.\n\nOn an export, `evicted_before_window` bounds how much — the window's\nlower end and the store's floor are independent numbers there, so their\ndifference means something. On a **capture** there is no such bound and\nnone is reported: the window opens at the first record that SURVIVED, so\nthe two coincide, and the document states the floor and the caller's\nshortfall as the separate facts they are rather than passing one off as\na count of the other.",
               "type": "string",
               "const": "evicted"
             },
@@ -690,7 +690,7 @@
           "const": "complete"
         },
         {
-          "description": "The ring dropped part of the window; `evicted_before_window` bounds how\nmuch.",
+          "description": "The ring dropped part of the window.\n\nOn an export, `evicted_before_window` bounds how much — the window's\nlower end and the store's floor are independent numbers there, so their\ndifference means something. On a **capture** there is no such bound and\nnone is reported: the window opens at the first record that SURVIVED, so\nthe two coincide, and the document states the floor and the caller's\nshortfall as the separate facts they are rather than passing one off as\na count of the other.",
           "type": "string",
           "const": "evicted"
         },
@@ -2924,7 +2924,7 @@
               "const": "complete"
             },
             {
-              "description": "The ring dropped part of the window; `evicted_before_window` bounds how\nmuch.",
+              "description": "The ring dropped part of the window.\n\nOn an export, `evicted_before_window` bounds how much — the window's\nlower end and the store's floor are independent numbers there, so their\ndifference means something. On a **capture** there is no such bound and\nnone is reported: the window opens at the first record that SURVIVED, so\nthe two coincide, and the document states the floor and the caller's\nshortfall as the separate facts they are rather than passing one off as\na count of the other.",
               "type": "string",
               "const": "evicted"
             },

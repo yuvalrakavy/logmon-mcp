@@ -797,9 +797,10 @@ pub fn resolved_seq_range(filter: Option<&ParsedFilter>) -> (Option<u64>, Option
 }
 
 /// Records lost off the front of an **inclusive** window starting at `from`:
-/// `oldest - from` when the ring no longer reaches back that far, else `None`.
-///
-/// Records lost off the front of an **inclusive** window starting at `from`.
+/// `lost_below - from` when the store's floor has risen into the window, else
+/// `None`. An upper bound on how many, never an exact count — one counter
+/// numbers two stores, so a stretch of `n` seqs held at most `n` records of
+/// either kind.
 ///
 /// `lost_below` is the store's own [`lost_below`] — the lowest seq it can still
 /// speak for, `0` when nothing has ever left it. **Deliberately not the oldest
@@ -821,8 +822,13 @@ pub fn evicted_below(from: u64, lost_below: u64) -> Option<u64> {
 /// returns the *strict* `Gt` value, so the window actually begins at `lb + 1`;
 /// comparing `lb` itself reported eviction whenever the window started exactly
 /// at the boundary, and overstated the gap by one everywhere it fired. One
-/// implementation, in [`evicted_below`], so the case-document path and this one
-/// cannot drift.
+/// implementation, in [`evicted_below`], so this and the bookmark sweep's
+/// `should_evict` cannot drift — they decide the same question about the same
+/// window and disagreed by one until they were made to share the arithmetic.
+///
+/// Not used by `cases.create`: there the window's lower end IS the store's
+/// floor, so this can only ever return `None`. That path reports the floor and
+/// the caller's shortfall as the two separate facts they are.
 pub fn evicted_before_window(filter: &ParsedFilter, lost_below: u64) -> Option<u64> {
     let lb = resolved_lower_bound(filter)?;
     evicted_below(lb.saturating_add(1), lost_below)

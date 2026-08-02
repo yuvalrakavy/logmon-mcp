@@ -577,7 +577,7 @@ fn a_window_the_ring_has_eaten_reports_evicted_not_complete() {
     );
     let doc = document_of(&r);
     assert!(doc.contains("**narrower than requested**"), "{doc}");
-    assert!(doc.contains("**gone** rather than absent"), "{doc}");
+    assert!(doc.contains("**gone** rather than never recorded"), "{doc}");
     assert!(
         doc.contains("Raise the domain's `log_buffer_size`"),
         "{doc}"
@@ -590,6 +590,147 @@ fn a_window_the_ring_has_eaten_reports_evicted_not_complete() {
             .any(|n| n["kind"] == "capture_gap"),
         "{r}"
     );
+}
+
+/// `evicted` reports the store's floor and the caller's shortfall as two
+/// separate facts, and **claims no count of what was lost**.
+///
+/// The defect: `short_before` — bounded by `before`, not by what the ring
+/// dropped — was handed to the document as records-lost. The test above passed
+/// only by luck of its fixture: 201 fed into a ring of 30 really did lose 171,
+/// so an over-claim of 71 stayed under the true figure. Thirty-two records is
+/// the input that separates them, and it is the ordinary shape of a young
+/// domain rather than a contrived one.
+#[test]
+fn an_evicted_capture_claims_no_count_of_what_the_ring_dropped() {
+    let h = harness_with_log_capacity(30);
+    for i in 1..=31 {
+        h.feed(Level::Info, &format!("entry {i}"));
+    }
+    let anchor = h.feed(Level::Info, "anchor");
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 100, "after": 0 }))
+        .unwrap();
+    assert_eq!(r["verdict"], "evicted", "{r}");
+
+    let doc = document_of(&r);
+    // Two records ever left this ring. The window is short by 71.
+    assert!(
+        doc.contains("It starts at seq 3, the ring has dropped everything below that"),
+        "the store fact is a seq — the floor it can still speak for: {doc}"
+    );
+    assert!(
+        doc.contains("71 record(s) short before the anchor"),
+        "the request fact is a count of what did not come back: {doc}"
+    );
+    assert!(
+        doc.contains("bounded by what was REQUESTED, not by what was lost"),
+        "and the verdict says why that 71 is not a count of lost records: {doc}"
+    );
+    assert!(
+        doc.contains("not knowable from here"),
+        "nor can the split between them be recovered: {doc}"
+    );
+    for overclaim in ["71 records are gone", "up to 71", "at least 71"] {
+        assert!(
+            !doc.contains(overclaim),
+            "this domain never held 71 records, so it cannot have lost them \
+             ({overclaim}):\n{doc}"
+        );
+    }
+    let note = r["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "capture_gap")
+        .expect("evicted raises a capture-gap note")
+        .to_string();
+    assert!(!note.contains("up to 71"), "and the note agrees: {note}");
+}
+
+/// Both ends of the shortfall reach the front matter, where a tool reads them.
+///
+/// Nothing read `requested_after_missing` at all, and nothing pinned the
+/// magnitude of either: hard-wiring the anchor's position to 0 — which makes
+/// every document claim to be the whole of `before` short — survived the suite.
+/// The two numbers here are deliberately different from each other and from
+/// zero, so a swap or a constant is caught.
+#[test]
+fn the_front_matter_carries_the_shortfall_at_both_ends() {
+    let h = harness();
+    // Twenty records, anchored on the tenth: nine below it, ten above.
+    let mut seqs = Vec::new();
+    for i in 1..=20 {
+        seqs.push(h.feed(Level::Info, &format!("entry {i}")));
+    }
+    let anchor = seqs[9];
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 100, "after": 100 }))
+        .unwrap();
+    let doc = document_of(&r);
+
+    assert!(
+        doc.contains("requested_before_missing: 91"),
+        "100 asked for, 9 stored below the anchor: {doc}"
+    );
+    assert!(
+        doc.contains("requested_after_missing: 90"),
+        "100 asked for, 10 stored above it: {doc}"
+    );
+    assert!(
+        doc.contains("91 record(s) short before the anchor and 90 after"),
+        "and the body states both, in the caller's terms: {doc}"
+    );
+
+    // Nothing ever left this ring, so neither end is a loss — and the two ends
+    // get different explanations.
+    assert_eq!(r["verdict"], "complete", "{r}");
+    assert!(doc.contains("empty past rather than a loss"), "{doc}");
+    assert!(doc.contains("history that had not happened yet"), "{doc}");
+}
+
+/// A failure DOWNSTREAM of the claim gives the whole claim back.
+///
+/// `a_failed_capture_does_not_commit_data_to_the_registry` cannot see this: its
+/// unresolvable anchor fails long before a stem is taken, so the rollback path
+/// never runs and deleting it entirely leaves that test green — a vacuous
+/// scenario rather than a vacuous assertion. A malformed `data` entry fails
+/// after the files exist, which is the only input that exercises the rollback.
+#[test]
+fn a_capture_that_fails_after_claiming_gives_the_stem_back() {
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+
+    let err = h
+        .capture(json!({
+            "anchor": { "seq": anchor },
+            "data": [{ "value": "no path here" }],
+        }))
+        .expect_err("a data entry without a path is malformed");
+    assert!(err.contains("path"), "and the error names it: {err}");
+
+    assert_eq!(
+        std::fs::read_dir(h.archive.path()).unwrap().count(),
+        0,
+        "the three claimed files are gone — a failed capture leaves no empty \
+         document behind"
+    );
+
+    // And the stem is genuinely free: a retry takes it rather than rolling to a
+    // second id, which is what a claim that was released means.
+    let ok = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
+    let stem = std::path::Path::new(ok["paths"][0].as_str().unwrap())
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        !stem.contains("-2."),
+        "a stranded claim would push the retry onto a rolled id: {stem}"
+    );
+    assert_eq!(std::fs::read_dir(h.archive.path()).unwrap().count(), 3);
 }
 
 /// The mirror, and the reason `lost_below` exists rather than `oldest_seq`: a
@@ -893,9 +1034,14 @@ fn an_over_wide_request_is_clamped_and_said_to_be() {
         "{r}"
     );
     // And it must not contradict the verdict — the defect this replaces put
-    // "nothing was capped" and "the read was capped" in one document.
+    // "nothing was capped" and "the read was capped" in one document. Asserted
+    // on the word rather than on the old sentences, which exist nowhere now and
+    // so could never have fired again.
     assert_eq!(r["verdict"], "complete", "{r}");
-    assert!(!doc.contains("nothing was capped"), "{doc}");
+    assert!(
+        !doc.contains("capped"),
+        "a clamped window is not a capped one, in any wording: {doc}"
+    );
 }
 
 /// `/logmon/*` is the daemon's own bookkeeping and stays out of the rendered

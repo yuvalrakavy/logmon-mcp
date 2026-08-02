@@ -426,6 +426,10 @@ Three properties worth knowing:
 - **A disconnected named session's filters still narrow the store**, until the TTL sweep
   retires it. The verdict reflects that, which is precisely the case you cannot see by
   asking what filters *you* hold.
+- **An unbounded read is judged over what the store can still answer for**, not over the
+  whole seq axis: the window opens at the ring's own floor. Naming a `from_seq` beneath
+  that floor is a different question — you asked about records that are gone, and the
+  reply says `evicted` rather than reporting a narrower window as if you had asked for it.
 
 A daemon restart forces `cannot_verify` for a window carried over from the previous run:
 the epoch log opens at the seq this incarnation started from, so a restored domain cannot

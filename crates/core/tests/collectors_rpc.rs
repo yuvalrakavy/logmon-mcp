@@ -46,6 +46,28 @@ fn make_domain_at(name: &str, initial_seq: u64) -> Arc<Domain> {
     make_domain_sized(name, initial_seq, 1000)
 }
 
+/// A domain whose LOG ring holds `log_capacity` entries — small enough that a
+/// test can actually overflow it, which is the only way to produce a real log
+/// eviction.
+fn make_domain_log_ring(name: &str, log_capacity: usize) -> Arc<Domain> {
+    let seq = Arc::new(SeqCounter::new());
+    Arc::new(Domain::from_parts(
+        DomainConfig {
+            name: DomainId::new(name).unwrap_or_else(|_| DomainId::default_domain()),
+            gelf_port: 0,
+            otlp_grpc_port: 0,
+            otlp_http_port: 0,
+            log_buffer_size: log_capacity,
+            span_buffer_size: 1000,
+            source: DomainSource::Config,
+        },
+        Arc::new(LogPipeline::new_with_seq_counter(log_capacity, seq.clone())),
+        Arc::new(SpanStore::new(1000, seq)),
+        Arc::new(BookmarkStore::new()),
+        Arc::new(ReceiverMetrics::new()),
+    ))
+}
+
 /// A domain whose span ring holds `span_capacity` spans — small enough that a
 /// test can actually overflow it, which is the only way to produce a real
 /// eviction.
@@ -3570,6 +3592,137 @@ fn spans_export_reports_the_span_rings_own_retention() {
     );
 }
 
+/// `spans.export` carries no verdict and no coverage, so its own floor is the
+/// only signal a caller gets that a window reaches below what this run can
+/// answer for. `lost_below` alone misses a RESTORED incarnation: seqs resume
+/// above where the previous daemon left off, this ring has evicted nothing, and
+/// a window down in the old numbering would come back looking intact.
+///
+/// The log path gets the same guarantee from the epoch log's origin, which is
+/// exactly where this one takes its floor from.
+#[test]
+fn spans_export_flags_a_window_reaching_below_this_incarnation() {
+    let h = harness();
+    h.domains.insert(make_domain_at("default", 500));
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+
+    d.span_store.insert(span("svc", "op", 10.0));
+    assert_eq!(
+        d.span_store.oldest_seq(),
+        Some(501),
+        "precondition: the counter resumed, it did not restart"
+    );
+
+    let carried = h
+        .call(&sid, "spans.export", json!({ "from_seq": 400 }))
+        .unwrap();
+    assert_eq!(
+        carried["truncated"], true,
+        "seqs below 501 belong to a run whose spans this process never had: {carried}"
+    );
+    assert_eq!(
+        carried["evicted_before_window"], 101,
+        "and the gap is named — seqs 400..=500: {carried}"
+    );
+
+    // A window wholly inside this incarnation is intact, and must not inherit
+    // the flag from the run below it.
+    let own = h
+        .call(&sid, "spans.export", json!({ "from_seq": 501 }))
+        .unwrap();
+    assert_eq!(own["truncated"], false, "{own}");
+    assert!(own["evicted_before_window"].is_null(), "{own}");
+}
+
+/// The sweep runs from the handler, and it is selective.
+///
+/// `should_evict` is unit-tested against hand-supplied integers, which cannot
+/// see whether anything CALLS it: deleting `sweep_bookmarks` from the list
+/// handler left every one of those tests green. This drives the real stores.
+#[test]
+fn listing_bookmarks_sweeps_only_the_ones_whose_window_is_gone() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+
+    h.feed_log("default", Level::Info, "one");
+    h.feed_log("default", Level::Info, "two");
+    d.span_store.insert(span("svc", "op", 10.0));
+
+    // One mark below everything, one above it.
+    h.call(&sid, "bookmarks.add", json!({ "name": "old", "start_seq": 0 }))
+        .unwrap();
+    h.call(
+        &sid,
+        "bookmarks.add",
+        json!({ "name": "keep", "start_seq": 100 }),
+    )
+    .unwrap();
+    assert_eq!(
+        h.call(&sid, "bookmarks.list", json!({})).unwrap()["bookmarks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "precondition: nothing has left either store yet"
+    );
+
+    // Both stores lose everything they held.
+    h.call(&sid, "domains.clear", json!({})).unwrap();
+
+    let names: Vec<String> = h.call(&sid, "bookmarks.list", json!({})).unwrap()["bookmarks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["qualified_name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.ends_with("old")),
+        "a bookmark whose whole window has left cannot outlive its data: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n.ends_with("keep")),
+        "and one whose window lies above the floor must survive the same sweep: {names:?}"
+    );
+}
+
+/// A clear loses spans exactly as an eviction does, so it raises the ring's
+/// floor. Without that, the ring reports "nothing has ever left me" over a range
+/// it just disposed of — and the log-side counterpart of this write is covered
+/// while this one was not.
+#[test]
+fn clearing_the_span_ring_raises_its_floor_like_an_eviction() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+
+    for i in 1..=3 {
+        d.span_store.insert(span("svc", "op", i as f64 * 10.0));
+    }
+    let intact = h
+        .call(&sid, "spans.export", json!({ "from_seq": 1 }))
+        .unwrap();
+    assert_eq!(
+        intact["truncated"], false,
+        "precondition: nothing has left yet: {intact}"
+    );
+
+    h.call(&sid, "domains.clear", json!({})).unwrap();
+
+    let after = h
+        .call(&sid, "spans.export", json!({ "from_seq": 1 }))
+        .unwrap();
+    assert_eq!(
+        after["truncated"], true,
+        "three spans were disposed of; a window over them is not complete: {after}"
+    );
+    assert_eq!(
+        after["evicted_before_window"], 3,
+        "and the floor sits above the newest span the clear took: {after}"
+    );
+}
+
 /// A cursor would advance the caller's read position as a side effect of
 /// gathering evidence, so it is refused — the same rule `traces.slow` applies.
 #[test]
@@ -3895,4 +4048,111 @@ fn the_verdict_set_is_closed_and_partial_is_not_in_it() {
     assert!(seen.iter().any(|v| v == "complete"), "{seen:?}");
     assert!(seen.iter().any(|v| v == "filtered"), "{seen:?}");
     assert!(seen.iter().any(|v| v == "cannot_verify"), "{seen:?}");
+}
+
+/// The LOWER half of an unbounded window, on the input that can actually tell
+/// the two implementations apart.
+///
+/// `export_reports_filtered_and_names_the_filter_and_the_seqs` stores an
+/// unfiltered entry FIRST, so `buffer_oldest_seq` is 1 and a lower end taken
+/// from the store already covered the whole axis: the mutation and the original
+/// are indistinguishable on that input, which is a vacuous scenario rather than
+/// a vacuous assertion. Here the filter is armed before anything is stored, so
+/// the entire dropped stretch lies BELOW the oldest surviving record.
+#[test]
+fn a_filter_that_dropped_the_head_of_the_window_is_not_reported_complete() {
+    let h = harness();
+    let sid = h.sessions.create_named("A").unwrap();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+
+    let fid = h.sessions.add_filter(&noisy, "l>=ERROR", None).unwrap();
+    for i in 1..=3 {
+        h.feed_log("default", Level::Info, &format!("dropped {i}"));
+    }
+    h.sessions.remove_filter(&noisy, fid).unwrap();
+    for i in 1..=3 {
+        h.feed_log("default", Level::Info, &format!("kept {i}"));
+    }
+
+    let out = h.call(&sid, "logs.export", json!({})).unwrap();
+    assert_eq!(
+        out["count"], 3,
+        "three of six were never recorded, and they are the FIRST three: {out}"
+    );
+    assert_eq!(
+        out["verdict"], "filtered",
+        "a window opening at the oldest STORED record puts the dropped stretch \
+         outside itself and calls the remainder complete: {out}"
+    );
+    let narrowed = out["narrowed_by"].as_array().expect("named, not flagged");
+    assert_eq!(narrowed.len(), 1, "{out}");
+    assert_eq!(narrowed[0]["filters"], json!(["l>=ERROR"]));
+    assert_eq!(
+        narrowed[0]["to_seq"].as_u64().unwrap(),
+        3,
+        "the filtered epoch ends where the filter was removed: {out}"
+    );
+}
+
+/// The other end of the same question: an unbounded window must not claim an
+/// extent the store cannot speak for.
+///
+/// The defect this pins: the lower end was widened to the epoch log's origin
+/// while the eviction test stayed keyed on the caller's explicit floor, so
+/// `logs.export {}` reported `complete` about a range that `logs.export
+/// {from_seq: 1}` — the identical window, asked for out loud — reported
+/// `evicted` about. Here a filtered stretch at the very bottom of the axis has
+/// rolled clean out of the ring: a window opening at the origin still names a
+/// filter over seqs whose records are all gone.
+///
+/// The asymmetry that REMAINS is the honest one. An explicit floor is a claim
+/// about records below it; an unbounded request has no floor to fall short of.
+#[test]
+fn an_unbounded_window_starts_where_the_store_can_still_answer() {
+    let h = harness();
+    h.domains.insert(make_domain_log_ring("default", 5));
+    let sid = h.sessions.create_named("A").unwrap();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+
+    let fid = h.sessions.add_filter(&noisy, "l>=ERROR", None).unwrap();
+    for i in 1..=3 {
+        h.feed_log("default", Level::Info, &format!("dropped {i}"));
+    }
+    h.sessions.remove_filter(&noisy, fid).unwrap();
+    // Enough traffic to roll the five-record ring past the filtered stretch and
+    // everything that followed it.
+    for i in 1..=12 {
+        h.feed_log("default", Level::Info, &format!("entry {i}"));
+    }
+
+    let out = h.call(&sid, "logs.export", json!({})).unwrap();
+    assert_eq!(out["count"], 5, "the ring holds five: {out}");
+    assert_eq!(
+        out["verdict"], "complete",
+        "every record over the range this store can still answer for is in the \
+         reply; the filtered seqs are not in the range because they are not in \
+         the store: {out}"
+    );
+    assert!(
+        out["narrowed_by"].as_array().is_none_or(|n| n.is_empty()),
+        "and no filter is named over seqs whose records have all left: {out}"
+    );
+
+    // Asked for out loud, the same bottom is a shortfall — and says so.
+    let explicit = h
+        .call(&sid, "logs.export", json!({ "from_seq": 1 }))
+        .unwrap();
+    assert_eq!(
+        explicit["count"], 5,
+        "the same five records, so the difference below is about the WINDOW, \
+         not about what came back: {explicit}"
+    );
+    assert!(
+        explicit["verdict"] == "evicted" || explicit["verdict"] == "filtered",
+        "a caller who named seq 1 asked about records that are gone: {explicit}"
+    );
+    assert_eq!(
+        explicit["truncated"], true,
+        "and the loss is on the wire whichever name the verdict takes: {explicit}"
+    );
 }

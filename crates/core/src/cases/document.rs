@@ -91,16 +91,29 @@ pub struct Window {
     /// one document, which is the wrong-information failure this whole feature
     /// exists to prevent.
     pub clamped: bool,
-    /// Requested-but-absent records below and above the window. Reported
-    /// because a window narrower than asked for is a fact a reader needs, and
-    /// separately from `evicted_before_window`, which says whether the shortfall
-    /// was a LOSS or simply an empty past.
+    /// Requested-but-absent records below and above the window: how much of
+    /// what the CALLER asked for did not come back. A request fact, bounded by
+    /// `before`/`after` and by nothing else.
     pub short_before: usize,
     pub short_after: usize,
-    pub evicted_before_window: Option<u64>,
-    /// The SPAN ring's own eviction. Separate because the two stores share a
-    /// seq axis but evict independently, and one verdict cannot honestly speak
-    /// for both.
+    /// The log store's floor — the lowest seq it can still speak for, `0` when
+    /// nothing has ever left it. A STORE fact.
+    ///
+    /// **A seq, not a count, and the two must never be multiplied into each
+    /// other.** `from` is by construction the first SURVIVING record, so
+    /// `log_lost_below - from` is zero here and `short_before` is the only
+    /// number in reach — but it is bounded by `before`, not by what the ring
+    /// dropped. Rendering it as records-lost made a domain that had ever held
+    /// 32 records report 71 of them gone.
+    ///
+    /// The span side below CAN carry a count, and the asymmetry is real rather
+    /// than an oversight: the window's ends come from the LOG store, so a span
+    /// floor above `from` measures a genuine stretch of the window the span
+    /// ring no longer covers.
+    pub log_lost_below: u64,
+    /// The SPAN ring's own eviction, as an upper bound on spans gone from
+    /// inside `[from, to]`. Separate because the two stores share a seq axis
+    /// but evict independently, and one verdict cannot honestly speak for both.
     pub spans_evicted_before_window: Option<u64>,
 }
 
@@ -459,18 +472,19 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
         EvidenceVerdict::Evicted => {
             let _ = writeln!(
                 s,
-                "**`evicted`** — the log ring had already dropped part of seqs {}–{}; at most \
-                 {} records are missing from the start of the window.\n",
-                w.from,
-                w.to,
-                w.evicted_before_window.unwrap_or(0)
+                "**`evicted`** — this window reaches the bottom of what the log ring still \
+                 holds. It starts at seq {}, the ring has dropped everything below that, and \
+                 records the capture asked for are **gone**. How many is not knowable from \
+                 here: a ring keeps no tally of what it evicted, and the shortfall stated \
+                 below is bounded by what was REQUESTED, not by what was lost.\n",
+                w.from
             );
             notes.push(Note {
                 kind: NOTE_CAPTURE_GAP,
                 detail: format!(
-                    "the log ring evicted below seq {}; up to {} records are gone",
-                    w.from,
-                    w.evicted_before_window.unwrap_or(0)
+                    "the log ring has dropped everything below seq {}; {} requested record(s) \
+                     before the anchor did not come back",
+                    w.log_lost_below, w.short_before
                 ),
             });
         }
@@ -493,27 +507,47 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
         }
     }
 
-    // The window can be narrower than the caller asked for, and the two reasons
-    // for that are different facts. Records that LEFT are a gap; a domain that
-    // never had that much history is not.
+    // The window can be narrower than the caller asked for, and the reasons are
+    // not one fact but three: records that LEFT are a gap, a domain that never
+    // had that much history is not, and neither of those is what a shortfall
+    // ABOVE the anchor means. Each end gets its own sentence, because a single
+    // cause line gated on `before || after` explained the bottom while the
+    // shortfall was at the top.
     if w.short_before > 0 || w.short_after > 0 {
-        let cause = match w.evicted_before_window {
-            Some(gap) => format!(
-                "The log ring had already dropped records below seq {}, so at least {gap} of \
-                 them are **gone** rather than absent",
-                w.from
-            ),
-            None => format!(
-                "Seq {} is as far back as this store has ever held, so the shortfall is an \
-                 empty past rather than a loss",
-                w.from
-            ),
-        };
         let _ = writeln!(
             s,
             "The window is **narrower than requested**: {} record(s) short before the anchor \
-             and {} after. {cause}.\n",
+             and {} after.\n",
             w.short_before, w.short_after
+        );
+    }
+    if w.short_before > 0 {
+        let _ = if w.log_lost_below > 0 {
+            writeln!(
+                s,
+                "Below the window: the log ring has dropped everything under seq {}, so some \
+                 share of those {} missing record(s) are **gone** rather than never recorded. \
+                 The split is not recoverable — the ring counts what it holds, not what it \
+                 dropped.\n",
+                w.log_lost_below, w.short_before
+            )
+        } else {
+            writeln!(
+                s,
+                "Below the window: seq {} is the oldest record this store has ever held and it \
+                 has dropped nothing, so the shortfall before the anchor is an empty past \
+                 rather than a loss.\n",
+                w.from
+            )
+        };
+    }
+    if w.short_after > 0 {
+        let _ = writeln!(
+            s,
+            "After the window: seq {} was the newest record stored when the capture was taken, \
+             so the shortfall after the anchor is history that had not happened yet. A ring \
+             evicts from the bottom, never the top — nothing was lost here.\n",
+            w.to
         );
     }
     if w.clamped {
@@ -701,7 +735,7 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
         ),
         EvidenceVerdict::Complete => {}
     }
-    if i.window.evicted_before_window.is_some() {
+    if i.window.short_before > 0 && i.window.log_lost_below > 0 {
         item(
             s,
             "**Records below this window had already been dropped.** Raise the domain's \
@@ -994,7 +1028,9 @@ fn pointers(s: &mut String, i: &CaseInput) {
          Logdata records are log entries: `seq`, `timestamp`, `level`, `message`, `host`, and \
          optional `full_message`, `facility`, `file`, `line`, `trace_id`, `span_id`, plus a \
          `source` saying which rule stored the entry and `matched_filters` naming any filter \
-         it matched. Spandata records are spans: `seq`, `trace_id`, `span_id`, \
+         it matched. `additional_fields` is an object holding every custom field the sender \
+         attached — a GELF `_request_id` arrives here as `request_id`, and it is where \
+         anything application-specific will be. Spandata records are spans: `seq`, `trace_id`, `span_id`, \
          `parent_span_id`, `start_time`, `end_time`, `duration_ms`, `name`, `kind`, \
          `service_name`, `status`, `attributes`, `events`. Both are seq-ascending, and both \
          number their seqs from the same counter — which is why a span and a log never share \

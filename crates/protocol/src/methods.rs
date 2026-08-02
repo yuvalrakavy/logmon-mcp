@@ -375,8 +375,15 @@ pub enum EvidenceVerdict {
     /// daemon's storage policy over the range — which is the only thing a later
     /// read cannot recover — not about what this particular call returned.
     Complete,
-    /// The ring dropped part of the window; `evicted_before_window` bounds how
-    /// much.
+    /// The ring dropped part of the window.
+    ///
+    /// On an export, `evicted_before_window` bounds how much — the window's
+    /// lower end and the store's floor are independent numbers there, so their
+    /// difference means something. On a **capture** there is no such bound and
+    /// none is reported: the window opens at the first record that SURVIVED, so
+    /// the two coincide, and the document states the floor and the caller's
+    /// shortfall as the separate facts they are rather than passing one off as
+    /// a count of the other.
     Evicted,
     /// A session filter was narrowing the store over part of the window. See
     /// `narrowed_by` for which filters, and over which seqs.

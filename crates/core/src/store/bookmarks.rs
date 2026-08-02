@@ -128,11 +128,18 @@ pub fn is_valid_bookmark_name(name: &str) -> bool {
 /// export, and a ring that has never dropped anything has not aged any bookmark
 /// out of relevance however far its oldest record sits above the bookmark.
 pub fn should_evict(bookmark_seq: u64, log_lost_below: u64, span_lost_below: u64) -> bool {
-    // `> bookmark_seq`, not `>= `: a bookmark marks a boundary and `b>=name`
-    // admits `seq > bookmark_seq`, so a store that has lost everything up to and
-    // including the bookmark's own seq has lost nothing the window asked for.
-    let log_gone = log_lost_below > bookmark_seq;
-    let span_gone = span_lost_below > bookmark_seq;
+    // The window itself, not the mark: `b>=name` admits `seq > bookmark_seq`,
+    // so the range at stake opens at `bookmark_seq + 1` and a store that has
+    // lost everything up to and INCLUDING the bookmark's own seq has lost
+    // nothing the window asked for. Written `> bookmark_seq`, the sweep deleted
+    // a bookmark in exactly that state — every record its window selects still
+    // present — while the comment beside it argued the opposite.
+    //
+    // Through `evicted_below`, so this and the export path share one boundary
+    // rather than agreeing by inspection.
+    let window_start = bookmark_seq.saturating_add(1);
+    let log_gone = crate::filter::parser::evicted_below(window_start, log_lost_below).is_some();
+    let span_gone = crate::filter::parser::evicted_below(window_start, span_lost_below).is_some();
     log_gone && span_gone
 }
 
@@ -449,6 +456,32 @@ mod tests {
         // Only the side that has data and rolled past is "confirmed gone."
         // If either side has no data, we can't confirm — keep alive.
         assert!(!should_evict(60, 120, 0));
+    }
+
+    /// The exact boundary, which is where this disagreed with the export path
+    /// by one. `b>=name` admits `seq > 10`, so the window opens at 11: a store
+    /// whose floor is exactly 11 has lost everything up to and INCLUDING the
+    /// mark and nothing the window asked for. Written `lost_below > seq`, the
+    /// sweep deleted the bookmark in that state — while the comment beside it
+    /// argued, correctly, that it should not.
+    #[test]
+    fn the_sweep_boundary_is_the_windows_start_not_the_mark() {
+        assert!(
+            !should_evict(10, 11, 11),
+            "everything below the mark is gone and the window is untouched"
+        );
+        assert!(
+            should_evict(10, 12, 12),
+            "seq 11 — the window's first record — has now left too"
+        );
+        // And it is the same boundary the export path applies to `b>=name`.
+        for floor in [11u64, 12] {
+            assert_eq!(
+                should_evict(10, floor, floor),
+                crate::filter::parser::evicted_below(11, floor).is_some(),
+                "the sweep and the export must not disagree at floor {floor}"
+            );
+        }
     }
 
     #[test]
