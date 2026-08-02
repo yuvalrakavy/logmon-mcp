@@ -3,7 +3,65 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
-## Unreleased
+## 0.10.0 — 2026-08-02
+
+**Upgrade the broker BEFORE the shim.** The shim now requires `tools.manifest`
+and refuses to start without it; a broker older than that leaves you with no
+tools at all.
+
+### Added — the daemon supplies presentation (`_display`)
+
+**Every CLI command and every MCP tool printed raw JSON on this branch**, because
+deleting the shim's hand-written command groups took ~215 lines of rendering with
+them. That was committed and undeployed; this closes it before the release rather
+than after, so no version ever ships with the regression.
+
+A reply now carries a rendered `_display` string when the caller asks for one and
+the daemon has a renderer for that method. The flag rides on the JSON-RPC
+envelope, not in `params` — in `params` it would be rejected client-side by any
+MCP client validating the advertised schema, hard-error on four typed handlers,
+and be **silently ignored** by the other 45, which read their fields one at a
+time. A caller would have asked for a rendering, got none, and been told nothing.
+
+**Skew needs no capability.** An old client sends no flag and gets JSON; a new
+client's flag is ignored by an old broker, which also gets JSON. Both directions
+land on the same fallback a method without a renderer takes.
+
+`--json` is untouched: the CLI does not request a rendering, so a script piping
+into `jq` gets exactly the result it got before, with no text field to strip.
+
+**What renders, and why that list is short.** The primary client is an AI agent,
+for which a small flat JSON object is *already* ideal — unambiguous,
+machine-parseable, cheap. What costs an agent is volume and noise. So: render
+where rendering removes noise, leave a small flat result as JSON. Measured on a
+live broker, `status.get` goes from 1,967 bytes to about 300 — and most of the
+difference is a list of 47 tool names the MCP client already holds because it
+registered them. Log reads roughly halve. A `filters.add` reply is 50 bytes and
+is left alone.
+
+Mutations therefore stay JSON **by rule rather than by omission**.
+
+**A rendering drops only the record array.** Every other key is stated, which is
+load-bearing rather than tidy: `{"logs": [], "count": 0, "scanned": 4000}` shown
+as `(no logs)` tells a reader the system is quiet while four thousand records
+flowed past. The rendered form says which, carrying `verdict`, `truncated`,
+`evicted_before_window` and `cursor_advanced_to` with it — and it recomputes the
+old CLI's derived note, which was never a field on anything.
+
+Long lists are **cut at 50 records or 16 KB and name the remainder**, because
+`logs.export` defaults `count` to unbounded and a rendering that silently
+returned 50 of 1,000 would read as the whole answer.
+
+`_display` outranks a `content_field` whose value is not a string. `export_logs`
+names `logs` as its content field, and that is an array — both surfaces printed
+it and returned before the rendered form was reachable.
+
+### Fixed — `cell()` escaped the pipe and not the backslash
+
+A case document value containing a backslash before a pipe — `id\|name`, which is
+how the filter DSL spells a literal pipe in a regex — split its table row, and
+every cell after it slid one header to the left. A registry key's value rendered
+under `age`. Present since case documents shipped.
 
 ### Changed — the shim is now built from the broker's manifest
 

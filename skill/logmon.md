@@ -463,6 +463,38 @@ renders the gap, so a fact you record twenty minutes later is visibly a fact abo
 twenty minutes later. That is honest, and it is also weaker evidence than the same fact
 recorded at the time.
 
+## What a reply looks like
+
+Most reads come back **already rendered** — a block list of records, or a padded
+markdown table — rather than as a JSON envelope. That is the daemon's doing, not
+the shim's, and you do not ask for it.
+
+**Read it as the answer.** The rendering is not a summary: it carries every key
+on the result except the record array itself. When a log read comes back
+
+```
+(no logs)
+count=0  scanned=4000  truncated=false
+the filter matched 0 of 4000 scanned records — data is flowing, so the filter is what to check
+```
+
+that last line is the finding. `(no logs)` alone would have read as a quiet
+system.
+
+**Three things in a rendered reply that are easy to skim past and shouldn't be:**
+
+- **`verdict`** — how much of the window the daemon can vouch for. `complete`,
+  `filtered`, `evicted`, `cannot_verify`. Absent means `cannot_verify`.
+- **`cursor_advanced_to`** — the read **moved your cursor**. The next call
+  returning nothing is expected, not a bug.
+- **`… N more record(s)`** — the list was cut at 50 records or 16 KB. What you
+  are looking at is not all of it; narrow the filter or lower `count`.
+
+**Mutations still return JSON** — `add_filter`, `clear_logs`, `add_bookmark` and
+the rest. They are small and flat, and the fields are what you need to reference
+them later. Nothing is being withheld: a method with no renderer returns its
+result unchanged.
+
 ## Filter DSL
 
 Comma-separated qualifiers, AND-ed within a filter. Multiple filters on a session OR together.

@@ -436,6 +436,45 @@ the epoch log opens at the seq this incarnation started from, so a restored doma
 speak for its predecessor's seqs. Nothing detects the restart — the property falls out of
 the log being per-process.
 
+## Rendered output
+
+The daemon supplies presentation. A reply carries a **`_display`** string —
+already formatted for a reader — whenever the caller asks for one and the daemon
+has a renderer for that method. The CLI prints it instead of JSON; the MCP shim
+hands it to the agent instead of a pretty-printed envelope.
+
+**You do not ask for it explicitly.** The CLI requests it unless you pass
+`--json`; the MCP route requests it unless the reply is being written to a file.
+So `logmon-mcp status` is seven readable lines and `logmon-mcp status --json` is
+exactly the result it always was, with no rendered field to strip in `jq`.
+
+**Not every method has one, and that is the design.** A method with no renderer
+returns its JSON unchanged, which is also what an older broker does — so the two
+degrade identically and renderers can land one method at a time.
+
+Which methods render follows one rule: **render where rendering removes noise;
+leave a small flat result as JSON.** For an agent — the primary client — a reply
+like `{"id": 3, "filter": "l>=ERROR"}` is already ideal: unambiguous,
+machine-parseable, cheap. What costs an agent is volume. So:
+
+| reply | rendered | why |
+|---|---|---|
+| `status.get` | yes | 1,967 bytes → ~300. Most of the difference is a list of 47 tool names an MCP client already holds |
+| log / span / trace reads | yes | ~2× denser, and no JSON punctuation to mis-parse |
+| list reads | yes | one row per thing; keys stated once rather than per record |
+| mutations (`add_filter`, `clear_logs`, …) | no | already small and flat; rendering would save ~20 bytes and risk hiding a field |
+
+A rendering **drops only the record array** — every other key on the result is
+stated. That matters more than it sounds: `{"logs": [], "count": 0,
+"scanned": 4000}` shown as just `(no logs)` would tell a reader the system was
+quiet while four thousand records flowed past. The rendered form says so
+outright, and it carries `verdict`, `truncated`, `evicted_before_window` and
+`cursor_advanced_to` with it.
+
+Long record lists are **cut at 50 records or 16 KB and say how many were left**,
+because `export_logs` defaults to unbounded and a rendering that silently
+returned 50 of 1,000 would read as the whole answer.
+
 ## Triggers
 
 Triggers watch every incoming log and fire when a match occurs, capturing context:
