@@ -139,8 +139,8 @@ matching entries are kept. So *"nothing appeared before the error"* is ambiguous
 | `evicted` | the ring dropped part of the window; `evicted_before_window` bounds how much |
 | `cannot_verify` | no claim is possible: the store is empty, the window predates this daemon run, or the read was capped |
 
-**`cannot_verify` is the default when the field is absent**, so a reply from an older
-broker never reads as a clean bill of health. And note the filter that narrowed your
+**`cannot_verify` is the default when the field is absent**, so a missing verdict never
+reads as a clean bill of health. And note the filter that narrowed your
 window may belong to **another session, possibly a disconnected one** — its filters go on
 shaping storage until the TTL sweep retires it. That is precisely the case you cannot see
 by asking what filters *you* hold.
@@ -312,19 +312,20 @@ Points worth knowing before you rely on it:
 
   It also reports **`broker_version`** and **`broker_tools`** — see below.
 
-**The tools you hold came from the broker itself.** The shim keeps no tool list of its own: on startup it calls `tools.manifest` and builds its MCP router and its CLI from the reply. So your tool list *is* this broker's surface, and `broker_tools` agrees with it by construction. There is nothing to compare and no `shim_note` — that field belonged to an older arrangement where the list was compiled into the shim, and it no longer exists.
+**The tools you hold came from the broker itself.** The shim keeps no tool list of its own: on startup it calls `tools.manifest` and builds its MCP router and its CLI from the reply. So your tool list *is* the running broker's surface, and `broker_tools` agrees with it by construction — there is nothing to reconcile.
 
-**So a tool named in this document that you do not hold means the BROKER is older than this document** — not that your client is stale. That inverts the old advice, and it changes what you tell the user:
+**So a tool named in this document that you do not hold means the running broker predates it.** The daemon is long-lived and does not pick up a rebuild until it is restarted, so this is what a fresh build that nobody restarted into looks like:
 
 ```
-The logmon broker running here is 0.9.0, which doesn't serve create_case.
-Upgrade it — `cargo install --path crates/broker --locked` from a logmon-mcp
-checkout — then restart the broker service and this MCP server.
+The logmon broker answering here doesn't serve create_case — it's running an
+older build than this checkout. Rebuild and restart it:
+`cargo install --path crates/broker --locked`, restart the broker service,
+then restart this MCP server.
 ```
 
-Read `broker_version` the first time you call `get_status`, and reach for `broker_tools` when a tool you expected isn't there. **Don't hand-roll around a missing capability without saying so.** `snapshot_collector` and `diff_collectors` are how a before/after comparison is done at all; substituting hand-computed ratios silently is exactly the failure this reporting exists to prevent.
+Read `broker_version` the first time you call `get_status`, and reach for `broker_tools` when a tool you expected isn't there. **Don't hand-roll around a missing capability without saying so.** `snapshot_collector` and `diff_collectors` are how a before/after comparison is done at all; substituting hand-computed ratios silently is exactly the failure these fields exist to prevent.
 
-**If you are reading this and have NO logmon tools at all**, the shim refused to start — you have this document from the Claude Code plugin or a local skills directory rather than from the MCP server, which is why the two can disagree. The shim requires `tools.manifest` and will not serve a partial surface, so the usual cause is a broker older than the shim. Same fix, same order: broker first, restart it, then the client. Fall back to the `logmon-mcp` CLI in the meantime only if it works — it fails the same way, with `could not read the tool manifest`.
+**If you are reading this and have NO logmon tools at all**, the shim refused to start — you have this document from the Claude Code plugin or a local skills directory rather than from the MCP server, which is why the two can disagree. The shim requires `tools.manifest` and will not serve a partial surface. Same fix, same order: rebuild the broker, restart it, then restart the client. The `logmon-mcp` CLI is not a fallback here — it fails the same way, with `could not read the tool manifest`.
 
 **`trace_ingest` — loss on the OTLP trace transports, before any collector saw a span.** Non-zero on any of the three means every span-derived number you report from elsewhere is a **lower bound**, `matched` included.
 
@@ -751,7 +752,7 @@ A cursor was idle long enough that its seq fell off the ring buffer. The broker 
 ### "A trigger isn't firing"
 
 1. Triggers evaluate **every** incoming log, regardless of filters. So a filter isn't the cause.
-2. A trigger is debounced only by its OWN `post_window` — a sibling firing never suppresses it. But within that window it won't re-fire, so a burst gives you one capture, not one per entry; set `post_window=0` to count every match — on a low-rate signal only; see the cost note under Triggers above. (Before 2026-07-25 the window was session-wide and a busy trigger really did silence quiet ones — if you are on an older broker, that is your answer.)
+2. A trigger is debounced only by its OWN `post_window` — a sibling firing never suppresses it. But within that window it won't re-fire, so a burst gives you one capture, not one per entry; set `post_window=0` to count every match — on a low-rate signal only; see the cost note under Triggers above.
 3. CLI mode invocations can't receive trigger fires — the CLI process exits before any log can match. Use the MCP shim or the SDK for that.
 4. Confirm the trigger exists AND is armed: `get_triggers` — `post_remaining > 0` means it is inside its own debounce window right now, so it is suppressed rather than broken.
 5. Verify the filter actually matches incoming logs by trying the same filter in `get_recent_logs`.

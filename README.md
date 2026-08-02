@@ -59,19 +59,20 @@ tool gains an MCP tool *and* a CLI command with no rebuild of the client.
 
 Two consequences worth knowing before you install anything:
 
-- **Upgrade the broker before the shim.** The shim requires `tools.manifest` and
-  refuses to start without it, so a broker older than the shim leaves you with no
-  tools at all rather than a subset. See [Upgrades](#upgrades-and-version-skew).
+- **Install the broker before the shim, and restart it.** The shim requires
+  `tools.manifest` and refuses to start without it, so a shim talking to a broker
+  process older than itself gets no tools at all rather than a subset. See
+  [Reinstalling](#reinstalling-after-a-change).
 - **CLI command paths are derived from RPC method names**, never declared —
   `collectors.list` is `logmon-mcp collectors list`, `domain_data.update` is
   `logmon-mcp domain-data update`. A derived path has no second place to disagree
   with itself, which is why `--help` is authoritative and any table of commands
   (including the ones in this file) can lag.
 
-This replaces an earlier arrangement where the tool list was compiled into the
-shim. That version could not gain a capability without being reinstalled, and
-nothing told anyone when the reinstall was overdue — a project once filed a
-report proposing three collector features that had already shipped.
+The payoff is that a tool is declared in exactly one place —
+`crates/protocol/src/mcp_tools.rs` — rather than once in the daemon and again in
+each client that wants to reach it. Nothing can drift, because there is no second
+copy to drift from.
 
 **Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. A session targets one via `use_domain` (MCP) or the `--domain` flag (CLI). For a per-worktree / per-project setup, set **`LOGMON_DOMAIN`** in the MCP server's env once — **alongside a named `--session`** — so the shim binds that domain at connect and **re-binds it on every reconnect** (durable across daemon restarts). Reconnect-preservation needs a named session: an anonymous session can't resume a restart, so it fails *loud* (never a silent revert to `default`) and the shim is restarted. Every session then auto-scopes with zero per-call ceremony. Create the domain before the shim connects; a missing domain is a loud handshake error, not a silent fallback.
 
@@ -374,7 +375,7 @@ Full guide: [Provenance and case documents](#provenance-and-case-documents).
 |---|---|
 | `get_sessions` / `drop_session` | Multi-session inspection. |
 | `rename_session` | Rename this session in place — all state (domain binding, triggers, filters, bookmarks, collectors) survives. A name held by a *connected* session errors (deliberate: two live clients must not share an identity); a *disconnected* holder is displaced (reported via `displaced_stale_holder`). |
-| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. Also **`broker_version`** and **`broker_tools`** — the tools this broker serves, which is what your client registered from. See [Upgrades](#upgrades-and-version-skew). |
+| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. Also **`broker_version`** and **`broker_tools`** — the tools this broker serves, which is what your client registered from. See [Reinstalling](#reinstalling-after-a-change). |
 | `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale) and `bound_sessions` — which sessions are bound to each domain (derived from the session registry; disconnected holders are suffixed). |
 | `use_domain` | Bind this session to a domain for subsequent queries + notifications. |
 | `clear_domain` | Dispose the bound domain's logs + spans (keeps the domain alive). |
@@ -495,8 +496,8 @@ policy, plus that policy — and `export_logs` reports against it:
 
 Three properties worth knowing:
 
-- **`cannot_verify` is the default when the field is absent**, so a reply from a broker too
-  old to send it never reads as a clean bill of health.
+- **`cannot_verify` is the default when the field is absent**, so a missing verdict never
+  reads as a clean bill of health. The safe answer is the one you get for free.
 - **The epoch records filter *strings*, not a boolean.** `edit_filter` replaces a condition
   in place and never moves a boolean, so a flag-only marker would report the new filter
   string over the old range — wrong information rather than missing information.
@@ -644,8 +645,8 @@ So `logmon-mcp status` is seven readable lines and `logmon-mcp status --json` is
 exactly the result it always was, with no rendered field to strip in `jq`.
 
 **Not every method has one, and that is the design.** A method with no renderer
-returns its JSON unchanged, which is also what an older broker does — so the two
-degrade identically and renderers can land one method at a time.
+returns its JSON unchanged, so renderers can land one method at a time and a
+caller never has to ask which methods have one.
 
 Which methods render follows one rule: **render where rendering removes noise;
 leave a small flat result as JSON.** For an agent — the primary client — a reply
@@ -973,21 +974,11 @@ That remedy is for channel-full drops only: a `shed_batches` count means the pro
 told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
 unusable trace id) — no buffer size changes either.
 
-## Upgrades and version skew
+## Reinstalling after a change
 
-The broker and `logmon-mcp` are separate binaries with separate lifetimes: the broker runs
-as a long-lived service, the shim is spawned per client session. **Skew in the tool surface
-is gone** — the shim builds its MCP router and its CLI from `tools.manifest` at startup, so
-whatever the broker serves is what the client offers, and upgrading the broker alone makes
-new tools reachable.
-
-That was not always true. The tool list used to be compiled into the shim, so a new
-capability was unusable until the shim was reinstalled and nothing said when that was
-overdue: a project once filed a report proposing three collector features that had all
-shipped, because their shim was three minor versions behind.
-
-**What replaced it is an ordering requirement.** The shim requires `tools.manifest` and
-refuses to start without one, with an error naming the fix. So:
+The broker and `logmon-mcp` are separate binaries with separate lifetimes — the broker runs
+as a long-lived service, the shim is spawned per client session — and the shim builds its
+whole surface from the broker's `tools.manifest` at startup. So a rebuild has an order:
 
 ```bash
 cargo install --path crates/broker --locked   # 1. broker
@@ -996,11 +987,13 @@ cargo install --path crates/mcp --locked      # 3. shim
 # 4. restart your MCP client
 ```
 
-A shim newer than the broker has **no tools at all**, not a stale subset — loud, and
-deliberately so. Reinstalling a binary never affects a running process; it keeps the image
-it started with, so both restarts are load-bearing.
+**Both restarts are load-bearing.** Reinstalling a binary never affects a running process;
+it keeps the image it started with. So a shim that connects to a broker still running the
+previous image gets the previous image's manifest — and if that image predates
+`tools.manifest` entirely, the shim refuses to start and you have **no tools at all**
+rather than a stale subset. That failure is loud by design; the error names the fix.
 
-`status.get` still reports what the broker is:
+`status.get` reports which broker you actually reached:
 
 ```json
 "broker_version": "0.10.0",
@@ -1008,15 +1001,9 @@ it started with, so both restarts are load-bearing.
 ```
 
 `broker_tools` names *tools*, not RPC methods, because that is the vocabulary a client
-holds (`traces.slow` is `get_slow_spans`). Since the client registered from that same
-manifest the two now agree by construction, which is what makes the list useful for a
-different question: whether the broker you are talking to is the one you just installed.
-The old `shim_note` — a shim comparing its compiled-in list against the broker's — is gone,
-because there is no compiled-in list left to compare.
-
-The **wire** protocol is a separate matter, and it still uses additive-field discipline: an
-older broker that omits a field deserializes it as that field's default, and `_display`
-degrades to plain JSON in both directions.
+holds (`traces.slow` is `get_slow_spans`). Your client registered from that same manifest,
+so the two agree by construction — which is what makes the pair useful for the question
+that remains: whether the broker answering you is the one you just built.
 
 ## SDK and cross-language clients
 
