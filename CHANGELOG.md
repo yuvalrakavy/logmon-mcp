@@ -282,6 +282,59 @@ is a second name to support forever.
 
 ### Fixed
 
+- **"Evicted" was measured from the wrong thing entirely, and both directions
+  were wrong.** Three call sites read a store's oldest **surviving** seq as the
+  point below which records had been lost. It is not that. One `SeqCounter`
+  numbers both the log store and the span ring, so a ring that has never filled
+  has an oldest seq equal to the first record it ever received — every seq
+  beneath it belonged to the *other* store, or to nothing.
+
+  Two live consequences, both of them claims about records that never existed or
+  silence about records that did:
+
+  - A domain that logged before it traced reported *"the span ring **had**
+    evicted below seq 1 — up to 100 spans over this window are gone"*, with zero
+    spans ever having existed there. That is the ordinary shape of a domain, not
+    an edge case.
+  - **`cases.create` could not report eviction at all.** Its window's lower end
+    comes from the stored entries themselves, so it could never sit below the
+    oldest one. A ring of 30 with 200 entries fed, asked for 100 records of
+    context, returned 29 and said *"nothing was evicted from the window.
+    Everything that reached the daemon over this range is in the logdata."*
+
+  Both stores now track the lowest seq they can still speak for — written when a
+  record actually leaves, and by `clear_logs`, which loses records exactly as an
+  eviction does. A capture measures the **shortfall** against what was requested,
+  and says which of the two things it means: records that left are a gap, a
+  domain with no more history is not.
+
+- **`logs.export` called a window `complete` when a filter had emptied its
+  head.** The unbounded window took *both* ends from the store's extent. A filter
+  that dropped everything since seq N put the filtered tail outside the window;
+  one that dropped everything before seq M put the filtered head outside it. An
+  unbounded export now describes the whole seq axis this daemon run owns.
+
+- **A capture said `complete` and "the read was capped" in one document.**
+  `before`/`after` exceeding the maximum set a flag the renderer printed as a cap
+  on the read, four lines under a paragraph saying nothing was capped — and
+  offered a remedy (*"re-capture with larger `before`/`after`"*) that cannot be
+  followed, because the clamp is hard. The clamp is now its own fact under its
+  own name, and never contradicts the verdict.
+
+- **A bookmark anchor could reach another session's mark.** `cases.create`
+  resolved a bare bookmark name by scanning every session, so a stale `boom` in
+  another session silently anchored the document — and since the anchor's message
+  is the headline, that is a wrong document rather than a wrong parameter.
+  Bookmarks now resolve session-scoped, exactly as `b>=name` does; use
+  `<session>/<name>` for another session's.
+
+- **A failed capture could leave `data` applied to the domain registry.** An
+  unresolvable anchor returned an error with no files written — and `/Action`
+  permanently set on a shared, long-lived store, with the caller never told. The
+  filenames are now claimed before anything durable happens, and a failed write
+  gives the whole claim back rather than stranding an empty `.md` under a stem no
+  retry can take. `data: []` no longer aborts the capture.
+
 - **`evicted_before_window` was off by one, and false-positived at the
   boundary.** It compared the *strict* `Gt` value against `buffer_oldest_seq`,
   but the window actually begins at `lb + 1` — so a window starting exactly at
