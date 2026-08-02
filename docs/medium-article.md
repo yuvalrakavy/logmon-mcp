@@ -8,26 +8,32 @@ I got tired of being the assistant's `tail -f`. So I built **logmon**, a tiny lo
 
 ## The one-paragraph version
 
-logmon is a single Rust daemon you run on your dev machine. Your app emits structured logs (GELF, UDP or TCP) and/or OpenTelemetry traces (OTLP, gRPC or HTTP), all of which the daemon parks in in-memory ring buffers. AI assistants — Claude Code, Cursor, Windsurf, Copilot, Codex CLI, Gemini CLI, anything that speaks MCP — connect through a thin stdio shim and query that telemetry as tools. Multiple sessions, a CLI, and any Rust process linking the SDK all observe the same stream in parallel. No SaaS, no hosted backend, no agents to deploy.
+logmon is a single Rust daemon you run on your dev machine. Your app emits structured logs (GELF, UDP or TCP) and/or OpenTelemetry traces (OTLP, gRPC or HTTP), all of which the daemon parks in in-memory ring buffers. AI assistants — Claude Code, Cursor, Windsurf, Copilot, Codex CLI, Gemini CLI, anything that speaks MCP — connect through a thin stdio shim and query that telemetry as 47 tools. Multiple sessions, a CLI, and any Rust process linking the SDK all observe the same stream in parallel. No SaaS, no hosted backend, no agents to deploy.
 
 ## Architecture
 
 Four crates, one repo:
 
 - **`logmon-broker`** — long-lived daemon. Owns the GELF and OTLP receivers, the log and span ring buffers, and a JSON-RPC server on a Unix domain socket. Run it as a launchd agent or systemd user unit via `logmon-broker install-service`. Or don't — the shim auto-starts it on first use.
-- **`logmon-mcp`** — dual-mode binary. Without arguments it's an MCP stdio server. With a subcommand (`logmon-mcp logs recent --json`) it's a CLI that mirrors the MCP surface 1:1.
+- **`logmon-mcp`** — dual-mode binary. Without arguments it's an MCP stdio server. With a subcommand (`logmon-mcp logs recent --json`) it's a CLI that mirrors the MCP surface 1:1. Both are assembled at startup from what the broker declares, so a tool added to the daemon becomes an MCP tool and a CLI command with no reinstall.
 - **`logmon-broker-sdk`** — typed Rust client. Test harnesses, dashboards, anything Rust that wants to talk to the broker without going through MCP.
 - **`logmon-broker-protocol`** — wire types. Ships `protocol-v1.schema.json` (JSON Schema 2020-12), drift-guarded against the Rust definitions, safe to treat as the contract for codegen in other languages.
 
 The architectural bet: **one daemon, many clients, shared buffer.** Multi-session falls out naturally, CLI and MCP shim are trivial, new transports are just another client.
 
-## The features that actually matter once an LLM is on the other end
+---
+
+The tool started as "let the assistant read the logs." It grew two more jobs, and they turned out to matter more than the first one. What follows is organised that way: **see it**, **measure it**, **keep it**.
+
+## Part one: see it
 
 ### Multi-session, with named sessions that survive
 
 The broker tracks every connected session. A Claude Code window in one terminal and a Cursor window in another both see the same buffer of logs without stepping on each other, because triggers and filters are per-session.
 
 Anonymous sessions get a UUID and disappear on disconnect. **Named sessions** (`logmon-mcp --session my-debug`) persist across disconnects and across daemon restarts; their filters, triggers, and bookmarks live in `~/.config/logmon/state.json`. Notifications queue while disconnected, so an assistant reconnecting after a crash sees what fired in its absence.
+
+**Domains** partition the data itself. One per project or test run, each with its own ports, its own ring buffers, and its own seq axis — so two projects on one machine never read each other's telemetry, and clearing one leaves the other alone.
 
 ### A filter DSL the assistant can actually compose
 
@@ -51,44 +57,85 @@ A **cursor** is the same bookmark used through `c>=` instead of `b>=`. Every rea
 
 Why this matters for an AI: it lets the assistant scope queries to *moments in its own workflow* ("everything between when I made the edit and when the test finished") without destructively clearing logs, and without you copy-pasting sequence numbers between turns.
 
-Cross-session reads work. Cross-session *advances* don't — only the owning session can move its own cursor. Bookmarks auto-evict when both buffers have rolled past their seq.
+### Triggers, and logs correlated with traces
 
-### Triggers with pre/post windows
+A trigger is a filter that runs against every incoming log. When it matches, the broker captures `pre_window` entries before and `post_window` after and pushes a notification to the owning session. The pre-trigger buffer ignores buffer filters, so context around a panic is never truncated. Two triggers auto-create per session: `l>=ERROR` and a panic regex. Add your own with `oneshot=true` for "wake me up the next time the broken thing happens".
 
-A trigger is a filter that runs against every incoming log. When it matches, the broker captures `pre_window` entries before and `post_window` after and pushes a notification to the owning session. The pre-trigger buffer ignores buffer filters, so context around a panic is never truncated.
+Logs and spans sit in separate ring buffers but share one `seq` counter, so the same bookmark works across both. Logs carrying `trace_id`/`span_id` are linked to their spans — `get_trace(trace_id=...)` returns the full span tree *and* the logs emitted under it. The assistant pivots from "this trace was slow" to "which log lines were emitted during the slow span" without correlating by hand.
 
-Two triggers auto-create per session: `l>=ERROR` and `mfm=panic`. Add your own with `oneshot=true` for "wake me up the next time the broken thing happens".
+## Part two: measure it
 
-### Logs and traces, correlated
-
-OTLP ingests both. They sit in separate ring buffers but share a global `seq` counter, so the same bookmark works across both. Logs carrying `trace_id`/`span_id` are linked to their spans — `get_trace(trace_id=...)` returns the full span tree *and* the logs emitted under it. The assistant can pivot from "this trace was slow" to "which log lines were emitted during the slow span" without correlating by hand.
-
-### Span time collectors: making "did that make it faster?" answerable
-
-Traces tell you what one request did. They're bad at telling you whether a *change* helped, because answering that means aggregating many runs and knowing whether the difference you're looking at is bigger than the noise. Assistants do this badly by default: they eyeball three numbers and declare victory.
+Traces tell you what one request did. They're bad at telling you whether a *change* helped, because answering that means aggregating many runs and knowing whether the difference is bigger than the noise. Assistants do this badly by default: they eyeball three numbers and declare victory.
 
 So logmon has a measuring instrument. You arm a **collector** over a span filter *before* the run — `add_collector(name="lookup", filter="sn=Lookup", level="tree")` — and it accumulates while the workload executes. Then you read exact totals, percentiles, self time (duration minus the union of matched children, so concurrent children don't double-count), and call paths.
 
-Three design choices that only matter because an LLM reads the output:
+**Runs are kept, not just read.** `snapshot_collector(label="before")` closes a window and starts the next; `diff_collectors("lookup@before", "lookup@after")` subtracts them and reports what moved — **and refuses when the arms aren't comparable**, naming the flag that would permit it anyway. Merge several runs of one configuration and it reports the run-to-run spread, so a 5% difference gets called noise or signal instead of guessed at. A single run reports that spread as *unknown*, which is the honest answer and not zero.
 
-**It declines to report figures it can't compute.** Every suppressed field comes back `null` with a reason and a remedy: *"no matched span has a matched parent, so self time would equal total time by construction — broaden the filter so nested spans are matched too."* An instrument that quietly returns a plausible-but-meaningless number is worse than one that refuses, because the assistant will use it. This turned out to be the feature users cite as the reason they trust the rest of the output.
+You can also arm a **threshold** on a collector — `avg_ms` over a rolling window — and let the broker tell you when the workload crosses it, rather than polling.
 
-**It reports what it did to the data, not just the result.** `skip_warmup_ms` says how many spans it excluded. A grouped read says how many groups existed before `top_n` truncated the list. "Skipped nothing" and "skipped half the data" are indistinguishable downstream otherwise.
+## Part three: keep it
 
-**It knows the difference between a small sample and a real one.** At three runs, percentiles are order statistics of three numbers and say nothing — so the sampled block also returns the raw durations in arrival order, plus a Bessel-corrected standard deviation. That turns "are these two arms actually separated?" from a judgement by eye into arithmetic. And it's honest about the limit: separating two three-run means properly takes a difference of roughly 2.3 standard deviations, not one.
+Everything above lives in a ring buffer. The moment you decide something is worth understanding later, it is already on a countdown: a restart, a `clear_logs` from another session, or simply enough traffic, and the evidence is gone with no error anywhere.
 
-Runs are kept, not just read. `snapshot_collector(label="before")` records a window and starts the next; `diff_collectors("lookup@before", "lookup@after")` subtracts them and reports what moved — **and refuses when the arms aren't comparable**, naming the flag that would permit it anyway. Merge several runs of the same configuration and it reports the run-to-run spread, so a 5% difference can be called noise or signal instead of guessed at. A single run reports that spread as *unknown*, which is the honest answer and not zero.
+**`create_case` freezes a window to disk.** Three files sharing one stem:
 
-### Backpressure resilience
+```
+checkout-hang-260731-021530.md               ← read this to triage
+checkout-hang-260731-021530.logdata.jsonl    ← the log records
+checkout-hang-260731-021530.spandata.jsonl   ← the spans
+```
+
+The markdown document is what you read to decide *whether this is your bug*; the JSONL is the evidence you consult once you've decided it is. The document leads with what could **not** be captured — before anything it qualifies.
+
+### The registry: what was running when this happened
+
+A log window without provenance is a puzzle. logmon keeps a small per-domain key-value store — `update_domain_data` — and the case document renders it as of the capture:
+
+| key | what it is |
+|---|---|
+| `/Build/commit` | `git rev-parse HEAD`. The only exact identity of the code — a version string is a label someone maintains, a SHA is what actually ran |
+| `/Build/profile` | `debug` or `release`. logmon is a timing instrument and the two differ by an order of magnitude |
+| `/Action` | what you were doing, in prose. Without it a reader has logs and no scenario |
+
+Each key carries the age of its last confirmation, so a stale value reads as stale rather than as fact. A key prefixed `@` is asserted about *that capture alone* and never enters the registry — a random seed belongs to one incident, not to the project.
+
+### This is where "not an archive" stopped being true
+
+The old version of this article said logmon was *"not a long-term archive — ring buffers, in memory."* Half of that is still right: the **live buffer** is not an archive and never will be. But a case is a deliberate, durable artifact that outlives the ring, the daemon, and the machine's uptime. It is meant to be committed next to the code it describes.
+
+That is a smaller claim than "log retention", and a more useful one. You don't want thirty days of everything. You want the twenty minutes around the thing that broke, with enough context to know what produced it, still readable in six months.
+
+## The thread running through all three: an instrument that admits what it can't tell you
+
+This is the design constraint that shaped more of logmon than any other, and it exists **because** an LLM is reading the output. A human who gets a suspicious number squints at it. An assistant uses it.
+
+**Collectors decline to report figures they can't compute.** Every suppressed field comes back `null` with a reason and a remedy: *"no matched span has a matched parent, so self time would equal total time by construction — broaden the filter so nested spans are matched too."* An instrument that quietly returns a plausible-but-meaningless number is worse than one that refuses. This turned out to be the feature users cite as the reason they trust the rest of the output.
+
+**They report what they did to the data, not just the result.** `skip_warmup_ms` says how many spans were excluded; a grouped read says how many groups existed before `top_n` truncated the list. "Skipped nothing" and "skipped half the data" are otherwise indistinguishable downstream.
+
+**They know a small sample from a real one.** At three runs, percentiles are order statistics of three numbers and say nothing — so the sampled block also returns raw durations in arrival order plus a Bessel-corrected standard deviation. That turns "are these two arms actually separated?" from a judgement by eye into arithmetic. And it's honest about the limit: separating two three-run means properly takes a difference of roughly 2.3 standard deviations, not one.
+
+**And every range read carries a verdict.** This one is subtler, and it is the reason cases are trustworthy. Storage in logmon is *conditional* — a filter held by any session narrows what the daemon keeps, and the session holding it may be one you can't see. So a quiet buffer has two completely different explanations: nothing happened, or nothing was recorded. Every read answers which:
+
+| verdict | means |
+|---|---|
+| `complete` | everything that reached the daemon over this range was stored |
+| `filtered` | a session filter was narrowing the store over part of it — and **which filters, over which seqs** |
+| `evicted` | the ring had already dropped part of the window |
+| `cannot_verify` | no claim is possible: the store is empty, the window predates this daemon run, or the read was cut short |
+
+`cannot_verify` is the **default** when the field is absent, so a reply from a broker too old to send one never reads as a clean bill of health. And a case document puts the verdict at the top, before the evidence it qualifies — because the most expensive thing an archive can do is look complete when it isn't.
+
+## Backpressure resilience
 
 A noisy producer should slow itself down, not take the broker down. Concretely:
 
-- Every receiver uses `try_send` into the pipeline channel — full channel means the entry is dropped at the receiver, not enqueued without bound.
+- Every receiver uses `try_send` into the pipeline channel — a full channel means the entry is dropped at the receiver, not enqueued without bound.
 - GELF UDP sets `SO_RCVBUF` to **8 MB**, giving the OS a sizeable burst cushion before datagrams hit the floor.
 - OTLP gRPC returns `UNAVAILABLE`, OTLP HTTP returns `429`, when the destination channel is **≥80% full**. OTel exporters retry with backoff on their own.
-- Per-source drop counters (`gelf_udp`, `gelf_tcp`, and four OTLP variants) surface in `status.get`, so the assistant can see exactly which receiver is bleeding.
+- Per-source drop counters surface in `status.get`, so the assistant can see exactly which receiver is bleeding.
 
-### CLI mode and the SDK
+## CLI mode and the SDK
 
 `logmon-mcp` is also a CLI — every command mirrors an MCP tool:
 
@@ -104,42 +151,44 @@ For non-MCP consumers — test harnesses, dashboards, archival workers — `logm
 
 ## A realistic session
 
-Imagine a Rust service whose `/export` endpoint occasionally feels slow. I tell my assistant: *"the /export endpoint feels slow this afternoon, can you figure out why?"*
+A Rust service whose `/export` endpoint occasionally feels slow. I tell my assistant: *"the /export endpoint feels slow this afternoon, can you figure out why?"*
 
-> **Assistant:** Let me grab the recent traces.
+> **Assistant:** Let me record what we're running first, so whatever I find is attributable.
+>
+> *calls* `update_domain_data(entries=[{path:"/Build/commit", value:"9f2a1c4"}, {path:"/Build/profile", value:"release"}, {path:"/Action", value:"investigating slow /export"}])`
 >
 > *calls* `get_recent_traces(filter="sn=POST /export", count=10)`
 >
-> Three of the last ten are over 2 seconds, the rest under 200ms. Looking at the slowest:
+> Three of the last ten are over 2 seconds, the rest under 200ms. 92% of the wall-clock on the slowest is in a child span called `s3.PutObject`.
 >
-> *calls* `get_trace_summary(trace_id="3f...")`
+> Before this rolls out of the buffer, I'm freezing it.
 >
-> 92% of the wall-clock is in a child span called `s3.PutObject`. Bookmarking this so we can compare after a fix.
+> *calls* `create_case(reason="POST /export p95 blowout, 3 of 10 over 2s", anchor={trace_id:"3f…"}, dir="/repo/docs/cases")`
 >
-> *calls* `add_bookmark(name="before-fix")`, then `get_slow_spans(min_duration_ms=500, filter="sv=export-service", group_by="name")`
+> Captured — verdict `complete`, so nothing was filtered or evicted over that window. Now let me measure rather than eyeball.
 >
-> `s3.PutObject` is the only outlier — p95 1800ms, the rest under 50ms. You're constructing a fresh `aws_sdk_s3::Client` per request, which re-resolves credentials each time. Want me to switch it to a shared client?
+> *calls* `add_collector(name="put", filter="sn=s3.PutObject", level="tree")` … *load test runs* … `snapshot_collector(name="put", label="before")`
+>
+> 40 calls, avg 1,840ms, p95 2,100ms, run-to-run spread 6%. You're constructing a fresh `aws_sdk_s3::Client` per request, which re-resolves credentials each time. Want me to switch it to a shared client?
 
-I say yes, it edits, I run a load test:
+I say yes, it edits, I re-run the load test:
 
-> **Assistant:** *calls* `get_recent_traces(filter="sn=POST /export, b>=before-fix", count=20)`
+> **Assistant:** *calls* `snapshot_collector(name="put", label="after")`, then `diff_collectors("put@before", "put@after")`
 >
-> p95 for `POST /export` is now 180ms, no outliers. And checking for new errors:
+> avg 1,840ms → 47ms. The arms are comparable — same filter, same level, both release builds — and the change is far outside the 6% run-to-run spread, so that's signal, not noise.
 >
-> *calls* `get_recent_logs(filter="c>=before-fix, l>=ERROR", count=50)`
->
-> Buffer's clean. Looks good.
+> The case document from before the fix is still in `docs/cases/`, with the commit that produced it recorded in the front matter.
 
-No copy-pasting log snippets into the chat. The assistant goes and looks.
+No copy-pasting log snippets into the chat. The assistant goes and looks, measures, and leaves a record that survives the buffer.
 
 ## What logmon isn't
 
-- **Not a long-term archive.** Ring buffers, in memory. Default 10,000 logs and 10,000 spans. For 30-day retention, pipe through to something built for that.
+- **Not a log-retention system.** The live buffers are in memory — 10,000 logs and 10,000 spans by default. Cases are deliberate, hand-sized archives of a specific window, not a firehose sink. For 30-day retention of everything, pipe through to something built for that.
 - **Not a hosted service.** Local daemon. No SaaS, no telemetry leaves your box.
 - **Not a multi-host aggregator.** Each developer runs their own broker on their own machine. For fleet-wide log shipping use Loki, Vector, or one of the dozen things that already do that well.
 - **Not Windows-first.** Builds on Windows over a 127.0.0.1 TCP fallback, but launchd/systemd integration, `SO_RCVBUF` tuning, and the UDS path are Unix-shaped.
 
-logmon is deliberately a developer-loop tool. The job is to help your AI assistant see what's happening *right now* on *your* laptop.
+logmon is deliberately a developer-loop tool. The job is to help your AI assistant see what's happening *right now* on *your* laptop — and, when it matters, to keep an honest record of it.
 
 ## Try it in five minutes
 
