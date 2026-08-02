@@ -233,37 +233,11 @@ fn age_of(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 
 /// Caller text on its way into the body, where nothing quotes it.
 ///
-/// Front-matter has `yaml_str`; the body has this. A `reason` containing a
-/// newline and `---` would otherwise open a second front-matter block, and one
-/// spelling `\n## Evidence` would produce a second Evidence section — the
-/// document's own structure, forged by a value it is reporting. The three
-/// Unicode line breaks are here for the reason they are in `yaml_str`: they are
-/// not C0, so a check keyed on C0 misses them.
-fn flatten(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}' => ' ',
-            c => c,
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
-/// Caller text on its way into a markdown table cell.
-///
-/// **Backslashes are escaped first, and that order is the whole correctness of
-/// this function.** Escaping only the pipe turns `id\|name` into `id\\|name`,
-/// where markdown consumes `\\` as one literal backslash and the `|` behind it
-/// is an unescaped delimiter — the row gains a column and every later cell
-/// slides under the wrong header. Not hypothetical: the filter DSL compiles Rust
-/// regexes, so matching a literal pipe in a pipe-delimited log format is written
-/// `m~/id\|name/`, and a filter string is exactly the kind of caller text that
-/// reaches a cell. A value ending in a lone backslash is the mirror case, where
-/// it escapes the row's own closing delimiter.
-fn cell(s: &str) -> String {
-    flatten(s).replace('\\', "\\\\").replace('|', "\\|")
-}
+// Front-matter has `yaml_str`; the body has these. They moved to
+// `crate::render::escape` when `_display` began rendering the same untrusted
+// strings into the same markdown — one implementation, so a fix to either
+// surface reaches both.
+use crate::render::escape::{cell, flatten};
 
 /// A code fence long enough to contain `content`.
 ///

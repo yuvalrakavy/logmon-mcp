@@ -174,9 +174,38 @@ impl Broker {
     /// Untyped JSON-RPC call — convenience pass-through used by the MCP shim
     /// and by [`Broker::call_typed`].
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, BrokerError> {
+        self.call_maybe_rendered(method, params, false).await
+    }
+
+    /// The same, asking the daemon to render the result into a `_display`
+    /// string alongside it.
+    ///
+    /// For front-ends that show a reply to a reader — the CLI without `--json`,
+    /// and the MCP route. [`Broker::call_typed`] and the per-method wrappers in
+    /// [`crate::methods`] deliberately do NOT use this: they deserialize into a
+    /// result struct and would discard the string.
+    ///
+    /// A method the daemon has no renderer for simply returns no `_display`, so
+    /// a caller always needs its own fallback. That is the mechanism, not a
+    /// deficiency: it is what lets renderers land one method at a time.
+    pub async fn call_rendered(&self, method: &str, params: Value) -> Result<Value, BrokerError> {
+        self.call_maybe_rendered(method, params, true).await
+    }
+
+    async fn call_maybe_rendered(
+        &self,
+        method: &str,
+        params: Value,
+        display: bool,
+    ) -> Result<Value, BrokerError> {
         let deadline = tokio::time::Instant::now() + self.inner.config.resolved_call_timeout();
         let bridge = self.inner.current_bridge(deadline).await?;
-        match bridge.call(method, params).await {
+        let sent = if display {
+            bridge.call_rendered(method, params).await
+        } else {
+            bridge.call(method, params).await
+        };
+        match sent {
             Ok(v) => Ok(v),
             Err(e) => {
                 if is_transport_error(&e) {

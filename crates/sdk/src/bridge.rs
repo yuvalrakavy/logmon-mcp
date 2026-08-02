@@ -141,8 +141,37 @@ impl DaemonBridge {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, BridgeError> {
+        self.call_inner(method, params, false).await
+    }
+
+    /// The same, asking the daemon for a rendered `_display` string beside the
+    /// result.
+    ///
+    /// **This is the seam, not `RpcRequest::new`.** Neither surface that wants
+    /// rendering constructs a request: the MCP route and the CLI both call
+    /// `Broker::call`, which lands here. Of the constructor's call sites only
+    /// this one carries a tool call; the rest are tests and `session.start`.
+    ///
+    /// A daemon with no renderer for `method` returns no `_display`, and the
+    /// caller falls back to JSON — the same path as an old broker that does not
+    /// know the flag at all.
+    pub async fn call_rendered(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, BridgeError> {
+        self.call_inner(method, params, true).await
+    }
+
+    async fn call_inner(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        display: bool,
+    ) -> Result<serde_json::Value, BridgeError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = RpcRequest::new(id, method, params);
+        let request = if display { request.rendered() } else { request };
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         {

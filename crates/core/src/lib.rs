@@ -5,6 +5,7 @@ pub mod engine;
 pub mod filter;
 pub mod gelf;
 pub mod receiver;
+pub mod render;
 pub(crate) mod rejection;
 pub mod span;
 pub mod store;

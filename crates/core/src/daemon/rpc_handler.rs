@@ -234,9 +234,39 @@ impl RpcHandler {
         };
 
         match result {
-            Ok(value) => RpcResponse::success(request.id, value),
+            Ok(value) => RpcResponse::success(request.id, Self::maybe_render(request, value)),
             Err(msg) => RpcResponse::error(request.id, -32601, &msg),
         }
+    }
+
+    /// Add `_display` when the caller asked for it and this method has a
+    /// renderer. The one place presentation enters a reply.
+    ///
+    /// **`as_object_mut`, not `value["_display"] = …`.** Index-assign panics on
+    /// a non-object and silently replaces a `Value::Null` result with an object
+    /// — a result change rather than a presentation change. Every dispatch arm
+    /// returns an object today, so the panic is latent; but there is no
+    /// `catch_unwind` in the workspace and `handle_async` runs inside the
+    /// per-connection loop, so one would take that client's connection down. The
+    /// guarantee should not rest on a property of 48 handlers that nothing
+    /// enforces.
+    fn maybe_render(request: &RpcRequest, value: Value) -> Value {
+        if !request.display {
+            return value;
+        }
+        let text = crate::render::for_method(&request.method, &value);
+        Self::apply_render(text, value)
+    }
+
+    /// Split out so the insert and its guard are reachable from a test with a
+    /// rendering in hand. Folded into `maybe_render`, the guard could only be
+    /// exercised through a method that has a renderer, which made its test pass
+    /// vacuously for every method that does not.
+    fn apply_render(text: Option<String>, mut value: Value) -> Value {
+        if let (Some(text), Some(obj)) = (text, value.as_object_mut()) {
+            obj.insert("_display".to_string(), Value::String(text));
+        }
+        value
     }
 
     /// Async dispatch entry used by the connection loop. `domains.create` must
@@ -246,7 +276,11 @@ impl RpcHandler {
     pub async fn handle_async(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         if request.method == "domains.create" {
             return match self.handle_domains_create(&request.params).await {
-                Ok(value) => RpcResponse::success(request.id, value),
+                // Through the same step as the sync path: `domains.create` has
+                // no renderer today, so this is `None` either way — but a second
+                // exit that silently could not render would be a trap for
+                // whoever adds one.
+                Ok(value) => RpcResponse::success(request.id, Self::maybe_render(request, value)),
                 Err(msg) => RpcResponse::error(request.id, -32601, &msg),
             };
         }
@@ -3784,5 +3818,91 @@ fn wire_outcome(o: &crate::domain_data::DataOutcome) -> DomainDataOutcome {
             Outcome::Rejected { reason } => Some(reason.as_str().to_string()),
             _ => None,
         },
+    }
+}
+
+#[cfg(test)]
+mod render_hook_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn req(method: &str, display: bool) -> RpcRequest {
+        let r = RpcRequest::new(1, method, json!({}));
+        if display {
+            r.rendered()
+        } else {
+            r
+        }
+    }
+
+    /// The flag gates the whole step. A reply nobody asked to have rendered is
+    /// byte-identical to what shipped before the field existed.
+    ///
+    /// **Driven through a method that HAS a renderer**, or the assertion is
+    /// vacuous: against an unclaimed method `maybe_render` returns the value
+    /// unchanged whatever the flag says, so deleting the guard would leave the
+    /// test green.
+    #[test]
+    fn a_result_is_untouched_when_no_rendering_was_asked_for() {
+        let before = json!({"logs": [], "count": 0});
+        let after = RpcHandler::maybe_render(&req("logs.recent", false), before.clone());
+        assert_eq!(after, before, "the flag was not consulted");
+
+        // The control on the control: the same reply WITH the flag does change,
+        // so the pair proves the guard rather than the renderer's absence.
+        let asked = RpcHandler::maybe_render(&req("logs.recent", true), before.clone());
+        assert!(asked.get("_display").is_some(), "{asked}");
+    }
+
+    /// `apply_render` inserts where it can and leaves the result alone where it
+    /// cannot — split out of `maybe_render` precisely so both halves are
+    /// reachable with a rendering in hand.
+    #[test]
+    fn a_rendering_is_inserted_without_disturbing_the_result() {
+        let out = RpcHandler::apply_render(Some("rendered".into()), json!({"a": 1, "b": [2]}));
+        assert_eq!(out["_display"], json!("rendered"));
+        assert_eq!(out["a"], json!(1));
+        assert_eq!(out["b"], json!([2]));
+
+        let untouched = RpcHandler::apply_render(None, json!({"a": 1}));
+        assert!(untouched.get("_display").is_none());
+    }
+
+    /// A method with no renderer gets NO key — not an empty one. A client has to
+    /// tell "not rendered" from "rendered to nothing": the first falls back to
+    /// JSON, the second would print a blank line.
+    #[test]
+    fn an_unclaimed_method_adds_no_key_even_when_asked() {
+        let before = json!({"cleared": 3});
+        let after = RpcHandler::maybe_render(&req("logs.clear", true), before.clone());
+        assert_eq!(after, before, "an unclaimed method must not grow `_display`");
+        assert!(after.get("_display").is_none());
+    }
+
+    /// The guard, on the shape no handler produces.
+    ///
+    /// Every dispatch arm returns an object today, so index-assign would never
+    /// actually have panicked — which is precisely why this needs a direct test.
+    /// The guarantee otherwise rests on a property of 48 handlers that nothing
+    /// enforces, and the failure mode is a panic inside the per-connection loop
+    /// with no `catch_unwind` above it. Unreachable through `handle`, so it is
+    /// reached here or nowhere.
+    #[test]
+    fn a_non_object_result_survives_the_render_step() {
+        for v in [
+            json!(null),
+            json!([1, 2]),
+            json!("text"),
+            json!(7),
+            json!(true),
+        ] {
+            let out = RpcHandler::maybe_render(&req("logs.recent", true), v.clone());
+            assert_eq!(out, v, "a non-object result was altered or panicked: {v}");
+            // And directly, with a rendering in hand — `maybe_render` alone
+            // cannot reach the guard, because `for_method` refuses these shapes
+            // first, so the two together are what cover it.
+            let forced = RpcHandler::apply_render(Some("x".into()), v.clone());
+            assert_eq!(forced, v, "the insert guard let a non-object through: {v}");
+        }
     }
 }
