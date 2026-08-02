@@ -303,16 +303,53 @@ is a second name to support forever.
     Everything that reached the daemon over this range is in the logdata."*
 
   Both stores now track the lowest seq they can still speak for — written when a
-  record actually leaves, and by `clear_logs`, which loses records exactly as an
-  eviction does. A capture measures the **shortfall** against what was requested,
-  and says which of the two things it means: records that left are a gap, a
-  domain with no more history is not.
+  record actually leaves, and by a clear, which loses records exactly as an
+  eviction does.
+
+- **A capture claimed more records lost than the domain had ever held.** Fixing
+  the above, a capture began reporting the **shortfall** — how much of what the
+  caller asked for did not come back — as the count of records the ring had
+  dropped. Those are different numbers: the shortfall is bounded by `before`, and
+  nothing bounds it by what was lost. A ring of 30 that had ever received 32
+  records, asked for 100 of context, reported *"at least 71 records are gone"*.
+
+  There is no honest count available here. The window's lower end **is** the
+  store's floor — the first surviving record — which is why the eviction was
+  invisible in the first place, and why reaching for the shortfall instead looked
+  like the fix. A capture now states the floor (a seq: what the store can still
+  answer for) and the shortfall (a count: what the caller did not get) as the
+  separate facts they are, says outright that the shortfall is bounded by what
+  was requested rather than by what was lost, and claims no split between them.
+
+- **A window short at the top was explained by how far back the store reached.**
+  One cause line covered both ends of the shortfall while describing only the
+  bottom — so a capture that asked for 400 records *after* the anchor on a domain
+  that had 100 got a sentence about eviction below it. A ring evicts from the
+  bottom, never the top; each end now says its own thing.
 
 - **`logs.export` called a window `complete` when a filter had emptied its
   head.** The unbounded window took *both* ends from the store's extent. A filter
   that dropped everything since seq N put the filtered tail outside the window;
-  one that dropped everything before seq M put the filtered head outside it. An
-  unbounded export now describes the whole seq axis this daemon run owns.
+  one that dropped everything before seq M put the filtered head outside it.
+
+  Widening it to the whole seq axis then over-corrected: `logs.export {}` reported
+  `complete` about the range that `logs.export {from_seq: 1}` — the identical
+  window, asked for out loud — reported `evicted` about. An unbounded export now
+  describes the range this daemon run can still **answer** for, opening at the
+  store's own floor. Naming a `from_seq` beneath that floor stays a different
+  question, and still answers `evicted`: you asked about records that are gone.
+
+- **A bookmark could be swept while every record its window selects survived.**
+  `b>=name` admits `seq > mark`, so the window opens at `mark + 1` — but the
+  sweep fired as soon as the stores had lost the mark's own seq. Both now decide
+  it through the same helper.
+
+- **`spans.export` could call a window from a previous daemon run intact.** It
+  carries no verdict and no coverage, so its own floor is the only signal a caller
+  gets — and a restored domain resumes its predecessor's seq counter without
+  having evicted anything. Its floor is now the later of what it has dropped and
+  where this run began, which is the guarantee the log path takes from the epoch
+  log.
 
 - **A capture said `complete` and "the read was capped" in one document.**
   `before`/`after` exceeding the maximum set a flag the renderer printed as a cap
@@ -348,7 +385,9 @@ is a second name to support forever.
   `spans.export` and `logs.recent` all reported it.
 
   There is now one implementation, `evicted_below`, taking the **inclusive**
-  bound, so the case-document path and the export path cannot drift.
+  bound, so the export path and the bookmark sweep cannot drift — they decide the
+  same question about the same window and disagreed by one until they were made
+  to share the arithmetic.
 
   Two tests moved with it, and both had been passing for the wrong reason: each
   asked for a window at `oldest.saturating_sub(50)` on a store whose oldest seq
