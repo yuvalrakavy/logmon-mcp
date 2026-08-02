@@ -28,8 +28,10 @@
 
 pub mod blocks;
 pub mod escape;
+pub mod profile;
 pub mod status;
 pub mod table;
+pub mod trace;
 
 use serde_json::Value;
 use table::Col;
@@ -202,6 +204,12 @@ pub fn for_method(method: &str, result: &Value) -> Option<String> {
         "filters.list" => dsl_list(result, "filters", "(no filters)"),
         "triggers.list" => dsl_list(result, "triggers", "(no triggers)"),
         "status.get" => status::render(result),
+        // One renderer, two methods: both return `ProfileResult`, and the
+        // deleted CLI called `print_profile` from both call sites.
+        "collectors.get" | "traces.profile" => profile::render(result),
+        "collectors.diff" => profile::render_diff(result),
+        "traces.get" => trace::render_trace(result),
+        "traces.summary" => trace::render_summary(result),
         // Renderers are wired in per method as they land. Until one claims a
         // method, its reply is JSON — see the module docs.
         _ => None,

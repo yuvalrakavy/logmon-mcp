@@ -256,10 +256,15 @@ async fn arguments_survive_the_trip_with_their_types() {
         )
         .expect("armed with a threshold");
 
+        // `get_collector` renders now, so the round trip is read out of the
+        // rendering rather than the envelope. That is the stronger assertion:
+        // it proves the nested object survived the trip AND that the renderer
+        // does not drop it — which it did, until a backstop was added, because
+        // the deleted CLI never printed the threshold either.
         let text = mcp.call("get_collector", json!({ "name": "t" })).unwrap();
-        let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["threshold"]["metric"], "avg_ms", "{text}");
-        assert_eq!(v["threshold"]["window_ms"], 60000);
+        assert!(text.contains("avg_ms"), "the metric did not survive: {text}");
+        assert!(text.contains("60000"), "the window did not survive: {text}");
+        assert!(text.contains("gte"), "the operator did not survive: {text}");
     })
     .await;
 }
