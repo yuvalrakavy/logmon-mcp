@@ -30,6 +30,9 @@ opentelemetry-proto.workspace = true
 axum.workspace = true
 tempfile = { workspace = true, optional = true }
 sketches-ddsketch = "0.4.0"
+# Column alignment in rendered tables. Already in the lock file, and the
+# alternative — `chars().count()` — misaligns every row beneath a CJK value.
+unicode-width = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sd-notify = { workspace = true }

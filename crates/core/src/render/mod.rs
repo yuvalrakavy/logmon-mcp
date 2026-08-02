@@ -28,8 +28,98 @@
 
 pub mod blocks;
 pub mod escape;
+pub mod status;
+pub mod table;
 
 use serde_json::Value;
+use table::Col;
+
+/// The columns each list read renders, and the marker for an empty one.
+///
+/// **Not every field.** A rendering that reproduced the whole record would save
+/// nothing and read worse than the JSON; these are the columns that answer the
+/// question the read is for. A caller who needs a field that is not here asks
+/// for the reply unrendered — the structured result is still right there.
+const LISTS: &[(&str, &str, &[Col], &str)] = &[
+    (
+        "domains.list",
+        "domains",
+        &[
+            ("name", "name"),
+            ("src", "source"),
+            ("logs", "log_count"),
+            ("spans", "span_count"),
+            ("oldest", "oldest_seq"),
+            ("newest", "newest_seq"),
+            ("idle_s", "idle_secs"),
+            ("stale", "stale"),
+        ],
+        "(no domains)",
+    ),
+    (
+        "sessions.list",
+        "sessions",
+        &[
+            ("session", "name"),
+            ("connected", "connected"),
+            ("triggers", "trigger_count"),
+            ("filters", "filter_count"),
+            ("queued", "queue_size"),
+            ("last_seen_s", "last_seen_secs_ago"),
+        ],
+        "(no sessions)",
+    ),
+    (
+        "filters.list",
+        "filters",
+        &[
+            ("id", "id"),
+            ("filter", "filter"),
+            ("description", "description"),
+        ],
+        "(no filters)",
+    ),
+    (
+        "triggers.list",
+        "triggers",
+        &[
+            ("id", "id"),
+            ("filter", "filter"),
+            ("pre", "pre_window"),
+            ("post", "post_window"),
+            ("notify", "notify_context"),
+            ("matched", "match_count"),
+            ("oneshot", "oneshot"),
+            ("description", "description"),
+        ],
+        "(no triggers)",
+    ),
+    (
+        "bookmarks.list",
+        "bookmarks",
+        &[
+            ("bookmark", "qualified_name"),
+            ("seq", "seq"),
+            ("created", "created_at"),
+            ("description", "description"),
+        ],
+        "(no bookmarks)",
+    ),
+    (
+        "collectors.list",
+        "collectors",
+        &[
+            ("collector", "name"),
+            ("filter", "filter"),
+            ("level", "level"),
+            ("domain", "domain"),
+            ("matched", "matched"),
+            ("snapshots", "snapshots"),
+            ("armed", "armed_at"),
+        ],
+        "(no collectors)",
+    ),
+];
 
 /// Every key on a log/span read that is NOT the record array.
 ///
@@ -92,8 +182,12 @@ fn empty_but_flowing(result: &Value) -> Option<String> {
 /// enforce — no byte slicing of a string (`&s[..n]` panics mid-codepoint), no
 /// bare `usize` subtraction, no `unwrap`/`expect`.
 pub fn for_method(method: &str, result: &Value) -> Option<String> {
+    if let Some((_, key, cols, empty)) = LISTS.iter().find(|(m, ..)| *m == method) {
+        return table::table_read(result, key, cols, empty);
+    }
     match method {
         "logs.recent" | "logs.context" | "logs.export" => log_read(result),
+        "status.get" => status::render(result),
         // Renderers are wired in per method as they land. Until one claims a
         // method, its reply is JSON — see the module docs.
         _ => None,
