@@ -120,6 +120,58 @@ pub fn log_line(e: &Value) -> String {
     line
 }
 
+/// One span, as the block form renders it.
+///
+/// Spans are not tabular either: `attributes` is an open map and `events` is a
+/// list, so a table would need a column per key nobody knows in advance.
+pub fn span_line(s: &Value) -> String {
+    let seq = s.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+    let svc = s.get("service_name").and_then(|v| v.as_str()).unwrap_or("?");
+    let ms = s
+        .get("duration_ms")
+        .and_then(|v| v.as_f64())
+        .map(|d| format!("{d:.1}ms"))
+        .unwrap_or_else(|| "?".to_string());
+    // `status` is `{"type": "unset"}` on the wire; the type alone is what a
+    // reader wants, and `error` is the only value worth noticing.
+    let status = s
+        .get("status")
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut line = format!("[{seq}] {ms:>10}  {svc}  {name}");
+    if !status.is_empty() && status != "unset" && status != "ok" {
+        line.push_str(&format!("  status={status}"));
+    }
+
+    let mut extra: Vec<String> = Vec::new();
+    for key in ["trace_id", "span_id", "parent_span_id"] {
+        if let Some(v) = s.get(key).filter(|v| !v.is_null()) {
+            extra.push(format!("{key}={}", scalar(v)));
+        }
+    }
+    if let Some(map) = s.get("attributes").and_then(|v| v.as_object()) {
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for k in keys {
+            // `trace_id` is repeated inside attributes by some exporters, and it
+            // is already on the line above.
+            if k == "trace_id" {
+                continue;
+            }
+            if let Some(v) = map.get(k) {
+                extra.push(format!("{k}={}", scalar(v)));
+            }
+        }
+    }
+    if !extra.is_empty() {
+        line.push_str("\n    ");
+        line.push_str(&extra.join("  "));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

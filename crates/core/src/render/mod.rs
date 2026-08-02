@@ -186,12 +186,56 @@ pub fn for_method(method: &str, result: &Value) -> Option<String> {
         return table::table_read(result, key, cols, empty);
     }
     match method {
-        "logs.recent" | "logs.context" | "logs.export" => log_read(result),
+        "logs.recent" | "logs.context" | "logs.export" | "traces.logs" => log_read(result),
+        "spans.export" | "spans.context" => span_read(result),
+        // `traces.slow` answers two shapes from one method: grouped it is a
+        // table of names, ungrouped it is a list of spans. The branch is a
+        // property of the RESULT, so the renderer keeps it rather than picking
+        // one — and a reply carrying neither array is a third case that must not
+        // be collapsed into "no slow spans", which would claim the query found
+        // none when in fact it returned nothing to look at.
+        "traces.slow" => {
+            if result.get("groups").is_some() {
+                table::table_read(result, "groups", SLOW_GROUP_COLS, "(no groups)")
+            } else if result.get("spans").is_some() {
+                span_read(result)
+            } else {
+                None
+            }
+        }
+        "traces.recent" => table::table_read(result, "traces", TRACE_COLS, "(no traces)"),
         "status.get" => status::render(result),
         // Renderers are wired in per method as they land. Until one claims a
         // method, its reply is JSON — see the module docs.
         _ => None,
     }
+}
+
+const TRACE_COLS: &[Col] = &[
+    ("trace_id", "trace_id"),
+    ("root", "root_span_name"),
+    ("service", "service_name"),
+    ("ms", "total_duration_ms"),
+    ("spans", "span_count"),
+    ("logs", "linked_log_count"),
+    ("errors", "has_errors"),
+    ("started", "start_time"),
+];
+
+const SLOW_GROUP_COLS: &[Col] = &[
+    ("name", "name"),
+    ("count", "count"),
+    ("avg_ms", "avg_ms"),
+    ("p95_ms", "p95_ms"),
+];
+
+/// A span read: the records, then everything the result says about itself.
+fn span_read(result: &Value) -> Option<String> {
+    let records = result.get("spans")?.as_array()?;
+    let lines: Vec<String> = records.iter().map(blocks::span_line).collect();
+    let mut out = blocks::blocks(lines, "(no spans)");
+    out.push_str(&diagnostics(result, "spans"));
+    Some(out)
 }
 
 /// A log read: the records, then everything the result says about itself.
@@ -262,6 +306,45 @@ mod tests {
         {
             assert!(out.contains(key), "`{key}` was dropped from:\n{out}");
         }
+    }
+
+    /// `traces.slow` answers two shapes from one method, and a third that is
+    /// neither. Collapsing the third into the empty-spans marker would claim the
+    /// query found no slow spans when in fact the result carried nothing to look
+    /// at — a different fact.
+    #[test]
+    fn traces_slow_keeps_all_three_of_its_branches_apart() {
+        let grouped = for_method(
+            "traces.slow",
+            &json!({"groups": [{"name": "put", "count": 3, "avg_ms": 12.0, "p95_ms": 30.0}]}),
+        )
+        .expect("grouped renders");
+        assert!(grouped.contains("| name "), "a table: {grouped}");
+        assert!(grouped.contains("| put "), "{grouped}");
+
+        let listed = for_method(
+            "traces.slow",
+            &json!({"spans": [{"seq": 1, "name": "put", "service_name": "s",
+                               "duration_ms": 11017.1}]}),
+        )
+        .expect("ungrouped renders");
+        assert!(listed.contains("11017.1ms"), "blocks: {listed}");
+        assert!(!listed.contains("| name "), "not a table: {listed}");
+
+        // Neither array: no claim at all.
+        assert_eq!(for_method("traces.slow", &json!({"count": 0})), None);
+    }
+
+    /// `traces.logs` returns log records, so it renders as one.
+    #[test]
+    fn a_traces_logs_reply_renders_as_log_records() {
+        let out = for_method(
+            "traces.logs",
+            &json!({"logs": [{"seq": 4, "level": "Error", "message": "boom",
+                              "timestamp": "2026-08-02T03:29:02Z"}], "count": 1}),
+        )
+        .expect("renders");
+        assert!(out.contains("[4] 2026-08-02T03:29:02 ERROR boom"), "{out}");
     }
 
     /// The derived note, which is not a field on any result: `count == 0` with
