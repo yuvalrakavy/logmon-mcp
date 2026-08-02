@@ -251,8 +251,18 @@ fn flatten(s: &str) -> String {
 }
 
 /// Caller text on its way into a markdown table cell.
+///
+/// **Backslashes are escaped first, and that order is the whole correctness of
+/// this function.** Escaping only the pipe turns `id\|name` into `id\\|name`,
+/// where markdown consumes `\\` as one literal backslash and the `|` behind it
+/// is an unescaped delimiter — the row gains a column and every later cell
+/// slides under the wrong header. Not hypothetical: the filter DSL compiles Rust
+/// regexes, so matching a literal pipe in a pipe-delimited log format is written
+/// `m~/id\|name/`, and a filter string is exactly the kind of caller text that
+/// reaches a cell. A value ending in a lone backslash is the mirror case, where
+/// it escapes the row's own closing delimiter.
 fn cell(s: &str) -> String {
-    flatten(s).replace('|', "\\|")
+    flatten(s).replace('\\', "\\\\").replace('|', "\\|")
 }
 
 /// A code fence long enough to contain `content`.

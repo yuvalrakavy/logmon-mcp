@@ -724,6 +724,61 @@ fn a_hostile_value_survives_both_rendering_contexts() {
     );
 }
 
+/// A **backslash before a pipe** still splits the row, because escaping the pipe
+/// and not the backslash produces `\\|` — markdown consumes `\\` as one literal
+/// backslash and the `|` behind it is an unescaped delimiter.
+///
+/// Not hypothetical: the filter DSL compiles Rust regexes, so matching a literal
+/// pipe in a pipe-delimited log format is written `m~/id\|name/`, and a filter
+/// string is exactly the kind of caller text that reaches a cell. A value ending
+/// in a lone backslash is the mirror case — it escapes the row's own closing
+/// delimiter.
+#[test]
+fn a_backslash_before_a_pipe_does_not_split_the_row() {
+    // Count delimiters the way a markdown renderer does: scan forward, and let
+    // a backslash consume the character after it. The naive "is the previous
+    // byte a backslash" test encodes the SAME mistake as the buggy escaper and
+    // reports the broken row as fine — it did, on the first draft of this test.
+    fn delimiters(row: &str) -> usize {
+        let b = row.as_bytes();
+        let (mut n, mut i) = (0, 0);
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'|' => {
+                    n += 1;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        n
+    }
+
+    let plain = render(&base()).body;
+    let expected = delimiters(
+        plain
+            .lines()
+            .find(|l| l.starts_with("| `/Build/commit`"))
+            .expect("a baseline row"),
+    );
+
+    for value in [r"id\|name", r"trailing\", r"\\|both"] {
+        let mut i = base();
+        i.registry = vec![fact("/Note", value, "2026-07-31T14:03:11Z")];
+        let out = render(&i).body;
+        let row = out
+            .lines()
+            .find(|l| l.starts_with("| `/Note`"))
+            .expect("the key is rendered as a table row");
+        assert_eq!(
+            delimiters(row),
+            expected,
+            "value {value:?} changed the row's column count: {row:?}"
+        );
+    }
+}
+
 /// The three Unicode line breaks YAML recognises beyond `\n` and `\r`. They are
 /// not C0, so a hex-escape arm keyed on C0 misses them, and a raw one inside a
 /// double-quoted scalar ends the scalar.
