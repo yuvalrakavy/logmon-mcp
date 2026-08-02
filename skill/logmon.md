@@ -85,11 +85,35 @@ The same operations are available as `logmon-mcp <subcommand>`. Use the CLI when
 - The MCP connection has dropped mid-session.
 - You want to pipe through `jq`, `grep`, or `head`.
 
-Mapping is mechanical: `get_recent_logs` ↔ `logmon-mcp logs recent`, `add_bookmark` ↔ `logmon-mcp bookmarks add`. Add `--json` for machine-readable output. CLI invocations default to a named session called `"cli"` so state persists across calls.
+**Commands are derived from the broker's RPC method names, not from tool names**, so the mapping is mechanical but it is not the tool name with the words rearranged. The rule: take the method, replace `.` with a space and `_` with `-`.
+
+| Tool | Method | Command |
+|---|---|---|
+| `get_recent_logs` | `logs.recent` | `logmon-mcp logs recent` |
+| `add_bookmark` | `bookmarks.add` | `logmon-mcp bookmarks add` |
+| `get_slow_spans` | `traces.slow` | `logmon-mcp traces slow` |
+| `profile_traces` | `traces.profile` | `logmon-mcp traces profile` |
+| `get_filters` | `filters.list` | `logmon-mcp filters list` |
+| `get_sessions` | `sessions.list` | `logmon-mcp sessions list` |
+| `document_collectors` | `collectors.document` | `logmon-mcp collectors document` |
+| `create_case` | `cases.create` | `logmon-mcp cases create` |
+| `update_domain_data` | `domain_data.update` | `logmon-mcp domain-data update` |
+
+Note the shape: the *group* is the noun (`traces`, `collectors`, `cases`), so `get_slow_spans` is **not** `spans slow` and `profile_traces` is **not** `collectors profile`. When unsure, **ask the binary rather than guessing** — `--help` is built from the same manifest the daemon just served, so it is always current where a table can lag:
+
+```bash
+logmon-mcp --help                  # every group
+logmon-mcp collectors --help       # one group's verbs
+logmon-mcp cases create --help     # one command's arguments and accepted values
+```
+
+Global flags — `--session NAME`, `--domain NAME`, `--json` — go **before** the command; after it, a flag belongs to the tool (`logmon-mcp collectors edit --domain …` re-pins a collector; `logmon-mcp --domain t3 logs recent` scopes the query). CLI invocations default to a named session called `"cli"` so state persists across calls.
+
+Output arrives **already rendered** for most reads; `--json` opts out and gives the raw result with no rendered field to strip.
 
 ## Architecture (one-paragraph version)
 
-`logmon-broker` is a long-running daemon that ingests GELF (UDP/TCP on `12201`) and OTLP (gRPC `4317`, HTTP `4318`), stores logs and spans in in-memory ring buffers, correlates them by `trace_id`, and serves multiple clients over `~/.config/logmon/logmon.sock` via JSON-RPC 2.0. `logmon-mcp` is the thin MCP shim — one per editor session, all sharing the same broker. Each session owns its triggers, filters, and bookmarks; named sessions persist across reconnects and daemon restarts.
+`logmon-broker` is a long-running daemon that ingests GELF (UDP/TCP on `12201`) and OTLP (gRPC `4317`, HTTP `4318`), stores logs and spans in in-memory ring buffers, correlates them by `trace_id`, and serves multiple clients over `~/.config/logmon/logmon.sock` via JSON-RPC 2.0. `logmon-mcp` is the thin MCP shim — one per editor session, all sharing the same broker — and it holds no knowledge of the daemon: the tools you are holding, their parameters and the CLI's commands were all assembled at startup from the broker's `tools.manifest`. Each session owns its triggers, filters, bookmarks and collectors; named sessions persist across reconnects and daemon restarts.
 
 ## Available tools
 
@@ -171,7 +195,7 @@ Collectors need a **named** session (`--session NAME`, or `session.start` with a
 - **`reset_collector(name)`** — zero it and **discard** the run. Prefer `snapshot_collector` unless you genuinely want it gone.
 - **`remove_collector(name)`** — unarm it and hand the budget back. Do this when you're done; a collector left armed keeps costing ingest time and reserved memory.
 - **`diff_collectors(a, b, group_by?, …)`** — subtract two runs and get what moved. **This is the payoff**; everything above measures. An *arm* is `"<collector>"` (the live window), `"<collector>@<label>"` (one recorded run), or `"<collector>@*"` (every recorded run merged). **Prefer `@*` on both sides** — with single runs there is no spread, so every threshold comes back `unknown` and nothing in the result can be called a result.
-- **`document_collectors(names, format?, question?, finding?)`** — write it up: what moved, what to do next, and every caveat attached to the number it qualifies. The first name is the baseline. Pass `question` when you generate it and `finding` on a second call once you have read it — regeneration is free and lossless, which is why nothing is stored. `format: "folded"` gives collapsed stacks for a flame graph, one arm at a time, `tree` level only.
+- **`document_collectors(names, format?, question?, finding?, path?)`** — write it up: what moved, what to do next, and every caveat attached to the number it qualifies. The first name is the baseline. Pass `question` when you generate it and `finding` on a second call once you have read it — regeneration is free and lossless, which is why nothing is stored. `format: "folded"` gives collapsed stacks for a flame graph, one arm at a time, `tree` level only. `path` is resolved by **your** client, not the daemon (same as `export_logs`), and writes the document plus its sidecar to disk instead of returning them.
 - **`profile_traces(filter?, …)`** — the same projection, over the span buffer instead of a collector. See below for which to reach for.
 
 **`profile_traces` or `get_collector`?** They return the same shape and answer different questions, so the choice is made *before* the run, not after:
@@ -286,23 +310,21 @@ Points worth knowing before you rely on it:
 
 - **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
-  It also reports **`broker_version`** and **`broker_tools`** — see below, and read them the first time you call it.
+  It also reports **`broker_version`** and **`broker_tools`** — see below.
 
-**Are you holding every tool this broker has?** The broker and the MCP shim are separate binaries: the tool list is compiled into the shim, so upgrading the broker cannot make a new tool appear. A shim several versions behind silently lacks capabilities, and this has already cost real work — a project proposed three collector features as new when all three had shipped, because nothing told them.
+**The tools you hold came from the broker itself.** The shim keeps no tool list of its own: on startup it calls `tools.manifest` and builds its MCP router and its CLI from the reply. So your tool list *is* this broker's surface, and `broker_tools` agrees with it by construction. There is nothing to compare and no `shim_note` — that field belonged to an older arrangement where the list was compiled into the shim, and it no longer exists.
 
-`get_status` answers it. `broker_tools` is the tool names a shim at *this broker's* version exposes; compare it against the tools you actually have. If the shim is current enough to do that itself, it adds a **`shim_note`** naming what is missing:
+**So a tool named in this document that you do not hold means the BROKER is older than this document** — not that your client is stale. That inverts the old advice, and it changes what you tell the user:
 
 ```
-"shim_note": "This logmon MCP shim reaches 37 of the 42 tools broker 0.9.0 supports.
-              Not reachable from this shim: diff_collectors, document_collectors,
-              edit_collector, get_collector_history, snapshot_collector. Reinstall the
-              `logmon-mcp` binary (`cargo install --path crates/mcp` from a logmon-mcp
-              checkout) and restart this MCP server to use them."
+The logmon broker running here is 0.9.0, which doesn't serve create_case.
+Upgrade it — `cargo install --path crates/broker --locked` from a logmon-mcp
+checkout — then restart the broker service and this MCP server.
 ```
 
-**If you see it, say so and stop reaching for workarounds.** The missing tools are usually the ones worth having — `snapshot_collector` and `diff_collectors` are how a before/after comparison is done at all, and their absence is exactly what leads to hand-rolled counters and hand-computed ratios. Tell the user which tools are unreachable and what to run; the reinstall needs a restart of the MCP server to take effect, which only they can trigger.
+Read `broker_version` the first time you call `get_status`, and reach for `broker_tools` when a tool you expected isn't there. **Don't hand-roll around a missing capability without saying so.** `snapshot_collector` and `diff_collectors` are how a before/after comparison is done at all; substituting hand-computed ratios silently is exactly the failure this reporting exists to prevent.
 
-No note and no mismatch means you are current — nothing is emitted in the normal case.
+**If you are reading this and have NO logmon tools at all**, the shim refused to start — you have this document from the Claude Code plugin or a local skills directory rather than from the MCP server, which is why the two can disagree. The shim requires `tools.manifest` and will not serve a partial surface, so the usual cause is a broker older than the shim. Same fix, same order: broker first, restart it, then the client. Fall back to the `logmon-mcp` CLI in the meantime only if it works — it fails the same way, with `could not read the tool manifest`.
 
 **`trace_ingest` — loss on the OTLP trace transports, before any collector saw a span.** Non-zero on any of the three means every span-derived number you report from elsewhere is a **lower bound**, `matched` included.
 
@@ -752,10 +774,10 @@ Don't suggest editing `~/.config/logmon/state.json` or `daemon.pid` by hand unle
 ## Multi-session behavior
 
 - **Shared (within a domain):** the log/span ring buffers, the receivers, `clear_logs`.
-- **Per-session:** triggers, filters, bookmarks, queued notifications.
+- **Per-session:** triggers, filters, bookmarks, collectors, queued notifications.
 - **Domains:** a session can bind to an isolated **domain** — its own buffers, receivers, triggers, and filters — via `use_domain` (or the `--domain` CLI flag); data never crosses domains. See Domains above.
-- **Anonymous sessions** (no `--session` flag): cleaned up on disconnect.
-- **Named sessions** (`logmon-mcp --session NAME`): persist across disconnect; trigger fires queue while disconnected and replay on reconnect; state survives daemon restart via `state.json`.
+- **Anonymous sessions** (no `--session` flag): cleaned up on disconnect. They **cannot own a collector** — an anonymous identity is a UUID that never returns, so anything armed would be unreachable after a disconnect, and `add_collector` refuses with that reason.
+- **Named sessions** (`logmon-mcp --session NAME`): persist across disconnect; trigger fires queue while disconnected and replay on reconnect; state survives daemon restart via `state.json`, and collectors via `~/.config/logmon/collectors/`. A *disconnected* named session is swept once it passes the session TTL (default 24 h); a connected one never expires.
 
 Filters are unioned across sessions (the broker stores anything any session's filters match), so adding a narrow filter in your session doesn't hide records from another session — but if every session has a narrow filter, only the union is stored.
 
