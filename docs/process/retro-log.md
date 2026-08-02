@@ -400,3 +400,91 @@ it.** Proposal for the next consolidation: reformulate it as a **live-probe lens
 new surface with hostile inputs and report what it actually does" — rather than a reading pass.
 Cold reader is the best value in the table by an order of magnitude and is currently only invoked
 for artifacts meant to be read without context; worth trying on APIs.
+
+## 2026-08-02 `_display` — the daemon supplies presentation, and 0.10.0 (T2)
+
+**What shipped.** gh#10 end to end: a `display` flag on the JSON-RPC envelope, one
+render hook, 24 methods rendering across blocks / padded-markdown tables / five
+narrative renderers, both surfaces wired. Plus gh#18, the headline of gh#19, the
+article rebalance, shadow docs, and the 0.10.0 release. 1119 → 1204 tests.
+
+- time: design + two rounds of self-review / design gate + revision / four build
+  phases / code gate + fixes / release. Review and revision outweighed building
+  by a wide margin, which is the correct ratio for a contract and the wrong one
+  for the amount of design rework it implies.
+- catches: probe=3 self-review=5 design-gate=26 code-gate=54 user=2 post-merge=1
+- **DG ≈ 46.** Four blockers, three of them false claims of mine: the flag had no
+  route to the wire, `emit()` did change, and the thing I said to "port" (padded
+  markdown) did not exist — the deleted renderer was comfy-table. Plus a census
+  wrong by 6× that a coverage decision rested on.
+- **IG ≈ 100.** Three renderings that stated something untrue (S3 each), plus the
+  mutation lens: 51 survivors of 130, and 43 applied simultaneously left the
+  workspace green at the exact clean baseline.
+- **post-merge = 1.** The `--locked` install failure, in the tagged release.
+- tier-call: T2, right, and for the right reason — the *decision surface* was a
+  wire contract, not the size of the code.
+- delegation: 4 fresh-context lenses (design ×2, code ×2). The mutation lens in
+  its own worktree earned its cost by a wide margin again.
+- improve: see the three below; the first is the one worth a skill edit.
+
+### The pattern: my query answered something narrower than my question
+
+**Three load-bearing numbers failed in one day, all the same shape.**
+
+- "20 rendering sites" was a count of *calls to two helpers*. The real figure is
+  133, and `status.rs` scored **zero** because it rendered inline — so the group
+  most obviously missed was the one the query was structurally blind to.
+- "5–6× saving" was the best case quoted as the rule. The shipped renderer is 2×.
+  I had spent "the 5–6× already won" to justify a 20% cost.
+- The never-drop field list, enumerated in prose, was wrong in *both* directions:
+  three of five fields are not on `LogsRecentResult`, and the two that matter
+  most there were missing.
+
+The existing rule says a load-bearing number carries the context it was measured
+in. That is necessary and was not sufficient: each of these WAS measured, in
+context, correctly — against a question narrower than the one it was used to
+answer. **Write the question down before running the measurement, and check that
+the decision turns on the question you wrote.** The fix for the third was to stop
+enumerating and state a structural rule a test can check.
+
+### A phase boundary can manufacture vacuous tests
+
+I split "plumbing" from "first renderer" so the mechanism could land clean. With
+`for_method` stubbed to `None`, `maybe_render` returns the value unchanged
+whatever the flag says — so the `display` guard's test passed vacuously and
+deleting the guard changed nothing. The negative control caught it; the skill
+edit I had made that same morning described the shape exactly.
+
+**A phase that defers the only consumer of a mechanism cannot test the
+mechanism.** Merging the first renderer into the phase fixed it, and splitting
+`apply_render` out of `maybe_render` made the insert guard reachable with a
+rendering in hand.
+
+### The check that no test could have made
+
+`cargo install --path crates/mcp` failed to build the tagged release, with a
+macro error, on a commit where `cargo test --workspace` and
+`cargo clippy --all-targets` were both green. **`cargo install` ignores
+Cargo.lock without `--locked`**, so it re-resolved `rmcp` past the pinned 1.2.0.
+
+Nothing in the suite can catch this by construction — the suite builds *from* the
+lockfile, and the defect exists only without it. The broker installed fine
+(no rmcp dependency), so it landed precisely between the two halves of a
+broker-first deploy, with the new daemon already serving.
+
+**Running the documented install command is a release step, not a formality.**
+It is the only check that exercises the resolver a user gets.
+
+### Two-way evidence, and two costs
+
+- **Shadow docs worked.** Staging README/skill/CHANGELOG in `docs/shadow/` kept
+  `git diff` readable for review, and the promote script's ordering warning is
+  load-bearing: the skill is `include_str!`'d into the shim, so promoting after
+  `cargo install` ships a binary with the old instructions and no error.
+- **A gate brief that runs a daemon must say which daemon.** The correctness lens
+  cleaned up with `pkill -f logmon-broker` and killed the user's production
+  broker; launchd restarted it, but the ring buffers were cleared. My brief said
+  "execute against a real broker" and never scoped it. Any future brief that
+  starts a service names the isolation.
+- **The cold-reader lens was not run this cycle**, and the article rewrite was
+  the artifact that most wanted it.
