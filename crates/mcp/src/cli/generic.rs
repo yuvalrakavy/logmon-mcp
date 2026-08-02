@@ -726,7 +726,20 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
         .and_then(|f| params.remove(f.path_param.as_str()))
         .and_then(|v| v.as_str().map(str::to_string));
 
-    let reply = match broker.call(&m.entry.method, Value::Object(params)).await {
+    // Rendered only when a reader will see it. `--json` selects the raw result,
+    // so asking for a rendering would put a multi-KB text field in every reply a
+    // script pipes into `jq`; and a reply headed for a file is written from its
+    // own field, so rendering it is work that is transmitted and dropped.
+    let want_display = !json && out_path.is_none();
+    let params = Value::Object(params);
+    // Awaited inside each arm: two `async fn`s have two distinct opaque types,
+    // so the futures cannot share a binding.
+    let sent = if want_display {
+        broker.call_rendered(&m.entry.method, params).await
+    } else {
+        broker.call(&m.entry.method, params).await
+    };
+    let reply = match sent {
         Ok(r) => r,
         Err(e) => {
             format::error(&e.to_string(), json);
@@ -759,24 +772,35 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
         // A tool that CAN write a file but was given no path prints its body
         // rather than the envelope — `collectors document` with no `--path` is
         // meant to show you the document.
-        if let Some(field) = m
+        //
+        // **Only when that body is a STRING.** `export_logs` names `logs` as its
+        // content field, and that is an ARRAY: printing it handed back a pretty
+        // JSON list and returned before `emit` was ever reached, so the rendered
+        // form could never be seen — and `emit` was passed the field's value
+        // rather than the reply, so it looked for `_display` on the wrong node.
+        // Where the field holds a document the intent stands; where it holds an
+        // array, the rendering is strictly better and outranks it.
+        let body = m
             .entry
             .cli
             .file_output
             .as_ref()
             .and_then(|f| f.content_field.as_ref())
-        {
-            if let Some(v) = reply.get(field) {
-                match v.as_str() {
-                    Some(s) => println!("{s}"),
-                    None => emit(v, false),
-                }
-                warn_about_unwritten_sidecar(m.entry, &reply);
-                print_notes(&reply);
-                return 0;
-            }
+            .and_then(|field| reply.get(field))
+            .and_then(|v| v.as_str());
+        if let Some(s) = body {
+            println!("{s}");
+            warn_about_unwritten_sidecar(m.entry, &reply);
+            print_notes(&reply);
+            return 0;
         }
         emit(&reply, false);
+        // `emit` prints `_display` when the daemon sent one, and warnings do not
+        // ride inside it — so they are appended here, on the arm that replaces
+        // the envelope. On the JSON arm above they are already in the reply.
+        if reply.get("_display").is_some() {
+            print_notes(&reply);
+        }
         return 0;
     }
 

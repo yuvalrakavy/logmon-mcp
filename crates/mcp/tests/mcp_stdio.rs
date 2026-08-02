@@ -178,12 +178,24 @@ async fn the_router_is_built_from_the_daemons_manifest() {
 
 /// The forwarding closure actually forwards — the mutation that replaced this
 /// whole path with a canned success left the old suite green.
+///
+/// `list_collectors` now comes back RENDERED, which is the shim asking the
+/// daemon for a `_display` and printing it. That is a stronger proof of
+/// forwarding than parsing the envelope was: a canned success cannot produce a
+/// table whose rows came out of the daemon's registry.
 #[tokio::test]
 async fn a_tool_call_reaches_the_daemon_and_returns_its_reply() {
     with_mcp(|mcp, _| {
         let text = mcp.call("list_collectors", json!({})).expect("call ok");
-        let v: Value = serde_json::from_str(&text).expect("the reply is JSON");
-        assert_eq!(v["count"], 0, "an empty registry, from the daemon: {text}");
+        assert!(
+            text.starts_with("(no collectors)"),
+            "an empty registry, from the daemon: {text}"
+        );
+        // The diagnostics ride along, by the structural rule: everything that is
+        // not the record array renders. `count=0` beside `(no collectors)` is
+        // redundant, and that is the deliberate price of a rule that cannot omit
+        // something by accident.
+        assert!(text.contains("reserved_bytes="), "{text}");
 
         mcp.call(
             "add_collector",
@@ -192,9 +204,39 @@ async fn a_tool_call_reaches_the_daemon_and_returns_its_reply() {
         .expect("armed");
 
         let text = mcp.call("list_collectors", json!({})).expect("call ok");
-        let v: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(v["count"], 1, "the arm must be visible: {text}");
-        assert_eq!(v["collectors"][0]["name"], "c");
+        assert!(
+            text.contains("| collector |"),
+            "the reply should be the rendered table, not an envelope: {text}"
+        );
+        assert!(text.contains("| c "), "the arm must be visible: {text}");
+        assert!(
+            !text.trim_start().starts_with('{'),
+            "the shim printed the envelope rather than the rendering: {text}"
+        );
+    })
+    .await;
+}
+
+/// A tool with no renderer still returns its envelope, unchanged.
+///
+/// This is the incrementality mechanism seen from the client: `add_collector`
+/// is a mutation, so by §5's rule it stays JSON, and the shim's fallback is what
+/// makes that work without any per-tool knowledge.
+#[tokio::test]
+async fn a_tool_without_a_renderer_still_returns_json() {
+    with_mcp(|mcp, _| {
+        let text = mcp
+            .call(
+                "add_collector",
+                json!({ "name": "m", "filter": "ALL", "level": "tree" }),
+            )
+            .expect("armed");
+        let v: Value = serde_json::from_str(&text).expect("an unrendered reply is JSON");
+        assert_eq!(v["name"], "m", "{text}");
+        assert!(
+            v.get("_display").is_none(),
+            "a mutation asked for a rendering it does not have: {text}"
+        );
     })
     .await;
 }

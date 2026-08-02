@@ -62,7 +62,17 @@ pub fn render(result: &Value) -> Option<String> {
     }
     if let Some(rs) = obj.get("receivers").and_then(|v| v.as_array()) {
         let names: Vec<String> = rs.iter().map(super::blocks::compact).collect();
-        lines.push(format!("receivers: {}", names.join("  ")));
+        // Named even when empty. A broker with nothing bound accepts no
+        // telemetry at all, and `receivers:` followed by nothing reads as a
+        // rendering bug rather than as the finding it is.
+        lines.push(format!(
+            "receivers: {}",
+            if names.is_empty() {
+                "(none bound — this broker is not accepting telemetry)".to_string()
+            } else {
+                names.join("  ")
+            }
+        ));
     }
     if let Some(store) = obj.get("store").and_then(|v| v.as_object()) {
         let mut keys: Vec<&String> = store.keys().collect();

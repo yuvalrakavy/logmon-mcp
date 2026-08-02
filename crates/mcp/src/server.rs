@@ -151,12 +151,27 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                     .and_then(|f| args.remove(f.path_param.as_str()))
                     .and_then(|v| v.as_str().map(str::to_string));
 
-                let result = ctx
-                    .service
-                    .broker
-                    .call(&method, serde_json::Value::Object(args))
-                    .await
-                    .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+                // Rendered UNLESS the reply is headed for a file. `export_logs`
+                // is the largest result in the system, and rendering it into a
+                // `_display` string that gets written past, transmitted and
+                // dropped is pure waste.
+                //
+                // **Not covered by a test, and cannot be.** The reply is
+                // `wrote <path>` either way and the file is written from the
+                // content field, so the two branches are observationally
+                // identical from any client — an efficiency choice in a coverage
+                // dead zone, not an untested behaviour. Said here so the next
+                // reader does not go looking for the test that would prove it.
+                let params = serde_json::Value::Object(args);
+                // Awaited inside each arm: two `async fn`s have two distinct
+                // opaque types, so the futures cannot share a binding.
+                let sent = if out_path.is_some() {
+                    ctx.service.broker.call(&method, params).await
+                } else {
+                    ctx.service.broker.call_rendered(&method, params).await
+                };
+                let result =
+                    sent.map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
 
                 // Which files, and what goes in them, is the protocol's answer
                 // rather than this function's — so the CLI and this surface
@@ -172,16 +187,31 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                     // produces markdown; handing an agent
                     // `{"content":"# Title\n…"}` costs it a turn to unwrap and
                     // JSON-escapes every line of the document it asked for.
+                    //
+                    // **Only when the body is a STRING.** `export_logs` names
+                    // `logs` as its content field, and that is an array — a
+                    // "document" nobody wants to read, pretty-printed. Where the
+                    // field holds a document the intent stands and the body
+                    // wins; where it holds an array, `_display` is strictly
+                    // better and outranks it.
                     let body = hints
                         .file_output
                         .as_ref()
                         .and_then(|f| f.content_field.as_ref())
                         .and_then(|field| result.get(field))
-                        .map(|v| match v.as_str() {
-                            Some(s) => s.to_string(),
-                            None => serde_json::to_string_pretty(v).unwrap_or_default(),
-                        });
-                    let text = match body {
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let rendered = || {
+                        result
+                            .get("_display")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_string)
+                    };
+                    let text = match body.or_else(rendered) {
+                        // `notes()` rides with every arm that replaces the
+                        // envelope, and with NO arm that prints it: the JSON
+                        // already carries `warnings`, so appending there would
+                        // print each one twice.
                         Some(b) => format!("{b}{}", notes(&result)),
                         None => serde_json::to_string_pretty(&result)
                             .unwrap_or_else(|e| format!("unserialisable reply: {e}")),
