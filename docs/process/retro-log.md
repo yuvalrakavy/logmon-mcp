@@ -320,3 +320,83 @@ error, and with one test line removed the whole workspace passed green). The sec
 as a **class** — any unmirrored `status.get` key fails a test, not just that field. A 7th
 harness-lie mode was found and recorded in `gate-briefs.md`: the file-watcher reminder that
 misattributes an agent's own `git checkout --` and instructs it not to revert.
+
+## 2026-08-01/02 case documents — cases.create, the epoch log, and two gate rounds (T2)
+
+**What shipped.** gh#11 (a/b/c: `logs.export` seq range, `spans.export`, the per-domain epoch
+log), gh#12 (`cases.create` writing three files, 25 RPC-level tests), gh#17, the skill and README
+sections, and two rounds of the deep gate. 1119 → 1132 tests, 72 suites.
+
+- time: design (pre-compaction) / implement ~3 phases / gate round 1 (4 lenses) / gate round 2
+  (2 lenses) / fix batch + both-ways verification. Review dominated implementation.
+- catches: probe=2 self-review=1 gate=~30 (round 1) + 15 (round 2) user=0 post-merge=0
+- **IG (round 2 only, weighted): 98.** S3×5 correctness defects = 50; S3×2 vacuous-BY-SCENARIO
+  tests = 20; S2×6 missing probes = 18; S2×2 (a protocol doc comment promising a field that does
+  not exist on that path, one undocumented behaviour change) = 6; S1×4 stale internal comments = 4.
+- **DG: not recorded.** The design gate ran at d5a3199 (task #9) before the ledger existed, and I
+  will not reconstruct a number I cannot defend. `docs/process/gate-kpi.md` does not exist; there
+  is no previous window to compare against, so "DG 0" today would mean the process was skipped,
+  not that it worked. **Starting the ledger is the open item.**
+- tier-call: T2, right. It minted a persisted format (the JSONL header contract) and a wire
+  contract (`EvidenceVerdict`), which is what set the tier rather than the size of the diff.
+- delegation: 6 gate lenses to fresh contexts (line-by-line, removed-behaviour, mutation,
+  cold-reader; then 2 for the re-gate). Mutation and cold-reader earned their cost by a wide
+  margin; line-by-line did not — see below.
+- improve: the mutation lens brief now names the vacuous-SCENARIO shape and requires both-ways
+  verification (applied to the skill this session).
+
+### The pattern: a fix inherits its finding's blind spot
+
+**Three of round 2's five correctness defects were round 1's own fixes, over-corrected in the
+direction the finding pointed.** The skill already says *change the defect, not the mechanism*;
+this is the same rule seen from the other side — I changed the defect, correctly, and then
+asserted something the fix made newly false.
+
+The worst: round 1 found `Evicted` structurally unreachable from a capture, because the window's
+lower end **is** the store's floor. The fix measured the caller's shortfall instead — and the
+shortfall is bounded by `before`, not by what the ring dropped. A ring of 30 that had ever
+received 32 records, asked for 100 of context, reported *"at least 71 records are gone."* Silent,
+over-claiming, on default parameters, in the artifact whose entire purpose is honesty about what
+is missing. There was never an honest count to report; the document now states the floor (a seq)
+and the shortfall (a count) side by side and claims no split between them.
+
+**The re-gate on the fix diff cost about a third of the original round and found the three worst
+defects of the feature.** That is the cheapest gate this project has run. Candidate rule for the
+next consolidation: *a fix batch answering a gate is itself gateable surface, and gets one
+narrow lens before the suite is believed.*
+
+### Vacuous by scenario — n=5 across three rounds
+
+Tests whose assertion is correct but whose SETUP makes the mutant and the original
+indistinguishable. Nothing about the test is wrong, so no amount of reading reaches it:
+
+- a rollback test inducing failure 82 lines ABOVE the claim it exists to test — deleting the
+  rollback entirely left it green;
+- a filtered-window test storing an unfiltered entry first, so the pre-fix and post-fix window
+  already coincided on that input;
+- an eviction test whose fixture (feed=201, cap=30) really did lose 171 records, so an
+  over-claim of 71 stayed under the true figure and passed **by luck**.
+
+Applied to the skill: brief the lens on the shape, and verify each proposed fix both ways.
+
+### The harness lied about its own result
+
+The both-ways verification script reported **6 false greens on its first run**: `cargo test --lib
+NAME -- --exact` matches no test, because lib test names are module-qualified, and a filter that
+matches nothing still prints `ok`. Same trap one level up from the tests it was auditing. It now
+counts tests executed and refuses to grade a run of zero. **GUARDED.**
+
+### Lens effectiveness, measured
+
+| lens | tokens | wall | unique findings |
+|---|---|---|---|
+| cold reader | 38k | 5 min | ~20 |
+| mutation | 207k | 36 min | 10 (2 unreachable any other way) |
+| removed-behaviour | 230k | 15 min | ~5 |
+| line-by-line | 216k | 14 min | ~1 |
+
+**Line-by-line is the weak one, and its two real findings came from RUNNING the code, not reading
+it.** Proposal for the next consolidation: reformulate it as a **live-probe lens** — "call the
+new surface with hostile inputs and report what it actually does" — rather than a reading pass.
+Cold reader is the best value in the table by an order of magnitude and is currently only invoked
+for artifacts meant to be read without context; worth trying on APIs.
