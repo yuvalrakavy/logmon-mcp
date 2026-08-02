@@ -163,9 +163,14 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                 // dead zone, not an untested behaviour. Said here so the next
                 // reader does not go looking for the test that would prove it.
                 let params = serde_json::Value::Object(args);
+                // `-` is the stdout spelling and `files_to_write` treats it as
+                // "no file", so it must mean "no path" here too — otherwise the
+                // rendering is suppressed for a reply that is about to be
+                // printed rather than written.
+                let writes_a_file = out_path.as_deref().is_some_and(|p| p != "-");
                 // Awaited inside each arm: two `async fn`s have two distinct
                 // opaque types, so the futures cannot share a binding.
-                let sent = if out_path.is_some() {
+                let sent = if writes_a_file {
                     ctx.service.broker.call(&method, params).await
                 } else {
                     ctx.service.broker.call_rendered(&method, params).await

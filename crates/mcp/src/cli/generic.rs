@@ -730,7 +730,14 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
     // so asking for a rendering would put a multi-KB text field in every reply a
     // script pipes into `jq`; and a reply headed for a file is written from its
     // own field, so rendering it is work that is transmitted and dropped.
-    let want_display = !json && out_path.is_none();
+    // `-` means stdout, and `files_to_write` already treats it as "no file" —
+    // so it must mean "no path" here too. Counting it as a path suppressed the
+    // rendering AND left the body arm to reject a non-string content field, so
+    // `logs export --path -` printed the whole envelope where it used to print
+    // the bare array. Neither the body nor the rendering: the worst of both, on
+    // the documented stdout spelling.
+    let to_stdout = out_path.as_deref() == Some("-");
+    let want_display = !json && (out_path.is_none() || to_stdout);
     let params = Value::Object(params);
     // Awaited inside each arm: two `async fn`s have two distinct opaque types,
     // so the futures cannot share a binding.
@@ -794,6 +801,11 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
             print_notes(&reply);
             return 0;
         }
+        // The sidecar warning belongs to the CONTENT-FIELD decision, not to the
+        // string-ness of the field, so it runs on this arm too. Latent today —
+        // no tool has both a non-string content field and a sidecar — and a
+        // silent omission the moment one does.
+        warn_about_unwritten_sidecar(m.entry, &reply);
         emit(&reply, false);
         // `emit` prints `_display` when the daemon sent one, and warnings do not
         // ride inside it — so they are appended here, on the arm that replaces

@@ -1,10 +1,11 @@
 //! `status.get` — the single biggest saving in the feature, and the clearest
 //! case of the coverage rule.
 //!
-//! Measured on a live broker: 1,967 bytes of JSON becomes 293. Most of the
-//! difference is `broker_tools`, a list of 42 tool names — **which an MCP client
-//! already holds**, because it registered them. Sending it back is noise to the
-//! primary client and unreadable to the secondary one.
+//! Measured on one live broker: 1,967 bytes of JSON becomes about 300 — roughly
+//! 6×, though the ratio is broker-dependent (a quieter instance measured 3.9×).
+//! Most of the difference is `broker_tools`, the full list of tool names —
+//! **which an MCP client already holds**, because it registered them. Sending it
+//! back is noise to the primary client and unreadable to the secondary one.
 //!
 //! It is still on the result for a caller who wants it. Rendering drops it from
 //! the *rendering*, never from the reply.
@@ -133,9 +134,20 @@ pub fn render(result: &Value) -> Option<String> {
             .into_iter()
             .filter_map(|k| live.get(k).map(|v| format!("{k}={}", super::blocks::compact(v))))
             .collect();
-        if !bits.is_empty() {
-            lines.push(format!("last traffic: {}", bits.join("  ")));
-        }
+        // **Stated when empty, which is the case that matters.** Every field of
+        // `ReceiverLiveness` is `Option` and skipped when `None`, so a broker
+        // that has never received anything serializes `{}` — and a guard on
+        // `bits.is_empty()` made the line appear when it was redundant and
+        // vanish when it was the finding. Seven lines advertising four bound
+        // listeners, and nothing saying not one had seen a byte.
+        lines.push(format!(
+            "last traffic: {}",
+            if bits.is_empty() {
+                "(none — no listener has received anything)".to_string()
+            } else {
+                bits.join("  ")
+            }
+        ));
     }
 
     // `broker_tools` is deliberately reduced to its count: the MCP client that
@@ -259,12 +271,83 @@ mod tests {
     }
 
     /// The first question behind an empty buffer is whether anything is being
-    /// sent at all.
+    /// sent at all — **including when the answer is "nothing, ever".**
+    ///
+    /// Every field of `ReceiverLiveness` is skipped when `None`, so a broker
+    /// that has received nothing serializes `{}`. A guard on `bits.is_empty()`
+    /// made this line appear when it was redundant and vanish when it was the
+    /// finding: seven lines advertising four bound listeners, silent on the fact
+    /// that not one had seen a byte.
     #[test]
-    fn receiver_liveness_reaches_the_reader() {
+    fn receiver_liveness_reaches_the_reader_especially_when_it_is_empty() {
         let mut r = reply();
         r["receiver_liveness"] = json!({"gelf_udp": "2026-08-02T06:36:55Z"});
         let out = render(&r).expect("renders");
         assert!(out.contains("last traffic: gelf_udp=2026-08-02T06:36:55Z"), "{out}");
+
+        let mut fresh = reply();
+        fresh["receiver_liveness"] = json!({});
+        let out = render(&fresh).expect("renders");
+        assert!(
+            out.contains("no listener has received anything"),
+            "a broker that has never received anything said nothing about it:\n{out}"
+        );
+    }
+
+    /// The lines nothing pinned. Deleting the session, store or domain line
+    /// outright left the whole suite green.
+    #[test]
+    fn every_narrated_line_is_present() {
+        let out = render(&reply()).expect("renders");
+        for expected in [
+            "broker 0.9.0, up ",
+            "domain: default",
+            "receivers: UDP:12201",
+            "store: ",
+            "session cli: connected=true",
+            "active filters:",
+            "tools: ",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?}:\n{out}");
+        }
+        // A fixed line count, so a line cannot be dropped without a failure and
+        // the join separator cannot silently change.
+        assert_eq!(out.lines().count(), 7, "line set changed:\n{out}");
+    }
+
+    /// The session is named by `name`, falling back to `id`. The old fixture set
+    /// both to `"cli"`, so hard-wiring the label to either one — or to a
+    /// constant — was invisible.
+    #[test]
+    fn the_session_is_named_by_name_and_falls_back_to_id() {
+        let mut r = reply();
+        r["session"]["id"] = json!("s-1");
+        r["session"]["name"] = json!("friendly");
+        assert!(render(&r).expect("renders").contains("session friendly:"));
+
+        let mut only_id = reply();
+        only_id["session"] = json!({"id": "s-2", "connected": false});
+        assert!(render(&only_id).expect("renders").contains("session s-2:"));
+    }
+
+    /// Two counters, out of alphabetical order, so the sort is doing work the
+    /// fixture can see. The old one set exactly one counter non-zero.
+    #[test]
+    fn loss_counters_render_in_a_stable_order() {
+        let mut r = reply();
+        r["receiver_drops"] = json!({"z_udp": 3, "a_tcp": 9, "m_http": 0});
+        let out = render(&r).expect("renders");
+        assert!(out.contains("receiver drops: a_tcp=9  z_udp=3"), "{out}");
+        assert!(!out.contains("m_http"), "a zero counter rode along: {out}");
+    }
+
+    /// Same, for the unknown-key backstop.
+    #[test]
+    fn unknown_keys_render_in_a_stable_order() {
+        let mut r = reply();
+        r["zebra_metric"] = json!(1);
+        r["alpha_metric"] = json!(2);
+        let out = render(&r).expect("renders");
+        assert!(out.contains("alpha_metric=2  zebra_metric=1"), "{out}");
     }
 }

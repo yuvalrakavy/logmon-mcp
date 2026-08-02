@@ -43,8 +43,13 @@ pub fn blocks(lines: Vec<String>, empty: &str) -> String {
     if shown < total {
         // The daemon is emitting this, so it must not say "use --json" — that
         // is one front-end's vocabulary, and the MCP route has no such flag.
+        //
+        // **And the remedy has to be one that works.** "lower `count`" cannot
+        // reach record 51: a smaller count returns the same newest records, just
+        // fewer of them. Only moving the WINDOW gets at what was cut.
         out.push_str(&format!(
-            "\n… {} more record(s) — narrow the filter or lower `count` to see them",
+            "\n… {} more record(s) not shown — move the window with `from_seq`/`to_seq` \
+             to reach them; a smaller `count` returns the same newest records",
             total - shown
         ));
     }
@@ -120,6 +125,21 @@ pub fn log_line(e: &Value) -> String {
     line
 }
 
+/// A duration, at a precision that does not erase it.
+///
+/// **`{:.1}` renders a 40-microsecond span as `0.0ms`**, indistinguishable from
+/// one that took no time at all — and the same number rendered `0.039936` in the
+/// `traces.recent` table, so two renderings of one value disagreed. Sub-millisecond
+/// spans are the common case for anything in-process.
+fn duration(ms: f64) -> String {
+    match ms.abs() {
+        0.0 => "0ms".to_string(),
+        d if d < 1.0 => format!("{:.3}ms", ms),
+        d if d < 1000.0 => format!("{:.1}ms", ms),
+        _ => format!("{:.0}ms", ms),
+    }
+}
+
 /// One span, as the block form renders it.
 ///
 /// Spans are not tabular either: `attributes` is an open map and `events` is a
@@ -131,7 +151,7 @@ pub fn span_line(s: &Value) -> String {
     let ms = s
         .get("duration_ms")
         .and_then(|v| v.as_f64())
-        .map(|d| format!("{d:.1}ms"))
+        .map(duration)
         .unwrap_or_else(|| "?".to_string());
     // `status` is `{"type": "unset"}` on the wire; the type alone is what a
     // reader wants, and `error` is the only value worth noticing.
@@ -216,12 +236,63 @@ mod tests {
     }
 
     /// A huge single record hits the byte cap before the record cap.
+    ///
+    /// **The remainder is asserted exactly.** Checking only that *something* was
+    /// cut let a mutant compute the remainder as `total - MAX_BLOCK_RECORDS`,
+    /// which on a byte-capped list is `10 - 50` saturating to **`0 more`** — a
+    /// cut that reports nothing was cut, which is the false-completeness failure
+    /// the cap exists to prevent.
     #[test]
-    fn the_byte_cap_cuts_before_the_record_cap_when_records_are_large() {
+    fn the_byte_cap_cuts_before_the_record_cap_and_counts_the_remainder() {
         let lines: Vec<String> = (0..10).map(|_| "x".repeat(4000)).collect();
         let out = blocks(lines, "(none)");
-        assert!(out.contains("more record(s)"), "the byte cap did not fire");
+        let shown = out.lines().filter(|l| l.starts_with('x')).count();
+        assert!(shown > 0 && shown < 10, "byte cap did not fire: {shown} shown");
+        assert!(
+            out.contains(&format!("{} more record(s)", 10 - shown)),
+            "remainder wrong for {shown} shown:\n{}",
+            out.lines().last().unwrap_or("")
+        );
+        assert!(!out.contains("0 more record(s)"), "a cut reported nothing cut");
         assert!(out.len() < MAX_BLOCK_BYTES + 4200, "{}", out.len());
+    }
+
+    /// The remedy named has to be one that can reach the cut records. "Lower
+    /// `count`" returns the same newest records, just fewer of them.
+    #[test]
+    fn the_truncation_hint_names_a_remedy_that_can_work() {
+        let out = blocks((1..=200).map(|i| format!("l{i}")).collect(), "(none)");
+        assert!(out.contains("from_seq"), "{out}");
+        assert!(
+            !out.contains("lower `count` to see them"),
+            "a smaller count cannot surface record 51: {out}"
+        );
+    }
+
+    /// A locator that is present must render, and one that is explicitly null
+    /// must not render as the string "null".
+    #[test]
+    fn locators_render_when_present_and_vanish_when_null() {
+        let mut e = entry(7, "Info", "ok");
+        e["trace_id"] = json!("7f3a");
+        e["span_id"] = json!(null);
+        let line = log_line(&e);
+        assert!(line.contains("trace_id=7f3a"), "{line}");
+        assert!(!line.contains("span_id"), "an explicit null rendered: {line}");
+    }
+
+    /// Sub-millisecond durations are the common case in-process, and `{:.1}`
+    /// rendered a 40-microsecond span as `0.0ms` — indistinguishable from one
+    /// that took no time, and disagreeing with the same number in a table.
+    #[test]
+    fn a_sub_millisecond_duration_is_not_rendered_as_zero() {
+        assert_eq!(duration(0.039936), "0.040ms");
+        assert_eq!(duration(0.0), "0ms");
+        assert_eq!(duration(533.34), "533.3ms");
+        assert_eq!(duration(11017.13), "11017ms");
+        let mut s = json!({"seq": 1, "name": "tiny", "service_name": "svc"});
+        s["duration_ms"] = json!(0.039936);
+        assert!(span_line(&s).contains("0.040ms"), "{}", span_line(&s));
     }
 
     /// `Level` serializes as the variant name, so upper-casing is a step that

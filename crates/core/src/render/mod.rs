@@ -69,31 +69,7 @@ const LISTS: &[(&str, &str, &[Col], &str)] = &[
         ],
         "(no sessions)",
     ),
-    (
-        "filters.list",
-        "filters",
-        &[
-            ("id", "id"),
-            ("filter", "filter"),
-            ("description", "description"),
-        ],
-        "(no filters)",
-    ),
-    (
-        "triggers.list",
-        "triggers",
-        &[
-            ("id", "id"),
-            ("filter", "filter"),
-            ("pre", "pre_window"),
-            ("post", "post_window"),
-            ("notify", "notify_context"),
-            ("matched", "match_count"),
-            ("oneshot", "oneshot"),
-            ("description", "description"),
-        ],
-        "(no triggers)",
-    ),
+    // `filters.list` and `triggers.list` are NOT here — see `dsl_list`.
     (
         "bookmarks.list",
         "bookmarks",
@@ -159,18 +135,37 @@ fn diagnostics(result: &Value, record_key: &str) -> String {
 
 /// The derived note the deleted CLI computed rather than read.
 ///
-/// `empty && scanned > 0` is not a field on any result — it is the B2 heuristic
-/// that tells "nothing matched" from "nothing is happening", and it has to be
-/// ported as logic or it is lost.
+/// `empty && scanned > 0` is not a field on any result — it is the heuristic that
+/// tells "nothing matched" from "nothing is happening", and it has to be ported
+/// as logic or it is lost.
+///
+/// **It names the query, not the filter.** The original ran only over
+/// `LogsExport { count, filter }`, where a filter was the only thing that could
+/// have excluded anything. `logs.export` has since gained `from_seq`/`to_seq`,
+/// and porting the wording verbatim moved a true sentence onto a shape it was
+/// never true for: a range read wholly above the buffer scans every record,
+/// matches none, and got told to check a filter it never passed — beside a
+/// `verdict=complete` saying the daemon vouched for the window.
+///
+/// The buffer's extent is stated instead, because in that case it IS the answer.
 fn empty_but_flowing(result: &Value) -> Option<String> {
     let count = result.get("count")?.as_u64()?;
     let scanned = result.get("scanned")?.as_u64()?;
-    (count == 0 && scanned > 0).then(|| {
-        format!(
-            "\nthe filter matched 0 of {scanned} scanned records — data is flowing, \
-             so the filter is what to check"
-        )
-    })
+    if count > 0 || scanned == 0 {
+        return None;
+    }
+    let extent = match (
+        result.get("buffer_oldest_seq").and_then(|v| v.as_u64()),
+        result.get("buffer_newest_seq").and_then(|v| v.as_u64()),
+    ) {
+        (Some(lo), Some(hi)) => format!(" The stored range is seqs {lo}–{hi}."),
+        _ => String::new(),
+    };
+    Some(format!(
+        "\n0 of {scanned} scanned records matched — records ARE flowing, so what \
+         was asked for is what to check: the filter, or a seq range outside what \
+         is stored.{extent}"
+    ))
 }
 
 /// The rendered form of `result`, or `None` when this method has no renderer.
@@ -204,6 +199,8 @@ pub fn for_method(method: &str, result: &Value) -> Option<String> {
             }
         }
         "traces.recent" => table::table_read(result, "traces", TRACE_COLS, "(no traces)"),
+        "filters.list" => dsl_list(result, "filters", "(no filters)"),
+        "triggers.list" => dsl_list(result, "triggers", "(no triggers)"),
         "status.get" => status::render(result),
         // Renderers are wired in per method as they land. Until one claims a
         // method, its reply is JSON — see the module docs.
@@ -222,12 +219,74 @@ const TRACE_COLS: &[Col] = &[
     ("started", "start_time"),
 ];
 
+/// **`max_ms` is not optional here.** The floor decides which names appear, not
+/// which spans are counted, so a name qualifies on its slowest span while its
+/// average sits far below the floor — and `TracesSlowGroup`'s own doc calls that
+/// gap "the useful signal". Rendering count/avg/p95 without it produced a query
+/// for "slower than 5000 ms" answering with a row whose every displayed number
+/// was under 533, from twenty spans at 10 ms and one at 11 seconds. The reader
+/// concludes the tool is broken, or that the name averages 533 ms.
 const SLOW_GROUP_COLS: &[Col] = &[
     ("name", "name"),
     ("count", "count"),
-    ("avg_ms", "avg_ms"),
+    ("max_ms", "max_ms"),
     ("p95_ms", "p95_ms"),
+    ("avg_ms", "avg_ms"),
+    ("p50_ms", "p50_ms"),
 ];
+
+/// Filters and triggers: the DSL string **verbatim**, one entry per block.
+///
+/// These are tables everywhere else in this module, and they are not tables here
+/// for one reason: a markdown cell escapes `|`, and the CLI prints the rendering
+/// as raw terminal text rather than through a markdown renderer. So a filter
+/// configured `m~/id\|name/` displayed as `m~/id\\\|name/`, and the two default
+/// triggers displayed `/panic\|unwrap failed\|stack backtrace/` — a regex that
+/// matches one literal string instead of three alternatives. Copying the cell
+/// back registers something different from what is running.
+///
+/// The escaping is correct for markdown and the row must not break; the fix is
+/// to keep DSL out of a cell. The block form flattens newlines and escapes
+/// nothing, so the string a reader copies is the string that is configured.
+fn dsl_list(result: &Value, key: &str, empty: &str) -> Option<String> {
+    let records = result.get(key)?.as_array()?;
+    let lines: Vec<String> = records
+        .iter()
+        .map(|e| {
+            let id = e.get("id").map(blocks::compact).unwrap_or_default();
+            let filter = e
+                .get("filter")
+                .and_then(|v| v.as_str())
+                .map(escape::flatten)
+                .unwrap_or_default();
+            let mut line = format!("[{id}] {filter}");
+            let mut extra: Vec<String> = Vec::new();
+            for (label, field) in [
+                ("matched", "match_count"),
+                ("pre", "pre_window"),
+                ("post", "post_window"),
+                ("notify", "notify_context"),
+                ("oneshot", "oneshot"),
+                ("post_remaining", "post_remaining"),
+            ] {
+                if let Some(v) = e.get(field).filter(|v| !v.is_null()) {
+                    extra.push(format!("{label}={}", blocks::compact(v)));
+                }
+            }
+            if let Some(d) = e.get("description").and_then(|v| v.as_str()) {
+                extra.push(format!("— {}", escape::flatten(d)));
+            }
+            if !extra.is_empty() {
+                line.push_str("\n    ");
+                line.push_str(&extra.join("  "));
+            }
+            line
+        })
+        .collect();
+    let mut out = blocks::blocks(lines, empty);
+    out.push_str(&diagnostics(result, key));
+    Some(out)
+}
 
 /// A span read: the records, then everything the result says about itself.
 fn span_read(result: &Value) -> Option<String> {
@@ -328,7 +387,7 @@ mod tests {
                                "duration_ms": 11017.1}]}),
         )
         .expect("ungrouped renders");
-        assert!(listed.contains("11017.1ms"), "blocks: {listed}");
+        assert!(listed.contains("11017ms"), "blocks: {listed}");
         assert!(!listed.contains("| name "), "not a table: {listed}");
 
         // Neither array: no claim at all.
@@ -352,15 +411,135 @@ mod tests {
     /// "the system is quiet", and an agent told only `(no logs)` concludes the
     /// second.
     #[test]
-    fn an_empty_read_over_a_live_buffer_says_the_filter_is_what_to_check() {
+    fn an_empty_read_over_a_live_buffer_says_the_query_is_what_to_check() {
         let out = for_method("logs.recent", &json!({"logs": [], "count": 0, "scanned": 4000}))
             .expect("renders");
-        assert!(out.contains("matched 0 of 4000"), "{out}");
-        assert!(out.contains("data is flowing"), "{out}");
+        assert!(out.contains("0 of 4000 scanned records matched"), "{out}");
+        assert!(out.contains("records ARE flowing"), "{out}");
 
         // A genuinely quiet buffer must NOT get the note — it would be false.
         let quiet = for_method("logs.recent", &json!({"logs": [], "count": 0, "scanned": 0}))
             .expect("renders");
-        assert!(!quiet.contains("data is flowing"), "{quiet}");
+        assert!(!quiet.contains("ARE flowing"), "{quiet}");
+
+        // **And a read that MATCHED must not get it either.** Both fixtures
+        // above set `count: 0`, so dropping the `count == 0` term from the
+        // predicate left them green — and the mutant printed "0 of 4000
+        // matched" directly above the records that had matched. A flat lie to
+        // whoever reads it.
+        let matched = for_method(
+            "logs.recent",
+            &json!({"logs": [{"seq": 1, "level": "Info", "message": "hi",
+                              "timestamp": "2026-08-02T03:29:02Z"}],
+                    "count": 1, "scanned": 4000}),
+        )
+        .expect("renders");
+        assert!(
+            !matched.contains("scanned records matched"),
+            "the note fired on a read that returned records: {matched}"
+        );
+
+        // The buffer's extent is named, because when the cause is a seq range
+        // outside it, that IS the answer — and the note must not blame a filter
+        // the caller never passed.
+        let ranged = for_method(
+            "logs.export",
+            &json!({"logs": [], "count": 0, "scanned": 210,
+                    "buffer_oldest_seq": 1, "buffer_newest_seq": 210}),
+        )
+        .expect("renders");
+        assert!(ranged.contains("stored range is seqs 1–210"), "{ranged}");
+        assert!(
+            !ranged.contains("the filter is what to check"),
+            "an export with no filter was told to check its filter: {ranged}"
+        );
+    }
+
+    /// The record array is the ONE key a rendering may omit — and the reason is
+    /// that the reader is getting it rendered instead. Re-emitting it in the
+    /// diagnostics tail doubles the reply and inverts the entire point.
+    ///
+    /// `every_key_but_the_records_reaches_the_rendering` is named for this rule
+    /// and only checks the positive half, so turning the skip off left it green.
+    #[test]
+    fn the_record_array_is_not_re_emitted_in_the_diagnostics() {
+        let out = for_method(
+            "logs.recent",
+            &json!({"logs": [{"seq": 1, "level": "Info", "message": "unique-marker",
+                              "timestamp": "2026-08-02T03:29:02Z"}], "count": 1}),
+        )
+        .expect("renders");
+        assert_eq!(
+            out.matches("unique-marker").count(),
+            1,
+            "the records were rendered AND dumped as JSON:\n{out}"
+        );
+        assert!(!out.contains("\"message\""), "raw record JSON in the tail:\n{out}");
+    }
+
+    /// Spans render, refuse an unrecognised shape, and carry their diagnostics —
+    /// none of which had a single unit test. Every CLI span test passes
+    /// `--json`, so the rendered path was never reached at any level.
+    #[test]
+    fn a_span_read_renders_its_records_and_its_diagnostics() {
+        let out = for_method(
+            "spans.export",
+            &json!({"spans": [{"seq": 9, "name": "put", "service_name": "svc",
+                               "duration_ms": 11017.13, "trace_id": "7f3a",
+                               "status": {"type": "error"},
+                               "attributes": {"b": 2, "a": 1}}],
+                    "count": 1, "scanned": 40}),
+        )
+        .expect("renders");
+        assert!(out.contains("svc  put"), "{out}");
+        assert!(out.contains("11017ms"), "{out}");
+        assert!(out.contains("status=error"), "an errored span must say so: {out}");
+        assert!(out.contains("trace_id=7f3a"), "correlation is lost: {out}");
+        assert!(out.contains("a=1  b=2"), "attributes sorted: {out}");
+        assert!(out.contains("scanned=40"), "diagnostics dropped: {out}");
+
+        for shape in [json!(null), json!({"count": 0}), json!("x")] {
+            assert_eq!(
+                for_method("spans.export", &shape),
+                None,
+                "an unrecognised shape was claimed as an empty span read: {shape}"
+            );
+        }
+        assert_eq!(for_method("spans.context", &json!({"spans": []})).as_deref(),
+                   Some("(no spans)"));
+    }
+
+    /// `traces.recent` had no test at all — its whole CLI surface uses `--json`.
+    #[test]
+    fn a_traces_recent_reply_renders_as_a_table() {
+        let out = for_method(
+            "traces.recent",
+            &json!({"traces": [{"trace_id": "7c57", "root_span_name": "distribute",
+                                "service_name": "store", "total_duration_ms": 0.014,
+                                "span_count": 1, "linked_log_count": 0,
+                                "has_errors": false, "start_time": "2026-08-02T08:05:18Z"}],
+                    "count": 1}),
+        )
+        .expect("renders");
+        assert!(out.contains("| trace_id |"), "{out}");
+        assert!(out.contains("| 7c57 "), "{out}");
+        assert!(out.contains("| distribute "), "{out}");
+    }
+
+    /// The grouped `traces.slow` table must carry `max_ms` — the field the
+    /// display floor is evaluated against. Without it a query for "slower than
+    /// 5000ms" answers with a row whose every displayed number is far below it.
+    #[test]
+    fn a_grouped_slow_row_shows_the_number_the_floor_tested() {
+        let out = for_method(
+            "traces.slow",
+            &json!({"groups": [{"name": "handler", "count": 21, "avg_ms": 533.3,
+                                "p50_ms": 10.0, "p95_ms": 10.0, "max_ms": 11000.0}],
+                    "display_floor_ms": 5000.0}),
+        )
+        .expect("renders");
+        assert!(out.contains("| max_ms "), "{out}");
+        assert!(out.contains("11000"), "the one number explaining the row: {out}");
+        assert!(out.contains("display_floor_ms=5000"), "{out}");
     }
 }

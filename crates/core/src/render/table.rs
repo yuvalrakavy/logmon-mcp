@@ -211,13 +211,23 @@ mod tests {
         }
     }
 
-    /// An absent field is `—`, not an empty cell that reads as an empty string.
+    /// An absent field is `—`, not an empty cell that reads as an empty string —
+    /// **and an explicitly null field is too.**
+    ///
+    /// The fixture used to carry only a MISSING key, so dropping the null filter
+    /// left it green while a `null` rendered as the literal text `null`.
     #[test]
-    fn an_absent_field_is_marked_rather_than_blank() {
-        let result = json!({"items": [{"a": 1}]});
-        let out = table_read(&result, "items", &[("a", "a"), ("b", "b")], "(none)")
-            .expect("renders");
-        assert!(out.contains("| 1 | — |"), "{out}");
+    fn an_absent_or_null_field_is_marked_rather_than_blank() {
+        let result = json!({"items": [{"a": 1, "c": null}]});
+        let out = table_read(
+            &result,
+            "items",
+            &[("a", "a"), ("b", "b"), ("c", "c")],
+            "(none)",
+        )
+        .expect("renders");
+        assert!(out.contains("| 1 | — | — |"), "{out}");
+        assert!(!out.contains("null"), "an explicit null rendered as text: {out}");
     }
 
     #[test]
