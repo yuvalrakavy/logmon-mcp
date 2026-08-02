@@ -3,7 +3,11 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
-## Unreleased
+## 0.10.0 — 2026-08-02
+
+**Upgrade the broker BEFORE the shim.** The shim now requires `tools.manifest`
+and refuses to start without it; a broker older than that leaves you with no
+tools at all.
 
 ### Added — the daemon supplies presentation (`_display`)
 
