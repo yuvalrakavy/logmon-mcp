@@ -18,7 +18,7 @@ use crate::gelf::message::{Level, LogEntry};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-pub use logmon_broker_protocol::methods::{LevelCounts, LogGroup, Suppressed};
+pub use logmon_broker_protocol::methods::{LevelCounts, LogGroup, ReservedBucket, Suppressed};
 
 /// Distinct accumulator KEYS before the fold.
 ///
@@ -114,6 +114,20 @@ impl Axis {
         match self {
             Axis::Field => keys.get(i).cloned().unwrap_or_default(),
             other => other.as_str().to_string(),
+        }
+    }
+
+    /// Which PARAMETER a `Suppressed` entry is about.
+    ///
+    /// `Suppressed.field` is a dotted path to the thing being reported on, and
+    /// a built-in axis is named by `group_by` — it has no `group_keys` at all.
+    /// Saying `group_keys[0]` there points the caller at a parameter that this
+    /// method would have REFUSED had they sent it, which is a worse kind of
+    /// wrong than vague.
+    fn suppressed_field(self, i: usize) -> String {
+        match self {
+            Axis::Field => format!("group_keys[{i}]"),
+            _ => "group_by".to_string(),
         }
     }
 }
@@ -480,7 +494,28 @@ impl GroupMap {
         }
         for (i, present) in self.present.iter().enumerate() {
             let name = self.axis.member_label(&self.keys, i);
-            if *present == 0 {
+            // **Structured is checked FIRST, and the order is the whole
+            // correctness of this block.** The two counters are independent:
+            // `present` counts usable scalars, `structured` counts values that
+            // are present but cannot be a dimension. A field ALWAYS logged as
+            // an object — `metadata`, `context`, `attributes` — has
+            // `present == 0` and `structured > 0`, and the absent branch would
+            // then tell the caller it "did not appear in any matched record"
+            // when it appeared in every one. Worse, that branch's remedy reads
+            // `alt`, which is structurally always 0 on the `field` axis, so the
+            // false claim would arrive with no way to reach the true one.
+            if self.structured[i] > 0 {
+                out.push(Suppressed {
+                    field: self.axis.suppressed_field(i),
+                    reason: format!(
+                        "{} of {} records carry `{name}` with a null, array or object \
+                         value, which is not a dimension; they are counted in \
+                         `{ABSENT_LABEL}`",
+                        self.structured[i], self.matched
+                    ),
+                    remedy: None,
+                });
+            } else if *present == 0 {
                 let remedy = (self.alt[i] > 0).then(|| {
                     format!(
                         "an additional field named `{name}` covers {:.2}% — use \
@@ -489,24 +524,13 @@ impl GroupMap {
                     )
                 });
                 out.push(Suppressed {
-                    field: format!("group_keys[{i}]"),
+                    field: self.axis.suppressed_field(i),
                     reason: format!(
                         "`{name}` did not appear in any of the {} matched records, so \
                          every row is `{ABSENT_LABEL}`",
                         self.matched
                     ),
                     remedy,
-                });
-            } else if self.structured[i] > 0 {
-                out.push(Suppressed {
-                    field: format!("group_keys[{i}]"),
-                    reason: format!(
-                        "{} of {} records carry `{name}` with a null, array or object \
-                         value, which is not a dimension; they are counted in \
-                         `{ABSENT_LABEL}`",
-                        self.structured[i], self.matched
-                    ),
-                    remedy: None,
                 });
             }
         }
@@ -531,8 +555,17 @@ impl GroupMap {
         let mut real: Vec<LogGroup> = Vec::new();
         let mut reserved: Vec<(Reserved, LogGroup)> = Vec::new();
         for (key, a) in self.accs {
+            let kind = reserved_kind(&key);
             let row = LogGroup {
                 key: label(&key),
+                // Carried on the row rather than left to be re-derived from
+                // the label. An emitter field valued `__absent__` renders
+                // identically, so a consumer matching on the string picks the
+                // wrong row — which is exactly what the renderer did.
+                reserved: kind.map(|r| match r {
+                    Reserved::Absent => ReservedBucket::Absent,
+                    Reserved::Overflow => ReservedBucket::Overflow,
+                }),
                 count: a.count,
                 levels: a.levels,
                 first_seq: a.first_seq,
@@ -542,7 +575,9 @@ impl GroupMap {
                 last_time: a.last_time,
                 last_exemplar: a.last_exemplar,
             };
-            match reserved_kind(&key) {
+            // The same `kind` the row carries — computed once, so the row's
+            // marker and the bucket it is filed under cannot disagree.
+            match kind {
                 Some(r) => reserved.push((r, row)),
                 None => real.push(row),
             }
@@ -551,7 +586,20 @@ impl GroupMap {
         // Ties broken on the key so two identical calls agree; leaving that to
         // `HashMap` iteration is the reproducibility bug this project has ruled
         // against twice.
-        real.sort_by(|x, y| y.count.cmp(&x.count).then_with(|| x.key.cmp(&y.key)));
+        //
+        // **`first_seq` is the final tie-break, and it is what makes this a
+        // TOTAL order.** Two rows can share a key string: `label` joins tuple
+        // members with ` / ` without escaping, so `("x / y", "z")` and
+        // `("x", "y / z")` both render `x / y / z`. Stopping at the key would
+        // leave those two ordered by whatever the `HashMap` yielded whenever
+        // they also tie on count — the exact nondeterminism the key tie-break
+        // was added to remove, one level down.
+        real.sort_by(|x, y| {
+            y.count
+                .cmp(&x.count)
+                .then_with(|| x.key.cmp(&y.key))
+                .then_with(|| x.first_seq.cmp(&y.first_seq))
+        });
         real.truncate(top_n);
 
         // `__absent__` before `__overflow__`, always, so two calls agree.
@@ -684,6 +732,77 @@ mod tests {
         for r in &rows {
             assert_eq!(r.count, 1, "neither absorbed the other");
         }
+
+        // And the distinction has to SURVIVE onto the row, or every consumer
+        // re-derives it from the label and picks whichever comes first. The
+        // renderer did exactly that and inverted its own absent share.
+        let marked: Vec<Option<ReservedBucket>> = rows.iter().map(|r| r.reserved).collect();
+        assert_eq!(
+            marked.iter().filter(|m| m.is_some()).count(),
+            1,
+            "exactly one of these two identically-labelled rows is the reserved \
+             bucket: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().find(|r| r.reserved.is_some()).map(|r| r.reserved),
+            Some(Some(ReservedBucket::Absent))
+        );
+    }
+
+    /// A member whose value is ALWAYS structured must not be reported as
+    /// having never appeared.
+    ///
+    /// `present` counts usable scalars and `structured` counts present-but-not-
+    /// a-dimension values, and they are independent — so a field logged only
+    /// ever as an object has `present == 0` and `structured > 0`. Checking
+    /// absence first told the caller it "did not appear in any matched record"
+    /// when it appeared in every one, and that branch's remedy reads `alt`,
+    /// which is structurally always 0 on the `field` axis — so the false claim
+    /// arrived with no route to the true one.
+    ///
+    /// The existing structured test cannot catch this: its fixture mixes two
+    /// structured values with one plain, leaving `present == 1`.
+    #[test]
+    fn an_always_structured_member_is_not_reported_as_never_appearing() {
+        let logs = vec![
+            at(1, "a", &[("k", json!({"nested": 1}))]),
+            at(2, "b", &[("k", json!(["x", "y"]))]),
+        ];
+        let (axis, keys) = field_axis(&["k"]);
+        let mut map = GroupMap::new(axis, keys);
+        for e in &logs {
+            map.observe(e);
+        }
+        let s = map.suppressed();
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(
+            !s[0].reason.contains("did not appear"),
+            "`k` is on BOTH records; claiming it never appeared is a false \
+             statement about the data: {s:?}"
+        );
+        assert!(
+            s[0].reason.contains("not a dimension"),
+            "the true explanation is that its values cannot be grouped: {s:?}"
+        );
+        assert!(s[0].reason.contains("2 of 2"), "and how many: {s:?}");
+    }
+
+    /// `Suppressed.field` names the parameter the caller actually used.
+    ///
+    /// A built-in axis is named by `group_by` and has no `group_keys` — and
+    /// this method REFUSES `group_keys` on a built-in axis, so pointing at
+    /// `group_keys[0]` names a parameter the caller could not legally have
+    /// sent.
+    #[test]
+    fn a_suppressed_entry_names_the_parameter_that_was_actually_used() {
+        let mut builtin = GroupMap::new(Axis::Line, Vec::new());
+        builtin.observe(&at(1, "m", &[]));
+        assert_eq!(builtin.suppressed()[0].field, "group_by");
+
+        let (axis, keys) = field_axis(&["nope"]);
+        let mut field = GroupMap::new(axis, keys);
+        field.observe(&at(1, "m", &[]));
+        assert_eq!(field.suppressed()[0].field, "group_keys[0]");
     }
 
     /// P3 — past the cap, keys fold to `__overflow__`, distinctly from

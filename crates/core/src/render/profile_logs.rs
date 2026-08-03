@@ -23,6 +23,28 @@ use std::fmt::Write;
 
 /// Longest group key shown before it is elided.
 const KEY_WIDTH: usize = 40;
+/// The key column, sized to what it actually holds.
+///
+/// **Measured, not assumed.** `{:<width$}` is a MINIMUM width, not a maximum,
+/// so a constant narrower than the widest key does not truncate it — it just
+/// stops padding, and every later column shifts right for that row alone. That
+/// is what a fixed `KEY_WIDTH + 2` did once `disambiguate` began appending
+/// ` #<first_seq>` on collisions: the collision test's own fixture produced a
+/// 44-character key against a 42-character budget and drifted the seq column by
+/// two, for exactly the rows the disambiguator exists to make comparable.
+///
+/// A fixed reservation wide enough for any suffix is the other wrong answer —
+/// it pads ~21 blank characters onto every row for a suffix almost none of them
+/// carry. So the width is the widest rendered key, which is bounded by
+/// `KEY_WIDTH` plus the suffix and needs no constant at all.
+fn key_col(keys: &[String]) -> usize {
+    keys.iter()
+        .map(|k| k.chars().count())
+        .chain(std::iter::once("key".len()))
+        .max()
+        .unwrap_or(KEY_WIDTH)
+        + 2
+}
 /// Longest exemplar shown.
 const EXEMPLAR_WIDTH: usize = 52;
 /// `<first>-<last>`. Wide enough for two 8-digit seqs, which the live buffer
@@ -124,7 +146,7 @@ fn levels_cell(levels: &Value, present: &[&str]) -> String {
     present
         .iter()
         .map(|k| match levels.get(k).and_then(Value::as_u64).unwrap_or(0) {
-            0 => format!("{:>7}", ""),
+            0 => format!("{:>LEVEL_WIDTH$}", ""),
             n => format!("{n:>7}"),
         })
         .collect()
@@ -178,9 +200,15 @@ pub fn render(result: &Value) -> Option<String> {
     // The absent share, where it cannot be missed. On a typical buffer most
     // axes are absent from over 90% of records, and a reader who does not see
     // that reads the remaining rows as the whole population.
+    // **Selected on `reserved`, never on the rendered key.** GELF validates
+    // nothing after the `_`, so an emitter field valued literally `__absent__`
+    // produces a REAL row whose key is character-for-character the reserved
+    // bucket's — and real rows sort first, so a label match returns the wrong
+    // one and this share comes out inverted. The projection carries a typed key
+    // precisely to keep the two apart; matching on the string threw that away.
     let absent = groups
         .iter()
-        .find(|g| g.get("key").and_then(Value::as_str) == Some(super::super::collector::intern::ABSENT_LABEL))
+        .find(|g| g.get("reserved").and_then(Value::as_str) == Some("absent"))
         .and_then(|g| g.get("count").and_then(Value::as_u64));
     if let Some(n) = absent {
         if matched > 0 {
@@ -200,7 +228,41 @@ pub fn render(result: &Value) -> Option<String> {
             let _ = write!(o, ", {total} {noun}");
         }
     }
+    if let Some(total) = u("buffer_total") {
+        let _ = write!(o, " ({total} in buffer)");
+    }
     o.push('\n');
+
+    // The whole-population level breakdown and time window.
+    //
+    // **Emitted means rendered.** The MCP path returns this instead of the
+    // JSON, and the per-row columns cannot reconstruct these: a truncated row
+    // set does not sum to the population, and the row `seqs` columns say
+    // nothing about wall-clock. The tool's own description promises "counts, a
+    // per-level breakdown, seq/time bounds", and the ungrouped call — which is
+    // what `logmon-mcp logs profile` with no arguments does — has no rows at
+    // all, so without this line it printed one sentence and nothing else.
+    if let Some(levels) = result.get("levels") {
+        let counts: Vec<String> = LEVELS
+            .iter()
+            .filter_map(|(k, label)| {
+                match levels.get(k).and_then(Value::as_u64).unwrap_or(0) {
+                    0 => None,
+                    n => Some(format!("{label} {n}")),
+                }
+            })
+            .collect();
+        if !counts.is_empty() {
+            let _ = write!(o, "  levels: {}", counts.join("  "));
+            if let (Some(f), Some(l)) = (
+                result.get("first_time").and_then(Value::as_str),
+                result.get("last_time").and_then(Value::as_str),
+            ) {
+                let _ = write!(o, "   window: {} .. {}", flatten(f), flatten(l));
+            }
+            o.push('\n');
+        }
+    }
 
     // Eviction first: every figure below it describes a population missing
     // records, so it qualifies the table rather than footnoting it.
@@ -248,7 +310,7 @@ pub fn render(result: &Value) -> Option<String> {
         let heads: String = LEVELS
             .iter()
             .filter(|(k, _)| present.contains(k))
-            .map(|(_, label)| format!("{label:>7}"))
+            .map(|(_, label)| format!("{label:>LEVEL_WIDTH$}"))
             .collect();
 
         let refs: Vec<&Value> = groups.iter().collect();
@@ -257,9 +319,12 @@ pub fn render(result: &Value) -> Option<String> {
         // Computed once and shared by the header, the rows and the continuation
         // line, so the three cannot drift apart — which is exactly what
         // hand-repeated widths did on the first pass.
+        // Sized AFTER disambiguation, so a suffixed key is what the column is
+        // measured against rather than what overflows it.
+        let kcol = key_col(&keys);
+
         let lead = 2 // the row's own indent
-            + KEY_WIDTH
-            + 2
+            + kcol
             + COUNT_WIDTH
             + SHARE_WIDTH
             + present.len() * LEVEL_WIDTH
@@ -269,12 +334,11 @@ pub fn render(result: &Value) -> Option<String> {
 
         let _ = writeln!(
             o,
-            "\n  {:<width$}{:>COUNT_WIDTH$}{:>SHARE_WIDTH$}{heads}  {:<SEQ_WIDTH$} exemplar",
+            "\n  {:<kcol$}{:>COUNT_WIDTH$}{:>SHARE_WIDTH$}{heads}  {:<SEQ_WIDTH$} exemplar",
             "key",
             "count",
             "share",
             "seqs",
-            width = KEY_WIDTH + 2
         );
         for (g, key) in groups.iter().zip(keys) {
             let count = g.get("count").and_then(Value::as_u64).unwrap_or(0);
@@ -291,13 +355,16 @@ pub fn render(result: &Value) -> Option<String> {
 
             let _ = writeln!(
                 o,
-                "  {:<width$}{count:>COUNT_WIDTH$}{:>6.1}%{}  {:<SEQ_WIDTH$} {}",
+                // `SHARE_WIDTH - 1` because the `%` sign is the last character
+                // of that cell — the header pads to SHARE_WIDTH, so hardcoding
+                // the number here is how the two came to differ by one.
+                "  {:<kcol$}{count:>COUNT_WIDTH$}{:>width$.1}%{}  {:<SEQ_WIDTH$} {}",
                 key,
                 share,
                 levels_cell(&levels, &present),
                 format!("{first}-{last}"),
                 clip(fx, EXEMPLAR_WIDTH),
-                width = KEY_WIDTH + 2
+                width = SHARE_WIDTH - 1
             );
             // The second line IS the signal: printed only when the group's
             // shape changed across the window, which is what the pair of
@@ -374,6 +441,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn reserved(key: &str, kind: &str, count: u64, first: u64, last: u64) -> Value {
+        let mut g = group(key, count, first, last);
+        g["reserved"] = json!(kind);
+        g
+    }
+
     fn group(key: &str, count: u64, first: u64, last: u64) -> Value {
         json!({
             "key": key, "count": count,
@@ -437,10 +510,79 @@ mod tests {
     #[test]
     fn the_absent_share_is_in_the_header() {
         let mut r = reply();
-        r["groups"] = json!([group("svc::a", 20, 1, 90), group("__absent__", 80, 3, 99)]);
+        r["groups"] = json!([
+            group("svc::a", 20, 1, 90),
+            reserved("__absent__", "absent", 80, 3, 99)
+        ]);
         let out = render(&r).expect("renders");
         assert!(out.contains("80 __absent__ (80.0%)"), "{out}");
         assert!(out.contains("20 carry it"), "{out}");
+    }
+
+    /// The absent share is read off `reserved`, never off the rendered key.
+    ///
+    /// GELF validates nothing after the `_`, so a field valued literally
+    /// `__absent__` is a REAL row whose key matches the reserved bucket's
+    /// character for character — and real rows sort first, so a label match
+    /// returns the wrong one. Here the truth is 3 carry the axis and 1 lacks
+    /// it; a label match reports the exact inverse, and the MCP path returns
+    /// this rendering INSTEAD of the JSON, so the inverted number is all the
+    /// agent sees.
+    #[test]
+    fn the_absent_share_ignores_a_real_row_that_merely_looks_reserved() {
+        let mut r = reply();
+        r["matched"] = json!(4);
+        r["groups"] = json!([
+            group("__absent__", 3, 1, 3),                 // a real value, sorts first
+            reserved("__absent__", "absent", 1, 4, 4),    // the actual bucket
+        ]);
+        let out = render(&r).expect("renders");
+        assert!(
+            out.contains("1 __absent__ (25.0%)"),
+            "the bucket holds 1 of 4; reading the first row by label reports 3 \
+             and inverts the whole header: {out}"
+        );
+        assert!(out.contains("3 carry it"), "{out}");
+    }
+
+    /// The whole-population figures reach the rendering.
+    ///
+    /// The per-row columns cannot reconstruct them: a truncated row set does
+    /// not sum to the population, and the ungrouped call — `logmon-mcp logs
+    /// profile` with no arguments — has no rows at all, so without this it
+    /// printed one sentence and stopped.
+    #[test]
+    fn the_population_levels_and_buffer_total_are_rendered() {
+        let mut r = reply();
+        r["levels"] = json!({"trace": 0, "debug": 0, "info": 90, "warn": 4, "error": 7});
+        r["first_time"] = json!("2026-08-03T09:00:00Z");
+        r["last_time"] = json!("2026-08-03T10:00:00Z");
+        let out = render(&r).expect("renders");
+        assert!(out.contains("Error 7"), "the population breakdown: {out}");
+        assert!(out.contains("Warn 4") && out.contains("Info 90"), "{out}");
+        assert!(out.contains("(250 in buffer)"), "{out}");
+        assert!(out.contains("window: "), "the wall-clock span: {out}");
+        assert!(
+            !out.contains("Debug 0"),
+            "a level nobody logged is noise, not information: {out}"
+        );
+    }
+
+    /// An ungrouped call is the DEFAULT call, and it must still say something.
+    #[test]
+    fn the_ungrouped_call_still_reports_the_population() {
+        let mut r = reply();
+        r["groups"] = json!([]);
+        r["grouped_by"] = Value::Null;
+        r["group_keys"] = Value::Null;
+        r["groups_total"] = Value::Null;
+        r["levels"] = json!({"trace": 0, "debug": 0, "info": 1, "warn": 0, "error": 1});
+        let out = render(&r).expect("renders");
+        assert!(out.contains("Error 1") && out.contains("Info 1"), "{out}");
+        assert!(
+            out.lines().filter(|l| !l.trim().is_empty()).count() >= 2,
+            "one line with no level breakdown is what this call used to print: {out}"
+        );
     }
 
     /// Two keys differing only past the clip width must not render identically.
@@ -465,6 +607,27 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2, "{out}");
         assert_ne!(rows[0], rows[1], "two distinct groups must not render alike");
+
+        // **And the suffix must fit its column.** `{:<width$}` is a MINIMUM
+        // width: a key clipped to KEY_WIDTH and then suffixed is longer than a
+        // KEY_WIDTH-sized pad, so nothing truncates it and every later column
+        // shifts right — for exactly the rows the disambiguator exists to make
+        // comparable. Measured on this fixture before the fix: a 44-character
+        // key against a 42-character budget, drifting the seq column by two.
+        let header = out
+            .lines()
+            .find(|l| l.contains("exemplar"))
+            .expect("header");
+        let want = header.find("seqs").expect("seqs column");
+        for row in &rows {
+            let got = row.find('#').and_then(|h| row[h..].find(' ').map(|s| h + s + 1));
+            assert_eq!(
+                got.map(|g| g.max(want)),
+                Some(want),
+                "a disambiguated row must not push its columns past the header's:\n\
+                 {header}\n{row}"
+            );
+        }
     }
 
     /// The population's seq span reaches the rendering.
@@ -501,7 +664,10 @@ mod tests {
         r["groups"] = json!([group("only", 100, 1, 9)]);
         r["groups_total"] = json!(1);
         let out = render(&r).expect("renders");
-        assert!(out.contains("1 group,") || out.contains("1 group\n"), "{out}");
+        // The property is the noun, not what follows it — an earlier version of
+        // this assertion pinned a trailing comma and broke when another field
+        // was added after the count.
+        assert!(out.contains("1 group"), "{out}");
         assert!(!out.contains("1 groups"), "{out}");
     }
 

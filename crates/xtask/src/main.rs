@@ -81,6 +81,7 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "LogsProfileResult":     schema_for!(LogsProfileResult),
             "LogGroup":              schema_for!(LogGroup),
             "LevelCounts":           schema_for!(LevelCounts),
+            "ReservedBucket":        schema_for!(ReservedBucket),
             "LogsContext":           schema_for!(LogsContext),
             "LogsContextResult":     schema_for!(LogsContextResult),
             "LogsExport":            schema_for!(LogsExport),

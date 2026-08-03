@@ -485,6 +485,24 @@ impl LevelCounts {
     }
 }
 
+/// Which reserved bucket a `LogGroup` is, if any.
+///
+/// **Structural, never derived from `key`.** A key is emitter text, and GELF
+/// validates nothing after the `_`, so a field valued literally `__absent__`
+/// renders character-for-character like the reserved bucket. The projection
+/// keeps them apart with a typed key; a consumer that matches on the rendered
+/// label throws that distinction away — and the renderer did exactly that,
+/// picking the wrong row and inverting its own header's absent share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservedBucket {
+    /// The records here lacked the axis entirely.
+    Absent,
+    /// A cardinality cap folded these keys together. A different fact from
+    /// `Absent`, and merging the two makes the denominator lie.
+    Overflow,
+}
+
 /// One row of a `logs.profile` breakdown.
 ///
 /// **Each end of the row is one whole record** — a seq, its timestamp, and the
@@ -497,7 +515,19 @@ impl LevelCounts {
 pub struct LogGroup {
     /// The value; `__absent__` or `__overflow__` for the reserved buckets;
     /// tuple members joined with ` / `.
+    ///
+    /// **Not an identity.** Two rows can share a key: an emitter field valued
+    /// `__absent__` renders like the reserved bucket, and a tuple member
+    /// containing ` / ` can collide with a different split of the same joined
+    /// text. Use `reserved` to identify a bucket, and `first_seq` — unique per
+    /// row, since each record lands in exactly one group — to tell two rows
+    /// apart.
     pub key: String,
+    /// Set only on a reserved bucket. Absent on ordinary rows, including a
+    /// partially-absent tuple like `store::net / __absent__`, which describes
+    /// real records that carry one member and lack the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<ReservedBucket>,
     pub count: usize,
     pub levels: LevelCounts,
     pub first_seq: u64,

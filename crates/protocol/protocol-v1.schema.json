@@ -866,8 +866,19 @@
           "type": "object",
           "properties": {
             "key": {
-              "description": "The value; `__absent__` or `__overflow__` for the reserved buckets;\ntuple members joined with ` / `.",
+              "description": "The value; `__absent__` or `__overflow__` for the reserved buckets;\ntuple members joined with ` / `.\n\n**Not an identity.** Two rows can share a key: an emitter field valued\n`__absent__` renders like the reserved bucket, and a tuple member\ncontaining ` / ` can collide with a different split of the same joined\ntext. Use `reserved` to identify a bucket, and `first_seq` — unique per\nrow, since each record lands in exactly one group — to tell two rows\napart.",
               "type": "string"
+            },
+            "reserved": {
+              "description": "Set only on a reserved bucket. Absent on ordinary rows, including a\npartially-absent tuple like `store::net / __absent__`, which describes\nreal records that carry one member and lack the other.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ReservedBucket"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "count": {
               "type": "integer",
@@ -914,6 +925,21 @@
             "last_seq",
             "last_time",
             "last_exemplar"
+          ]
+        },
+        "ReservedBucket": {
+          "description": "Which reserved bucket a `LogGroup` is, if any.\n\n**Structural, never derived from `key`.** A key is emitter text, and GELF\nvalidates nothing after the `_`, so a field valued literally `__absent__`\nrenders character-for-character like the reserved bucket. The projection\nkeeps them apart with a typed key; a consumer that matches on the rendered\nlabel throws that distinction away — and the renderer did exactly that,\npicking the wrong row and inverting its own header's absent share.",
+          "oneOf": [
+            {
+              "description": "The records here lacked the axis entirely.",
+              "type": "string",
+              "const": "absent"
+            },
+            {
+              "description": "A cardinality cap folded these keys together. A different fact from\n`Absent`, and merging the two makes the denominator lie.",
+              "type": "string",
+              "const": "overflow"
+            }
           ]
         },
         "LevelCounts": {
@@ -987,8 +1013,19 @@
       "type": "object",
       "properties": {
         "key": {
-          "description": "The value; `__absent__` or `__overflow__` for the reserved buckets;\ntuple members joined with ` / `.",
+          "description": "The value; `__absent__` or `__overflow__` for the reserved buckets;\ntuple members joined with ` / `.\n\n**Not an identity.** Two rows can share a key: an emitter field valued\n`__absent__` renders like the reserved bucket, and a tuple member\ncontaining ` / ` can collide with a different split of the same joined\ntext. Use `reserved` to identify a bucket, and `first_seq` — unique per\nrow, since each record lands in exactly one group — to tell two rows\napart.",
           "type": "string"
+        },
+        "reserved": {
+          "description": "Set only on a reserved bucket. Absent on ordinary rows, including a\npartially-absent tuple like `store::net / __absent__`, which describes\nreal records that carry one member and lack the other.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReservedBucket"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "count": {
           "type": "integer",
@@ -1037,6 +1074,21 @@
         "last_exemplar"
       ],
       "$defs": {
+        "ReservedBucket": {
+          "description": "Which reserved bucket a `LogGroup` is, if any.\n\n**Structural, never derived from `key`.** A key is emitter text, and GELF\nvalidates nothing after the `_`, so a field valued literally `__absent__`\nrenders character-for-character like the reserved bucket. The projection\nkeeps them apart with a typed key; a consumer that matches on the rendered\nlabel throws that distinction away — and the renderer did exactly that,\npicking the wrong row and inverting its own header's absent share.",
+          "oneOf": [
+            {
+              "description": "The records here lacked the axis entirely.",
+              "type": "string",
+              "const": "absent"
+            },
+            {
+              "description": "A cardinality cap folded these keys together. A different fact from\n`Absent`, and merging the two makes the denominator lie.",
+              "type": "string",
+              "const": "overflow"
+            }
+          ]
+        },
         "LevelCounts": {
           "description": "Records per level. A fixed struct, never a map.\n\n`Level` has five variants and no more (`gelf/message.rs`), so every field is\nalways emitted: a reader never has to tell \"key absent\" from \"count zero\",\nwhich carries no information here and is a reliable source of downstream\n`unwrap_or(0)`. It also lets the renderer lay out fixed columns in severity\norder, and lets the schema state the whole domain instead of\n`additionalProperties`.",
           "type": "object",
@@ -1115,6 +1167,23 @@
         "info",
         "warn",
         "error"
+      ]
+    },
+    "ReservedBucket": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ReservedBucket",
+      "description": "Which reserved bucket a `LogGroup` is, if any.\n\n**Structural, never derived from `key`.** A key is emitter text, and GELF\nvalidates nothing after the `_`, so a field valued literally `__absent__`\nrenders character-for-character like the reserved bucket. The projection\nkeeps them apart with a typed key; a consumer that matches on the rendered\nlabel throws that distinction away — and the renderer did exactly that,\npicking the wrong row and inverting its own header's absent share.",
+      "oneOf": [
+        {
+          "description": "The records here lacked the axis entirely.",
+          "type": "string",
+          "const": "absent"
+        },
+        {
+          "description": "A cardinality cap folded these keys together. A different fact from\n`Absent`, and merging the two makes the denominator lie.",
+          "type": "string",
+          "const": "overflow"
+        }
       ]
     },
     "LogsContext": {

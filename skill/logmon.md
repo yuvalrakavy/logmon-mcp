@@ -167,9 +167,9 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
 
   **Both exemplars are worth reading.** They print on one line when the group did not change and two when it did, so a second line means the group's shape moved across the window — for a recurring error, `run script failed` then `run script failed (retry 4)` is most of the diagnosis.
 
-  Counts only for now: no sums or averages over field values. Walks the whole ring, not the newest N. Cursor qualifiers are refused before resolution, so a refusal leaves nothing behind.
+  Counts only for now: no sums or averages over field values. Walks the whole ring, not the newest N.
 
-  Cursor qualifiers (`c>=`) are refused: a cursor advances on read, so two identical calls would describe different populations. Use `b>=` for a repeatable window.
+  Cursor qualifiers (`c>=`) are refused by **both** of these reads: a cursor advances on read, so two identical calls would describe different populations. Use `b>=` for a repeatable window. The refusal happens before resolution, so it leaves no bookmark behind.
 - **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=50`.
 - **`get_log_context(seq, before?, after?)`** — logs around a specific entry. Use this when you have a `seq` from another query.
 - **`export_logs(path, count?, filter?, from_seq?, to_seq?, format?)`** — write matching logs to a file (`json` or `text`). `from_seq`/`to_seq` are **inclusive** and compose with a bookmark bound. The reply carries a **`verdict`** — see below.

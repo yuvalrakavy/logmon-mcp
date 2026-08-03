@@ -119,6 +119,18 @@ async fn the_reply_carries_its_evidence_and_both_ends_of_each_row() {
     assert_eq!(reply["group_keys"], json!(["k"]));
     assert_eq!(reply["levels"]["info"].as_u64(), Some(2));
 
+    // `LogsProfileResult` is schema-only: the handler hand-builds the envelope
+    // and nothing constructs the struct, so `verify-schema` — which re-runs the
+    // definitions map against itself — cannot see the two drift apart. This
+    // repo has already named that hazard for `ToolsManifestResult`. One
+    // round-trip closes it: a field renamed on either side stops deserializing.
+    let typed: logmon_broker_protocol::methods::LogsProfileResult =
+        serde_json::from_value(reply.clone())
+            .expect("the wire reply must deserialize into the struct that documents it");
+    assert_eq!(typed.matched, 2);
+    assert_eq!(typed.levels.info, 2);
+    assert_eq!(typed.groups.len(), reply["groups"].as_array().map_or(0, Vec::len));
+
     let a = row(&reply, "a").expect("the group");
     assert_eq!(a["first_exemplar"].as_str(), Some("first one"));
     assert_eq!(a["last_exemplar"].as_str(), Some("second one"));

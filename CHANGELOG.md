@@ -5,6 +5,44 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Added — `profile_logs` (`logs.profile`), the measurement beside the map
+
+`list_log_fields` says which dimensions exist; this says how the population
+spreads along the one you pick. Per group: a count, a per-level breakdown, the
+seq and time bounds, and a **verbatim exemplar at each end** — which print as
+one line when the group did not change across the window and two when it did, so
+the second line is the signal that something moved.
+
+The axis vocabulary mirrors `traces.profile`, because it is the only spelling
+that reaches every row `list_log_fields` reports: a closed `group_by` names a
+built-in (`level`, `message`, `host`, `facility`, `file`, `line`, `trace_id`,
+`span_id`), while `group_by="field"` plus `group_keys` names emitter fields.
+`trace_id` and `span_id` carry no filter selector at all, so a
+selector-string vocabulary could not have named them. Two keys form a tuple.
+
+**`__absent__` is a normal row and is usually the largest one.** Measured on a
+live buffer, 20 of 31 candidate axes are absent from more than 90% of records —
+`kind` from 86.4%. Dropping those records would draw a clean picture of a
+population nobody asked about, so absence gets a row and the counts account for
+every matched record. It sorts last and does **not** consume `top_n`, so asking
+for twenty rows buys twenty real values.
+
+**`__overflow__` is a different fact** — a cardinality cap folded keys — and the
+two are never merged. "Lacked the field" and "was one of too many values" are
+different, and conflating them makes the denominator lie in a way nothing
+downstream can detect. The reserved buckets are exempt from the cap itself, so a
+buffer whose distinct values fill the table before the first record lacking the
+field cannot lose that distinction.
+
+**An axis absent from every matched record is announced, not answered.** A lone
+`__absent__` row covering 100% reads exactly like a real result; a `suppressed`
+entry says so instead, and where a candidate exists the remedy is the call that
+works — *"an additional field named `line` covers 99.97% — use
+`group_by="field", group_keys=["line"]`"*. For `trace_id`/`span_id` no candidate
+can exist, so the reason is factual and there is no remedy.
+
+Counts only: sums and averages over field values are a later step.
+
 ### Added — `list_log_fields` (`logs.fields`), and a full-buffer walk
 
 Map the log buffer before querying it: every field with coverage, distinct
