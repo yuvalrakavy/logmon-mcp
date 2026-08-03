@@ -27,6 +27,12 @@ population nobody asked about, so absence gets a row and the counts account for
 every matched record. It sorts last and does **not** consume `top_n`, so asking
 for twenty rows buys twenty real values.
 
+Each row carries a **`reserved`** field (`absent` / `overflow`, absent on
+ordinary rows), and that — not the key — is how a bucket is identified. GELF
+keeps whatever follows the `_`, so an emitter field *valued* literally
+`__absent__` produces an ordinary row whose key matches the bucket's character
+for character and which sorts ahead of it.
+
 **`__overflow__` is a different fact** — a cardinality cap folded keys — and the
 two are never merged. "Lacked the field" and "was one of too many values" are
 different, and conflating them makes the denominator lie in a way nothing

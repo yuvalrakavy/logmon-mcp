@@ -130,6 +130,20 @@ async fn the_reply_carries_its_evidence_and_both_ends_of_each_row() {
     assert_eq!(typed.matched, 2);
     assert_eq!(typed.levels.info, 2);
     assert_eq!(typed.groups.len(), reply["groups"].as_array().map_or(0, Vec::len));
+    // **The `#[serde(default)]` fields are asserted, not just deserialized.**
+    // Most of this struct defaults, so a rename on either side yields `None`
+    // and a round-trip alone stays green — the check would claim more than it
+    // tests. These are the ones that would silently become nothing.
+    assert!(typed.grouped_by.is_some(), "{reply}");
+    assert!(typed.group_keys.is_some(), "{reply}");
+    assert!(typed.groups_total.is_some(), "{reply}");
+    assert!(typed.first_seq.is_some() && typed.last_seq.is_some(), "{reply}");
+    assert!(typed.first_time.is_some() && typed.last_time.is_some(), "{reply}");
+    assert!(
+        typed.groups.iter().all(|g| g.reserved.is_none()),
+        "no reserved bucket in this fixture, and `reserved` must not appear \
+         from nowhere: {reply}"
+    );
 
     let a = row(&reply, "a").expect("the group");
     assert_eq!(a["first_exemplar"].as_str(), Some("first one"));
@@ -260,7 +274,15 @@ async fn a_wholly_absent_axis_is_announced_over_the_wire() {
         .await
         .unwrap();
 
-    assert!(row(&reply, "__absent__").is_some(), "the row is still there");
+    // Found by its MARKER, and the marker's wire spelling is asserted here —
+    // the renderer derives it from the enum, but nothing else pins what that
+    // enum serialises to. Dropping `rename_all` from `ReservedBucket` left the
+    // whole suite green while the absent share vanished from every reply.
+    let bucket = reply["groups"]
+        .as_array()
+        .and_then(|gs| gs.iter().find(|g| g["reserved"] == "absent"))
+        .unwrap_or_else(|| panic!("no row marked `absent`: {reply}"));
+    assert_eq!(bucket["key"].as_str(), Some("__absent__"), "{reply}");
     let s = reply["suppressed"].as_array().expect("the honesty channel");
     assert_eq!(s.len(), 1, "one entry for the one absent member: {reply}");
     assert!(

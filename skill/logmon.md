@@ -145,13 +145,16 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
   ```
 
   ```
-  log profile by `field` [target] — 11 matched of 101 scanned, 2 groups
+  log profile by `field` [target] — 11 matched (seq 91-101) of 101 scanned, 2 groups
+    levels: Error 7  Warn 4   window: 2026-08-03T14:39:27.070707Z .. 2026-08-03T14:39:27.070830Z
 
-    key                    count  share  Error   Warn  seqs      exemplar
-    store::rhai                7  63.6%      7         91-97     run script failed
-                                                                 run script failed (retry 4)
-    store::mqtt                4  36.4%             4  98-101    MQTT backpressure
+    key             count  share  Error   Warn  seqs               exemplar
+    store::rhai         7  63.6%      7         91-97              run script failed
+                                                                   run script failed (retry 4)
+    store::mqtt         4  36.4%             4  98-101             MQTT backpressure
   ```
+
+  The header's `levels` and `window` describe the **whole** matched population, not the rows shown — read them against `groups_total` when the rows are a sample.
 
   **How to name the axis.** A built-in goes straight into `group_by` — `level`, `message`, `host`, `facility`, `file`, `line`, `trace_id`, `span_id`. An emitter field needs `group_by="field"` plus `group_keys` naming it, and the name is the `field` value from a `list_log_fields` row. Repeat `--group-keys` for a tuple, joined with ` / ` in the key. Passing `group_keys` on a built-in axis is an error rather than an answer to a question you did not ask.
 
@@ -159,9 +162,11 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
 
   **`__overflow__` is a different fact** — the cardinality cap folded keys — and the two are never merged. If you see it, `cardinality_capped` is set and that row aggregates an arbitrary, arrival-ordered set.
 
+  **Identify a reserved bucket by its `reserved` field (`absent` / `overflow`), never by its key.** GELF keeps whatever follows the `_`, so an emitter field can be *valued* literally `__absent__` — that is an ordinary row whose key matches the bucket's character for character, and it sorts ahead of it. Only `reserved` tells them apart. Ordinary rows do not carry the field at all, including a partially-absent tuple like `store::net / __absent__`, which describes real records that carry one member and lack the other.
+
   **Read `groups_total`.** The rows sum to `matched` only when it is at most `top_n`; otherwise you are looking at a sample and the header says `top N of M`.
 
-  **A `suppressed` entry means the axis you named appears on NO matched record.** That is almost always a spelling problem, not an empty buffer — and for a built-in it usually means the emitter sends that name as an underscore-prefixed extra instead. The remedy says which call works:
+  **A `suppressed` entry means the axis you named could not group.** Two causes, and the entry says which. Either it appears on **no** matched record — almost always a spelling problem rather than an empty buffer, and for a built-in it usually means the emitter sends that name as an underscore-prefixed extra instead — or it appears but its values are null/arrays/objects, which are not dimensions and are counted in `__absent__`. When a field is *only* ever structured you get both facts in one sentence. The remedy, where one exists, says which call works:
 
   > `line` did not appear in any of the 9347 matched records… an additional field named `line` covers 99.97% — use `group_by="field", group_keys=["line"]`
 

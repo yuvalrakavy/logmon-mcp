@@ -17,6 +17,7 @@
 //! and `disambiguate` below.
 
 use super::escape::flatten;
+use logmon_broker_protocol::methods::ReservedBucket;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -42,7 +43,11 @@ fn key_col(keys: &[String]) -> usize {
         .map(|k| k.chars().count())
         .chain(std::iter::once("key".len()))
         .max()
-        .unwrap_or(KEY_WIDTH)
+        // `chain` guarantees a non-empty iterator, so this arm cannot run. It
+        // is written as 0 rather than as a plausible-looking `KEY_WIDTH`
+        // precisely so it cannot be mistaken for a live empty-groups fallback:
+        // the caller already guards on `!groups.is_empty()`.
+        .unwrap_or(0)
         + 2
 }
 /// Longest exemplar shown.
@@ -147,7 +152,7 @@ fn levels_cell(levels: &Value, present: &[&str]) -> String {
         .iter()
         .map(|k| match levels.get(k).and_then(Value::as_u64).unwrap_or(0) {
             0 => format!("{:>LEVEL_WIDTH$}", ""),
-            n => format!("{n:>7}"),
+            n => format!("{n:>LEVEL_WIDTH$}"),
         })
         .collect()
 }
@@ -206,9 +211,17 @@ pub fn render(result: &Value) -> Option<String> {
     // bucket's — and real rows sort first, so a label match returns the wrong
     // one and this share comes out inverted. The projection carries a typed key
     // precisely to keep the two apart; matching on the string threw that away.
+    //
+    // The marker is DERIVED from the enum, not written as `"absent"`. A literal
+    // is tied to the enum's serde spelling by nothing: dropping
+    // `rename_all = "snake_case"` from `ReservedBucket` left all 691 tests
+    // green while this share silently vanished from every reply — and
+    // `verify-schema`'s own remedy ("run gen-schema and commit the result")
+    // makes the breakage permanent rather than reporting it.
+    let absent_marker = serde_json::to_value(ReservedBucket::Absent).unwrap_or(Value::Null);
     let absent = groups
         .iter()
-        .find(|g| g.get("reserved").and_then(Value::as_str) == Some("absent"))
+        .find(|g| g.get("reserved") == Some(&absent_marker))
         .and_then(|g| g.get("count").and_then(Value::as_u64));
     if let Some(n) = absent {
         if matched > 0 {
@@ -228,8 +241,16 @@ pub fn render(result: &Value) -> Option<String> {
             let _ = write!(o, ", {total} {noun}");
         }
     }
-    if let Some(total) = u("buffer_total") {
-        let _ = write!(o, " ({total} in buffer)");
+    // Only when it differs from `scanned`. For this method the walk visits
+    // every ring entry, so the two are the same number on every call today and
+    // printing both said `250 … 250` — with the parenthetical sitting where it
+    // read as a property of the group count beside it. Kept as a guard rather
+    // than deleted: if this read ever stops covering the whole ring, that is
+    // exactly when a reader needs to see both.
+    if let (Some(total), Some(s)) = (u("buffer_total"), u("scanned")) {
+        if total != s {
+            let _ = write!(o, " ({total} in buffer)");
+        }
     }
     o.push('\n');
 
@@ -356,8 +377,10 @@ pub fn render(result: &Value) -> Option<String> {
             let _ = writeln!(
                 o,
                 // `SHARE_WIDTH - 1` because the `%` sign is the last character
-                // of that cell — the header pads to SHARE_WIDTH, so hardcoding
-                // the number here is how the two came to differ by one.
+                // of the cell the header pads to `SHARE_WIDTH`. Derived rather
+                // than written as a number so the two cannot drift — the
+                // literal that was here agreed with the header, but only by
+                // coincidence, and nothing would have said so if it stopped.
                 "  {:<kcol$}{count:>COUNT_WIDTH$}{:>width$.1}%{}  {:<SEQ_WIDTH$} {}",
                 key,
                 share,
@@ -560,8 +583,17 @@ mod tests {
         let out = render(&r).expect("renders");
         assert!(out.contains("Error 7"), "the population breakdown: {out}");
         assert!(out.contains("Warn 4") && out.contains("Info 90"), "{out}");
-        assert!(out.contains("(250 in buffer)"), "{out}");
         assert!(out.contains("window: "), "the wall-clock span: {out}");
+        assert!(
+            !out.contains("in buffer"),
+            "scanned already says 250; printing it twice is noise: {out}"
+        );
+
+        // And it DOES appear when the two genuinely differ, or the guard above
+        // would be satisfied by never printing it at all.
+        r["buffer_total"] = json!(900);
+        let out = render(&r).expect("renders");
+        assert!(out.contains("(900 in buffer)"), "{out}");
         assert!(
             !out.contains("Debug 0"),
             "a level nobody logged is noise, not information: {out}"
@@ -614,17 +646,29 @@ mod tests {
         // shifts right — for exactly the rows the disambiguator exists to make
         // comparable. Measured on this fixture before the fix: a 44-character
         // key against a 42-character budget, drifting the seq column by two.
+        //
+        // **Compare the seq VALUE's column against the header's, in
+        // characters.** The first version of this check computed an offset from
+        // the `#` and asserted it was at most the header's — which is true of
+        // any padding position and stayed green under the very mutation it
+        // named. It also mixed `find`'s byte indices with column counts, and
+        // the clipped key carries a 3-byte `…`.
         let header = out
             .lines()
             .find(|l| l.contains("exemplar"))
             .expect("header");
-        let want = header.find("seqs").expect("seqs column");
-        for row in &rows {
-            let got = row.find('#').and_then(|h| row[h..].find(' ').map(|s| h + s + 1));
+        let col = |line: &str, needle: &str| -> usize {
+            let b = line
+                .find(needle)
+                .unwrap_or_else(|| panic!("no `{needle}` in:\n{line}"));
+            line[..b].chars().count()
+        };
+        let want = col(header, "seqs");
+        for (row, seqs) in rows.iter().zip(["41-41", "77-77"]) {
             assert_eq!(
-                got.map(|g| g.max(want)),
-                Some(want),
-                "a disambiguated row must not push its columns past the header's:\n\
+                col(row, seqs),
+                want,
+                "a disambiguated row must line its columns up with the header's:\n\
                  {header}\n{row}"
             );
         }

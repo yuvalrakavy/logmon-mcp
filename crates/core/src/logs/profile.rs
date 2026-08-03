@@ -504,13 +504,31 @@ impl GroupMap {
             // when it appeared in every one. Worse, that branch's remedy reads
             // `alt`, which is structurally always 0 on the `field` axis, so the
             // false claim would arrive with no way to reach the true one.
+            // The two counters are INDEPENDENT, so the message says whichever
+            // of the two facts is true — and both, when both are.
+            //
+            // Ordering alone was not enough. Checking absence first claimed a
+            // field on every record "did not appear"; checking structured first
+            // fixed that but then dropped the absence when both held, leaving a
+            // caller to read "1 of 100 records carry `k` as an object" beside a
+            // bucket at 100% and infer the rest. The property every doc
+            // promises is that a wholly-ungroupable axis is ANNOUNCED, so it
+            // has to be said outright.
             if self.structured[i] > 0 {
+                let all = if *present == 0 {
+                    format!(
+                        " — so `{name}` never appeared with a value that can be grouped, \
+                         and every row is `{ABSENT_LABEL}`"
+                    )
+                } else {
+                    String::new()
+                };
                 out.push(Suppressed {
                     field: self.axis.suppressed_field(i),
                     reason: format!(
                         "{} of {} records carry `{name}` with a null, array or object \
                          value, which is not a dimension; they are counted in \
-                         `{ABSENT_LABEL}`",
+                         `{ABSENT_LABEL}`{all}",
                         self.structured[i], self.matched
                     ),
                     remedy: None,
@@ -785,6 +803,35 @@ mod tests {
             "the true explanation is that its values cannot be grouped: {s:?}"
         );
         assert!(s[0].reason.contains("2 of 2"), "and how many: {s:?}");
+        assert!(
+            s[0].reason.contains("never appeared with a value that can be grouped"),
+            "and the ABSENCE has to be stated outright, not left for the caller \
+             to infer from `2 of 2` beside a 100% bucket -- every doc promises a \
+             wholly-ungroupable axis is announced: {s:?}"
+        );
+    }
+
+    /// A PARTLY structured member reports the structured count and nothing
+    /// more, because the axis did group — otherwise the sentence above would
+    /// just be unconditional text.
+    #[test]
+    fn a_partly_structured_member_does_not_claim_the_axis_never_grouped() {
+        let logs = vec![
+            at(1, "a", &[("k", json!({"nested": 1}))]),
+            at(2, "b", &[("k", json!("plain"))]),
+        ];
+        let (axis, keys) = field_axis(&["k"]);
+        let mut map = GroupMap::new(axis, keys);
+        for e in &logs {
+            map.observe(e);
+        }
+        let s = map.suppressed();
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].reason.contains("1 of 2"), "{s:?}");
+        assert!(
+            !s[0].reason.contains("never appeared"),
+            "it DID appear groupably, on one record: {s:?}"
+        );
     }
 
     /// `Suppressed.field` names the parameter the caller actually used.
@@ -838,6 +885,19 @@ mod tests {
             row(&rows, ABSENT_LABEL).count,
             1,
             "and it is NOT the same bucket as `lacked the field entirely`"
+        );
+        // The MARKERS have to differ too, not just the labels. Mislabelling
+        // overflow as absent is not inert: the renderer reads the header's
+        // absent share off `reserved`, so a mislabelled overflow row BECOMES
+        // the reported absent count — the same defect this field was added to
+        // prevent, one variant over.
+        assert_eq!(
+            row(&rows, OVERFLOW_LABEL).reserved,
+            Some(ReservedBucket::Overflow)
+        );
+        assert_eq!(
+            row(&rows, ABSENT_LABEL).reserved,
+            Some(ReservedBucket::Absent)
         );
         let summed: usize = rows.iter().map(|r| r.count).sum();
         assert_eq!(summed, matched, "the fold must not lose records");
@@ -1126,6 +1186,41 @@ mod tests {
             "all three tie on count; leaving that to HashMap iteration makes \
              two identical calls disagree"
         );
+    }
+
+    /// Two DIFFERENT tuples can render the same key, and the order must still
+    /// be deterministic.
+    ///
+    /// `label` joins members with ` / ` and escapes nothing, so `("x / y","z")`
+    /// and `("x","y / z")` both render `x / y / z`. Tying on count as well,
+    /// the key tie-break decides nothing and the order falls back to whatever
+    /// the `HashMap` yielded — the exact bug the key tie-break was added to
+    /// remove, one level down. `first_seq` is the total order, and it is unique
+    /// per row because each record lands in exactly one group.
+    #[test]
+    fn colliding_tuple_labels_still_order_deterministically() {
+        let logs = vec![
+            at(1, "m", &[("a", json!("x / y")), ("b", json!("z"))]),
+            at(2, "m", &[("a", json!("x")), ("b", json!("y / z"))]),
+        ];
+        let (axis, keys) = field_axis(&["a", "b"]);
+        let render = || -> Vec<(String, u64)> {
+            summarize(&logs, axis, keys.clone(), ALL_ROWS)
+                .0
+                .into_iter()
+                .map(|r| (r.key, r.first_seq))
+                .collect()
+        };
+        let once = render();
+        assert_eq!(once.len(), 2, "two distinct tuples: {once:?}");
+        assert_eq!(
+            once[0].0, once[1].0,
+            "that render identically -- which is the whole fixture: {once:?}"
+        );
+        for _ in 0..8 {
+            assert_eq!(render(), once, "and the order must not vary between calls");
+        }
+        assert_eq!(once[0].1, 1, "lowest first_seq first");
     }
 
     /// P16 — per-group levels sum to the top-level levels, per level.
