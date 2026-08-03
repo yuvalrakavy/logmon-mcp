@@ -14,7 +14,7 @@
 //! > **Render where rendering removes noise. Leave a small flat result as JSON.**
 //!
 //! Measured on live replies: `status.get` renders 6.7× smaller, and what it
-//! drops is 47 tool names an MCP client already holds. Record reads render ~2×
+//! drops is 48 tool names an MCP client already holds. Record reads render ~2×
 //! smaller with no JSON punctuation to mis-parse. A `filters.add` reply is 50
 //! bytes and rendering it would save 20 while risking a hidden field — so
 //! mutations return JSON, by rule rather than by omission.

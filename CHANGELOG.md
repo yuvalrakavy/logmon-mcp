@@ -20,6 +20,14 @@ and `line` sit at ~100% as *additional fields*. Reporting the empty row is the
 point; omitting it reads as "no such field" and sends you looking for another
 name.
 
+**A row is identified by `(source, field)`, and carries the selector that
+reaches it.** Because GELF strips the `_` prefix, a payload with both `file` and
+`_file` produces a built-in AND an additional field of the same name — different
+values, different selectors (`fi` versus `file`). Each gets its own row. The
+`selector` field is what you paste into a filter; it is deliberately not always
+the field name, and a `null` there means no log filter reaches that field at all
+(`trace_id`/`span_id` — use the `trace_id` parameter on `get_recent_logs`).
+
 Also new underneath: `InMemoryStore::for_each_matching`, a whole-ring walk that
 does not clone. The existing `recent_with_scanned` early-stops at `count`, so
 anything built on it describes the newest slice of the buffer while claiming to

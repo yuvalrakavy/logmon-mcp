@@ -125,10 +125,13 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
 
   Why first: any grouping or filtering needs a **field name**, and a name that does not exist returns an empty result rather than an error — so guessing costs you a silent wrong answer. This is the map.
 
-  Three things it tells you that nothing else will:
-  - **A row at 0% coverage means the field EXISTS and is never populated.** That is the normal case for the top-level GELF built-ins (`fa`, `fi`, `ln`) when an emitter sends everything as underscore-prefixed extras — `file` and `line` will be there at ~100% as *additional fields* while `fi`/`ln` match nothing. Group by the spelling that has coverage.
-  - **`kind`** (`string` / `integer` / `float` / `bool` / `mixed`) tells you which fields a numeric aggregation could ever sum.
-  - **`[promoted]`** marks `trace_id` / `span_id`, which the parser lifts out of `additional_fields` — they are real, just not where you would look for them.
+  Four things it tells you that nothing else will:
+  - **Filter with the row's `selector`, NOT its field name.** They differ, and the difference is silent. GELF strips the `_` prefix, so `_file` becomes an additional field named `file` sitting *beside* the built-in `file` — two different fields, reached by `file` and `fi` respectively. Both may appear as separate rows. Typing the name where a selector was needed matches nothing and reports no error.
+  - **A row at 0% coverage means the field EXISTS and is never populated.** The normal case for the top-level GELF built-ins (`fa`, `fi`, `ln`) when an emitter sends everything as underscore-prefixed extras. Use the spelling that has coverage.
+  - **`kind`** (`string` / `integer` / `float` / `number` / `bool` / `mixed`) tells you which fields a numeric aggregation could sum. It is stated from the schema for built-ins, so a never-populated `line` still reports `integer`.
+  - **`selector: (none)`** means **no log filter reaches this field at all.** That is `trace_id` and `span_id`: the parser lifts them out of `additional_fields`, so `trace_id=…` in a filter matches nothing silently. Use `get_recent_logs(trace_id=…)` instead.
+
+  `names_capped` means there were more distinct field names than the cap and some rows are missing. `truncated` needs a lower bound (`b>=`) to mean anything — with no bound, read `buffer_oldest_seq` / `lost_below` to see whether the ring wrapped.
 
   Cursor qualifiers (`c>=`) are refused: a cursor advances on read, so two identical calls would describe different populations. Use `b>=` for a repeatable window.
 - **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=50`.

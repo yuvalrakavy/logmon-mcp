@@ -97,11 +97,104 @@ async fn an_absent_builtin_is_reported_at_zero_rather_than_omitted() {
 
     // And the promoted pair are present as rows even with no trace ids, since
     // grouping by `trace_id` is the natural thing for an agent to try.
-    assert!(field(&reply, "trace_id").is_some());
+    let t = field(&reply, "trace_id").expect("promoted rows are seeded");
+    assert_eq!(t["source"].as_str(), Some("promoted"));
+    assert!(
+        t.get("selector").is_none() || t["selector"].is_null(),
+        "no log filter selector reaches trace_id; offering one would \
+         manufacture a silent-empty filter"
+    );
+}
+
+/// A built-in and a same-named additional field are DIFFERENT rows.
+///
+/// GELF strips `_`, so `_file` becomes `additional_fields["file"]` beside the
+/// top-level `file`. Merged, coverage exceeded 100% and the built-in's row —
+/// the one this whole read exists to surface — was absorbed.
+#[tokio::test]
+async fn a_builtin_and_a_same_named_extra_do_not_merge() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let mut e = logmon_broker_core::gelf::message::LogEntry::synthetic(Level::Info, "m");
+    e.file = Some("builtin.rs".into());
+    e.additional_fields
+        .insert("file".into(), json!("extra.rs"));
+    daemon.inject_entry(e).await;
+    settle(&mut client, 1).await;
+
+    let reply: Value = client.call("logs.fields", json!({})).await.unwrap();
+    let rows: Vec<&Value> = reply["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .filter(|f| f["field"].as_str() == Some("file"))
+        .collect();
+
+    assert_eq!(rows.len(), 2, "two sources, two rows: {rows:?}");
+    for r in &rows {
+        assert_eq!(r["present"].as_u64(), Some(1), "one record, not two");
+        assert!(
+            r["coverage_pct"].as_f64().unwrap_or(0.0) <= 100.0,
+            "coverage cannot exceed 100% of matched: {r}"
+        );
+    }
+    let selectors: Vec<Option<&str>> = rows.iter().map(|r| r["selector"].as_str()).collect();
+    assert!(
+        selectors.contains(&Some("fi")) && selectors.contains(&Some("file")),
+        "and they carry the different selectors that reach them: {selectors:?}"
+    );
+}
+
+/// The completeness channel actually FIRES.
+///
+/// Mutation found the gap: hardcoding `evicted_before_window` to `None` left
+/// every test in this file green, because nothing drove a real eviction. The
+/// default filter has no lower bound, so `truncated` is structurally false —
+/// only a bound filter over an evicted region can exercise it.
+#[tokio::test]
+async fn truncated_fires_when_the_window_predates_the_buffer() {
+    // A ring small enough to wrap in this test's lifetime.
+    let mut config = default_test_config();
+    config.buffer_size = 20;
+    let daemon = TestDaemonHandle::spawn_with_config(config).await;
+    let mut client = daemon.connect_anon().await;
+
+    client
+        .call::<Value>("bookmarks.add", json!({ "name": "start" }))
+        .await
+        .expect("mark before the flood");
+
+    for i in 0..200 {
+        daemon.inject_log(Level::Info, &format!("m{i}")).await;
+    }
+    // Wait for the ring to wrap. Polling on `lost_below` rather than sleeping:
+    // the property under test is eviction, and a fixed sleep that fired early
+    // would make this pass for the wrong reason.
+    let mut wrapped = false;
+    for _ in 0..80 {
+        let r: Value = client.call("logs.fields", json!({})).await.unwrap();
+        if r["lost_below"].as_u64().unwrap_or(0) > 0 {
+            wrapped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(wrapped, "the ring never wrapped, so this proves nothing");
+
+    let reply: Value = client
+        .call("logs.fields", json!({ "filter": "b>=start" }))
+        .await
+        .unwrap();
+
     assert_eq!(
-        field(&reply, "trace_id").and_then(|t| t["promoted"].as_bool()),
+        reply["truncated"].as_bool(),
         Some(true),
-        "marked, or a reader looks for it inside additional_fields"
+        "the window starts below what the ring still holds: {reply}"
+    );
+    assert!(
+        reply["evicted_before_window"].as_u64().unwrap_or(0) > 0,
+        "and says how much rolled off: {reply}"
     );
 }
 
@@ -137,6 +230,41 @@ async fn a_cursor_qualifier_is_rejected() {
     assert!(
         msg.contains("b>="),
         "naming the read-only alternative, or the caller has to guess: {msg}"
+    );
+}
+
+/// A refusal must leave NOTHING behind.
+///
+/// `resolve_bookmarks` -> `cursor_read_and_advance` auto-creates a bookmark at
+/// seq 0 for an unknown cursor name, as a side effect of resolution. Checking
+/// the commit handle afterwards is too late — the refusal was honest about not
+/// advancing and silently wrong about not writing.
+///
+/// The test above cannot catch this: it reuses a bookmark created moments
+/// earlier, so resolution takes the read-existing branch and never inserts. An
+/// UNKNOWN name is the whole fixture.
+#[tokio::test]
+async fn a_refused_cursor_creates_no_bookmark() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    daemon.inject_log(Level::Info, "one").await;
+    settle(&mut client, 1).await;
+
+    let before: Value = client.call("bookmarks.list", json!({})).await.unwrap();
+    assert_eq!(before["count"].as_u64(), Some(0), "clean slate");
+
+    client
+        .call::<Value>("logs.fields", json!({ "filter": "c>=never_seen_before" }))
+        .await
+        .expect_err("refused");
+
+    let after: Value = client.call("bookmarks.list", json!({})).await.unwrap();
+    assert_eq!(
+        after["count"].as_u64(),
+        Some(0),
+        "a refused call must not mutate the bookmark store; this read is the \
+         first thing an agent runs against an unfamiliar buffer, and a quiet \
+         workload would accumulate one of these per typo: {after}"
     );
 }
 

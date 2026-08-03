@@ -186,6 +186,13 @@ impl TestDaemonHandle {
         let _ = self.log_tx.send(entry).await;
     }
 
+    /// Inject a fully-built entry, for fixtures that need fields
+    /// `LogEntry::synthetic` leaves empty — a populated `file`/`line`, a trace
+    /// context, or an additional field that collides with a built-in name.
+    pub async fn inject_entry(&self, entry: LogEntry) {
+        let _ = self.log_tx.send(entry).await;
+    }
+
     /// Pause the accept loop. While paused, the daemon skips the `accept()`
     /// call and yields for 50 ms per tick; the listener stays bound, so new
     /// `connect_*` calls queue in the kernel backlog and complete once

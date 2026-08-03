@@ -281,8 +281,32 @@
           "format": "uint",
           "minimum": 0
         },
+        "buffer_oldest_seq": {
+          "description": "The ring's real bounds.\n\nPresent because `truncated` can only speak about a WINDOW: it needs a\nresolved lower bound, so a call with no `b>=` reports `false` however\nmuch rolled off. These two, with `lost_below`, are how a caller sees a\nwrapped buffer regardless of the filter.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lost_below": {
+          "description": "The lowest seq this buffer can still speak for; `0` means nothing has\never been evicted.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
         "truncated": {
-          "description": "True when the query's lower bound predates the oldest retained record,\nso this describes an incomplete window.",
+          "description": "True when the query's lower bound predates the oldest retained record,\nso this describes an incomplete window. **Requires a lower bound to be\nmeaningful** — see `buffer_oldest_seq`.",
           "type": "boolean",
           "default": false
         },
@@ -293,6 +317,11 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "names_capped": {
+          "description": "True when the field-NAME cap was reached and some names are missing from\n`fields`. A truncated map presented as the whole one would be the same\nsilent-undercount this read exists to prevent.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -303,12 +332,22 @@
       ],
       "$defs": {
         "FieldStats": {
-          "description": "One field's row in the map.",
+          "description": "One field's row in the map.\n\nIdentified by `(source, field)`, not by `field` alone: two rows may share a\nname and differ in source. Read `selector` to know what to actually type.",
           "type": "object",
           "properties": {
             "field": {
-              "description": "The name an axis would be spelled with.",
+              "description": "The field's name as it appears on the record.",
               "type": "string"
+            },
+            "source": {
+              "$ref": "#/$defs/FieldSource"
+            },
+            "selector": {
+              "description": "**The DSL spelling that matches this row**, ready to paste into a\nfilter — `fi` for the built-in `file`, `file` for the additional field of\nthe same name.\n\n`null` means no log filter selector reaches this field at all. That is\nthe case for `trace_id` and `span_id`: the parser removes them from\n`additional_fields`, so `trace_id=…` in a filter would match nothing and\nreport no error. Use the `trace_id` PARAMETER on `logs.recent` instead.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "present": {
               "description": "Records carrying it, out of `matched`.",
@@ -338,18 +377,35 @@
             },
             "kind": {
               "$ref": "#/$defs/ValueKind"
-            },
-            "promoted": {
-              "description": "True for fields the parser lifts out of `additional_fields` (`trace_id`,\n`span_id`). They are real, but not where an agent expects to find them.",
-              "type": "boolean"
             }
           },
           "required": [
             "field",
+            "source",
             "present",
             "coverage_pct",
             "top_values",
             "kind"
+          ]
+        },
+        "FieldSource": {
+          "description": "Where a field's value lives on a record — and therefore which filter\nselector reaches it.\n\n**A name alone does not identify a field.** GELF strips the `_` prefix, so a\npayload sending both `file` and `_file` produces a top-level `LogEntry.file`\nAND an `additional_fields[\"file\"]`. Those are two different values reached by\ntwo different selectors (`fi` versus `file`), and merging them into one row\ndouble-counts coverage and hides the built-in's true (often zero) presence —\nwhich is the one fact this whole read exists to surface.",
+          "oneOf": [
+            {
+              "description": "A dedicated slot on the record: level, message, host, facility, file,\nline. Reached by a short DSL selector (`fi`, `ln`, …).",
+              "type": "string",
+              "const": "builtin"
+            },
+            {
+              "description": "An underscore-prefixed GELF extra, stripped of its prefix. Reached by its\nown name.",
+              "type": "string",
+              "const": "additional"
+            },
+            {
+              "description": "Lifted out of `additional_fields` by the parser (`trace_id`, `span_id`).\nReal, but **no log filter selector reaches it** — see `selector`.",
+              "type": "string",
+              "const": "promoted"
+            }
           ]
         },
         "TopValue": {
@@ -383,7 +439,12 @@
               ]
             },
             {
-              "description": "Values of more than one kind under one name. Not an error — emitters do\nthis — but a caller must not assume it can be summed.",
+              "description": "Integers and floats seen under one name. Still summable — an emitter\nwriting `100` and `100.5` for one quantity is ordinary, and calling that\n`mixed` would warn against the one case where the warning is wrong.",
+              "type": "string",
+              "const": "number"
+            },
+            {
+              "description": "Genuinely disagreeing kinds under one name (a string and a number, say).\nNot an error — emitters do this — but a caller must not assume it can be\nsummed.",
               "type": "string",
               "const": "mixed"
             },
@@ -399,12 +460,22 @@
     "FieldStats": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "FieldStats",
-      "description": "One field's row in the map.",
+      "description": "One field's row in the map.\n\nIdentified by `(source, field)`, not by `field` alone: two rows may share a\nname and differ in source. Read `selector` to know what to actually type.",
       "type": "object",
       "properties": {
         "field": {
-          "description": "The name an axis would be spelled with.",
+          "description": "The field's name as it appears on the record.",
           "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/FieldSource"
+        },
+        "selector": {
+          "description": "**The DSL spelling that matches this row**, ready to paste into a\nfilter — `fi` for the built-in `file`, `file` for the additional field of\nthe same name.\n\n`null` means no log filter selector reaches this field at all. That is\nthe case for `trace_id` and `span_id`: the parser removes them from\n`additional_fields`, so `trace_id=…` in a filter would match nothing and\nreport no error. Use the `trace_id` PARAMETER on `logs.recent` instead.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "present": {
           "description": "Records carrying it, out of `matched`.",
@@ -434,20 +505,37 @@
         },
         "kind": {
           "$ref": "#/$defs/ValueKind"
-        },
-        "promoted": {
-          "description": "True for fields the parser lifts out of `additional_fields` (`trace_id`,\n`span_id`). They are real, but not where an agent expects to find them.",
-          "type": "boolean"
         }
       },
       "required": [
         "field",
+        "source",
         "present",
         "coverage_pct",
         "top_values",
         "kind"
       ],
       "$defs": {
+        "FieldSource": {
+          "description": "Where a field's value lives on a record — and therefore which filter\nselector reaches it.\n\n**A name alone does not identify a field.** GELF strips the `_` prefix, so a\npayload sending both `file` and `_file` produces a top-level `LogEntry.file`\nAND an `additional_fields[\"file\"]`. Those are two different values reached by\ntwo different selectors (`fi` versus `file`), and merging them into one row\ndouble-counts coverage and hides the built-in's true (often zero) presence —\nwhich is the one fact this whole read exists to surface.",
+          "oneOf": [
+            {
+              "description": "A dedicated slot on the record: level, message, host, facility, file,\nline. Reached by a short DSL selector (`fi`, `ln`, …).",
+              "type": "string",
+              "const": "builtin"
+            },
+            {
+              "description": "An underscore-prefixed GELF extra, stripped of its prefix. Reached by its\nown name.",
+              "type": "string",
+              "const": "additional"
+            },
+            {
+              "description": "Lifted out of `additional_fields` by the parser (`trace_id`, `span_id`).\nReal, but **no log filter selector reaches it** — see `selector`.",
+              "type": "string",
+              "const": "promoted"
+            }
+          ]
+        },
         "TopValue": {
           "type": "object",
           "properties": {
@@ -479,7 +567,12 @@
               ]
             },
             {
-              "description": "Values of more than one kind under one name. Not an error — emitters do\nthis — but a caller must not assume it can be summed.",
+              "description": "Integers and floats seen under one name. Still summable — an emitter\nwriting `100` and `100.5` for one quantity is ordinary, and calling that\n`mixed` would warn against the one case where the warning is wrong.",
+              "type": "string",
+              "const": "number"
+            },
+            {
+              "description": "Genuinely disagreeing kinds under one name (a string and a number, say).\nNot an error — emitters do this — but a caller must not assume it can be\nsummed.",
               "type": "string",
               "const": "mixed"
             },
@@ -527,7 +620,12 @@
           ]
         },
         {
-          "description": "Values of more than one kind under one name. Not an error — emitters do\nthis — but a caller must not assume it can be summed.",
+          "description": "Integers and floats seen under one name. Still summable — an emitter\nwriting `100` and `100.5` for one quantity is ordinary, and calling that\n`mixed` would warn against the one case where the warning is wrong.",
+          "type": "string",
+          "const": "number"
+        },
+        {
+          "description": "Genuinely disagreeing kinds under one name (a string and a number, say).\nNot an error — emitters do this — but a caller must not assume it can be\nsummed.",
           "type": "string",
           "const": "mixed"
         },

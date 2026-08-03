@@ -282,8 +282,13 @@ pub enum ValueKind {
     Integer,
     Float,
     Bool,
-    /// Values of more than one kind under one name. Not an error — emitters do
-    /// this — but a caller must not assume it can be summed.
+    /// Integers and floats seen under one name. Still summable — an emitter
+    /// writing `100` and `100.5` for one quantity is ordinary, and calling that
+    /// `mixed` would warn against the one case where the warning is wrong.
+    Number,
+    /// Genuinely disagreeing kinds under one name (a string and a number, say).
+    /// Not an error — emitters do this — but a caller must not assume it can be
+    /// summed.
     Mixed,
     /// Null, array or object: present, but neither a dimension nor a number.
     Other,
@@ -297,11 +302,48 @@ pub struct TopValue {
     pub count: usize,
 }
 
+/// Where a field's value lives on a record — and therefore which filter
+/// selector reaches it.
+///
+/// **A name alone does not identify a field.** GELF strips the `_` prefix, so a
+/// payload sending both `file` and `_file` produces a top-level `LogEntry.file`
+/// AND an `additional_fields["file"]`. Those are two different values reached by
+/// two different selectors (`fi` versus `file`), and merging them into one row
+/// double-counts coverage and hides the built-in's true (often zero) presence —
+/// which is the one fact this whole read exists to surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldSource {
+    /// A dedicated slot on the record: level, message, host, facility, file,
+    /// line. Reached by a short DSL selector (`fi`, `ln`, …).
+    Builtin,
+    /// An underscore-prefixed GELF extra, stripped of its prefix. Reached by its
+    /// own name.
+    Additional,
+    /// Lifted out of `additional_fields` by the parser (`trace_id`, `span_id`).
+    /// Real, but **no log filter selector reaches it** — see `selector`.
+    Promoted,
+}
+
 /// One field's row in the map.
+///
+/// Identified by `(source, field)`, not by `field` alone: two rows may share a
+/// name and differ in source. Read `selector` to know what to actually type.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FieldStats {
-    /// The name an axis would be spelled with.
+    /// The field's name as it appears on the record.
     pub field: String,
+    pub source: FieldSource,
+    /// **The DSL spelling that matches this row**, ready to paste into a
+    /// filter — `fi` for the built-in `file`, `file` for the additional field of
+    /// the same name.
+    ///
+    /// `null` means no log filter selector reaches this field at all. That is
+    /// the case for `trace_id` and `span_id`: the parser removes them from
+    /// `additional_fields`, so `trace_id=…` in a filter would match nothing and
+    /// report no error. Use the `trace_id` PARAMETER on `logs.recent` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
     /// Records carrying it, out of `matched`.
     pub present: usize,
     /// Share of `matched` carrying it.
@@ -312,10 +354,6 @@ pub struct FieldStats {
     pub distinct: Option<usize>,
     pub top_values: Vec<TopValue>,
     pub kind: ValueKind,
-    /// True for fields the parser lifts out of `additional_fields` (`trace_id`,
-    /// `span_id`). They are real, but not where an agent expects to find them.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub promoted: bool,
 }
 
 /// `logs.fields` — the map an agent needs before it can name an axis.
@@ -350,12 +388,32 @@ pub struct LogsFieldsResult {
     pub scanned: usize,
     /// Total records currently in the queried buffer.
     pub buffer_total: usize,
+    /// The ring's real bounds.
+    ///
+    /// Present because `truncated` can only speak about a WINDOW: it needs a
+    /// resolved lower bound, so a call with no `b>=` reports `false` however
+    /// much rolled off. These two, with `lost_below`, are how a caller sees a
+    /// wrapped buffer regardless of the filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_newest_seq: Option<u64>,
+    /// The lowest seq this buffer can still speak for; `0` means nothing has
+    /// ever been evicted.
+    #[serde(default)]
+    pub lost_below: u64,
     /// True when the query's lower bound predates the oldest retained record,
-    /// so this describes an incomplete window.
+    /// so this describes an incomplete window. **Requires a lower bound to be
+    /// meaningful** — see `buffer_oldest_seq`.
     #[serde(default)]
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evicted_before_window: Option<u64>,
+    /// True when the field-NAME cap was reached and some names are missing from
+    /// `fields`. A truncated map presented as the whole one would be the same
+    /// silent-undercount this read exists to prevent.
+    #[serde(default)]
+    pub names_capped: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
