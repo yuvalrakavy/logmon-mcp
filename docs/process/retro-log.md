@@ -537,3 +537,90 @@ It is the only check that exercises the resolver a user gets.
      built-in axes it endorsed match zero records.
 - note: **4 entries since `## Consolidated through 2026-07-30`** — one short of
   the `/process-retro` trigger. Worth running after the next feature.
+
+## 2026-08-03 `logs.profile` (T2) — the axis, and three vacuous tests I wrote
+
+- time: design ~35% (duty 0 + live probes + spec + 2 self-review rounds), build
+  ~25%, gates and remediation ~40%. Four gate ROUNDS: design gate (4 lenses),
+  mutation, deep gate (2 readers), re-gate of the fix delta. Remediation
+  dominated again, and this time it was earned rather than avoidable — see
+  `improve`.
+- catches: probe=6 self-review=8 gate=53 user=1 post-merge=0.
+  - **probes did real work for once.** Live-buffer measurement falsified two of
+    the parent spec's own claims: the 1024 cardinality cap is a leak guard that
+    never fires on real data (highest real axis: 204 distinct), while
+    `__absent__` — which the spec treated as an edge case — is the MEDIAN case
+    at 86.4% on `kind` and >90% on 20 of 31 axes. That inversion drove the whole
+    design. Rendering the candidate shapes on real data (rather than describing
+    them) found the clip collision and the level-spelling mismatch before either
+    was written.
+  - **design gate, 4 lenses, 25 findings.** Six were one-sentence "reuse X"
+    claims never traced — the dominant bucket and now its own memory. The
+    architect audit found five requirement gaps I had decided unilaterally
+    (three went back to the user and two changed the design) plus two
+    structurally different shapes that were never offered. The false-positive
+    lens found `group_keys: []` would be refused despite a live test asserting
+    `Some(vec![])` and `None` are deliberately different for that exact
+    parameter.
+  - **deep gate: 25 mutations (23 caught), then 15 reader findings.** Both
+    survivors were ABSENT PROBES, not vacuous fixtures — `MAX_KEYS` had no test
+    at all, and `bounds()` could be replaced with `Bounds::default()` with all
+    30 tests green. Two blockers followed: the renderer selected the reserved
+    bucket **by its rendered label**, so an emitter field valued literally
+    `__absent__` inverted the header's absent share (measured: reported 5 carry
+    it / 3 absent when the truth was the reverse); and `suppressed()` told the
+    caller a field "did not appear in any matched record" when it was on every
+    one, because `present == 0` and `structured > 0` are independent and it
+    checked absence first.
+  - **re-gate of the fix delta, 3 blockers.** The sharpest finding of the day:
+    **the test I wrote to prove the width fix could not fail.** Reverting
+    `key_col` to the pre-fix constant left all 19 renderer tests green,
+    including that one, under its own 20-line comment claiming to catch exactly
+    that. It compared an offset inside the padding, and mixed byte indices with
+    columns.
+  - **user catch:** gate agents were creating chips for out-of-scope findings.
+    Chips die with the session, and the orchestrator has no list tool — so when
+    asked "are those implemented?" the honest answer included "I cannot tell you
+    what else is sitting there."
+- DG≈90 IG≈84 SG≈6 post-merge=0. Both high, and the ratio is the story: DG did
+  not fall, so the design pass is still where the defects originate.
+- friction: the `--features test-support` trap cost a round-trip for every agent
+  not warned about it — without the flag the integration suite compiles to ZERO
+  tests and prints `ok`. UNGUARDED, and the fix is a shared brief file (below).
+  A `grep -c` returning 0 made a green suite report as a failed command, because
+  a pipeline exits with the FILTER's status; already a red flag, fired anyway.
+- tier-call: right (T2). The contract surface justified it and the gate found
+  contract-level defects.
+- delegation: design gate 4× (Sonnet grounding audit, Opus implementer+soundness,
+  Opus architect audit, Sonnet false-positive lens) = 673k tokens. Deep gate 3×
+  (Sonnet mutation in its own worktree, Opus depth, Sonnet breadth) = 740k.
+  Re-gate 1× Opus = 192k. **~1.6M subagent tokens total.** Sonnet on breadth
+  found the highest-value semantic bug of the session, so the cost tier is not
+  where the quality lives. The mutation lens earned its worktree: it mutates.
+- improve:
+  1. **A test written to prove a fix inherits the fix's blind spot.** Three
+     vacuous tests this feature, and every one was written in the same breath as
+     the code it guards. Author-of-the-fix is the worst-placed person to write
+     its test, and the only thing that finds it is running the mutation. Rule:
+     every fix that answers a finding owes its mutation re-run, not just a green
+     test.
+  2. **A field added to a reply is not done until the renderer prints it.** Six
+     findings in this bucket, and it is a REPEAT — the same class was fixed on
+     `logs.fields` weeks ago, and I fixed `first_seq`/`last_seq` for exactly this
+     reason one commit BEFORE the gate, then left `levels`, `buffer_total` and
+     both timestamps behind. A fix aimed at one instance does not sweep the
+     class. The MCP path returns the rendering INSTEAD of the JSON, so an
+     unrendered field is unreachable, not merely unpolished. Mechanically
+     checkable: every key in the handler's `json!` is printed or listed as
+     internal.
+  3. **Gate findings outside the diff get FIXED if small, filed if not, never a
+     chip** (user-directed). Three of this session's most valuable findings were
+     not in the diff under review — GELF silently destroying a non-hex
+     `_trace_id`, the CLI accepting a JSON array as one bogus key, and a sibling
+     renderer splitting rows on a newline. All three fixed.
+  4. **Gate briefs should reference a committed brief file** rather than
+     re-deriving context per agent. Seven agents each rediscovered the build
+     commands, the domain facts, and the test-support trap. One file would have
+     paid for itself on the second dispatch.
+- note: **5 entries since `## Consolidated through 2026-07-30`** — this trips the
+  `/process-retro` trigger. Run it before the next feature.
