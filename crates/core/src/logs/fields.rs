@@ -273,7 +273,6 @@ impl FieldMap {
     /// `matched` is passed in rather than counted here: the caller already has
     /// it from the walk, and a second count taken over a different iteration is
     /// how two numbers describing one population come to disagree.
-
     pub fn finish(self, matched: usize, top_values: usize) -> Vec<FieldStats> {
         let mut rows: Vec<FieldStats> = self
             .accs

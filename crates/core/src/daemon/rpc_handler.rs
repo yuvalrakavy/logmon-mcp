@@ -3129,16 +3129,17 @@ impl RpcHandler {
             // repeatable.
             return Err("cursor qualifier not permitted in traces.profile".to_string());
         }
-        let resolved = Some(
-            crate::filter::bookmark_resolver::resolve_bookmarks(
-                parsed,
-                &d.bookmarks,
-                &session_id.to_string(),
-            )
-            .map_err(|e| e.to_string())?
-            .filter,
-        );
-        let parsed = resolved.unwrap_or(crate::filter::parser::ParsedFilter::All);
+        // Resolution cannot yield "no filter" — the empty case was turned into
+        // `ParsedFilter::All` above, before the cursor check. An `Option` here
+        // was scaffolding left by the reordering, and it read as though a
+        // `None` arm existed to fall back on.
+        let parsed = crate::filter::bookmark_resolver::resolve_bookmarks(
+            parsed,
+            &d.bookmarks,
+            &session_id.to_string(),
+        )
+        .map_err(|e| e.to_string())?
+        .filter;
         let warnings: Vec<String> = crate::filter::admission::admit_span_filter(&parsed)
             .map_err(|e| e.to_string())?
             .warnings

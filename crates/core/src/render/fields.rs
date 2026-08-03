@@ -12,11 +12,21 @@ use serde_json::Value;
 /// Longest value shown inline before it is elided.
 const VALUE_WIDTH: usize = 34;
 
-/// Truncate on CHARACTER boundaries. `&s[..n]` panics mid-codepoint, and a
-/// field value is arbitrary emitter text.
+/// Flatten line breaks, then truncate on CHARACTER boundaries.
+///
+/// **Flatten first, and it is not optional.** Field names, values and selectors
+/// are all emitter-controlled — GELF strips the `_` and keeps whatever follows
+/// (`gelf/message.rs:208-214`) — so any of them can carry a newline, and one
+/// reaching a fixed-width column splits the row. 510 of 4235 distinct messages
+/// in the buffer this was measured on contain a line break; it stayed invisible
+/// only because none fell inside the first 33 characters, which an ordinary
+/// error chain (`timeout\n  at foo.rs:12`) does.
+///
+/// Truncation is on `chars()`, never bytes: `&s[..n]` panics mid-codepoint.
 fn clip(s: &str, max: usize) -> String {
+    let s = crate::render::escape::flatten(s);
     if s.chars().count() <= max {
-        return s.to_string();
+        return s;
     }
     let kept: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{kept}…")
@@ -128,8 +138,12 @@ pub fn render(result: &Value) -> Option<String> {
         // additional field that matches nothing and reports no error. The
         // column runs long instead; the FIELD name is the derivable one now,
         // so that is what gets clipped.
+        // Flattened but NOT clipped: the two rules are independent. A newline
+        // here would split the row exactly as it would in any other column,
+        // while shortening the text would hand back a filter that silently
+        // matches something else.
         let selector = match f.get("selector").and_then(Value::as_str) {
-            Some(s) => s.to_string(),
+            Some(s) => crate::render::escape::flatten(s),
             None => "(none)".to_string(),
         };
         let tops = f.get("top_values").map(top_values).unwrap_or_default();
@@ -264,6 +278,48 @@ mod tests {
             out.contains("http_status_code_detailed"),
             "the full selector must appear, unelided: {out}"
         );
+    }
+
+    /// No caller-derived string may carry a line break into the table.
+    ///
+    /// Every column here is emitter-controlled: GELF strips the leading `_` and
+    /// keeps whatever follows (`gelf/message.rs:208-214`), so a field can be
+    /// NAMED with a newline as easily as valued with one. One break turns a row
+    /// into two, and the second has no columns.
+    ///
+    /// Latent rather than live when found: 510 of 4235 distinct messages in the
+    /// measured buffer contain a break, and none happened to fall inside the
+    /// first 33 characters. An ordinary Rust error chain — `timeout\n  at
+    /// foo.rs:12` — does.
+    ///
+    /// The three Unicode breaks are here for the reason `escape::flatten` lists
+    /// them: they are not C0, so a check keyed on C0 misses them.
+    #[test]
+    fn no_column_carries_a_line_break_into_the_table() {
+        for bad in ["a\nb", "a\rb", "a\u{85}b", "a\u{2028}b", "a\u{2029}b"] {
+            let mut r = reply();
+            // A value, a field NAME and a selector — the clipped column, the
+            // clipped column with a different width, and the column that is
+            // deliberately never clipped. Flattening and clipping are separate
+            // rules and the unclipped one is the easy miss.
+            r["fields"][0]["top_values"] = json!([{"value": bad, "count": 1}]);
+            r["fields"][1]["field"] = json!(bad);
+            r["fields"][1]["selector"] = json!(bad);
+
+            let out = render(&r).expect("renders");
+            let table = out.split("top values").nth(1).unwrap_or(&out);
+            for (i, line) in table.lines().enumerate() {
+                assert!(
+                    !line.starts_with('b'),
+                    "line {i} begins with the tail of a split cell — a break \
+                     survived into the table for input {bad:?}:\n{out}"
+                );
+            }
+            assert!(
+                out.contains("a b"),
+                "the break must become a space, not vanish, for {bad:?}: {out}"
+            );
+        }
     }
 
     /// `truncated` needs a lower bound to mean anything, so these are the only
