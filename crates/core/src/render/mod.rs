@@ -30,6 +30,7 @@ pub mod blocks;
 pub mod escape;
 pub mod fields;
 pub mod profile;
+pub mod profile_logs;
 pub mod status;
 pub mod table;
 pub mod trace;
@@ -206,6 +207,7 @@ pub fn for_method(method: &str, result: &Value) -> Option<String> {
         "triggers.list" => dsl_list(result, "triggers", "(no triggers)"),
         "status.get" => status::render(result),
         "logs.fields" => fields::render(result),
+        "logs.profile" => profile_logs::render(result),
         // One renderer, two methods: both return `ProfileResult`, and the
         // deleted CLI called `print_profile` from both call sites.
         "collectors.get" | "traces.profile" => profile::render(result),
