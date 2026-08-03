@@ -11,6 +11,28 @@ committed `${SHA}`. Finders on a moving tree reconcile phantom state and never
 see the mechanisms added after dispatch, which is where the subtlest defect
 hides (twice-costed, 2026-07-19/20).
 
+**This project's test invocation, and the trap in it.** Integration suites under
+`crates/core/tests/` are gated behind `#![cfg(feature = "test-support")]`.
+Without the flag they compile to **zero tests and print `ok`** — a whole suite
+silently skipped, reported as a pass. Every brief that asks an agent to run
+tests must carry this:
+
+```
+cargo test -p logmon-broker-core --lib <module>                       # unit
+cargo test -p logmon-broker-core --features test-support --test <file>  # integration
+cargo test --workspace --features logmon-broker-core/test-support      # everything
+```
+
+Measured 2026-08-03: agents not warned about this each lost a round-trip to it.
+
+**Out-of-scope findings: FIX if small, file a GitHub issue if not, never a
+chip** (user-directed 2026-08-03). Close every brief with this — a lens aimed at
+one thing routinely finds a real defect somewhere else, and that is some of the
+highest-value output a gate produces. Three of one session's best findings were
+outside the diff under review. A chip dies with the session and the orchestrator
+cannot even enumerate them; `spawn_task` is the wrong home. Small means
+confirmed, local, and carrying its own test and control — as its own commit.
+
 **On results:** a finding both reading finders reached independently is fixed,
 not triaged — 8/8 convergent findings were real on 2026-07-30, including the
 three worst. Spend the verification pass on the non-convergent findings; that

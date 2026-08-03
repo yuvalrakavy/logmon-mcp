@@ -618,9 +618,23 @@ It is the only check that exercises the resolver a user gets.
      not in the diff under review — GELF silently destroying a non-hex
      `_trace_id`, the CLI accepting a JSON array as one bogus key, and a sibling
      renderer splitting rows on a newline. All three fixed.
-  4. **Gate briefs should reference a committed brief file** rather than
-     re-deriving context per agent. Seven agents each rediscovered the build
-     commands, the domain facts, and the test-support trap. One file would have
-     paid for itself on the second dispatch.
+  4. **`docs/process/gate-briefs.md` ALREADY EXISTS and I did not open it.**
+     This entry originally proposed creating it — written without checking,
+     which is `grep-the-specs-before-designing` failing on my own process docs,
+     in a retro about unchecked claims. All seven briefs this session were
+     hand-written from scratch, and the file's own header says why that is
+     expensive: "recomposing these from memory is how a discipline gets dropped
+     (the briefs drift ~30% per rewrite; the load-bearing lines are the ones
+     that look optional)."
+
+     Measurable consequence: the file's mutation lens already warns about "a
+     FEATURE GATE that compiles a whole suite empty and reports it ok" — the
+     exact trap that cost a round-trip for every agent I did not warn by hand.
+     The discipline was written down and unused.
+
+     The real improvement is a step, not a file: **the first action of any gate
+     is to READ `docs/process/gate-briefs.md`**, then fill its slots. What the
+     file genuinely lacked has been added — the project's own test invocation,
+     and the fix-small/file-large/never-a-chip rule.
 - note: **5 entries since `## Consolidated through 2026-07-30`** — this trips the
   `/process-retro` trigger. Run it before the next feature.
