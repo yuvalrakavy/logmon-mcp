@@ -10,3 +10,4 @@
 //! along one of them lands here beside it.
 
 pub mod fields;
+pub mod profile;

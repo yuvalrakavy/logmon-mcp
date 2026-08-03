@@ -77,7 +77,7 @@ fn merge_kind(a: ValueKind, b: ValueKind) -> ValueKind {
 /// can paste into a filter and have it match.
 ///
 /// Diverging here would produce a summary whose own suggestions do not work.
-fn render(v: &serde_json::Value) -> String {
+pub(crate) fn render(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),

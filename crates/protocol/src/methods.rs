@@ -416,6 +416,172 @@ pub struct LogsFieldsResult {
     pub names_capped: bool,
 }
 
+/// `logs.profile` — how records distribute along one named axis.
+///
+/// The sibling of `logs.fields`: that one says which dimensions exist, this one
+/// says how the population spreads along the one you pick. The axis vocabulary
+/// mirrors `traces.profile` — a closed enum names the KIND of axis, an open
+/// `group_keys` list names emitter fields — because that is the only spelling
+/// that can reach every row `logs.fields` reports. `trace_id` and `span_id`
+/// carry `selector: null`, so a filter-selector vocabulary could not name them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LogsProfile {
+    /// DSL filter describing the population to profile. Defaults to everything.
+    ///
+    /// Cursor qualifiers (`c>=`) are **rejected**: a cursor advances on read, so
+    /// a second identical call would profile a different population.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// The axis. `field` takes its names from `group_keys`; everything else is
+    /// a built-in or promoted field. `none`, `""` or omitted returns the
+    /// ungrouped figures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("enum" = [
+        "none", "", "level", "message", "host", "facility", "file", "line",
+        "trace_id", "span_id", "field", null
+    ]))]
+    pub group_by: Option<String>,
+    /// Emitter field names, at most 8. **Required non-empty when `group_by` is
+    /// `field`, and an error, non-empty, on any other axis** — a caller who
+    /// passes field names believes they are grouping by fields, so answering a
+    /// different question silently is worse than one refused round trip.
+    ///
+    /// An explicit `[]` is NOT "present": it means the same as absent here.
+    /// Elsewhere the two differ (`collectors.edit` treats `[]` as a structural
+    /// clear), but this method persists nothing for an empty list to clear, and
+    /// a generated client that always serialises `[]` would otherwise have its
+    /// most ordinary call refused.
+    ///
+    /// More than one name forms a tuple, joined with ` / `.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+    /// **Real** rows returned (default 20). The reserved buckets are additional
+    /// — see `LogsProfileResult::groups`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_n: Option<u64>,
+}
+
+/// Records per level. A fixed struct, never a map.
+///
+/// `Level` has five variants and no more (`gelf/message.rs`), so every field is
+/// always emitted: a reader never has to tell "key absent" from "count zero",
+/// which carries no information here and is a reliable source of downstream
+/// `unwrap_or(0)`. It also lets the renderer lay out fixed columns in severity
+/// order, and lets the schema state the whole domain instead of
+/// `additionalProperties`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LevelCounts {
+    pub trace: usize,
+    pub debug: usize,
+    pub info: usize,
+    pub warn: usize,
+    pub error: usize,
+}
+
+impl LevelCounts {
+    pub fn total(&self) -> usize {
+        self.trace + self.debug + self.info + self.warn + self.error
+    }
+}
+
+/// One row of a `logs.profile` breakdown.
+///
+/// **Each end of the row is one whole record** — a seq, its timestamp, and the
+/// message that was there. That is why `first_time` is the timestamp OF the
+/// record at `first_seq` rather than `min(timestamp)`: `timestamp` is
+/// emitter-supplied while `seq` is assigned at receipt, so reordering, several
+/// senders or clock skew make those different records, and a row that mixed
+/// them would describe two records at once.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LogGroup {
+    /// The value; `__absent__` or `__overflow__` for the reserved buckets;
+    /// tuple members joined with ` / `.
+    pub key: String,
+    pub count: usize,
+    pub levels: LevelCounts,
+    pub first_seq: u64,
+    pub first_time: DateTime<Utc>,
+    /// The message at `first_seq`, **verbatim** — never synthesised. For a
+    /// recurring failure the first occurrence usually carries the root cause
+    /// and the later ones are cascade or retry.
+    pub first_exemplar: String,
+    pub last_seq: u64,
+    pub last_time: DateTime<Utc>,
+    /// The message at `last_seq`, verbatim. Read beside `first_exemplar` it
+    /// answers a question neither alone can: did this group change shape over
+    /// the window?
+    pub last_exemplar: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LogsProfileResult {
+    /// At most `top_n` **real** rows, plus up to two reserved rows
+    /// (`__absent__`, `__overflow__`), which sort last and do not consume the
+    /// budget — so asking for 20 rows buys 20 real values. `groups.len()` may
+    /// therefore be as large as `top_n + 2`.
+    ///
+    /// **The rows sum to `matched` only when the real-key count is at most
+    /// `top_n`.** `groups_total` is what makes the shortfall visible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<LogGroup>,
+    /// The axis actually used. `null` when none was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouped_by: Option<String>,
+    /// Echoed so a reply is self-describing. `null` when none were given, or
+    /// when an empty array normalised to none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+    /// Distinct keys **before** truncation, `__absent__` and `__overflow__`
+    /// included — the same convention as `ProfileResult::groups_total`, not
+    /// `CollectorsDiffResult`'s.
+    ///
+    /// `null`, never `0`, when no grouping was performed: `0` would read as
+    /// "this query touched nothing" rather than "we did not look".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_total: Option<usize>,
+    /// True when a cardinality cap folded keys into `__overflow__`, so at least
+    /// one row aggregates an arbitrary, arrival-ordered member set.
+    #[serde(default)]
+    pub cardinality_capped: bool,
+    /// Across the whole matched set, not just the returned rows.
+    pub levels: LevelCounts,
+    /// Records that passed the filter.
+    pub matched: usize,
+    /// Records EXAMINED — the whole ring, never a `count`-limited prefix.
+    pub scanned: usize,
+    /// Total records currently in the queried buffer.
+    pub buffer_total: usize,
+    /// Bounds of the matched set. `null` when nothing matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_time: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_time: Option<DateTime<Utc>>,
+    /// The ring's real bounds — the only way a caller sees a wrapped buffer
+    /// when the filter carries no lower bound, in which case `truncated` is
+    /// structurally false however much rolled off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_oldest_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_newest_seq: Option<u64>,
+    /// The lowest seq this buffer can still speak for; `0` means nothing has
+    /// ever been evicted.
+    #[serde(default)]
+    pub lost_below: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_before_window: Option<u64>,
+    /// Where an axis absent from every matched record is announced, and where a
+    /// structured value that cannot be a dimension is accounted for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<Suppressed>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LogsContext {
