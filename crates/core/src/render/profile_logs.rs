@@ -168,10 +168,11 @@ pub fn render(result: &Value) -> Option<String> {
     // "top N of M" whenever the rows are a sample. `groups_total` counts the
     // reserved buckets, so the comparison is against every row shown.
     if let Some(total) = u("groups_total") {
+        let noun = if total == 1 { "group" } else { "groups" };
         if total > groups.len() as u64 {
-            let _ = write!(o, ", top {} of {total} groups", groups.len());
+            let _ = write!(o, ", top {} of {total} {noun}", groups.len());
         } else {
-            let _ = write!(o, ", {total} groups");
+            let _ = write!(o, ", {total} {noun}");
         }
     }
     o.push('\n');
@@ -439,6 +440,18 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2, "{out}");
         assert_ne!(rows[0], rows[1], "two distinct groups must not render alike");
+    }
+
+    /// `1 groups` is the kind of thing a reader notices and a test does not.
+    /// Caught by running the real binary against a real buffer.
+    #[test]
+    fn a_single_group_is_not_pluralised() {
+        let mut r = reply();
+        r["groups"] = json!([group("only", 100, 1, 9)]);
+        r["groups_total"] = json!(1);
+        let out = render(&r).expect("renders");
+        assert!(out.contains("1 group,") || out.contains("1 group\n"), "{out}");
+        assert!(!out.contains("1 groups"), "{out}");
     }
 
     /// And a non-colliding key keeps its plain form, or the check above would

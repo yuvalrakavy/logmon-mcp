@@ -35,6 +35,7 @@ Skip it (and say so) when:
 | You want to … | Call |
 |---|---|
 | Find out what is even in the buffer | `list_log_fields` |
+| See how records spread along one of those fields | `profile_logs(group_by=…)` |
 | See the most recent activity | `get_recent_logs` |
 | Find errors / panics | `get_recent_logs(filter="l>=ERROR")` or `…mfm=panic` |
 | Investigate a known entry's context | `get_log_context(seq=N)` |
@@ -91,6 +92,7 @@ The same operations are available as `logmon-mcp <subcommand>`. Use the CLI when
 | Tool | Method | Command |
 |---|---|---|
 | `list_log_fields` | `logs.fields` | `logmon-mcp logs fields` |
+| `profile_logs` | `logs.profile` | `logmon-mcp logs profile` |
 | `get_recent_logs` | `logs.recent` | `logmon-mcp logs recent` |
 | `add_bookmark` | `bookmarks.add` | `logmon-mcp bookmarks add` |
 | `get_slow_spans` | `traces.slow` | `logmon-mcp traces slow` |
@@ -132,6 +134,40 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
   - **`selector: (none)`** means **no log filter reaches this field at all.** That is `trace_id` and `span_id`: the parser lifts them out of `additional_fields`, so `trace_id=…` in a filter matches nothing silently. Use `get_recent_logs(trace_id=…)` instead.
 
   `names_capped` means there were more distinct field names than the cap and some rows are missing. `truncated` needs a lower bound (`b>=`) to mean anything — with no bound, read `buffer_oldest_seq` / `lost_below` to see whether the ring wrapped.
+
+- **`profile_logs(group_by?, group_keys?, filter?, top_n?)`** — **how the records DISTRIBUTE along one field.** `list_log_fields` says which dimensions exist; this says what the population looks like along the one you pick. Counts, a per-level breakdown, seq/time bounds, and a verbatim exemplar at *each end* of every group.
+
+  These two are one workflow. Run `list_log_fields` first, take a row, then name it here:
+
+  ```
+  logmon-mcp logs fields                                  # what is in here?
+  logmon-mcp logs profile --group-by field --group-keys target --filter "l>=Warn"
+  ```
+
+  ```
+  log profile by `field` [target] — 11 matched of 101 scanned, 2 groups
+
+    key                    count  share  Error   Warn  seqs      exemplar
+    store::rhai                7  63.6%      7         91-97     run script failed
+                                                                 run script failed (retry 4)
+    store::mqtt                4  36.4%             4  98-101    MQTT backpressure
+  ```
+
+  **How to name the axis.** A built-in goes straight into `group_by` — `level`, `message`, `host`, `facility`, `file`, `line`, `trace_id`, `span_id`. An emitter field needs `group_by="field"` plus `group_keys` naming it, and the name is the `field` value from a `list_log_fields` row. Repeat `--group-keys` for a tuple, joined with ` / ` in the key. Passing `group_keys` on a built-in axis is an error rather than an answer to a question you did not ask.
+
+  **`__absent__` is a normal row, and it is usually the biggest one.** Most axes are absent from over 90% of records — profiling by `kind` on a typical buffer puts 86% of them there. It exists so the counts still account for every matched record. It sorts last and does **not** consume `top_n`, so `top_n=20` buys twenty real values.
+
+  **`__overflow__` is a different fact** — the cardinality cap folded keys — and the two are never merged. If you see it, `cardinality_capped` is set and that row aggregates an arbitrary, arrival-ordered set.
+
+  **Read `groups_total`.** The rows sum to `matched` only when it is at most `top_n`; otherwise you are looking at a sample and the header says `top N of M`.
+
+  **A `suppressed` entry means the axis you named appears on NO matched record.** That is almost always a spelling problem, not an empty buffer — and for a built-in it usually means the emitter sends that name as an underscore-prefixed extra instead. The remedy says which call works:
+
+  > `line` did not appear in any of the 9347 matched records… an additional field named `line` covers 99.97% — use `group_by="field", group_keys=["line"]`
+
+  **Both exemplars are worth reading.** They print on one line when the group did not change and two when it did, so a second line means the group's shape moved across the window — for a recurring error, `run script failed` then `run script failed (retry 4)` is most of the diagnosis.
+
+  Counts only for now: no sums or averages over field values. Walks the whole ring, not the newest N. Cursor qualifiers are refused before resolution, so a refusal leaves nothing behind.
 
   Cursor qualifiers (`c>=`) are refused: a cursor advances on read, so two identical calls would describe different populations. Use `b>=` for a repeatable window.
 - **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=50`.
