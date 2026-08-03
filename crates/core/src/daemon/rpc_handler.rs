@@ -1119,10 +1119,17 @@ impl RpcHandler {
     /// not this connection, so there is nothing about the caller that could
     /// change the answer.
     fn handle_tools_manifest() -> Result<Value, String> {
+        // `ToolsManifestResult` describes this reply but does NOT build it —
+        // the struct exists for schema generation and is never constructed, so
+        // adding a field there changes the published schema and not one byte of
+        // what goes on the wire. Any field added to that struct must be added
+        // HERE too. `capability_skew.rs` is what enforces the pairing; nothing
+        // in the type system does.
         Ok(json!({
             "protocol_version": PROTOCOL_VERSION,
             "broker_version": env!("CARGO_PKG_VERSION"),
             "tools": logmon_broker_protocol::mcp_tools::manifest(),
+            "skill": logmon_broker_protocol::mcp_tools::SKILL,
         }))
     }
 

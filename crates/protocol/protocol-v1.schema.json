@@ -4387,6 +4387,13 @@
           "items": {
             "$ref": "#/$defs/ManifestEntry"
           }
+        },
+        "skill": {
+          "description": "The agent-facing guide (`SKILL`), for the client to surface as MCP\n`instructions`.\n\nOptional on the wire, and its absence is **not** fatal to a shim: a\nmissing document degrades guidance, while a missing tool list would make\nthe shim misrepresent the surface. Those warrant different answers, and\nthe shim gives them different answers.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

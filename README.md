@@ -269,7 +269,9 @@ logmon-mcp speaks the standard MCP stdio transport. Configure your client to lau
 Depending on how you installed logmon, the skill reaches the assistant through one of three channels — pick whichever fits:
 
 1. **Claude Code plugin (recommended for Claude Code).** If you installed via `/plugin install logmon-mcp@claude-tools`, the plugin registers the skill alongside the MCP server. Claude Code surfaces it on-demand via the skill's natural-language triggers and exposes the `/logmon-mcp:logmon` slash-namespaced form.
-2. **Embedded in the MCP server (every other host).** `logmon-mcp` embeds `skill/logmon.md` at compile time and returns it as the MCP server's `instructions`. Any MCP host that honors server instructions (Cursor, Codex, …) picks it up automatically when the server is registered.
+2. **Served by the broker (every other host).** The daemon carries `skill/logmon.md` and hands it to the shim in the `tools.manifest` reply, which returns it as the MCP server's `instructions`. Any MCP host that honors server instructions (Cursor, Codex, …) picks it up automatically when the server is registered.
+
+   The shim holds **no copy of its own** — the document arrives over the same handshake as the tool list, so the guidance you read always describes the broker that is actually answering. The practical consequence: **a skill change ships with the broker.** Rebuild and restart *it* (`cargo install --path crates/broker --locked`), then restart the MCP server; reinstalling `crates/mcp` alone changes nothing about the text a client sees.
 3. **Manual install.** Drop the file into a skills directory for Claude Code if you want to use the skill in a project where the plugin route doesn't apply, or if you want to customize the `/logmon` aliases locally:
 
    ```bash
@@ -280,7 +282,7 @@ Depending on how you installed logmon, the skill reaches the assistant through o
    mkdir -p ~/.claude/skills && cp /path/to/logmon-mcp/skill/logmon.md ~/.claude/skills/
    ```
 
-   If you tweak the on-disk copy, it takes precedence over the embedded version for hosts that honor it.
+   If you tweak the on-disk copy, it takes precedence over the broker-served version for hosts that honor it.
 
 ## Wire up your application
 

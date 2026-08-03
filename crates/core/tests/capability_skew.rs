@@ -176,3 +176,41 @@ async fn every_method_in_the_shared_table_is_dispatched_by_this_daemon() {
         "the table names methods this daemon does not have: {unknown:?}"
     );
 }
+
+/// T1 (design §8) — the daemon SENDS the skill, not merely declares it.
+///
+/// `ToolsManifestResult` is schema-only: never constructed, never deserialized.
+/// The reply is a hand-built `json!` literal, so a field added to that struct
+/// changes the published schema and not one byte of what goes on the wire.
+/// `verify-schema` compares the schema against Rust and cannot see that gap;
+/// this is the only check that can.
+///
+/// It matters because the shim no longer carries an embedded copy to fall back
+/// on — an absent field means every client starts with no guidance at all.
+#[tokio::test]
+async fn tools_manifest_serves_the_skill_document() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let reply: Value = client.call("tools.manifest", json!({})).await.unwrap();
+
+    let skill = reply["skill"].as_str().unwrap_or_else(|| {
+        panic!(
+            "`tools.manifest` must carry `skill`. The struct that declares it \
+             does not build this reply, so adding the field there is not enough \
+             — it also belongs in the `json!` in `handle_tools_manifest`."
+        )
+    });
+
+    assert_eq!(
+        skill,
+        mcp_tools::SKILL,
+        "served verbatim from the shared const, never re-rendered"
+    );
+    assert!(
+        skill.len() > 500,
+        "an empty or truncated document silently removes every piece of guidance \
+         a client would have surfaced (got {} bytes)",
+        skill.len()
+    );
+}

@@ -3,6 +3,31 @@
 Notable changes per release. Versions are `0.x`, so the MINOR component carries
 anything behaviour-visible; PATCH is reserved for fixes nobody has to know about.
 
+## Unreleased
+
+### Changed — the skill ships with the broker, not the shim
+
+`skill/logmon.md` was compiled into `logmon-mcp` and served as MCP `instructions`.
+The daemon now carries it and hands it to the shim in the `tools.manifest` reply.
+
+**A skill change is now a broker change.** Rebuild and restart the broker
+(`cargo install --path crates/broker --locked`); reinstalling the shim alone no
+longer affects the text a client sees. This inverts the previous instruction, and
+every doc that said otherwise has been corrected.
+
+Why it moved: editing the document required rebuilding and reinstalling a binary
+that had nothing to do with the change — measured on 2026-08-02, when two
+docs-only commits left every installed shim serving guidance that described the
+architecture backwards. More importantly the shim could serve a document
+describing a broker it was not talking to. The doc and the surface it documents
+now ship together and cannot drift.
+
+The shim no longer holds a copy at all: with nothing referencing the const, the
+text is absent from the `logmon-mcp` binary and present only in `logmon-broker`.
+A `tools.manifest` reply without the field is **not** fatal — a missing document
+degrades guidance, while a missing tool list would make the shim misrepresent its
+surface, so only the latter refuses to start.
+
 ## 0.10.0 — 2026-08-02
 
 **Upgrade the broker BEFORE the shim.** The shim now requires `tools.manifest`

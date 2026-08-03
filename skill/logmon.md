@@ -113,7 +113,7 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
 
 ## Architecture (one-paragraph version)
 
-`logmon-broker` is a long-running daemon that ingests GELF (UDP/TCP on `12201`) and OTLP (gRPC `4317`, HTTP `4318`), stores logs and spans in in-memory ring buffers, correlates them by `trace_id`, and serves multiple clients over `~/.config/logmon/logmon.sock` via JSON-RPC 2.0. `logmon-mcp` is the thin MCP shim — one per editor session, all sharing the same broker — and it holds no knowledge of the daemon: the tools you are holding, their parameters and the CLI's commands were all assembled at startup from the broker's `tools.manifest`. Each session owns its triggers, filters, bookmarks and collectors; named sessions persist across reconnects and daemon restarts.
+`logmon-broker` is a long-running daemon that ingests GELF (UDP/TCP on `12201`) and OTLP (gRPC `4317`, HTTP `4318`), stores logs and spans in in-memory ring buffers, correlates them by `trace_id`, and serves multiple clients over `~/.config/logmon/logmon.sock` via JSON-RPC 2.0. `logmon-mcp` is the thin MCP shim — one per editor session, all sharing the same broker — and it holds no knowledge of the daemon: the tools you are holding, their parameters, the CLI's commands **and this document itself** were all assembled at startup from the broker's `tools.manifest`. Each session owns its triggers, filters, bookmarks and collectors; named sessions persist across reconnects and daemon restarts.
 
 ## Available tools
 
@@ -312,9 +312,11 @@ Points worth knowing before you rely on it:
 
   It also reports **`broker_version`** and **`broker_tools`** — see below.
 
-**The tools you hold came from the broker itself.** The shim keeps no tool list of its own: on startup it calls `tools.manifest` and builds its MCP router and its CLI from the reply. So your tool list *is* the running broker's surface, and `broker_tools` agrees with it by construction — there is nothing to reconcile.
+**The tools you hold came from the broker itself — and so did this document.** The shim keeps no tool list and no skill of its own: on startup it calls `tools.manifest` and builds its MCP router, its CLI, and its `instructions` from that one reply. So your tool list *is* the running broker's surface, `broker_tools` agrees with it by construction, and **if you are reading this as MCP server instructions, the text and the tools shipped together and cannot disagree.**
 
-**So a tool named in this document that you do not hold means the running broker predates it.** The daemon is long-lived and does not pick up a rebuild until it is restarted, so this is what a fresh build that nobody restarted into looks like:
+**So a tool named in this document that you do not hold means you are not reading the broker's copy.** You have it from the Claude Code plugin or a local skills directory — a file on disk, which can be any age. Check `broker_version` against the document you are holding before concluding a capability is missing.
+
+The other possibility is a daemon that predates the document legitimately: the broker is long-lived and does not pick up a rebuild until restarted, so this is what a fresh build nobody restarted into looks like:
 
 ```
 The logmon broker answering here doesn't serve create_case — it's running an
@@ -325,7 +327,9 @@ then restart this MCP server.
 
 Read `broker_version` the first time you call `get_status`, and reach for `broker_tools` when a tool you expected isn't there. **Don't hand-roll around a missing capability without saying so.** `snapshot_collector` and `diff_collectors` are how a before/after comparison is done at all; substituting hand-computed ratios silently is exactly the failure these fields exist to prevent.
 
-**If you are reading this and have NO logmon tools at all**, the shim refused to start — you have this document from the Claude Code plugin or a local skills directory rather than from the MCP server, which is why the two can disagree. The shim requires `tools.manifest` and will not serve a partial surface. Same fix, same order: rebuild the broker, restart it, then restart the client. The `logmon-mcp` CLI is not a fallback here — it fails the same way, with `could not read the tool manifest`.
+**If you are reading this and have NO logmon tools at all**, the shim refused to start — so this copy necessarily came from the Claude Code plugin or a local skills directory rather than from the MCP server. The shim requires `tools.manifest` and will not serve a partial surface. Same fix, same order: rebuild the broker, restart it, then restart the client. The `logmon-mcp` CLI is not a fallback here — it fails the same way, with `could not read the tool manifest`.
+
+**A skill change ships with the broker, not the shim.** Since the daemon serves this document, correcting it means `cargo install --path crates/broker --locked` and a broker restart; reinstalling `logmon-mcp` alone changes nothing about the text you are reading.
 
 **`trace_ingest` — loss on the OTLP trace transports, before any collector saw a span.** Non-zero on any of the three means every span-derived number you report from elsewhere is a **lower bound**, `matched` included.
 

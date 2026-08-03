@@ -27,6 +27,9 @@ use rmcp::ServerHandler;
 pub struct GelfMcpServer {
     broker: Broker,
     tool_router: ToolRouter<Self>,
+    /// The guide the daemon served, held because `get_info` is synchronous and
+    /// cannot fetch it. `None` when this broker did not send one.
+    skill: Option<String>,
 }
 
 /// Build a route that forwards a manifest-declared tool to the daemon, knowing
@@ -325,25 +328,44 @@ impl GelfMcpServer {
             tools = tool_router.list_all().len(),
             "registered tools from the broker"
         );
+
+        // Absent is not an error, unlike an absent tool list above. A shim with
+        // no tools looks to a client like a server that legitimately offers
+        // none, and clients cache that — so it refuses to start. A shim with no
+        // guidance still serves every tool correctly, so refusing there would
+        // be a harsher failure than the payload warrants.
+        //
+        // `debug`, not `warn`: nothing is deployed that could answer without
+        // this field, so a warning here would fire only for a state that cannot
+        // arise, and warnings for impossible states train readers to skip them.
+        let skill = reply
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if skill.is_none() {
+            tracing::debug!("the broker served no skill document; starting without instructions");
+        }
+
         Ok(Self {
             broker,
             tool_router,
+            skill,
         })
     }
 }
 
-/// Skill content shipped as MCP `instructions` so any compliant client
-/// (Claude Code, Cursor, etc.) surfaces it as server-level guidance
-/// without the user installing the file by hand. The file lives at
-/// `skill/logmon.md` at the workspace root and is embedded at compile
-/// time.
-const SKILL_INSTRUCTIONS: &str = include_str!("../../../skill/logmon.md");
-
 #[rmcp::tool_handler]
 impl ServerHandler for GelfMcpServer {
+    /// Synchronous by rmcp's contract, which is why the document is resolved in
+    /// `taught_by` and merely read here.
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(SKILL_INSTRUCTIONS)
+        let info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build());
+        match &self.skill {
+            // `as_str()`: the bound is `impl Into<String>`, which `&String`
+            // does not satisfy.
+            Some(s) => info.with_instructions(s.as_str()),
+            None => info,
+        }
     }
 }
 
@@ -530,13 +552,39 @@ mod forwarding_route_tests {
 
 #[cfg(test)]
 mod instructions_tests {
+    //! The shim no longer holds a skill to assert about — it serves whatever the
+    //! daemon sent. The intent of the retired
+    //! `skill_instructions_is_embedded_and_non_empty` ("an empty skill silently
+    //! removes every piece of guidance a client would have surfaced") now lives
+    //! where it can actually fail:
+    //!
+    //!   * `crates/core/tests/capability_skew.rs` — the daemon SENDS a non-empty
+    //!     skill. This is the one that catches a `tools.manifest` reply built
+    //!     without the field, which no schema check can see.
+    //!   * `crates/mcp/tests/mcp_stdio.rs` — a real shim SERVES it as
+    //!     `instructions`, and the text is the daemon's rather than a local copy.
+    //!
+    //! Asserting here on a const that no longer exists would have meant keeping
+    //! the const, which is the coupling this change removes.
+
+    /// The absent arm (design §6): a broker that sends no skill leaves the shim
+    /// serving no instructions, and must not make it fail.
+    ///
+    /// Drives the resolution step directly — constructing a `GelfMcpServer`
+    /// needs a live `Broker`, so the end-to-end version of this is the stdio
+    /// test above.
     #[test]
-    fn skill_instructions_is_embedded_and_non_empty() {
+    fn an_absent_skill_resolves_to_none_rather_than_an_empty_string() {
+        let reply = serde_json::json!({ "tools": [], "broker_version": "0.10.0" });
+        let skill = reply
+            .get("skill")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         assert!(
-            super::SKILL_INSTRUCTIONS.len() > 500,
-            "the skill ships as MCP instructions; an empty one silently removes \
-             every piece of guidance a client would have surfaced"
+            skill.is_none(),
+            "an absent skill must be None; Some(\"\") would publish empty \
+             instructions, which reads to a client as 'this server has guidance \
+             and it is blank'"
         );
-        assert!(super::SKILL_INSTRUCTIONS.contains("logmon"));
     }
 }

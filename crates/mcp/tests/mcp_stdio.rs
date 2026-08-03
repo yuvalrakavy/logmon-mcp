@@ -36,6 +36,11 @@ struct Mcp {
     stdin: ChildStdin,
     out: BufReader<ChildStdout>,
     next_id: u64,
+    /// The `initialize` result, kept because `instructions` arrives there and
+    /// the handshake happens once. Previously the reply was asserted non-empty
+    /// and dropped, which is why nothing could check what the server said about
+    /// itself.
+    init: Value,
 }
 
 impl Mcp {
@@ -62,6 +67,7 @@ impl Mcp {
             stdin,
             out,
             next_id: 1,
+            init: Value::Null,
         };
 
         let r = m.request(
@@ -73,6 +79,7 @@ impl Mcp {
             }),
         );
         assert!(r.get("result").is_some(), "initialize failed: {r}");
+        m.init = r;
         m.notify("notifications/initialized");
         m
     }
@@ -162,6 +169,50 @@ where
 }
 
 /// The shim serves what the daemon declares.
+/// T3 (design §8) — a real shim serves the skill as MCP `instructions`.
+///
+/// The whole chain in one assertion: daemon reads the const, puts it on the
+/// wire, shim stores it through a synchronous `get_info`, client receives it at
+/// `initialize`. Nothing below this level observes the property, because
+/// `instructions` exists only in the handshake.
+#[tokio::test]
+async fn the_shim_serves_the_skill_as_mcp_instructions() {
+    with_mcp(|mcp, _| {
+        let instructions = mcp.init["result"]["instructions"]
+            .as_str()
+            .expect("initialize must carry `instructions`");
+        assert!(
+            instructions.len() > 500,
+            "empty instructions read to a client as a server with blank \
+             guidance, not as one with none (got {} bytes)",
+            instructions.len()
+        );
+    })
+    .await;
+}
+
+/// T4 (design §8) — the served text is the DAEMON's, not a local copy.
+///
+/// T3 cannot tell "served from the wire" from "served from a const that happens
+/// to hold the same bytes" — and a const holding those bytes is exactly the
+/// state this change left behind, so it is the state a regression returns to.
+/// Pinning the text against the shared source is what makes T3 non-vacuous.
+#[tokio::test]
+async fn the_instructions_are_the_daemons_document_not_a_local_copy() {
+    with_mcp(|mcp, _| {
+        let instructions = mcp.init["result"]["instructions"]
+            .as_str()
+            .expect("initialize must carry `instructions`");
+        assert_eq!(
+            instructions,
+            logmon_broker_protocol::mcp_tools::SKILL,
+            "byte-identical to what the daemon sent; any divergence means the \
+             shim re-acquired a copy of its own"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn the_router_is_built_from_the_daemons_manifest() {
     with_mcp(|mcp, _| {

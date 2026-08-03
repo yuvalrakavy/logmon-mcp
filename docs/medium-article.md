@@ -15,11 +15,13 @@ logmon is a single Rust daemon you run on your dev machine. Your app emits struc
 Four crates, one repo:
 
 - **`logmon-broker`** — long-lived daemon. Owns the GELF and OTLP receivers, the log and span ring buffers, and a JSON-RPC server on a Unix domain socket. Run it as a launchd agent or systemd user unit via `logmon-broker install-service`. Or don't — the shim auto-starts it on first use.
-- **`logmon-mcp`** — dual-mode binary. Without arguments it's an MCP stdio server. With a subcommand (`logmon-mcp logs recent --json`) it's a CLI that mirrors the MCP surface 1:1. Both are assembled at startup from what the broker declares, so a tool added to the daemon becomes an MCP tool and a CLI command with no reinstall.
+- **`logmon-mcp`** — dual-mode binary. Without arguments it's an MCP stdio server. With a subcommand (`logmon-mcp logs recent --json`) it's a CLI that mirrors the MCP surface 1:1. Both are assembled at startup from what the broker declares, so a tool added to the daemon becomes an MCP tool and a CLI command with no reinstall. The shim ships with no tool list, no parameter schemas, no CLI verbs — and no documentation. All four arrive in one handshake.
 - **`logmon-broker-sdk`** — typed Rust client. Test harnesses, dashboards, anything Rust that wants to talk to the broker without going through MCP.
 - **`logmon-broker-protocol`** — wire types. Ships `protocol-v1.schema.json` (JSON Schema 2020-12), drift-guarded against the Rust definitions, safe to treat as the contract for codegen in other languages.
 
 The architectural bet: **one daemon, many clients, shared buffer.** Multi-session falls out naturally, CLI and MCP shim are trivial, new transports are just another client.
+
+The bet has a corollary that took a while to follow all the way down: if the daemon is the single source of truth, the shim should hold *nothing*. Tools went first, then their schemas, then the CLI's verbs. The last holdout was the agent-facing guide — a markdown file compiled into the shim, which meant a documentation fix required rebuilding and reinstalling a binary that had nothing to do with the change, and which could describe a broker it was not talking to. Now it travels in the same reply as the tool list. The document and the surface it documents ship together, so they cannot drift apart; the class of bug where your assistant confidently explains a capability the running daemon does not have is gone, rather than guarded against.
 
 ---
 

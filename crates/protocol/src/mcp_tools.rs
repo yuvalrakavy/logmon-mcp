@@ -34,6 +34,21 @@ use serde::{Deserialize, Serialize};
 /// what closes that, and it is the reason that check is not optional.
 pub const SCHEMA_JSON: &str = include_str!("../protocol-v1.schema.json");
 
+/// The agent-facing guide, served to clients as MCP `instructions`.
+///
+/// Embedded here beside `manifest()` for the same reason the tool descriptions
+/// are: the daemon has to serve it, and the daemon does not link its clients.
+/// Putting the document with the surface it documents is what stops the two
+/// disagreeing — a shim cannot serve guidance describing tools this broker does
+/// not have, because it no longer holds a copy to serve.
+///
+/// **Not compiled into the shim.** A `const` is materialised only where it is
+/// used, so a binary that never references this contributes none of its bytes.
+/// `SCHEMA_JSON` above demonstrates the same mechanism: it is present in
+/// `logmon-broker`, which calls `manifest()`, and absent from `logmon-mcp`,
+/// which does not.
+pub const SKILL: &str = include_str!("../../../skill/logmon.md");
+
 /// One agent-facing tool: its MCP name, the RPC method it calls, and the
 /// description an agent reads to decide whether to call it.
 ///
@@ -655,6 +670,15 @@ pub struct ToolsManifestResult {
     /// than guessing from the tool list.
     pub broker_version: String,
     pub tools: Vec<ManifestEntry>,
+    /// The agent-facing guide (`SKILL`), for the client to surface as MCP
+    /// `instructions`.
+    ///
+    /// Optional on the wire, and its absence is **not** fatal to a shim: a
+    /// missing document degrades guidance, while a missing tool list would make
+    /// the shim misrepresent the surface. Those warrant different answers, and
+    /// the shim gives them different answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
 }
 
 /// One file a client is to write, resolved from a reply.
