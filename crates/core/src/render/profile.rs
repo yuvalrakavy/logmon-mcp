@@ -156,7 +156,18 @@ pub fn render(result: &Value) -> Option<String> {
     if let Some(g) = s(result, "grouped_by") {
         let _ = writeln!(o, "\n  by {g}:");
         for row in obj.get("groups").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
-            let key = s(row, "key").unwrap_or("?");
+            // **Flattened, and clipped to the column it is formatted into.**
+            // A group key is an interned span-attribute VALUE, so it is
+            // emitter-controlled: a newline in one splits the row and drops
+            // the count and duration onto a continuation line with no columns.
+            // `{key:<40}` is a minimum width, so a long key shifts every cell
+            // after it rather than being cut.
+            //
+            // This is the defect fixed in `render/fields.rs`, which was live
+            // here the whole time — the design gate's claim that "every sibling
+            // renderer flattens" was false, and `traces.profile` and
+            // `collectors.get` both read this path.
+            let key = clip_cell(s(row, "key").unwrap_or("?"), 40);
             let count = row
                 .get("exact")
                 .and_then(|e| n(e, "count"))
@@ -188,14 +199,17 @@ pub fn render(result: &Value) -> Option<String> {
     if let Some(list) = suppressed {
         let _ = writeln!(o, "\n  not reported:");
         for item in list {
+            // Flattened too: `reason` and `remedy` quote caller-supplied names
+            // — a `group_keys` entry, an attribute — so they carry emitter text
+            // into the same table.
             let _ = writeln!(
                 o,
                 "    {} — {}",
-                s(item, "field").unwrap_or("?"),
-                s(item, "reason").unwrap_or("?")
+                crate::render::escape::flatten(s(item, "field").unwrap_or("?")),
+                crate::render::escape::flatten(s(item, "reason").unwrap_or("?"))
             );
             if let Some(rem) = s(item, "remedy") {
-                let _ = writeln!(o, "      try: {rem}");
+                let _ = writeln!(o, "      try: {}", crate::render::escape::flatten(rem));
             }
         }
     }
@@ -369,6 +383,19 @@ pub fn render_diff(result: &Value) -> Option<String> {
         };
     }
     Some(o.trim_end().to_string())
+}
+
+/// Caller text on its way into a fixed-width column.
+///
+/// Flatten then truncate on CHARACTER boundaries — `&s[..n]` panics
+/// mid-codepoint, and both group keys and span names are emitter-controlled.
+fn clip_cell(s: &str, max: usize) -> String {
+    let s = crate::render::escape::flatten(s);
+    if s.chars().count() <= max {
+        return s;
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
 }
 
 fn diff_rows(rows: Option<&Value>) -> String {
@@ -566,5 +593,59 @@ mod tests {
     fn a_shape_that_is_not_a_diff_renders_to_none() {
         assert_eq!(render_diff(&json!({"a": {}})), None);
         assert_eq!(render_diff(&json!(null)), None);
+    }
+
+    /// A group key is an interned span-ATTRIBUTE value, so it is
+    /// emitter-controlled — and a newline in one used to split the row, landing
+    /// the count and duration on a continuation line with no columns.
+    ///
+    /// This is the defect `render/fields.rs` was fixed for; it was live here
+    /// the whole time, on the path `traces.profile` and `collectors.get` share.
+    /// The claim that "every sibling renderer flattens" was simply false.
+    #[test]
+    fn a_group_key_cannot_split_the_row_or_shift_its_columns() {
+        // The sentinel after each break is deliberately distinctive. A first
+        // version guarded with `starts_with('b')` and fired on the literal
+        // section header `by group:` — a check that cannot tell the defect from
+        // the page it is printed on is not a check.
+        for (bad, tail) in [
+            ("HEAD\n  TAILMARKER at foo.rs:12", "TAILMARKER"),
+            ("HEAD\u{2028}TAILMARKER", "TAILMARKER"),
+            ("HEAD\rTAILMARKER", "TAILMARKER"),
+        ] {
+            let r = json!({
+                "filter": "ALL", "level": "tree", "matched": 4, "nesting": "detected",
+                "grouped_by": "group",
+                "groups": [{"key": bad, "exact": {"count": 3, "total_ms": 1.0}}],
+                "suppressed": [{"field": bad, "reason": bad, "remedy": bad}],
+            });
+            let out = render(&r).expect("renders");
+            for line in out.lines() {
+                assert!(
+                    !line.trim_start().starts_with(tail),
+                    "a break survived into the table for {bad:?}:\n{out}"
+                );
+            }
+            // Positive evidence, not just the absence of a split: the row still
+            // carries its own count and duration on the line with its key.
+            let row = out
+                .lines()
+                .find(|l| l.contains("HEAD"))
+                .unwrap_or_else(|| panic!("no key row in:\n{out}"));
+            assert!(
+                row.contains(tail) && row.contains('3') && row.contains("1.0ms"),
+                "the whole row must survive on one line: {row}"
+            );
+        }
+
+        // And a long key is CUT rather than allowed to shift the columns —
+        // `{key:<40}` is a minimum width, not a maximum.
+        let r = json!({
+            "filter": "ALL", "level": "tree", "matched": 1, "nesting": "detected",
+            "grouped_by": "group",
+            "groups": [{"key": "x".repeat(120), "exact": {"count": 1, "total_ms": 1.0}}],
+        });
+        let out = render(&r).expect("renders");
+        assert!(out.contains('…'), "clipped: {out}");
     }
 }

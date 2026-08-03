@@ -123,6 +123,24 @@ fn default_source() -> LogSource {
     LogSource::Filter
 }
 
+/// Lift a correlation id out of `additional_fields` — **but only if it parses**.
+///
+/// The removal and the parse have to be one decision. Removing first and
+/// parsing afterwards means a value that fails to parse has already been taken
+/// out of the map and is then dropped on the floor: not promoted, not
+/// additional, no error. Everything an emitter sent under that name is gone.
+fn parse_promoted<T>(
+    fields: &mut HashMap<String, serde_json::Value>,
+    key: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<T> {
+    let parsed = fields.get(key).and_then(|v| v.as_str()).and_then(&parse);
+    if parsed.is_some() {
+        fields.remove(key);
+    }
+    parsed
+}
+
 impl LogEntry {
     /// Construct a synthetic log entry for tests / harness injection.
     ///
@@ -213,15 +231,23 @@ pub fn parse_gelf_message(bytes: &[u8], seq: u64) -> Result<LogEntry, GelfParseE
         .map(|(k, v)| (k[1..].to_string(), v.clone()))
         .collect();
 
-    let trace_id = additional_fields
-        .remove("trace_id")
-        .and_then(|v| v.as_str().map(String::from))
-        .and_then(|s| u128::from_str_radix(&s, 16).ok());
-
-    let span_id = additional_fields
-        .remove("span_id")
-        .and_then(|v| v.as_str().map(String::from))
-        .and_then(|s| u64::from_str_radix(&s, 16).ok());
+    // **Parse first, remove only on success.** `.remove()` returns the value,
+    // so removing and then failing to parse it destroys the field: the entry
+    // gets no `trace_id`, and `additional_fields` no longer has it either. An
+    // emitter sending `_trace_id` as a UUID or a decimal id — anything but
+    // lowercase hex — lost the value entirely, with no `GelfParseError` variant
+    // and nothing in the reply to say so.
+    //
+    // Keeping it as an ordinary additional field is the honest outcome: the
+    // value survives, `logs.fields` reports it with a working selector, and
+    // `logs.profile` can group by it. A promoted `trace_id` still leaves
+    // `additional_fields`, so nothing that correlates by trace id changes.
+    let trace_id = parse_promoted(&mut additional_fields, "trace_id", |s| {
+        u128::from_str_radix(s, 16).ok()
+    });
+    let span_id = parse_promoted(&mut additional_fields, "span_id", |s| {
+        u64::from_str_radix(s, 16).ok()
+    });
 
     Ok(LogEntry {
         seq,

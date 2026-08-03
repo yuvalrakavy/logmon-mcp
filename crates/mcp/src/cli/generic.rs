@@ -173,7 +173,29 @@ fn coerce(raw: &str, node: Option<&Value>) -> Result<Value, String> {
         },
         // An array element's own type is what matters; the array is built by
         // repetition, one element per occurrence.
+        //
+        // **Except a value that IS a JSON array — that is refused, with the
+        // spelling that works.** Repetition is the only form this grammar
+        // builds an array from, so `--group-keys '["a","b"]'` used to arrive as
+        // a single element named `["a","b"]`, which no field is called. On a
+        // grouped read that answers with one `__absent__` row covering 100% of
+        // the population, and a 100%-absent row is indistinguishable from a
+        // real result.
+        //
+        // Refused rather than parsed: accepting it would make two spellings
+        // canonical for one thing, and the mistake is worth naming once. This
+        // is the provable case — a field literally named `["a","b"]` is not a
+        // thing — which is the only kind a blocking check may flag. A value
+        // containing a COMMA is deliberately not refused: GELF keeps whatever
+        // follows the `_`, so a comma in a field name is legal, and guessing
+        // there would reject valid input.
         Some("array") => {
+            if let Ok(Value::Array(_)) = serde_json::from_str::<Value>(raw) {
+                return Err(format!(
+                    "`{raw}` is a JSON array, and this flag builds its array by \
+                     REPETITION — pass the flag once per value instead"
+                ));
+            }
             let item = node.and_then(|n| unwrap_optional(n).get("items"));
             coerce(raw, item)
         }
@@ -1215,6 +1237,42 @@ mod tests {
         // An unknown group falls back rather than printing an empty section.
         let h = help_for(&m, &argv(&["nonsense"]));
         assert!(h.contains("bookmarks"), "{h}");
+    }
+
+    /// A JSON array handed to a repeated-flag parameter is refused, not taken
+    /// as one element.
+    ///
+    /// This grammar builds arrays by repetition only, so `'["a","b"]'` arrived
+    /// as a single key named `["a","b"]` — which nothing is called. Downstream
+    /// that is not an error but a *result*: one `__absent__` row covering 100%
+    /// of the population, which reads exactly like a real answer. Two of the
+    /// three spellings a caller would try produced a confident wrong number.
+    ///
+    /// A comma is deliberately NOT refused. GELF keeps whatever follows the
+    /// `_`, so a field name containing a comma is legal, and refusing it would
+    /// reject valid input to catch a guess.
+    #[test]
+    fn a_json_array_for_a_repeated_flag_is_refused_with_the_spelling_that_works() {
+        let schema = serde_json::json!({
+            "type": ["array", "null"], "items": {"type": "string"}
+        });
+
+        let e = coerce(r#"["a","b"]"#, Some(&schema)).expect_err("refused");
+        assert!(e.contains("REPETITION"), "the error must say what to do: {e}");
+
+        // An ordinary value still passes, or the check above would be satisfied
+        // by refusing everything.
+        assert_eq!(
+            coerce("target", Some(&schema)),
+            Ok(Value::String("target".into()))
+        );
+        // Including one with a comma, which is legal and unguessable.
+        assert_eq!(
+            coerce("a,b", Some(&schema)),
+            Ok(Value::String("a,b".into())),
+            "a comma in a field name is legal; refusing it would trade a silent \
+             wrong answer for a rejected valid one"
+        );
     }
 
     #[test]
