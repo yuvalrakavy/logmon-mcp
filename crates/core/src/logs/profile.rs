@@ -264,6 +264,17 @@ pub struct GroupMap {
     /// announced, because folding them silently would make that bucket mean
     /// two things with nothing saying so.
     structured: Vec<usize>,
+    /// Records carrying an ADDITIONAL field of the same name as a built-in
+    /// axis — the remedy's candidate, and one `usize` rather than a map of
+    /// every name in the buffer, which is the unbounded table `NAME_CAP` was
+    /// added to stop.
+    ///
+    /// Only meaningful off the `field` axis: there the member name already IS
+    /// the additional field, so this would restate `present`. It stays 0 for
+    /// `trace_id`/`span_id` without a special case, because the parser removes
+    /// those from `additional_fields` — which is exactly why they are the
+    /// permanent no-candidate case.
+    alt: Vec<usize>,
     levels: LevelCounts,
     matched: usize,
     first_seq: Option<u64>,
@@ -311,6 +322,7 @@ impl GroupMap {
             capped: false,
             present: vec![0; members],
             structured: vec![0; members],
+            alt: vec![0; members],
             levels: LevelCounts::default(),
             matched: 0,
             first_seq: None,
@@ -380,6 +392,13 @@ impl GroupMap {
         }
         if self.axis == Axis::None {
             return;
+        }
+        // The remedy's candidate: does an ADDITIONAL field of this built-in's
+        // name exist? On the measured buffer the built-in `line` matches 0 of
+        // 9347 records while an additional `line` matches 9344, and saying so
+        // turns a dead end into the call that works.
+        if self.axis != Axis::Field && e.additional_fields.contains_key(self.axis.as_str()) {
+            self.alt[0] += 1;
         }
 
         let mut key: Vec<MemberKey> = Vec::with_capacity(self.present.len());
@@ -454,7 +473,7 @@ impl GroupMap {
     /// `additional_fields`, so there is never a same-named field to fall back
     /// on. `reason` stays factual in every case — never a "did you mean" when
     /// nothing was found.
-    pub fn suppressed(&self, candidates: &HashMap<String, usize>) -> Vec<Suppressed> {
+    pub fn suppressed(&self) -> Vec<Suppressed> {
         let mut out = Vec::new();
         if self.matched == 0 || self.axis == Axis::None {
             return out;
@@ -462,11 +481,11 @@ impl GroupMap {
         for (i, present) in self.present.iter().enumerate() {
             let name = self.axis.member_label(&self.keys, i);
             if *present == 0 {
-                let remedy = candidates.get(&name).map(|n| {
+                let remedy = (self.alt[i] > 0).then(|| {
                     format!(
                         "an additional field named `{name}` covers {:.2}% — use \
                          group_by=\"field\", group_keys=[\"{name}\"]",
-                        100.0 * *n as f64 / self.matched as f64
+                        100.0 * self.alt[i] as f64 / self.matched as f64
                     )
                 });
                 out.push(Suppressed {
@@ -800,7 +819,7 @@ mod tests {
         for e in &logs {
             map.observe(e);
         }
-        let s = map.suppressed(&HashMap::new());
+        let s = map.suppressed();
         assert_eq!(s.len(), 1, "one entry, for the one absent member: {s:?}");
         assert!(s[0].reason.contains("targett"), "it must NAME it: {s:?}");
         assert_eq!(
@@ -824,7 +843,7 @@ mod tests {
         for e in &logs {
             map.observe(e);
         }
-        let s = map.suppressed(&HashMap::new());
+        let s = map.suppressed();
         assert_eq!(
             s.len(),
             1,
@@ -854,8 +873,11 @@ mod tests {
         for e in &logs {
             map.observe(e);
         }
-        let candidates = HashMap::from([("line".to_string(), 1usize)]);
-        let s = map.suppressed(&candidates);
+        // No candidate map is passed in: the projection counted it on the same
+        // walk, from the fixture's own additional `line` field. A caller-supplied
+        // map is a second source for one fact, and this is the fact the remedy
+        // is entirely made of.
+        let s = map.suppressed();
         assert_eq!(s.len(), 1, "{s:?}");
         assert!(s[0].reason.contains("line"), "{s:?}");
         let remedy = s[0].remedy.as_deref().expect("a candidate exists, so a remedy does");
@@ -875,7 +897,7 @@ mod tests {
         for e in &logs {
             map.observe(e);
         }
-        let s = map.suppressed(&HashMap::new());
+        let s = map.suppressed();
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].remedy, None);
         assert!(
@@ -891,7 +913,7 @@ mod tests {
         let (axis, keys) = field_axis(&["anything"]);
         let map = GroupMap::new(axis, keys);
         assert_eq!(map.matched(), 0);
-        assert!(map.suppressed(&HashMap::new()).is_empty());
+        assert!(map.suppressed().is_empty());
     }
 
     /// P12 — a tuple keeps `__absent__` PER MEMBER rather than folding whole.
@@ -981,7 +1003,7 @@ mod tests {
         for e in &logs {
             map.observe(e);
         }
-        let s = map.suppressed(&HashMap::new());
+        let s = map.suppressed();
         assert_eq!(s.len(), 1, "{s:?}");
         assert!(s[0].reason.contains('2'), "it must say HOW MANY: {s:?}");
 

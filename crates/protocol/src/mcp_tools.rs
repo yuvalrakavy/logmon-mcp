@@ -217,6 +217,12 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli::PLAIN,
     },
     Tool {
+        name: "profile_logs",
+        method: "logs.profile",
+        description: "How log records DISTRIBUTE along one axis: counts, a per-level breakdown, seq/time bounds and a verbatim exemplar at each end of every group. Run list_log_fields FIRST to learn which axes exist — group_by takes a built-in (level, message, host, facility, file, line, trace_id, span_id) or `field` plus group_keys naming emitter fields, which is the `field` value from a list_log_fields row. Two group_keys form a tuple joined with ` / `. `__absent__` is a normal row and is usually the LARGEST one: on a typical buffer most axes are absent from over 90% of records, and the row is there so the counts still account for every matched record. It sorts last and does not consume top_n, so top_n=20 buys 20 real values. `__overflow__` is a different fact — the cardinality cap folded keys — and the two are never merged. Read groups_total: rows sum to matched only when it is at most top_n. A `suppressed` entry means the axis you named appears on NO matched record; for a built-in it usually means an emitter sends that name as an underscore-prefixed extra instead, and the remedy says so. Walks the whole ring, not the newest N. Cursor qualifiers are rejected before resolution, so a refusal leaves nothing behind. Counts only — no sums or averages over field values yet.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "get_log_context",
         method: "logs.context",
         description: "Get log entries surrounding a specific entry identified by seq number. Returns context before and after.",
@@ -1091,8 +1097,8 @@ mod tests {
     fn every_pair_is_well_formed_and_unique() {
         // Pinned so a tool cannot be added here without also being added to the
         // shim — the source-scan test in `mcp/src/server.rs` is the other half.
-        // 48 since `list_log_fields` (logs.fields).
-        assert_eq!(TOOLS.len(), 48);
+        // 49 since `profile_logs` (logs.profile).
+        assert_eq!(TOOLS.len(), 49);
         for Tool {
             name: tool, method, ..
         } in TOOLS

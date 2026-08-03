@@ -24,6 +24,7 @@
 use logmon_broker_core::collector::diff::DiffGroupBy;
 use logmon_broker_core::collector::document::Format;
 use logmon_broker_core::collector::project::GroupBy;
+use logmon_broker_core::logs::profile::Axis;
 use logmon_broker_core::collector::sample::Level;
 use logmon_broker_core::collector::threshold::{Metric, Op};
 use logmon_broker_core::span::types::SlowGroupBy;
@@ -180,6 +181,30 @@ fn document_format_agrees_with_the_daemon() {
         ],
         |s| Format::parse(s).is_some(),
         "html",
+    );
+}
+
+/// `logs.profile`'s axis is a closed set from the day it shipped, and this is
+/// what keeps it closed in both directions.
+///
+/// The forward half matters more here than usual: an axis the schema declares
+/// but the daemon rejects is a client sending a call that fails, while an axis
+/// the daemon accepts but the schema omits is a validating client refusing a
+/// call the daemon would serve. Both are silent to every test inside either
+/// side, which is why this file exists — six of the ten doc comments it
+/// replaced were already wrong about their own parameter.
+#[test]
+fn logs_profile_group_by_agrees_with_the_daemon() {
+    agrees(
+        "LogsProfile",
+        "group_by",
+        &Axis::ALL.map(Axis::as_str),
+        |s| Axis::parse(s).is_some(),
+        // Not a transposition but a plausible SYNONYM: an agent that knows the
+        // span side would try `group`, which is what `traces.profile` calls its
+        // open-set arm. The log side spells it `field`, and a lenient parser
+        // would answer with the ungrouped figures.
+        "group",
     );
 }
 

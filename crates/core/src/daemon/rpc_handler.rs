@@ -175,6 +175,7 @@ impl RpcHandler {
         let result = match request.method.as_str() {
             "logs.recent" => self.handle_logs_recent(session_id, &request.params),
             "logs.fields" => self.handle_logs_fields(session_id, &request.params),
+            "logs.profile" => self.handle_logs_profile(session_id, &request.params),
             "logs.context" => self.handle_logs_context(session_id, &request.params),
             "logs.export" => self.handle_logs_export(session_id, &request.params),
             "logs.clear" => self.handle_logs_clear(session_id),
@@ -960,6 +961,126 @@ impl RpcHandler {
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
             "names_capped": names_capped,
+        }))
+    }
+
+    fn handle_logs_profile(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        use crate::logs::profile::{Axis, GroupMap, MAX_KEYS};
+
+        let d = self.resolve_domain(session_id)?;
+        let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
+        let top_n = opt_usize(params, "top_n")?.unwrap_or(20);
+
+        let axis_str = opt_str(params, "group_by")?.unwrap_or("none");
+        let axis = Axis::parse(axis_str).ok_or_else(|| {
+            format!(
+                "unknown group_by `{axis_str}`: expected {}",
+                Axis::accepted()
+            )
+        })?;
+
+        // `Some(vec![])` is NOT "present". `opt_str_array` keeps the two apart
+        // because `collectors.edit` needs them apart — there an empty list is a
+        // structural clear. Nothing here persists for an empty list to clear,
+        // and a generated client that always serialises `group_keys: []` would
+        // otherwise have its most ordinary call refused.
+        let keys: Vec<String> = opt_str_array(params, "group_keys")?.unwrap_or_default();
+        let keys = if keys.is_empty() { Vec::new() } else { keys };
+
+        if keys.len() > MAX_KEYS {
+            return Err(format!(
+                "too many group_keys ({} > {MAX_KEYS}): each one multiplies the number \
+                 of distinct rows, and the table is capped — group by one or two fields, \
+                 which is the case this is built for",
+                keys.len()
+            ));
+        }
+        match axis {
+            Axis::Field if keys.is_empty() => {
+                return Err(
+                    "group_by=\"field\" needs group_keys naming the emitter fields to \
+                     group along — run list_log_fields first, and use a row's `field` \
+                     name"
+                        .to_string(),
+                );
+            }
+            // Rejected rather than ignored: unambiguously meaningless here, and
+            // a caller who passes field names believes they are grouping by
+            // fields. Answering a different question silently is worse than one
+            // refused round trip. This diverges from `traces.profile`, which
+            // performs no such check — deliberately, and decided by the user.
+            Axis::Field => {}
+            other if !keys.is_empty() => {
+                return Err(format!(
+                    "group_keys is only meaningful with group_by=\"field\"; got \
+                     group_by=\"{}\", which names a built-in field and takes no keys",
+                    other.as_str()
+                ));
+            }
+            _ => {}
+        }
+
+        // Reject the cursor BEFORE resolving — `resolve_bookmarks` ->
+        // `cursor_read_and_advance` AUTO-CREATES a bookmark at seq 0 for an
+        // unknown cursor name as a side effect, so a refusal issued afterwards
+        // is honest about not advancing and silently wrong about leaving
+        // nothing behind. Empty/whitespace means "no filter", not a parse
+        // error: bypassing `parse_and_resolve_filter` for the early rejection
+        // also bypasses that half of its contract.
+        let parsed = if filter_string.trim().is_empty() {
+            crate::filter::parser::ParsedFilter::All
+        } else {
+            crate::filter::parser::parse_filter(filter_string).map_err(|e| e.to_string())?
+        };
+        if crate::filter::parser::contains_cursor_qualifier(&parsed) {
+            return Err("cursor qualifier not permitted in logs.profile; use b>= for a \
+                        read-only window"
+                .to_string());
+        }
+        let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
+            parsed,
+            &d.bookmarks,
+            &session_id.to_string(),
+        )
+        .map_err(|e| e.to_string())?
+        .filter;
+
+        let mut map = GroupMap::new(axis, keys.clone());
+        let (counts, stats) = d
+            .pipeline
+            .for_each_log(Some(&resolved), |e| map.observe(e));
+
+        let levels = map.levels();
+        let bounds = map.bounds();
+        let suppressed = map.suppressed();
+        let capped = map.cardinality_capped();
+        let (groups, groups_total) = map.finish(top_n);
+
+        let evicted_before_window =
+            crate::filter::parser::evicted_before_window(&resolved, d.pipeline.lost_below());
+
+        Ok(json!({
+            "groups": groups,
+            // `null`, never `0`, when nothing was grouped: `0` reads as "this
+            // query touched nothing" rather than "we did not look".
+            "grouped_by": (axis != Axis::None).then(|| axis.as_str()),
+            "group_keys": (!keys.is_empty()).then_some(keys),
+            "groups_total": (axis != Axis::None).then_some(groups_total),
+            "cardinality_capped": capped,
+            "levels": levels,
+            "matched": counts.matched,
+            "scanned": counts.scanned,
+            "buffer_total": stats.buffer_total,
+            "first_seq": bounds.first_seq,
+            "last_seq": bounds.last_seq,
+            "first_time": bounds.first_time,
+            "last_time": bounds.last_time,
+            "buffer_oldest_seq": stats.buffer_oldest_seq,
+            "buffer_newest_seq": stats.buffer_newest_seq,
+            "lost_below": d.pipeline.lost_below(),
+            "truncated": evicted_before_window.is_some(),
+            "evicted_before_window": evicted_before_window,
+            "suppressed": suppressed,
         }))
     }
 

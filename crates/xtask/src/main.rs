@@ -73,6 +73,14 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "TopValue":              schema_for!(TopValue),
             "ValueKind":             schema_for!(ValueKind),
             "FieldSource":           schema_for!(FieldSource),
+            // logs.profile. Same rule as logs.fields above: the nested row
+            // types are listed because this map is hand-maintained, so an
+            // omission is a live surface nothing describes and `verify-schema`
+            // cannot see it — it re-runs this map against itself.
+            "LogsProfile":           schema_for!(LogsProfile),
+            "LogsProfileResult":     schema_for!(LogsProfileResult),
+            "LogGroup":              schema_for!(LogGroup),
+            "LevelCounts":           schema_for!(LevelCounts),
             "LogsContext":           schema_for!(LogsContext),
             "LogsContextResult":     schema_for!(LogsContextResult),
             "LogsExport":            schema_for!(LogsExport),

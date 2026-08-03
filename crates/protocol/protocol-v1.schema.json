@@ -658,6 +658,465 @@
         }
       ]
     },
+    "LogsProfile": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsProfile",
+      "description": "`logs.profile` — how records distribute along one named axis.\n\nThe sibling of `logs.fields`: that one says which dimensions exist, this one\nsays how the population spreads along the one you pick. The axis vocabulary\nmirrors `traces.profile` — a closed enum names the KIND of axis, an open\n`group_keys` list names emitter fields — because that is the only spelling\nthat can reach every row `logs.fields` reports. `trace_id` and `span_id`\ncarry `selector: null`, so a filter-selector vocabulary could not name them.",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "description": "DSL filter describing the population to profile. Defaults to everything.\n\nCursor qualifiers (`c>=`) are **rejected**: a cursor advances on read, so\na second identical call would profile a different population.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_by": {
+          "description": "The axis. `field` takes its names from `group_keys`; everything else is\na built-in or promoted field. `none`, `\"\"` or omitted returns the\nungrouped figures.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "none",
+            "",
+            "level",
+            "message",
+            "host",
+            "facility",
+            "file",
+            "line",
+            "trace_id",
+            "span_id",
+            "field",
+            null
+          ]
+        },
+        "group_keys": {
+          "description": "Emitter field names, at most 8. **Required non-empty when `group_by` is\n`field`, and an error, non-empty, on any other axis** — a caller who\npasses field names believes they are grouping by fields, so answering a\ndifferent question silently is worse than one refused round trip.\n\nAn explicit `[]` is NOT \"present\": it means the same as absent here.\nElsewhere the two differ (`collectors.edit` treats `[]` as a structural\nclear), but this method persists nothing for an empty list to clear, and\na generated client that always serialises `[]` would otherwise have its\nmost ordinary call refused.\n\nMore than one name forms a tuple, joined with ` / `.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "top_n": {
+          "description": "**Real** rows returned (default 20). The reserved buckets are additional\n— see `LogsProfileResult::groups`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "LogsProfileResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsProfileResult",
+      "type": "object",
+      "properties": {
+        "groups": {
+          "description": "At most `top_n` **real** rows, plus up to two reserved rows\n(`__absent__`, `__overflow__`), which sort last and do not consume the\nbudget — so asking for 20 rows buys 20 real values. `groups.len()` may\ntherefore be as large as `top_n + 2`.\n\n**The rows sum to `matched` only when the real-key count is at most\n`top_n`.** `groups_total` is what makes the shortfall visible.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LogGroup"
+          }
+        },
+        "grouped_by": {
+          "description": "The axis actually used. `null` when none was asked for.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "group_keys": {
+          "description": "Echoed so a reply is self-describing. `null` when none were given, or\nwhen an empty array normalised to none.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "groups_total": {
+          "description": "Distinct keys **before** truncation, `__absent__` and `__overflow__`\nincluded — the same convention as `ProfileResult::groups_total`, not\n`CollectorsDiffResult`'s.\n\n`null`, never `0`, when no grouping was performed: `0` would read as\n\"this query touched nothing\" rather than \"we did not look\".",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "cardinality_capped": {
+          "description": "True when a cardinality cap folded keys into `__overflow__`, so at least\none row aggregates an arbitrary, arrival-ordered member set.",
+          "type": "boolean",
+          "default": false
+        },
+        "levels": {
+          "description": "Across the whole matched set, not just the returned rows.",
+          "$ref": "#/$defs/LevelCounts"
+        },
+        "matched": {
+          "description": "Records that passed the filter.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "scanned": {
+          "description": "Records EXAMINED — the whole ring, never a `count`-limited prefix.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "buffer_total": {
+          "description": "Total records currently in the queried buffer.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "first_seq": {
+          "description": "Bounds of the matched set. `null` when nothing matched.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "last_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "buffer_oldest_seq": {
+          "description": "The ring's real bounds — the only way a caller sees a wrapped buffer\nwhen the filter carries no lower bound, in which case `truncated` is\nstructurally false however much rolled off.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "buffer_newest_seq": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lost_below": {
+          "description": "The lowest seq this buffer can still speak for; `0` means nothing has\never been evicted.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
+        "truncated": {
+          "type": "boolean",
+          "default": false
+        },
+        "evicted_before_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "suppressed": {
+          "description": "Where an axis absent from every matched record is announced, and where a\nstructured value that cannot be a dimension is accounted for.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Suppressed"
+          }
+        }
+      },
+      "required": [
+        "levels",
+        "matched",
+        "scanned",
+        "buffer_total"
+      ],
+      "$defs": {
+        "LogGroup": {
+          "description": "One row of a `logs.profile` breakdown.\n\n**Each end of the row is one whole record** — a seq, its timestamp, and the\nmessage that was there. That is why `first_time` is the timestamp OF the\nrecord at `first_seq` rather than `min(timestamp)`: `timestamp` is\nemitter-supplied while `seq` is assigned at receipt, so reordering, several\nsenders or clock skew make those different records, and a row that mixed\nthem would describe two records at once.",
+          "type": "object",
+          "properties": {
+            "key": {
+              "description": "The value; `__absent__` or `__overflow__` for the reserved buckets;\ntuple members joined with ` / `.",
+              "type": "string"
+            },
+            "count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "levels": {
+              "$ref": "#/$defs/LevelCounts"
+            },
+            "first_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "first_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "first_exemplar": {
+              "description": "The message at `first_seq`, **verbatim** — never synthesised. For a\nrecurring failure the first occurrence usually carries the root cause\nand the later ones are cascade or retry.",
+              "type": "string"
+            },
+            "last_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "last_time": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "last_exemplar": {
+              "description": "The message at `last_seq`, verbatim. Read beside `first_exemplar` it\nanswers a question neither alone can: did this group change shape over\nthe window?",
+              "type": "string"
+            }
+          },
+          "required": [
+            "key",
+            "count",
+            "levels",
+            "first_seq",
+            "first_time",
+            "first_exemplar",
+            "last_seq",
+            "last_time",
+            "last_exemplar"
+          ]
+        },
+        "LevelCounts": {
+          "description": "Records per level. A fixed struct, never a map.\n\n`Level` has five variants and no more (`gelf/message.rs`), so every field is\nalways emitted: a reader never has to tell \"key absent\" from \"count zero\",\nwhich carries no information here and is a reliable source of downstream\n`unwrap_or(0)`. It also lets the renderer lay out fixed columns in severity\norder, and lets the schema state the whole domain instead of\n`additionalProperties`.",
+          "type": "object",
+          "properties": {
+            "trace": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "debug": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "info": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "warn": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "error": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "Suppressed": {
+          "description": "Why a field that normally carries a number is `null`.\n\nA profile has several ways to be legitimately unable to answer — the\nretention level is too low, a warm-up cut makes an unwindowed tier\nmeaningless, nothing nested so self time carries no information. Returning\n`null` alone would leave the reader to guess which, and the guesses differ\nin what they imply about the run. Every suppression names its field and its\nreason so a consumer can distinguish \"not measured\" from \"measured as zero\".",
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Dotted path of the suppressed field, e.g. `sampled.self_ms`.",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "remedy": {
+              "description": "What the caller could change to get a number instead. Absent when\nnothing would help.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "field",
+            "reason"
+          ]
+        }
+      }
+    },
+    "LogGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogGroup",
+      "description": "One row of a `logs.profile` breakdown.\n\n**Each end of the row is one whole record** — a seq, its timestamp, and the\nmessage that was there. That is why `first_time` is the timestamp OF the\nrecord at `first_seq` rather than `min(timestamp)`: `timestamp` is\nemitter-supplied while `seq` is assigned at receipt, so reordering, several\nsenders or clock skew make those different records, and a row that mixed\nthem would describe two records at once.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "The value; `__absent__` or `__overflow__` for the reserved buckets;\ntuple members joined with ` / `.",
+          "type": "string"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "levels": {
+          "$ref": "#/$defs/LevelCounts"
+        },
+        "first_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "first_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "first_exemplar": {
+          "description": "The message at `first_seq`, **verbatim** — never synthesised. For a\nrecurring failure the first occurrence usually carries the root cause\nand the later ones are cascade or retry.",
+          "type": "string"
+        },
+        "last_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "last_time": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "last_exemplar": {
+          "description": "The message at `last_seq`, verbatim. Read beside `first_exemplar` it\nanswers a question neither alone can: did this group change shape over\nthe window?",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "count",
+        "levels",
+        "first_seq",
+        "first_time",
+        "first_exemplar",
+        "last_seq",
+        "last_time",
+        "last_exemplar"
+      ],
+      "$defs": {
+        "LevelCounts": {
+          "description": "Records per level. A fixed struct, never a map.\n\n`Level` has five variants and no more (`gelf/message.rs`), so every field is\nalways emitted: a reader never has to tell \"key absent\" from \"count zero\",\nwhich carries no information here and is a reliable source of downstream\n`unwrap_or(0)`. It also lets the renderer lay out fixed columns in severity\norder, and lets the schema state the whole domain instead of\n`additionalProperties`.",
+          "type": "object",
+          "properties": {
+            "trace": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "debug": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "info": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "warn": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "error": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "trace",
+            "debug",
+            "info",
+            "warn",
+            "error"
+          ]
+        }
+      }
+    },
+    "LevelCounts": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LevelCounts",
+      "description": "Records per level. A fixed struct, never a map.\n\n`Level` has five variants and no more (`gelf/message.rs`), so every field is\nalways emitted: a reader never has to tell \"key absent\" from \"count zero\",\nwhich carries no information here and is a reliable source of downstream\n`unwrap_or(0)`. It also lets the renderer lay out fixed columns in severity\norder, and lets the schema state the whole domain instead of\n`additionalProperties`.",
+      "type": "object",
+      "properties": {
+        "trace": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "debug": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "info": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "warn": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "error": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "trace",
+        "debug",
+        "info",
+        "warn",
+        "error"
+      ]
+    },
     "LogsContext": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "LogsContext",
