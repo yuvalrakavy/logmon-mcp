@@ -488,3 +488,52 @@ It is the only check that exercises the resolver a user gets.
   starts a service names the isolation.
 - **The cold-reader lens was not run this cycle**, and the article rewrite was
   the artifact that most wanted it.
+
+## 2026-08-02/03 daemon-served skill (T2), then `logs.fields` (T2)
+- time: skill→daemon was ~10% of the day and landed clean. `logs.fields` was
+  design → implement → **three gate rounds** → two remediation rounds; review
+  and remediation dominated by a wide margin.
+- catches: probe=2 self-review=3 user=3 gate≈26 post-merge=0.
+  - **skill→daemon:** self-review (go-and-check) found a non-compiling `&String`
+    vs `impl Into<String>` and a too-broad claim about `verify-schema`. The USER
+    then falsified §4 outright — I had asserted the skill bytes land in the shim
+    regardless of crate; a `SCHEMA_JSON` probe showed the opposite, and claim C8
+    (shim "uses" `manifest()`) turned out to be a `#[cfg(test)]` call. Design
+    landed on a false premise I had written *and* reviewed.
+  - **`logs.fields` deep gate (3 lenses, ~16 findings, 4 convergent):** rows
+    keyed by NAME collided built-in `file` with `_file` → 200% coverage and the
+    0% row absorbed — the one fact the tool exists to show. Mutation proved the
+    eviction path had NO test (hardcoding it left all 16 green) and that the
+    multibyte clip test passed by arithmetic coincidence (3-byte chars, 33
+    divisible by 3).
+  - **Re-gate of the fix delta (1 lens, 10 findings):** the headline was the
+    fixed defect DISPLACED — name-space collision resolved, selector-space
+    collision created (`_h` → additional field `h` → selector `h` → resolves to
+    `Selector::Host`, matches nothing, no error). Plus a `filter=""` regression,
+    a 9-char clip on the one string the legend says to paste verbatim, and the
+    doc-orphan defect reintroduced one file over *in the commit that fixed it*.
+- friction: none over 15 min that was tooling. The cost was rework, not traps.
+- tier-call: right (T2 both). The failure was not the tier, it was skipping a
+  gate the tier calls for.
+- delegation: design gate on the log-agg spec = 3× (Opus implementer+soundness,
+  Opus architect-audit, Sonnet cold-reader) — the architect audit found B4 and
+  the missing no-axis shape, both of which changed the architecture. Deep gate =
+  Sonnet mutation (own worktree) + Opus depth + Sonnet breadth. Re-gate = 1×
+  Opus on the delta. Every round paid for itself; the re-gate paid most.
+- improve: **three, all earned**
+  1. **A REPLACEMENT is new design and gets its own gate.** Proven twice: the
+     fix for the gate's headline finding carried that finding's blind spot into
+     a new mechanism, and only a re-gate keyed to the delta caught it. The rule
+     already exists ("change the DEFECT, not the mechanism") — what was missing
+     is that when you *do* replace, the replacement does not inherit reviewed
+     status. Re-gate the delta, always.
+  2. **Duty 0 must include "has this been specified before?"** — one grep over
+     `docs/superpowers/specs/` before designing. The whole log-aggregation
+     feature had been proposed as **B4** in the 2026-06-30 proposal, deferred by
+     name, and designed straight past. Cost: a full spec and a gate round.
+  3. **A probe must answer its own claim's question.** L7 counted
+     `additional_fields` keys and was cited as "confirmed" for claims about
+     *selector* axes — adjacent, not the same population. Three of the four
+     built-in axes it endorsed match zero records.
+- note: **4 entries since `## Consolidated through 2026-07-30`** — one short of
+  the `/process-retro` trigger. Worth running after the next feature.
