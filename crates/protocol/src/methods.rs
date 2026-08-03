@@ -2788,13 +2788,19 @@ pub struct CasesCreate {
     /// domain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Vec<DomainDataEntry>>,
-    /// Stored records to capture before the anchor. Counts of **records**, not
-    /// seq distances: one counter feeds both the log and span stores, so a
-    /// 200-seq range holds an unpredictable number of logs. Default 350, capped
-    /// at 5000.
+    /// Stored records to capture before the anchor. Counts of **records from
+    /// EITHER store**, not seq distances and not logs alone: one counter feeds
+    /// both the log and span stores, so a 200-seq range holds an unpredictable
+    /// number of each, and `before: 50` may return 40 logs and 10 spans.
+    ///
+    /// Counting logs alone was a defect, not a simplification. A span is
+    /// exported when it ENDS, so the spans of a slow operation carry seqs above
+    /// the last log about it — and a window cut from the logs then excluded
+    /// exactly the spans the case was taken for. Default 350, capped at 5000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<u32>,
-    /// Stored records to capture after the anchor. Default 350, capped at 5000.
+    /// Stored records to capture after the anchor, from either store — see
+    /// [`Self::before`]. Default 350, capped at 5000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<u32>,
 }

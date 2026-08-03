@@ -5,6 +5,30 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Fixed — `create_case` captured a window cut from the logs alone
+
+`before`/`after` counted **log** records and the resulting seq range was then
+applied to spans. One counter numbers both stores, and OTLP exports a span when
+it **ends**, so the spans of a slow operation carry seqs *above* the last log
+about it — and a case anchored on the error log excluded exactly the spans it
+was taken for.
+
+Measured against a running broker: six logs at seqs 1001–1006, three spans at
+1007–1009, `spandata: {records: 0}`. Those spans had been stored 95 seconds
+before the capture ran, so nothing was racing. The document then reported that
+seq 1006 *"was the newest record stored when the capture was taken … nothing was
+lost here"* — false in both clauses.
+
+`before`/`after` now count records from **either** store, so `before: 50` may
+return 40 logs and 10 spans. The one-interval property the old code was built
+for is preserved: the interval is cut from both stores, which is what makes it
+one interval rather than a log window imposed on spans. Fixing the window also
+makes the document's sentence true, since the window's upper end is now the
+newest record across both stores.
+
+**If you have archived cases, their `spandata` may be short.** Re-capture is the
+only remedy; nothing can reconstruct records a capture did not take.
+
 ### Added — `profile_logs` (`logs.profile`), the measurement beside the map
 
 `list_log_fields` says which dimensions exist; this says how the population

@@ -1924,20 +1924,64 @@ impl RpcHandler {
 
         // §5.1: counts of stored RECORDS, not seq distances — one counter feeds
         // both stores, so a 200-seq range holds an unpredictable number of logs.
-        let logs = d
+        //
+        // **Counted across BOTH stores.** Deriving the window from logs alone and
+        // then applying it to spans omitted every span above the last log in the
+        // window — and OTLP exports a span when it ENDS, so a slow operation's
+        // spans land exactly there. A case anchored on the error log routinely
+        // captured none of the spans of the trace it was about, while the
+        // document reported that seq `to` "was the newest record stored when the
+        // capture was taken". Measured 2026-08-03: logs 1001–1006, spans
+        // 1007–1009, zero spans captured, and those spans were stored 95 seconds
+        // BEFORE the capture ran. Counting both stores makes that sentence true
+        // as well as filling the file.
+        let log_ctx = d
             .pipeline
             .context_by_seq(anchor.seq, before.value, after.value);
-        let (from, to) = match (logs.first(), logs.last()) {
-            (Some(f), Some(l)) => (f.seq, l.seq),
+        if log_ctx.is_empty() {
             // `resolve_case_anchor` already proved the anchor is stored, so an
             // empty neighbourhood means it was evicted between the two reads.
-            _ => {
-                return Err(format!(
-                    "the anchor entry at seq {} was evicted while the capture was being taken",
-                    anchor.seq
-                ))
+            return Err(format!(
+                "the anchor entry at seq {} was evicted while the capture was being taken",
+                anchor.seq
+            ));
+        }
+
+        // Candidate seqs either side of the anchor, from both stores. The log
+        // side needs no more than its own `before`/`after`: adding spans can
+        // only make the merged window NARROWER in seq terms, never wider, so the
+        // logs already reach at least as far as the answer does.
+        //
+        // The span scan is unfiltered because the range it would be filtered by
+        // is the thing being computed. It is bounded by the ring, and a capture
+        // is a deliberate one-shot action rather than a query on a hot path.
+        let mut below: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s < anchor.seq).collect();
+        let mut above: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s > anchor.seq).collect();
+        d.span_store.for_each_matching(None, |s| {
+            if s.seq < anchor.seq {
+                below.push(s.seq);
+            } else if s.seq > anchor.seq {
+                above.push(s.seq);
             }
-        };
+        });
+
+        // Nearest the anchor first, then keep what was asked for. Both ends fall
+        // back to the anchor itself, so a side with nothing on it is an empty
+        // side rather than an inverted range.
+        below.sort_unstable_by(|a, b| b.cmp(a));
+        below.truncate(before.value);
+        above.sort_unstable();
+        above.truncate(after.value);
+        let from = below.last().copied().unwrap_or(anchor.seq);
+        let to = above.last().copied().unwrap_or(anchor.seq);
+
+        // The logs the window actually contains — a subset of `log_ctx` by
+        // construction, since any log within `[from, to]` is among the
+        // `before`/`after` nearest the anchor.
+        let logs: Vec<_> = log_ctx
+            .into_iter()
+            .filter(|e| e.seq >= from && e.seq <= to)
+            .collect();
 
         // How much of what was ASKED for came back.
         //
@@ -1948,14 +1992,10 @@ impl RpcHandler {
         // domain simply not having that much history yet is not. Only
         // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
         // would call the second one eviction on every young domain.
-        let at_anchor = logs
-            .iter()
-            .position(|e| e.seq == anchor.seq)
-            .unwrap_or(logs.len());
-        let short_before = before.value.saturating_sub(at_anchor);
-        let short_after = after
-            .value
-            .saturating_sub(logs.len().saturating_sub(at_anchor + 1));
+        // Counted in the same merged space the window was cut from, or the two
+        // numbers would describe different axes.
+        let short_before = before.value.saturating_sub(below.len());
+        let short_after = after.value.saturating_sub(above.len());
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //

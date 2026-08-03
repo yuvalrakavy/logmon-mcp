@@ -908,6 +908,17 @@ fn a_collectors_latest_run_reaches_the_document() {
 /// Every earlier test asserted `spandata.records == 0`, so deleting the span
 /// gather entirely passed the suite — while the test comment claimed the two
 /// files "describe one interval by construction".
+///
+/// **The expectation here FLIPPED from 2 to 3 on 2026-08-04, and that is the
+/// point.** This test used to assert that a span arriving after the last log was
+/// excluded, and its comment called that span "the proof, by being excluded".
+/// It was proof of a defect: the window was derived from logs alone and then
+/// applied to spans, and OTLP exports a span when it ENDS, so the spans of a
+/// slow operation land precisely there. `before`/`after` now count records in
+/// the shared seq space, so the span above the anchor is one of the `after`
+/// records and belongs in the window. The "one interval" property the old
+/// comment defended is preserved — the interval is just cut from both stores
+/// now, which is what makes it one.
 #[test]
 fn spans_over_the_resolved_range_land_in_the_spandata_file() {
     let h = harness();
@@ -916,26 +927,79 @@ fn spans_over_the_resolved_range_land_in_the_spandata_file() {
     d.span_store.insert(a_span());
     d.span_store.insert(a_span());
     let anchor = h.feed(Level::Error, "boom");
-    // Outside the resolved LOG range: no log follows it, so the window's upper
-    // end is the anchor's seq. Spans are scoped by the log range rather than by
-    // a second window parameter, which is what makes the two files describe one
-    // interval — and this span is the proof, by being excluded.
+    // One record above the anchor in the merged space, so it is inside `after`.
     d.span_store.insert(a_span());
 
     let r = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
     assert_eq!(
-        r["spandata"]["records"], 2,
-        "the two spans inside the resolved log range, not the one beyond it: {r}"
+        r["spandata"]["records"], 3,
+        "two spans below the anchor and the one above it, all within `after`: {r}"
     );
 
     let text = std::fs::read_to_string(r["paths"][2].as_str().unwrap()).unwrap();
     assert_eq!(
         text.lines().count() as u64 - 1,
-        2,
+        3,
         "and they are on disk, not merely counted"
     );
     assert!(text.contains(r#""service_name":"svc""#), "{text}");
     assert!(document_of(&r).contains("Slowest spans"), "and summarised");
+}
+
+/// The defect this fix exists for, reproduced from the live probe that found it.
+///
+/// Measured 2026-08-03 against a real broker: six GELF logs took seqs 1001–1006,
+/// three OTLP spans took 1007–1009, and a case anchored on the error log
+/// captured **zero** spans — none of the trace it was about. The spans had been
+/// stored 95 seconds *before* the capture ran, so nothing was racing; the window
+/// was simply derived from one store and applied to two.
+///
+/// The document then said "seq 1006 was the newest record stored when the
+/// capture was taken, so the shortfall after the anchor is history that had not
+/// happened yet ... nothing was lost here" — false in both clauses.
+///
+/// **Under the log-derived window this test reports 0 spans and asserts against
+/// it.** That is its red-first criterion.
+#[test]
+fn spans_arriving_after_the_last_log_are_captured_not_silently_dropped() {
+    let h = harness();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+
+    // The shape a real service produces: the logs of an operation, then the
+    // spans of that same operation, because a span is exported when it ends.
+    h.feed(Level::Info, "checkout started");
+    h.feed(Level::Warn, "payment gateway slow");
+    let anchor = h.feed(Level::Error, "payment gateway timeout");
+    d.span_store.insert(a_span());
+    d.span_store.insert(a_span());
+    d.span_store.insert(a_span());
+
+    let r = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
+
+    assert_eq!(
+        r["spandata"]["records"], 3,
+        "the spans of the failing operation must be in the case: {r}"
+    );
+
+    // And the document's claim about the top of the window must be TRUE.
+    //
+    // The sentence at `document.rs:531` — "seq {to} was the newest record stored
+    // when the capture was taken" — still fires whenever `after` was not filled,
+    // and that is correct: what makes it a lie is `to` not being the newest
+    // record. So assert the property, not the absence of the sentence. (An
+    // earlier draft of this test asserted the sentence never appears, which was
+    // the same mistake in the other direction.)
+    let fm = logmon_broker_core::cases::parse_front_matter(&document_of(&r)).unwrap();
+    assert_eq!(
+        fm.seq_range.to,
+        d.span_store.newest_seq().unwrap(),
+        "the window's upper end must be the newest record in the domain, across \
+         BOTH stores — that is what makes document.rs:531's sentence true"
+    );
+    assert_eq!(
+        fm.spandata.records, 3,
+        "and the front matter agrees with the file"
+    );
 }
 
 /// The span ring's own retention reaches the document, and the note.
