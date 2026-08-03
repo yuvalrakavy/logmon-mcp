@@ -64,6 +64,14 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             // Method param/result structs
             "LogsRecent":            schema_for!(LogsRecent),
             "LogsRecentResult":      schema_for!(LogsRecentResult),
+            // logs.fields. The nested row types are listed too: this map is
+            // hand-maintained and `verify-schema` re-runs it against itself, so
+            // an omission here is a live surface nothing describes.
+            "LogsFields":            schema_for!(LogsFields),
+            "LogsFieldsResult":      schema_for!(LogsFieldsResult),
+            "FieldStats":            schema_for!(FieldStats),
+            "TopValue":              schema_for!(TopValue),
+            "ValueKind":             schema_for!(ValueKind),
             "LogsContext":           schema_for!(LogsContext),
             "LogsContextResult":     schema_for!(LogsContextResult),
             "LogsExport":            schema_for!(LogsExport),

@@ -34,6 +34,7 @@ Skip it (and say so) when:
 
 | You want to … | Call |
 |---|---|
+| Find out what is even in the buffer | `list_log_fields` |
 | See the most recent activity | `get_recent_logs` |
 | Find errors / panics | `get_recent_logs(filter="l>=ERROR")` or `…mfm=panic` |
 | Investigate a known entry's context | `get_log_context(seq=N)` |
@@ -89,6 +90,7 @@ The same operations are available as `logmon-mcp <subcommand>`. Use the CLI when
 
 | Tool | Method | Command |
 |---|---|---|
+| `list_log_fields` | `logs.fields` | `logmon-mcp logs fields` |
 | `get_recent_logs` | `logs.recent` | `logmon-mcp logs recent` |
 | `add_bookmark` | `bookmarks.add` | `logmon-mcp bookmarks add` |
 | `get_slow_spans` | `traces.slow` | `logmon-mcp traces slow` |
@@ -119,6 +121,16 @@ Output arrives **already rendered** for most reads; `--json` opts out and gives 
 
 ### Logs
 
+- **`list_log_fields(filter?, top_values?, min_coverage_pct?)`** — **reach for this first when you do not know what is in the buffer.** Every field present, with coverage, distinct count, top values and type. It walks the whole ring, not the newest N.
+
+  Why first: any grouping or filtering needs a **field name**, and a name that does not exist returns an empty result rather than an error — so guessing costs you a silent wrong answer. This is the map.
+
+  Three things it tells you that nothing else will:
+  - **A row at 0% coverage means the field EXISTS and is never populated.** That is the normal case for the top-level GELF built-ins (`fa`, `fi`, `ln`) when an emitter sends everything as underscore-prefixed extras — `file` and `line` will be there at ~100% as *additional fields* while `fi`/`ln` match nothing. Group by the spelling that has coverage.
+  - **`kind`** (`string` / `integer` / `float` / `bool` / `mixed`) tells you which fields a numeric aggregation could ever sum.
+  - **`[promoted]`** marks `trace_id` / `span_id`, which the parser lifts out of `additional_fields` — they are real, just not where you would look for them.
+
+  Cursor qualifiers (`c>=`) are refused: a cursor advances on read, so two identical calls would describe different populations. Use `b>=` for a repeatable window.
 - **`get_recent_logs(count?, filter?, trace_id?)`** — newest-first by default; **oldest-first** when the filter contains `c>=` (cursor). Default `count=50`.
 - **`get_log_context(seq, before?, after?)`** — logs around a specific entry. Use this when you have a `seq` from another query.
 - **`export_logs(path, count?, filter?, from_seq?, to_seq?, format?)`** — write matching logs to a file (`json` or `text`). `from_seq`/`to_seq` are **inclusive** and compose with a bookmark bound. The reply carries a **`verdict`** — see below.

@@ -28,6 +28,7 @@
 
 pub mod blocks;
 pub mod escape;
+pub mod fields;
 pub mod profile;
 pub mod status;
 pub mod table;
@@ -204,6 +205,7 @@ pub fn for_method(method: &str, result: &Value) -> Option<String> {
         "filters.list" => dsl_list(result, "filters", "(no filters)"),
         "triggers.list" => dsl_list(result, "triggers", "(no triggers)"),
         "status.get" => status::render(result),
+        "logs.fields" => fields::render(result),
         // One renderer, two methods: both return `ProfileResult`, and the
         // deleted CLI called `print_profile` from both call sites.
         "collectors.get" | "traces.profile" => profile::render(result),

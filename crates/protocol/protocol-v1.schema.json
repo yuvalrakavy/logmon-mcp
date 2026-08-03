@@ -218,6 +218,326 @@
         }
       }
     },
+    "LogsFields": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsFields",
+      "description": "`logs.fields` — the map an agent needs before it can name an axis.",
+      "type": "object",
+      "properties": {
+        "filter": {
+          "description": "DSL filter describing the population to describe. Defaults to everything.\n\nCursor qualifiers (`c>=`) are **rejected**: a cursor advances on read, so\na second identical call would describe a different population.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "top_values": {
+          "description": "Most-frequent values reported per field (default 3).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "min_coverage_pct": {
+          "description": "Omit fields present on fewer than this share of matched records.\n`0` (the default) reports everything, **including fields at 0%** — an\nabsent built-in is a fact worth seeing, not a row worth hiding.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LogsFieldsResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "LogsFieldsResult",
+      "type": "object",
+      "properties": {
+        "fields": {
+          "description": "Coverage descending, then field name — stable across identical calls.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FieldStats"
+          }
+        },
+        "matched": {
+          "description": "Records that passed the filter.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "scanned": {
+          "description": "Records EXAMINED — the whole ring, never a `count`-limited prefix. A\ndescription of the buffer that silently described its newest slice would\nbe the exact sampling bias this family of reads exists to remove.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "buffer_total": {
+          "description": "Total records currently in the queried buffer.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "truncated": {
+          "description": "True when the query's lower bound predates the oldest retained record,\nso this describes an incomplete window.",
+          "type": "boolean",
+          "default": false
+        },
+        "evicted_before_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "fields",
+        "matched",
+        "scanned",
+        "buffer_total"
+      ],
+      "$defs": {
+        "FieldStats": {
+          "description": "One field's row in the map.",
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "The name an axis would be spelled with.",
+              "type": "string"
+            },
+            "present": {
+              "description": "Records carrying it, out of `matched`.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "coverage_pct": {
+              "description": "Share of `matched` carrying it.",
+              "type": "number",
+              "format": "double"
+            },
+            "distinct": {
+              "description": "Distinct values — **`null` once the cap was exceeded**, never a partial\ncount presented as a total.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0
+            },
+            "top_values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TopValue"
+              }
+            },
+            "kind": {
+              "$ref": "#/$defs/ValueKind"
+            },
+            "promoted": {
+              "description": "True for fields the parser lifts out of `additional_fields` (`trace_id`,\n`span_id`). They are real, but not where an agent expects to find them.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "field",
+            "present",
+            "coverage_pct",
+            "top_values",
+            "kind"
+          ]
+        },
+        "TopValue": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "description": "Rendered exactly as the filter matcher renders it, so this string can be\npasted into a filter and will match.",
+              "type": "string"
+            },
+            "count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "value",
+            "count"
+          ]
+        },
+        "ValueKind": {
+          "description": "What the observed values of a field look like.\n\nLoad-bearing rather than decorative: it is what tells a caller which fields\na numeric aggregation could ever sum, without sampling records to find out.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "string",
+                "integer",
+                "float",
+                "bool"
+              ]
+            },
+            {
+              "description": "Values of more than one kind under one name. Not an error — emitters do\nthis — but a caller must not assume it can be summed.",
+              "type": "string",
+              "const": "mixed"
+            },
+            {
+              "description": "Null, array or object: present, but neither a dimension nor a number.",
+              "type": "string",
+              "const": "other"
+            }
+          ]
+        }
+      }
+    },
+    "FieldStats": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FieldStats",
+      "description": "One field's row in the map.",
+      "type": "object",
+      "properties": {
+        "field": {
+          "description": "The name an axis would be spelled with.",
+          "type": "string"
+        },
+        "present": {
+          "description": "Records carrying it, out of `matched`.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "coverage_pct": {
+          "description": "Share of `matched` carrying it.",
+          "type": "number",
+          "format": "double"
+        },
+        "distinct": {
+          "description": "Distinct values — **`null` once the cap was exceeded**, never a partial\ncount presented as a total.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "top_values": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TopValue"
+          }
+        },
+        "kind": {
+          "$ref": "#/$defs/ValueKind"
+        },
+        "promoted": {
+          "description": "True for fields the parser lifts out of `additional_fields` (`trace_id`,\n`span_id`). They are real, but not where an agent expects to find them.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "field",
+        "present",
+        "coverage_pct",
+        "top_values",
+        "kind"
+      ],
+      "$defs": {
+        "TopValue": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "description": "Rendered exactly as the filter matcher renders it, so this string can be\npasted into a filter and will match.",
+              "type": "string"
+            },
+            "count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "value",
+            "count"
+          ]
+        },
+        "ValueKind": {
+          "description": "What the observed values of a field look like.\n\nLoad-bearing rather than decorative: it is what tells a caller which fields\na numeric aggregation could ever sum, without sampling records to find out.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "string",
+                "integer",
+                "float",
+                "bool"
+              ]
+            },
+            {
+              "description": "Values of more than one kind under one name. Not an error — emitters do\nthis — but a caller must not assume it can be summed.",
+              "type": "string",
+              "const": "mixed"
+            },
+            {
+              "description": "Null, array or object: present, but neither a dimension nor a number.",
+              "type": "string",
+              "const": "other"
+            }
+          ]
+        }
+      }
+    },
+    "TopValue": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TopValue",
+      "type": "object",
+      "properties": {
+        "value": {
+          "description": "Rendered exactly as the filter matcher renders it, so this string can be\npasted into a filter and will match.",
+          "type": "string"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "value",
+        "count"
+      ]
+    },
+    "ValueKind": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "ValueKind",
+      "description": "What the observed values of a field look like.\n\nLoad-bearing rather than decorative: it is what tells a caller which fields\na numeric aggregation could ever sum, without sampling records to find out.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "string",
+            "integer",
+            "float",
+            "bool"
+          ]
+        },
+        {
+          "description": "Values of more than one kind under one name. Not an error — emitters do\nthis — but a caller must not assume it can be summed.",
+          "type": "string",
+          "const": "mixed"
+        },
+        {
+          "description": "Null, array or object: present, but neither a dimension nor a number.",
+          "type": "string",
+          "const": "other"
+        }
+      ]
+    },
     "LogsContext": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "LogsContext",

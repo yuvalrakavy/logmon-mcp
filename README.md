@@ -320,6 +320,7 @@ table is a convenience — the tool list your client registered is the truth, an
 
 | Tool | Description |
 |---|---|
+| `list_log_fields` | Map the buffer before querying it: every field present, with coverage, distinct count, top values and type. Walks the whole ring, not the newest N. **A field at 0% coverage exists but is never populated** — the usual case for the top-level GELF built-ins (`fa`/`fi`/`ln`) when an emitter sends everything as underscore-prefixed extras, where `file` and `line` show up at ~100% as additional fields instead. `kind` says which fields a numeric aggregation could sum. Cursor qualifiers are refused so two identical calls describe the same population. |
 | `get_recent_logs` | Fetch recent logs, optionally filtered or scoped to a `trace_id`. |
 | `get_log_context` | Get logs surrounding a specific entry by `seq`. |
 | `export_logs` | Save logs to a file (json or text). `from_seq`/`to_seq` bound an **inclusive** window and compose with a bookmark bound. Every reply carries a **`verdict`** — `complete` / `filtered` / `evicted` / `cannot_verify` — saying how much of that window the daemon can vouch for, with `narrowed_by` naming any session filter that was narrowing what got stored, and over which seqs. See [Evidence verdicts](#evidence-verdicts). |

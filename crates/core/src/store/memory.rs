@@ -118,6 +118,51 @@ impl InMemoryStore {
 
         (result, scanned)
     }
+
+    /// Visit every stored record matching `filter`, oldest first, **without
+    /// cloning any of them**, and report what the walk saw.
+    ///
+    /// `recent_with_scanned` cannot serve a whole-population read, for two
+    /// independent reasons. It early-stops once `count` matches are collected
+    /// (see the `break`s above), so a caller describing "the buffer" would
+    /// silently be describing its newest slice — and would look correct on any
+    /// fixture smaller than the default. And it clones every match, including a
+    /// `HashMap` per record, for data a projection folds and discards.
+    ///
+    /// Mirrors `SpanStore::for_each_matching`, which exists for the same reason
+    /// on the span side. Inherent rather than on `LogStore` because the pipeline
+    /// holds a concrete store, exactly as `recent_with_scanned` does.
+    pub fn for_each_matching<F>(&self, filter: Option<&ParsedFilter>, mut f: F) -> ScanCounts
+    where
+        F: FnMut(&LogEntry),
+    {
+        let inner = self.inner.read().unwrap();
+        let mut counts = ScanCounts::default();
+        for entry in inner.entries.iter() {
+            counts.scanned += 1;
+            if let Some(p) = filter {
+                if !matches_entry(p, entry) {
+                    continue;
+                }
+            }
+            counts.matched += 1;
+            f(entry);
+        }
+        counts
+    }
+}
+
+/// What a full-buffer walk examined and what it kept.
+///
+/// Two named fields rather than a `(usize, usize)`: they are the same type and
+/// differ only in meaning, so a tuple is one transposition away from reporting
+/// a filter that matched everything as one that matched nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCounts {
+    /// Records examined — the whole ring, never a `count`-limited prefix.
+    pub scanned: usize,
+    /// Records that passed the filter and reached the visitor.
+    pub matched: usize,
 }
 
 impl LogStore for InMemoryStore {
@@ -271,6 +316,68 @@ impl LogStore for InMemoryStore {
 
     fn newest_seq(&self) -> Option<u64> {
         self.inner.read().unwrap().entries.back().map(|e| e.seq)
+    }
+}
+
+#[cfg(test)]
+mod full_walk_tests {
+    use super::*;
+    use crate::gelf::message::{Level, LogEntry};
+
+    /// F2 — the walk covers the WHOLE buffer, not a `count`-limited prefix.
+    ///
+    /// The property every population-describing read rests on. The obvious
+    /// primitive next door (`recent_with_scanned`) early-stops at `count`, so a
+    /// summary built on it silently describes the newest slice while claiming
+    /// to describe the buffer — and looks correct on any fixture smaller than
+    /// the default. The fixture here is deliberately larger than any plausible
+    /// default so that a capped implementation cannot pass.
+    ///
+    /// Negative control: bound the loop in `for_each_matching` at 50 and this
+    /// goes red while the exactness tests stay green.
+    #[test]
+    fn for_each_matching_visits_every_record_regardless_of_any_count() {
+        let store = InMemoryStore::new(10_000);
+        const N: usize = 2_000;
+        for i in 0..N {
+            store.append(LogEntry::synthetic(Level::Info, &format!("m{i}")));
+        }
+
+        let mut seen = 0usize;
+        let counts = store.for_each_matching(None, |_| seen += 1);
+
+        assert_eq!(counts.scanned, N, "every buffered record examined");
+        assert_eq!(counts.matched, N, "no filter, so every record matched");
+        assert_eq!(seen, N, "and every one reached the visitor");
+
+        // The contrast that motivates this method existing at all.
+        let (_, capped_scan) = store.recent_with_scanned(50, None, false);
+        assert!(
+            capped_scan < N,
+            "recent_with_scanned early-stops ({capped_scan} of {N}); a summary \
+             built on it would describe the newest slice as though it were the \
+             buffer"
+        );
+    }
+
+    /// `matched` and `scanned` are different numbers and must not be swapped —
+    /// the reason `ScanCounts` has named fields rather than being a tuple.
+    #[test]
+    fn a_filter_narrows_matched_while_scanned_still_covers_everything() {
+        use crate::filter::parser::parse_filter;
+        let store = InMemoryStore::new(1_000);
+        for i in 0..100 {
+            let lvl = if i % 10 == 0 { Level::Error } else { Level::Info };
+            store.append(LogEntry::synthetic(lvl, "m"));
+        }
+        let f = parse_filter("l>=ERROR").expect("filter parses");
+
+        let mut visited = 0usize;
+        let counts = store.for_each_matching(Some(&f), |_| visited += 1);
+
+        assert_eq!(counts.scanned, 100, "the filter narrows matches, not the walk");
+        assert_eq!(counts.matched, 10, "one in ten");
+        assert_eq!(visited, 10, "the visitor sees matches only");
     }
 }
 

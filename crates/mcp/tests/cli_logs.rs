@@ -111,3 +111,69 @@ async fn logs_recent_against_missing_broker_fails_with_guidance() {
         "expected fail-fast guidance; got stderr: {stderr}"
     );
 }
+
+/// `logs fields` end to end: daemon → `tools.manifest` → CLI verb → RPC →
+/// server-side renderer.
+///
+/// The verb is not hand-written anywhere; it exists only because the daemon
+/// declares `logs.fields` in the manifest the shim builds its CLI from. So this
+/// also proves the new tool reached the surface at all.
+#[tokio::test]
+async fn logs_fields_maps_the_buffer_through_the_cli() {
+    let (daemon, cli) = spawn_with_cli().await;
+    daemon.inject_log(Level::Info, "alpha").await;
+    daemon.inject_log(Level::Warn, "beta").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let output = tokio::task::spawn_blocking(move || {
+        cli.cmd().args(["logs", "fields"]).output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(output.status.success(), "logs fields exits cleanly");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("log fields"), "rendered, not raw JSON: {stdout}");
+    assert!(
+        stdout.contains("message") && stdout.contains("level"),
+        "built-ins are reported: {stdout}"
+    );
+    // The property the tool exists for, visible in the rendered output.
+    assert!(
+        stdout.contains("facility"),
+        "an absent built-in still gets a row -- omitting it reads as 'no such \
+         field': {stdout}"
+    );
+    assert!(
+        stdout.contains("0%"),
+        "and reports zero coverage rather than being silently dropped: {stdout}"
+    );
+}
+
+/// A cursor qualifier is refused at the CLI too, with the alternative named.
+#[tokio::test]
+async fn logs_fields_refuses_a_cursor_and_names_the_alternative() {
+    let (daemon, cli) = spawn_with_cli().await;
+    daemon.inject_log(Level::Info, "one").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let output = tokio::task::spawn_blocking(move || {
+        cli.cmd()
+            .args(["logs", "fields", "--filter", "c>=nope"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("cursor") || combined.contains("bookmark"),
+        "the refusal has to explain itself: {combined}"
+    );
+}

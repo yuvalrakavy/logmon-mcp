@@ -5,6 +5,26 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Added — `list_log_fields` (`logs.fields`), and a full-buffer walk
+
+Map the log buffer before querying it: every field with coverage, distinct
+count, top values and type. Reach for it when you do not know what is in the
+buffer — every other tool needs a field NAME, and a name that does not exist
+returns an empty result rather than an error, so a guess costs a silent wrong
+answer.
+
+**A field at 0% coverage exists and is never populated.** That is the common
+case for the top-level GELF built-ins: an emitter sending everything as
+underscore-prefixed extras leaves `fa`/`fi`/`ln` matching nothing while `file`
+and `line` sit at ~100% as *additional fields*. Reporting the empty row is the
+point; omitting it reads as "no such field" and sends you looking for another
+name.
+
+Also new underneath: `InMemoryStore::for_each_matching`, a whole-ring walk that
+does not clone. The existing `recent_with_scanned` early-stops at `count`, so
+anything built on it describes the newest slice of the buffer while claiming to
+describe the buffer — and looks correct on any fixture smaller than the default.
+
 ### Changed — the skill ships with the broker, not the shim
 
 `skill/logmon.md` was compiled into `logmon-mcp` and served as MCP `instructions`.

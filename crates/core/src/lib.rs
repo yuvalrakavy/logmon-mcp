@@ -4,6 +4,7 @@ pub mod domain_data;
 pub mod engine;
 pub mod filter;
 pub mod gelf;
+pub mod logs;
 pub mod receiver;
 pub mod render;
 pub(crate) mod rejection;

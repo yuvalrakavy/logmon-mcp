@@ -267,6 +267,97 @@ pub struct LogsRecentResult {
     pub cursor_advanced_to: Option<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// logs.fields — what dimensions exist in this buffer
+// ---------------------------------------------------------------------------
+
+/// What the observed values of a field look like.
+///
+/// Load-bearing rather than decorative: it is what tells a caller which fields
+/// a numeric aggregation could ever sum, without sampling records to find out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueKind {
+    String,
+    Integer,
+    Float,
+    Bool,
+    /// Values of more than one kind under one name. Not an error — emitters do
+    /// this — but a caller must not assume it can be summed.
+    Mixed,
+    /// Null, array or object: present, but neither a dimension nor a number.
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TopValue {
+    /// Rendered exactly as the filter matcher renders it, so this string can be
+    /// pasted into a filter and will match.
+    pub value: String,
+    pub count: usize,
+}
+
+/// One field's row in the map.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FieldStats {
+    /// The name an axis would be spelled with.
+    pub field: String,
+    /// Records carrying it, out of `matched`.
+    pub present: usize,
+    /// Share of `matched` carrying it.
+    pub coverage_pct: f64,
+    /// Distinct values — **`null` once the cap was exceeded**, never a partial
+    /// count presented as a total.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distinct: Option<usize>,
+    pub top_values: Vec<TopValue>,
+    pub kind: ValueKind,
+    /// True for fields the parser lifts out of `additional_fields` (`trace_id`,
+    /// `span_id`). They are real, but not where an agent expects to find them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub promoted: bool,
+}
+
+/// `logs.fields` — the map an agent needs before it can name an axis.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LogsFields {
+    /// DSL filter describing the population to describe. Defaults to everything.
+    ///
+    /// Cursor qualifiers (`c>=`) are **rejected**: a cursor advances on read, so
+    /// a second identical call would describe a different population.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Most-frequent values reported per field (default 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_values: Option<u64>,
+    /// Omit fields present on fewer than this share of matched records.
+    /// `0` (the default) reports everything, **including fields at 0%** — an
+    /// absent built-in is a fact worth seeing, not a row worth hiding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_coverage_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct LogsFieldsResult {
+    /// Coverage descending, then field name — stable across identical calls.
+    pub fields: Vec<FieldStats>,
+    /// Records that passed the filter.
+    pub matched: usize,
+    /// Records EXAMINED — the whole ring, never a `count`-limited prefix. A
+    /// description of the buffer that silently described its newest slice would
+    /// be the exact sampling bias this family of reads exists to remove.
+    pub scanned: usize,
+    /// Total records currently in the queried buffer.
+    pub buffer_total: usize,
+    /// True when the query's lower bound predates the oldest retained record,
+    /// so this describes an incomplete window.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted_before_window: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LogsContext {

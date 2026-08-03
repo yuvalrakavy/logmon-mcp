@@ -174,6 +174,7 @@ impl RpcHandler {
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         let result = match request.method.as_str() {
             "logs.recent" => self.handle_logs_recent(session_id, &request.params),
+            "logs.fields" => self.handle_logs_fields(session_id, &request.params),
             "logs.context" => self.handle_logs_context(session_id, &request.params),
             "logs.export" => self.handle_logs_export(session_id, &request.params),
             "logs.clear" => self.handle_logs_clear(session_id),
@@ -852,6 +853,56 @@ impl RpcHandler {
     /// (`logs.recent`, `logs.export`, `traces.logs`) capture it and call
     /// `commit_handle.commit(max_seq)` after the lock-free query phase. For
     /// non-cursor handlers, the value is always `None`.
+    /// `logs.fields` — the map an agent needs before it can name an axis.
+    ///
+    /// Walks the **whole ring**, not a `count`-limited prefix. The obvious
+    /// primitive (`recent_logs_with_stats`) early-stops once it has collected
+    /// `count` matches, so a summary built on it would describe the newest
+    /// slice of the buffer while claiming to describe the buffer — and would
+    /// look correct on any fixture smaller than the default. Hence
+    /// `for_each_log`, which also avoids cloning a record per match for data
+    /// folded and discarded.
+    fn handle_logs_fields(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
+        let top_values = opt_u64(params, "top_values")?.unwrap_or(3) as usize;
+        let min_coverage_pct = opt_f64(params, "min_coverage_pct")?.unwrap_or(0.0);
+
+        let (resolved, cursor_commit) =
+            self.parse_and_resolve_filter(Some(filter_string), session_id, &d.bookmarks)?;
+        if cursor_commit.is_some() {
+            // Read-and-advance, so a second identical call would describe a
+            // different population. A description of "the buffer" has to be
+            // repeatable — same reasoning as `traces.profile`.
+            drop(cursor_commit);
+            return Err("cursor qualifier not permitted in logs.fields; use b>= for a \
+                        read-only window"
+                .to_string());
+        }
+
+        let mut map = crate::logs::fields::FieldMap::new();
+        let (counts, stats) = d
+            .pipeline
+            .for_each_log(resolved.as_ref(), |e| map.observe(e));
+        let mut fields = map.finish(counts.matched, top_values);
+        if min_coverage_pct > 0.0 {
+            fields.retain(|f| f.coverage_pct >= min_coverage_pct);
+        }
+
+        let evicted_before_window = resolved
+            .as_ref()
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, d.pipeline.lost_below()));
+
+        Ok(json!({
+            "fields": fields,
+            "matched": counts.matched,
+            "scanned": counts.scanned,
+            "buffer_total": stats.buffer_total,
+            "truncated": evicted_before_window.is_some(),
+            "evicted_before_window": evicted_before_window,
+        }))
+    }
+
     fn parse_and_resolve_filter(
         &self,
         filter_str: Option<&str>,

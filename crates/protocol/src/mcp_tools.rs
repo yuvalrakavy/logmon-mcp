@@ -211,6 +211,12 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli::PLAIN,
     },
     Tool {
+        name: "list_log_fields",
+        method: "logs.fields",
+        description: "Map the log buffer BEFORE grouping: every field present, with coverage, distinct count, top values and type. Reach for this first when you do not know what is in the buffer — grouping tools need an axis name, and guessing one returns an empty result rather than an error. Walks the whole ring, not the newest N. A field reported at 0% coverage EXISTS but is never populated, which is the common case for the top-level GELF built-ins (fi/ln/fa) when an emitter sends everything as underscore-prefixed additional fields; group by the additional-field spelling instead. kind tells you which fields a numeric aggregation could sum. Cursor qualifiers are rejected so two identical calls describe the same population.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "get_log_context",
         method: "logs.context",
         description: "Get log entries surrounding a specific entry identified by seq number. Returns context before and after.",
@@ -1085,7 +1091,8 @@ mod tests {
     fn every_pair_is_well_formed_and_unique() {
         // Pinned so a tool cannot be added here without also being added to the
         // shim — the source-scan test in `mcp/src/server.rs` is the other half.
-        assert_eq!(TOOLS.len(), 47);
+        // 48 since `list_log_fields` (logs.fields).
+        assert_eq!(TOOLS.len(), 48);
         for Tool {
             name: tool, method, ..
         } in TOOLS

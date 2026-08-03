@@ -196,6 +196,34 @@ impl LogPipeline {
         (entries, stats)
     }
 
+    /// Fold the **whole** matching population without materialising it.
+    ///
+    /// The seam every population-describing read needs.
+    /// `recent_logs_with_stats` cannot serve them: it early-stops at `count`,
+    /// so a summary built on it would describe the newest slice of the buffer
+    /// while claiming to describe the buffer.
+    ///
+    /// Returns the walk's counts alongside the same buffer facts
+    /// `recent_logs_with_stats` reports, so a caller can state its population
+    /// and its completeness from one query.
+    pub fn for_each_log<F>(
+        &self,
+        filter: Option<&ParsedFilter>,
+        f: F,
+    ) -> (crate::store::memory::ScanCounts, RecentStats)
+    where
+        F: FnMut(&LogEntry),
+    {
+        let counts = self.store.for_each_matching(filter, f);
+        let stats = RecentStats {
+            scanned: counts.scanned,
+            buffer_total: self.store.len(),
+            buffer_oldest_seq: self.store.oldest_seq(),
+            buffer_newest_seq: self.store.newest_seq(),
+        };
+        (counts, stats)
+    }
+
     pub fn oldest_log_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.store.oldest_timestamp()
     }
