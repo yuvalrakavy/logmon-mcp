@@ -96,6 +96,30 @@ fn disambiguate(rows: &[&Value]) -> Vec<String> {
         .collect()
 }
 
+/// The seq span of the matched population, ` (seq 1-101)`, or empty when
+/// nothing matched.
+///
+/// **Rendered because it is emitted.** The reply carries whole-population
+/// `first_seq`/`last_seq`, and the MCP path returns this rendering INSTEAD of
+/// the JSON — so an unrendered field does not exist for the primary consumer.
+/// A mutation campaign found it: replacing the whole-population bounds with
+/// defaults left every test green, because nothing asserted them and nothing
+/// printed them. That is the same defect this family already paid for once,
+/// when `logs.fields` emitted its ring bounds and rendered none of them.
+///
+/// It is also the span the per-row `seqs` column is read against: a row running
+/// 91-97 means one thing in a population spanning 1-101 and another in one
+/// spanning 90-101.
+fn span(result: &Value) -> String {
+    match (
+        result.get("first_seq").and_then(Value::as_u64),
+        result.get("last_seq").and_then(Value::as_u64),
+    ) {
+        (Some(f), Some(l)) => format!(" (seq {f}-{l})"),
+        _ => String::new(),
+    }
+}
+
 fn levels_cell(levels: &Value, present: &[&str]) -> String {
     present
         .iter()
@@ -140,12 +164,13 @@ pub fn render(result: &Value) -> Option<String> {
             } else {
                 format!("`{a}` [{keys}]")
             };
-            let _ = write!(o, "log profile by {named} — {matched} matched of {scanned} scanned");
+            let _ = write!(o, "log profile by {named} — {matched} matched{} of {scanned} scanned", span(result));
         }
         None => {
             let _ = write!(
                 o,
-                "log profile — ungrouped — {matched} matched of {scanned} scanned"
+                "log profile — ungrouped — {matched} matched{} of {scanned} scanned",
+                span(result)
             );
         }
     }
@@ -440,6 +465,32 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 2, "{out}");
         assert_ne!(rows[0], rows[1], "two distinct groups must not render alike");
+    }
+
+    /// The population's seq span reaches the rendering.
+    ///
+    /// The reply carries whole-population bounds and this renderer printed none
+    /// of them — found by a mutation campaign, and it is the same defect this
+    /// family paid for once already on `logs.fields`. The MCP path returns the
+    /// rendering instead of the JSON, so an unrendered field does not exist.
+    #[test]
+    fn the_population_seq_span_is_rendered() {
+        let mut r = reply();
+        r["first_seq"] = json!(1);
+        r["last_seq"] = json!(101);
+        let out = render(&r).expect("renders");
+        assert!(
+            out.contains("(seq 1-101)"),
+            "a row running 91-97 means one thing in a population spanning 1-101 \
+             and another in one spanning 90-101: {out}"
+        );
+    }
+
+    /// And an empty population says nothing rather than `(seq 0-0)`.
+    #[test]
+    fn a_population_with_no_bounds_renders_no_span() {
+        let out = render(&reply()).expect("renders");
+        assert!(!out.contains("(seq "), "{out}");
     }
 
     /// `1 groups` is the kind of thing a reader notices and a test does not.

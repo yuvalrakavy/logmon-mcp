@@ -810,6 +810,60 @@ mod tests {
         );
     }
 
+    /// The WHOLE-POPULATION bounds, which are a different quantity from any
+    /// row's.
+    ///
+    /// A mutation campaign replaced `bounds()` with `Bounds::default()` and all
+    /// 30 tests stayed green: every reply would have carried `first_seq: null`
+    /// regardless of what matched, and nothing asserted it. The integration
+    /// test whose name suggested it should — "carries its evidence and both
+    /// ends of each row" — reads its `first_seq` off a ROW.
+    ///
+    /// Driven on the out-of-order fixture so min/max is distinguishable from
+    /// visit order here too, and asserted across two groups so it cannot be
+    /// satisfied by one row's bounds.
+    #[test]
+    fn the_population_bounds_span_every_matched_record() {
+        let mut logs = out_of_order();
+        // A second group, and the extremes of the population belong to it.
+        let mut low = at(3, "lowest", &[("k", json!("other"))]);
+        low.timestamp = logs[0].timestamp - chrono::Duration::seconds(500);
+        let mut high = at(90, "highest", &[("k", json!("other"))]);
+        high.timestamp = logs[0].timestamp + chrono::Duration::seconds(500);
+        logs.push(low);
+        logs.push(high);
+
+        let (axis, keys) = field_axis(&["k"]);
+        let mut map = GroupMap::new(axis, keys);
+        for e in &logs {
+            map.observe(e);
+        }
+        let b = map.bounds();
+        assert_eq!(b.first_seq, Some(3), "min over the whole matched set");
+        assert_eq!(b.last_seq, Some(90), "max over the whole matched set");
+
+        let by_seq = |s: u64| logs.iter().find(|e| e.seq == s).unwrap().timestamp;
+        assert_eq!(
+            b.first_time,
+            Some(by_seq(3)),
+            "and the times come from those same records, not from min/max timestamp"
+        );
+        assert_eq!(b.last_time, Some(by_seq(90)));
+
+        // Without this the assertions above would hold for a bounds() that
+        // simply tracked one group.
+        let (rows, _) = map.finish(ALL_ROWS);
+        assert!(rows.len() > 1, "the extremes must span groups: {rows:?}");
+    }
+
+    /// An empty population has no bounds, rather than bounds of zero.
+    #[test]
+    fn an_empty_population_has_no_bounds() {
+        let b = GroupMap::new(Axis::Level, Vec::new()).bounds();
+        assert_eq!(b, Bounds::default());
+        assert_eq!(b.first_seq, None, "not Some(0), which is a real seq");
+    }
+
     /// P8 — a wholly-absent axis MEMBER is announced, named, per member.
     #[test]
     fn a_wholly_absent_field_axis_is_announced() {

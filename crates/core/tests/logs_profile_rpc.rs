@@ -104,11 +104,16 @@ async fn the_reply_carries_its_evidence_and_both_ends_of_each_row() {
         .await
         .unwrap();
 
+    // The whole-population bounds are in this list because a mutation campaign
+    // showed they were in NO list: zeroing them left every test green, since
+    // the row assertions below read a row's ends, not the population's.
     for key in [
         "matched", "scanned", "buffer_total", "lost_below", "truncated", "levels",
         "groups_total", "cardinality_capped", "grouped_by",
+        "first_seq", "last_seq", "first_time", "last_time",
     ] {
         assert!(reply.get(key).is_some(), "`{key}` missing from the reply: {reply}");
+        assert!(!reply[key].is_null(), "`{key}` is null on a non-empty population: {reply}");
     }
     assert_eq!(reply["grouped_by"].as_str(), Some("field"));
     assert_eq!(reply["group_keys"], json!(["k"]));
@@ -174,6 +179,38 @@ async fn group_keys_is_validated_against_the_axis_without_refusing_an_empty_arra
         .await
         .expect_err("keys on a built-in axis are refused");
     says(&e, "group_keys");
+
+    // More than MAX_KEYS members. A mutation campaign found this cap had NO
+    // probe at all — and the reason it looked covered is worth recording: a
+    // project-wide grep for "too many group_keys" hits `collectors_rpc.rs`,
+    // which exercises the collector method's own, differently-wired cap. A
+    // check tested somewhere else is not a check tested here.
+    let e = client
+        .call::<Value>(
+            "logs.profile",
+            json!({
+                "group_by": "field",
+                "group_keys": ["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+            }),
+        )
+        .await
+        .expect_err("nine keys exceed the cap");
+    says(&e, "too many group_keys");
+
+    // And eight is accepted, or the check above would be satisfied by a cap of
+    // any size — including one that refuses the two-key tuples the feature
+    // exists for.
+    let reply: Value = client
+        .call(
+            "logs.profile",
+            json!({
+                "group_by": "field",
+                "group_keys": ["a", "b", "c", "d", "e", "f", "g", "h"],
+            }),
+        )
+        .await
+        .expect("eight keys are within the cap");
+    assert_eq!(reply["matched"].as_u64(), Some(1), "{reply}");
 
     // **An explicit empty array is NOT "present".** A generated client that
     // always serialises `group_keys: []` would otherwise have its most ordinary
