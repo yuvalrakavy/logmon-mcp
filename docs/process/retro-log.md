@@ -638,3 +638,23 @@ It is the only check that exercises the resolver a user gets.
      and the fix-small/file-large/never-a-chip rule.
 - note: **5 entries since `## Consolidated through 2026-07-30`** — this trips the
   `/process-retro` trigger. Run it before the next feature.
+
+## Consolidated through 2026-08-03
+
+Four changes, all from patterns spanning 3+ entries. **Read-before-author** is
+new and is now the first action of any gate: a durable artifact nobody reads at
+the moment of use is equivalent to not existing — `gate-briefs.md` sat unread
+through seven hand-written briefs and was then proposed as a new idea in the
+same retro. **A fix's own test is mutation-verified by its AUTHOR**, not just by
+the lens; three vacuous tests in one feature were all written to prove a fix.
+**The docs surface list** is enumerated at `docs/process/docs-surface.md`,
+implementing a proposal deferred since 2026-07-30 that recurred meanwhile. And
+**`docs/process/gate-kpi.md` now exists**, seeded from this window with the
+unmeasurable rows marked rather than zeroed.
+
+Rejected on two-way evidence: reformulating the line-by-line lens. It was
+measured at ~1 unique finding per 216k tokens in the case-documents entry, and
+then produced the highest-value S3 of the `logs.profile` window — a reply that
+told the caller a field did not exist when it was on every record. The demotion
+bar is zero S3s across 5+ features; it just cleared it in the wrong direction.
+Kept unchanged.
