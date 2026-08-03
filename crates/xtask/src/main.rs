@@ -72,6 +72,7 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "FieldStats":            schema_for!(FieldStats),
             "TopValue":              schema_for!(TopValue),
             "ValueKind":             schema_for!(ValueKind),
+            "FieldSource":           schema_for!(FieldSource),
             "LogsContext":           schema_for!(LogsContext),
             "LogsContextResult":     schema_for!(LogsContextResult),
             "LogsExport":            schema_for!(LogsExport),

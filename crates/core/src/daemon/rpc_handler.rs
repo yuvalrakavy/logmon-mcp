@@ -909,7 +909,16 @@ impl RpcHandler {
         // read an agent runs against an unfamiliar buffer.
         // `contains_cursor_qualifier` is pure — it walks the parsed AST and
         // never touches the store.
-        let parsed = crate::filter::parser::parse_filter(filter_string).map_err(|e| e.to_string())?;
+        // Empty/whitespace means "no filter", NOT a parse error. Bypassing
+        // `parse_and_resolve_filter` to reject the cursor early also bypassed
+        // that half of its contract, and every sibling still routed through it
+        // (`logs.recent`, `logs.export`, `traces.logs`) kept the old
+        // behaviour — so `filter: ""` walked the buffer everywhere except here.
+        let parsed = if filter_string.trim().is_empty() {
+            crate::filter::parser::ParsedFilter::All
+        } else {
+            crate::filter::parser::parse_filter(filter_string).map_err(|e| e.to_string())?
+        };
         if crate::filter::parser::contains_cursor_qualifier(&parsed) {
             return Err("cursor qualifier not permitted in logs.fields; use b>= for a \
                         read-only window"
@@ -3104,14 +3113,31 @@ impl RpcHandler {
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
-        let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(Some(filter_string), session_id, &d.bookmarks)?;
-        if cursor_commit.is_some() {
+        // Rejected BEFORE resolution, the same as `logs.fields`. Resolving
+        // first auto-creates a bookmark at seq 0 for an unknown cursor name as
+        // a side effect, so a refused call quietly wrote — hazard symmetry:
+        // this is the sibling of the site that fix landed on, and leaving one
+        // of two is how a fixed defect stays alive.
+        let parsed = if filter_string.trim().is_empty() {
+            crate::filter::parser::ParsedFilter::All
+        } else {
+            crate::filter::parser::parse_filter(filter_string).map_err(|e| e.to_string())?
+        };
+        if crate::filter::parser::contains_cursor_qualifier(&parsed) {
             // A cursor is read-and-advance, so a second identical `profile`
             // call would return less than the first. A profile must be
             // repeatable.
             return Err("cursor qualifier not permitted in traces.profile".to_string());
         }
+        let resolved = Some(
+            crate::filter::bookmark_resolver::resolve_bookmarks(
+                parsed,
+                &d.bookmarks,
+                &session_id.to_string(),
+            )
+            .map_err(|e| e.to_string())?
+            .filter,
+        );
         let parsed = resolved.unwrap_or(crate::filter::parser::ParsedFilter::All);
         let warnings: Vec<String> = crate::filter::admission::admit_span_filter(&parsed)
             .map_err(|e| e.to_string())?

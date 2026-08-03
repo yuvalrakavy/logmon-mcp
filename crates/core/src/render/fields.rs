@@ -51,6 +51,25 @@ pub fn render(result: &Value) -> Option<String> {
         "log fields — {matched} matched of {scanned} scanned ({total} in buffer)\n"
     ));
 
+    // The ring's real bounds. `truncated` needs a resolved lower bound to mean
+    // anything, so on a default call it is false however much rolled off —
+    // these are the only way a reader sees a wrapped buffer. The skill tells
+    // agents to read them, and the MCP path returns this rendering INSTEAD of
+    // the JSON, so omitting them here made that instruction unfollowable.
+    let lost = result.get("lost_below").and_then(Value::as_u64).unwrap_or(0);
+    if let (Some(o), Some(n)) = (
+        result.get("buffer_oldest_seq").and_then(Value::as_u64),
+        result.get("buffer_newest_seq").and_then(Value::as_u64),
+    ) {
+        out.push_str(&format!("  buffer seqs {o}–{n}"));
+        if lost > 0 {
+            out.push_str(&format!(
+                "  — WRAPPED: everything below seq {lost} has rolled off"
+            ));
+        }
+        out.push('\n');
+    }
+
     // Eviction is a fact about the WINDOW, not about the fields, so it leads
     // rather than hiding under the table: every figure below describes a
     // population that is missing records.
@@ -103,8 +122,14 @@ pub fn render(result: &Value) -> Option<String> {
         // A row with no selector cannot be filtered on at all. Rendering the
         // field name there would invite exactly the silent-empty filter this
         // column exists to prevent.
+        // **Never clipped.** A truncated selector still looks pasteable, the
+        // legend below tells the reader to prefer it over the field name, and
+        // `request_id` elided to `request_…` resolves to a different
+        // additional field that matches nothing and reports no error. The
+        // column runs long instead; the FIELD name is the derivable one now,
+        // so that is what gets clipped.
         let selector = match f.get("selector").and_then(Value::as_str) {
-            Some(s) => clip(s, 9).to_string(),
+            Some(s) => s.to_string(),
             None => "(none)".to_string(),
         };
         let tops = f.get("top_values").map(top_values).unwrap_or_default();
@@ -218,6 +243,45 @@ mod tests {
         assert!(
             out.contains("get_recent_logs(trace_id="),
             "and the legend names the route that does work: {out}"
+        );
+    }
+
+    /// A selector is NEVER elided.
+    ///
+    /// It is the one string on the page the reader is told to paste verbatim,
+    /// and the legend directly beneath tells them to prefer it over the field
+    /// name sitting next to it. `request_id` clipped to `request_…` resolves to
+    /// a different additional field, matches nothing, and reports no error —
+    /// the exact silent-empty filter the selector column exists to prevent,
+    /// reintroduced in the only surface an agent actually reads.
+    #[test]
+    fn a_long_selector_is_never_clipped() {
+        let mut r = reply();
+        r["fields"][0]["field"] = json!("http_status_code_detailed");
+        r["fields"][0]["selector"] = json!("http_status_code_detailed");
+        let out = render(&r).expect("renders");
+        assert!(
+            out.contains("http_status_code_detailed"),
+            "the full selector must appear, unelided: {out}"
+        );
+    }
+
+    /// `truncated` needs a lower bound to mean anything, so these are the only
+    /// way a reader sees a wrapped ring — and the MCP path returns this
+    /// rendering INSTEAD of the JSON, so omitting them made the skill's own
+    /// instruction ("read buffer_oldest_seq / lost_below") unfollowable.
+    #[test]
+    fn a_wrapped_ring_is_announced_from_the_buffer_bounds() {
+        let mut r = reply();
+        r["buffer_oldest_seq"] = json!(181);
+        r["buffer_newest_seq"] = json!(200);
+        r["lost_below"] = json!(181);
+        let out = render(&r).expect("renders");
+        assert!(out.contains("181"), "the bounds are shown: {out}");
+        assert!(
+            out.contains("WRAPPED"),
+            "and a wrapped ring is called out, since `truncated` cannot say so \
+             without a bound filter: {out}"
         );
     }
 }

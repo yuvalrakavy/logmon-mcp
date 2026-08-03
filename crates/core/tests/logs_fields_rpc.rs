@@ -106,6 +106,52 @@ async fn an_absent_builtin_is_reported_at_zero_rather_than_omitted() {
     );
 }
 
+/// An empty filter means "no filter", not a parse error.
+///
+/// Bypassing `parse_and_resolve_filter` to reject the cursor early also
+/// bypassed the other half of its contract. Every sibling still routed through
+/// it kept accepting `""`, so this method alone would have errored — a
+/// divergence nobody would predict from the parameter's documentation.
+#[tokio::test]
+async fn an_empty_filter_means_no_filter() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    daemon.inject_log(Level::Info, "one").await;
+    settle(&mut client, 1).await;
+
+    for f in ["", "   "] {
+        let reply: Value = client
+            .call("logs.fields", json!({ "filter": f }))
+            .await
+            .unwrap_or_else(|e| panic!("filter {f:?} must mean ALL, got error: {e}"));
+        assert_eq!(
+            reply["matched"].as_u64(),
+            Some(1),
+            "and match everything, exactly as logs.recent does with the same input"
+        );
+    }
+}
+
+/// The sibling site had the identical cursor defect; fixing one of two is how a
+/// fixed defect stays alive.
+#[tokio::test]
+async fn traces_profile_also_creates_no_bookmark_on_a_refused_cursor() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    client
+        .call::<Value>("traces.profile", json!({ "filter": "c>=never_seen_here" }))
+        .await
+        .expect_err("refused");
+
+    let after: Value = client.call("bookmarks.list", json!({})).await.unwrap();
+    assert_eq!(
+        after["count"].as_u64(),
+        Some(0),
+        "traces.profile must not write on a refusal either: {after}"
+    );
+}
+
 /// A built-in and a same-named additional field are DIFFERENT rows.
 ///
 /// GELF strips `_`, so `_file` becomes `additional_fields["file"]` beside the

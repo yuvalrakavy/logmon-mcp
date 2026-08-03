@@ -26,7 +26,15 @@ pub use logmon_broker_protocol::methods::{FieldSource, FieldStats, TopValue, Val
 /// `request.id` turns a bounded collector into a leak". A payload minting a
 /// fresh field name per record produced ~10k rows and ~1.2 MB of reply on a
 /// default ring — every sibling read is bounded, and this one was not.
-pub const NAME_CAP: usize = crate::collector::intern::DEFAULT_NAME_CAP;
+///
+/// Sized against `DEFAULT_GROUP_VALUE_CAP` rather than `DEFAULT_NAME_CAP`,
+/// whose own doc says it bounds *distinct span names carrying their own stats
+/// and sketch* — a different quantity that happens to share the word "name".
+/// 1024 rows is ~120 KB at this reply's row size, and the low bound bit
+/// harder than it looks: the walk is oldest-first and there is no eviction, so
+/// a saturated cap keeps the field vocabulary of the OLDEST retained records
+/// and none of the newest — the reverse of what an investigation wants.
+pub const NAME_CAP: usize = DEFAULT_GROUP_VALUE_CAP;
 
 /// Distinct values tracked per field before the counter gives up.
 ///
@@ -167,10 +175,15 @@ const BUILTINS: &[(&str, FieldSource, Option<&str>, ValueKind)] = &[
     ("span_id", FieldSource::Promoted, None, ValueKind::String),
 ];
 
-fn builtin_kind(name: &str) -> Option<ValueKind> {
+/// Keyed on `(source, name)`, not the name alone — the same anti-pattern this
+/// module was re-modelled to remove. Unreachable today (built-ins are seeded
+/// with a kind, and an additional row cannot exist without a value), but a
+/// name-only lookup here would hand a built-in's kind to a same-named
+/// additional row the moment that invariant moved.
+fn builtin_kind(source: FieldSource, name: &str) -> Option<ValueKind> {
     BUILTINS
         .iter()
-        .find(|(n, ..)| *n == name)
+        .find(|(n, s, ..)| *n == name && *s == source)
         .map(|(_, _, _, k)| *k)
 }
 
@@ -249,16 +262,17 @@ impl FieldMap {
         }
     }
 
-    /// Close the map.
-    ///
-    /// `matched` is passed in rather than counted here: the caller already has
-    /// it from the walk, and a second count taken over a different iteration is
-    /// how two numbers describing one population come to disagree.
     /// Whether the field-NAME cap was hit, so the caller can say so rather than
     /// presenting a truncated map as the whole one.
     pub fn names_capped(&self) -> bool {
         self.names_capped
     }
+
+    /// Close the map.
+    ///
+    /// `matched` is passed in rather than counted here: the caller already has
+    /// it from the walk, and a second count taken over a different iteration is
+    /// how two numbers describing one population come to disagree.
 
     pub fn finish(self, matched: usize, top_values: usize) -> Vec<FieldStats> {
         let mut rows: Vec<FieldStats> = self
@@ -274,7 +288,14 @@ impl FieldMap {
                         .iter()
                         .find(|(n, s, ..)| *n == field && *s == source)
                         .and_then(|(_, _, sel, _)| sel.map(String::from)),
-                    FieldSource::Additional => Some(field.clone()),
+                    // NOT `Some(field.clone())`. GELF validates nothing after
+                    // the `_`, so `_h` yields an additional field named `h` —
+                    // and `h=value` resolves to `Selector::Host`, matching a
+                    // different field silently. Verified by round-trip, so a
+                    // claimed selector always reaches the row it sits on.
+                    FieldSource::Additional => {
+                        crate::filter::parser::additional_field_selector(&field)
+                    }
                 };
                 // BEFORE truncation. Reading it off `top` afterwards would
                 // report `min(distinct, top_values)` — a number that looks
@@ -306,7 +327,7 @@ impl FieldMap {
                     // and an additional field cannot exist without a value.
                     kind: a
                         .kind
-                        .or_else(|| builtin_kind(&field))
+                        .or_else(|| builtin_kind(source, &field))
                         .unwrap_or(ValueKind::Other),
                     source,
                     selector,
@@ -550,6 +571,42 @@ mod tests {
         );
         let rows = map.finish(logs.len(), 3);
         assert!(rows.len() <= NAME_CAP, "got {} rows", rows.len());
+    }
+
+    /// An additional field whose NAME collides with a DSL selector gets no
+    /// selector, because none reaches it.
+    ///
+    /// GELF validates nothing after the `_`, so `_h` produces an additional
+    /// field named `h` — and `h=value` resolves to `Selector::Host`, matching a
+    /// different field silently and with no error. Claiming `h` here would hand
+    /// the caller a filter that returns nothing: the fixed defect displaced out
+    /// of name-space and into selector-space.
+    #[test]
+    fn an_additional_field_named_like_a_selector_gets_no_selector() {
+        for reserved in ["h", "m", "fi", "ln", "fa", "fm", "mfm", "sn", "sv", "st", "sk", "l"] {
+            let e = entry("x", &[(reserved, json!("SENTINEL"))]);
+            let rows = summarize(std::slice::from_ref(&e), 1, 3);
+            let r = add(&rows, reserved);
+            assert_eq!(
+                r.selector, None,
+                "`{reserved}=SENTINEL` does not reach this field -- it resolves \
+                 to a built-in selector (or fails to parse), so offering it \
+                 would be a filter that silently matches nothing"
+            );
+            assert_eq!(r.present, 1, "the field is still REPORTED, just not filterable");
+        }
+    }
+
+    /// And an ordinary name keeps its selector, or the check above would be
+    /// indistinguishable from returning `None` for everything.
+    #[test]
+    fn an_ordinary_additional_field_keeps_its_name_as_selector() {
+        let e = entry("x", &[("request_id", json!("abc"))]);
+        let rows = summarize(std::slice::from_ref(&e), 1, 3);
+        assert_eq!(
+            add(&rows, "request_id").selector.as_deref(),
+            Some("request_id")
+        );
     }
 
     /// F5 — past the cap, `distinct` is `null` rather than a partial count.

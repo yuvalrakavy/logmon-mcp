@@ -636,6 +636,28 @@
         }
       ]
     },
+    "FieldSource": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "FieldSource",
+      "description": "Where a field's value lives on a record — and therefore which filter\nselector reaches it.\n\n**A name alone does not identify a field.** GELF strips the `_` prefix, so a\npayload sending both `file` and `_file` produces a top-level `LogEntry.file`\nAND an `additional_fields[\"file\"]`. Those are two different values reached by\ntwo different selectors (`fi` versus `file`), and merging them into one row\ndouble-counts coverage and hides the built-in's true (often zero) presence —\nwhich is the one fact this whole read exists to surface.",
+      "oneOf": [
+        {
+          "description": "A dedicated slot on the record: level, message, host, facility, file,\nline. Reached by a short DSL selector (`fi`, `ln`, …).",
+          "type": "string",
+          "const": "builtin"
+        },
+        {
+          "description": "An underscore-prefixed GELF extra, stripped of its prefix. Reached by its\nown name.",
+          "type": "string",
+          "const": "additional"
+        },
+        {
+          "description": "Lifted out of `additional_fields` by the parser (`trace_id`, `span_id`).\nReal, but **no log filter selector reaches it** — see `selector`.",
+          "type": "string",
+          "const": "promoted"
+        }
+      ]
+    },
     "LogsContext": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "LogsContext",

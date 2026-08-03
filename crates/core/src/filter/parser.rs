@@ -730,6 +730,40 @@ pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
 }
 
 /// Returns true if any qualifier in the filter is a CursorFilter.
+/// The DSL spelling that reaches an ADDITIONAL FIELD named `name`, or `None`
+/// when no filter reaches it at all.
+///
+/// **Round-trips through the real parser rather than re-listing reserved
+/// names.** Two tables can hide one: `parse_selector`'s arms (`m`, `h`, `fa`,
+/// `fi`, `ln`, `sn`, `sv`, `st`, `sk`, `fm`, `mfm`) and `parse_token`'s
+/// `strip_prefix` branches (`l=`, `l>=`, `d>=`, `b>=`, `c>=`). A hand-kept
+/// second list would drift from both, and the drift is silent.
+///
+/// This matters because GELF validates nothing after the `_` prefix
+/// (`gelf/message.rs:212`), so an emitter sending `_h` produces an additional
+/// field named `h` — and `h=value` resolves to `Selector::Host`, matching a
+/// different field entirely, with no error. Claiming `h` as that row's
+/// selector would hand the caller a filter that silently returns nothing,
+/// which is the exact failure the whole field map exists to prevent.
+///
+/// A parse failure counts as unreachable: it means the name was consumed by a
+/// branch that then rejected the probe value (`l=x` — "unknown level: x").
+pub fn additional_field_selector(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    let probe = format!("{name}=x");
+    match parse_filter(&probe).ok()? {
+        ParsedFilter::Qualifiers(qs) => match qs.as_slice() {
+            [Qualifier::SelectorPattern(Selector::AdditionalField(n), _)] if n == name => {
+                Some(name.to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn contains_cursor_qualifier(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,
