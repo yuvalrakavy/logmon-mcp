@@ -28,9 +28,11 @@
 
 pub mod document;
 pub mod naming;
+pub mod read;
 pub mod write;
 
 pub use naming::{file_names, resolve_prefix, roll_id, stem, MAX_PREFIX_BYTES};
+pub use read::{parse_front_matter, FrontMatter, ParseError};
 pub use write::{claim, write_document, write_jsonl, CaseFileStats, CaseFiles, CaseWriteError};
 
 /// The archive's record format. Carried as the first line of each JSONL file

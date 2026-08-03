@@ -1,0 +1,469 @@
+use super::*;
+use crate::cases::document::{
+    render, Anchor, CaseInput, CollectorLine, FilePointer, RegistryFact, Window,
+};
+use crate::domain_data::ScopedFact;
+use crate::collector::document::yaml_str;
+
+fn t(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+}
+
+fn fixture(stem: &str) -> String {
+    let p = format!(
+        "{}/tests/fixtures/cases/{stem}.md",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("fixture {p}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// The escaping property — the risky half of this module
+// ---------------------------------------------------------------------------
+
+/// Every character `yaml_str` branches on, plus enough ordinary ones that a
+/// rule which fires too eagerly is caught too.
+///
+/// **Exhaustive rather than random.** The input space that decides this
+/// property is exactly the set of characters the escaper switches on, and it is
+/// small enough to enumerate — so enumeration is a stronger statement than any
+/// number of random samples, and it cannot flake.
+fn interesting() -> Vec<char> {
+    let mut v: Vec<char> = (0u32..0x80).filter_map(char::from_u32).collect();
+    v.extend([
+        '\u{7f}',   // DEL
+        '\u{85}',   // NEL      -> \N
+        '\u{a0}',   // NBSP     (not escaped — guards over-eagerness)
+        '\u{2028}', // LS       -> \L
+        '\u{2029}', // PS       -> \P
+        '\u{e9}',   // é        multi-byte, unescaped
+        '\u{65e5}', // 日
+        '\u{1f600}', // 😀      outside the BMP
+    ]);
+    v
+}
+
+#[test]
+fn every_single_character_survives_the_round_trip() {
+    let mut checked = 0;
+    for c in interesting() {
+        let s = c.to_string();
+        let quoted = yaml_str(&s);
+        let back = Cur::new(&quoted, 0)
+            .quoted()
+            .unwrap_or_else(|e| panic!("{:?} (U+{:04X}) failed to parse: {e}", s, c as u32));
+        assert_eq!(
+            back, s,
+            "U+{:04X} did not survive: emitted {quoted:?}",
+            c as u32
+        );
+        checked += 1;
+    }
+    assert!(checked > 130, "the alphabet shrank: only {checked} chars");
+}
+
+#[test]
+fn every_pair_of_interesting_characters_survives() {
+    // Pairs catch a scanner that consumes one character too many or too few —
+    // the failure a single-character test cannot see, because there is nothing
+    // after the mistake to notice it.
+    let alphabet = interesting();
+    let mut checked = 0usize;
+    for &a in &alphabet {
+        for &b in &alphabet {
+            let s: String = [a, b].iter().collect();
+            let quoted = yaml_str(&s);
+            let back = Cur::new(&quoted, 0).quoted().unwrap_or_else(|e| {
+                panic!("U+{:04X}U+{:04X} failed to parse: {e}", a as u32, b as u32)
+            });
+            assert_eq!(
+                back, s,
+                "pair U+{:04X}U+{:04X} did not survive: emitted {quoted:?}",
+                a as u32, b as u32
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 18_000, "the pair space shrank: {checked}");
+}
+
+#[test]
+fn adversarial_strings_survive() {
+    // Each of these is a way a naive un-escaper goes wrong.
+    let cases = [
+        r"\",                    // a lone backslash
+        r"\\",                   // an escaped backslash
+        r"\n",                   // the TEXT backslash-n, not a newline
+        r"\x41",                 // text that looks like an escape
+        "\\\u{2028}",            // backslash then a real LS
+        "a\"b",                  // an embedded quote
+        "}",                     // would close a flow map if unquoted
+        ",",                     // would separate a flow item if unquoted
+        "{a: b, c: [d]}",        // a whole flow map as literal text
+        "\u{0}\u{1f}\u{7f}",     // C0 boundaries and DEL
+        "---",                   // would look like a fence
+        "key: value",            // would look like a line
+        "\u{1f600}\u{1f600}",    // astral pair
+    ];
+    for s in cases {
+        let quoted = yaml_str(s);
+        let back = Cur::new(&quoted, 0)
+            .quoted()
+            .unwrap_or_else(|e| panic!("{s:?} emitted as {quoted:?} failed: {e}"));
+        assert_eq!(back, s, "emitted {quoted:?}");
+    }
+}
+
+#[test]
+fn an_escape_the_emitter_never_produces_is_refused() {
+    // **This test carries the weight the round-trip property cannot.** That
+    // property quantifies over the emitter's IMAGE — every string `yaml_str`
+    // can produce — so it says nothing about inputs the emitter never produces.
+    // An over-permissive un-escaper passes it completely, and over-permissive
+    // is exactly the failure hand-rolling was chosen to prevent: it is how a
+    // corrupt document becomes a plausible record instead of an error.
+    let refused = [
+        r#""\q""#,     // an escape letter that does not exist
+        r#""\A""#,     // adjacent to the real \N \L \P
+        r#""\ ""#,     // backslash-space
+        r#""\0""#,     // C0 is written \x00, never \0
+        r#""\b""#,     // JSON has \b and \f; yaml_str writes \x08 / \x0c
+        r#""\f""#,
+        r#""\x""#,     // \x with no digits
+        r#""\xZ1""#,   // \x with non-hex
+        r#""\""#,      // the escape eats the closing quote
+        r#""abc"#,     // never closed
+    ];
+    for bad in refused {
+        let got = Cur::new(bad, 0).quoted();
+        assert!(
+            got.is_err(),
+            "{bad} should have been refused, got {got:?} — an un-escaper that \
+             accepts what the emitter cannot produce turns corruption into data"
+        );
+    }
+
+    // ...and the mirror: everything the emitter DOES produce must be accepted,
+    // so the strictness above cannot be achieved by refusing everything.
+    for good in [r#""\\""#, r#""\"""#, r#""\n""#, r#""\r""#, r#""\t""#, r#""\x07""#,
+                 r#""\N""#, r#""\L""#, r#""\P""#, r#""""#] {
+        assert!(
+            Cur::new(good, 0).quoted().is_ok(),
+            "{good} is emitter output and must parse"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round trip through the REAL emitter — what pins parser to writer
+// ---------------------------------------------------------------------------
+
+fn hostile_input() -> CaseInput {
+    CaseInput {
+        stem: "checkout-hang-260731-141530".into(),
+        captured_at: t("2026-07-31T14:15:30Z"),
+        domain: "t3".into(),
+        incarnation: Some("2".into()),
+        // Everything a user can type, in the fields a user controls.
+        reason: "he said \"boom\": a,b}c\nline2\ttab\u{2028}ls\u{7}bell".into(),
+        anchor: Anchor {
+            kind: "seq",
+            label: "41022".into(),
+            seq: 41022,
+            at: t("2026-07-31T14:02:07Z"),
+            message: "stalled: {awaiting, lock}".into(),
+            of_many: None,
+        },
+        window: Window {
+            from: 40672,
+            to: 41372,
+            verdict: EvidenceVerdict::Evicted,
+            narrowed_by: Vec::new(),
+            clamped: true,
+            short_before: 3,
+            short_after: 7,
+            log_lost_below: 0,
+            spans_evicted_before_window: None,
+        },
+        logdata: FilePointer {
+            file: "checkout-hang-260731-141530.logdata.jsonl".into(),
+            records: 700,
+        },
+        spandata: FilePointer {
+            file: "checkout-hang-260731-141530.spandata.jsonl".into(),
+            records: 168,
+        },
+        registry: Vec::<RegistryFact>::new(),
+        asserted: vec![ScopedFact {
+            key: "@/capture/note".into(),
+            value: "quoted \"thing\", with a comma".into(),
+        }],
+        neighbours: Vec::new(),
+        spans: Vec::new(),
+        collectors: Vec::<CollectorLine>::new(),
+    }
+}
+
+#[test]
+fn the_real_emitter_round_trips_through_this_parser() {
+    let input = hostile_input();
+    let doc = render(&input).body;
+    let fm = parse_front_matter(&doc).expect("the emitter's own output must parse");
+
+    assert_eq!(fm.case, input.stem);
+    assert_eq!(fm.logmon_format, FORMAT_VERSION);
+    assert_eq!(fm.captured_at, input.captured_at);
+    assert_eq!(fm.domain, input.domain);
+    assert_eq!(fm.incarnation, input.incarnation);
+    assert_eq!(fm.reason, input.reason, "the hostile reason must survive");
+    assert_eq!(fm.headline, input.anchor.message);
+    assert_eq!(fm.anchor.kind, input.anchor.kind);
+    assert_eq!(fm.anchor.value, input.anchor.label);
+    assert_eq!(fm.anchor.seq, input.anchor.seq);
+    assert_eq!(fm.anchor.at, input.anchor.at);
+    assert_eq!(fm.verdict, input.window.verdict);
+    assert_eq!(fm.seq_range.from, input.window.from);
+    assert_eq!(fm.seq_range.to, input.window.to);
+    assert_eq!(fm.seq_range.requested_before_missing, input.window.short_before);
+    assert_eq!(fm.seq_range.requested_after_missing, input.window.short_after);
+    assert!(fm.seq_range.clamped);
+    assert_eq!(fm.logdata.file, input.logdata.file);
+    assert_eq!(fm.logdata.records, input.logdata.records);
+    assert_eq!(fm.spandata.file, input.spandata.file);
+    assert_eq!(fm.spandata.records, input.spandata.records);
+    assert_eq!(
+        fm.asserted.get("@/capture/note").map(String::as_str),
+        Some("quoted \"thing\", with a comma"),
+        "an asserted value containing a quote AND a comma must not split the mapping"
+    );
+}
+
+#[test]
+fn every_verdict_round_trips() {
+    // A verdict that fails to parse would be read as a corrupt case; a verdict
+    // silently mapped to the wrong variant would mis-state what the evidence
+    // can show, which is worse.
+    for v in [
+        EvidenceVerdict::Complete,
+        EvidenceVerdict::Evicted,
+        EvidenceVerdict::Filtered,
+        EvidenceVerdict::CannotVerify,
+    ] {
+        let mut input = hostile_input();
+        input.window.verdict = v;
+        let doc = render(&input).body;
+        let fm = parse_front_matter(&doc).unwrap();
+        assert_eq!(fm.verdict, v, "verdict {v:?} did not survive");
+    }
+}
+
+#[test]
+fn a_null_incarnation_round_trips_as_none() {
+    let mut input = hostile_input();
+    input.incarnation = None;
+    let doc = render(&input).body;
+    assert_eq!(parse_front_matter(&doc).unwrap().incarnation, None);
+}
+
+// ---------------------------------------------------------------------------
+// The real fixtures — bytes a real broker really emitted
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_happy_path_fixture_parses() {
+    let fm = parse_front_matter(&fixture("with-spans-260803-214501")).unwrap();
+    assert_eq!(fm.case, "with-spans-260803-214501");
+    assert_eq!(fm.logmon_format, 1);
+    assert_eq!(fm.domain, "default");
+    assert_eq!(fm.incarnation.as_deref(), Some("1"));
+    assert_eq!(fm.verdict, EvidenceVerdict::Complete);
+    assert_eq!(fm.logdata.records, 9);
+    assert_eq!(fm.spandata.records, 3);
+    assert_eq!(fm.logdata.file, "with-spans-260803-214501.logdata.jsonl");
+    assert_eq!(fm.spandata.file, "with-spans-260803-214501.spandata.jsonl");
+    assert!(
+        fm.seq_range.from <= fm.anchor.seq && fm.anchor.seq <= fm.seq_range.to,
+        "the anchor must lie inside its own window: {:?} vs anchor {}",
+        fm.seq_range,
+        fm.anchor.seq
+    );
+}
+
+#[test]
+fn the_zero_span_fixture_parses_and_still_says_complete() {
+    // This is the writer defect preserved: a `complete` verdict on a capture
+    // that missed every span of the trace it is about. The loader must read it
+    // faithfully — it is not the reader's job to second-guess the document.
+    let fm = parse_front_matter(&fixture("checkout-hang-260803-214121")).unwrap();
+    assert_eq!(fm.spandata.records, 0);
+    assert_eq!(fm.verdict, EvidenceVerdict::Complete);
+    assert_eq!(fm.logdata.records, 6);
+}
+
+#[test]
+fn the_hostile_reason_fixture_parses() {
+    let fm = parse_front_matter(&fixture("nasty-260803-214626")).unwrap();
+    assert!(
+        fm.reason.contains('"') && fm.reason.contains('\n') && fm.reason.contains('\t'),
+        "the escaped characters did not come back: {:?}",
+        fm.reason
+    );
+    assert!(
+        fm.reason.contains('\u{7}'),
+        "the BEL did not come back: {:?}",
+        fm.reason
+    );
+    assert!(
+        fm.reason.contains('\u{2028}'),
+        "the line separator did not come back: {:?}",
+        fm.reason
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Version policy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_newer_format_is_refused_by_name() {
+    let doc = fixture("with-spans-260803-214501").replace("logmon_format: 1", "logmon_format: 2");
+    match parse_front_matter(&doc) {
+        Err(ParseError::FormatTooNew { found, known }) => {
+            assert_eq!((found, known), (2, FORMAT_VERSION));
+        }
+        other => panic!("expected FormatTooNew, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_older_format_is_accepted() {
+    // Refusing older would orphan every archived case on the first bump, which
+    // breaks the "readable years later" promise FORMAT_VERSION exists to make.
+    // FORMAT_VERSION is 1, so 0 is the only older value expressible.
+    let doc = fixture("with-spans-260803-214501").replace("logmon_format: 1", "logmon_format: 0");
+    let fm = parse_front_matter(&doc).expect("an older format must still load");
+    assert_eq!(fm.logmon_format, 0);
+}
+
+#[test]
+fn the_version_is_checked_before_anything_is_interpreted() {
+    // Order matters: a newer document may use a field in a way this parser
+    // would misread, so the refusal must not depend on parsing succeeding.
+    let doc = fixture("with-spans-260803-214501")
+        .replace("logmon_format: 1", "logmon_format: 9")
+        .replace("verdict: complete", "verdict: something_from_the_future");
+    assert!(
+        matches!(
+            parse_front_matter(&doc),
+            Err(ParseError::FormatTooNew { .. })
+        ),
+        "the version check must fire before the verdict is interpreted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Negative controls — each names a specific way to be wrong
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_missing_required_key_is_named() {
+    let doc = fixture("with-spans-260803-214501")
+        .lines()
+        .filter(|l| !l.starts_with("captured_at:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match parse_front_matter(&doc) {
+        Err(ParseError::MissingKey(k)) => assert_eq!(k, "captured_at"),
+        other => panic!("expected MissingKey(captured_at), got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unknown_key_is_ignored() {
+    // Additive forward compatibility: a field added by a later logmon must not
+    // stop this one reading the file.
+    let doc = fixture("with-spans-260803-214501")
+        .replacen("case: ", "future_field: {a: 1}\ncase: ", 1);
+    assert!(
+        parse_front_matter(&doc).is_ok(),
+        "an unknown key must not break the parse"
+    );
+}
+
+#[test]
+fn a_document_with_no_front_matter_says_so() {
+    assert_eq!(
+        parse_front_matter("# just a heading\n"),
+        Err(ParseError::NoFrontMatter)
+    );
+    assert_eq!(
+        parse_front_matter("---\ncase: x\n"),
+        Err(ParseError::NoFrontMatter),
+        "an unclosed fence is not front matter"
+    );
+}
+
+#[test]
+fn a_bad_verdict_is_refused_rather_than_defaulted() {
+    let doc =
+        fixture("with-spans-260803-214501").replace("verdict: complete", "verdict: probably_fine");
+    match parse_front_matter(&doc) {
+        Err(ParseError::BadVerdict(v)) => assert_eq!(v, "probably_fine"),
+        other => panic!("expected BadVerdict, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_non_numeric_seq_is_refused() {
+    let doc = fixture("with-spans-260803-214501").replace("from: 1001", "from: soon");
+    assert!(
+        matches!(
+            parse_front_matter(&doc),
+            Err(ParseError::WrongType { key: "seq_range", .. })
+        ),
+        "a non-numeric seq must not become 0"
+    );
+}
+
+#[test]
+fn a_brace_inside_a_quoted_value_does_not_close_the_mapping() {
+    // This is the entire reason this is a scanner and not `split(',')`. If it
+    // regresses, `logdata.records` silently reads as the wrong number.
+    let doc = format!(
+        "---\n\
+         case: x\n\
+         logmon_format: 1\n\
+         captured_at: \"2026-08-03T21:45:01Z\"\n\
+         domain: \"d\"\n\
+         incarnation: null\n\
+         reason: \"r\"\n\
+         anchor: {{kind: seq, value: \"1\", seq: 1, at: \"2026-08-03T21:45:01Z\"}}\n\
+         headline: \"h\"\n\
+         verdict: complete\n\
+         seq_range: {{from: 1, to: 2, requested_before_missing: 0, \
+         requested_after_missing: 0, clamped: false}}\n\
+         logdata: {{file: {}, records: 9}}\n\
+         spandata: {{file: \"s.jsonl\", records: 3}}\n\
+         provenance: {{core: \"3 of 3\", missing: []}}\n\
+         asserted: {{}}\n\
+         ---\n",
+        yaml_str("weird}, records: 999, x.jsonl")
+    );
+    let fm = parse_front_matter(&doc).unwrap();
+    assert_eq!(fm.logdata.file, "weird}, records: 999, x.jsonl");
+    assert_eq!(
+        fm.logdata.records, 9,
+        "the brace inside the string must not have ended the mapping"
+    );
+}
+
+#[test]
+fn provenance_missing_keys_are_read_as_a_list() {
+    let doc = fixture("with-spans-260803-214501").replace(
+        "provenance: {core: \"3 of 3\", missing: []}",
+        "provenance: {core: \"1 of 3\", missing: [\"/Build/commit\", \"/Action\"]}",
+    );
+    let fm = parse_front_matter(&doc).unwrap();
+    assert_eq!(fm.provenance.core, "1 of 3");
+    assert_eq!(fm.provenance.missing, vec!["/Build/commit", "/Action"]);
+}
