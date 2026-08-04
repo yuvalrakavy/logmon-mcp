@@ -2871,6 +2871,31 @@ pub struct CasesCreate {
     /// [`Self::before`]. Default 350, capped at 5000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<u32>,
+    /// Write loose files instead of one `<stem>.case.zip`.
+    ///
+    /// **The default is one artifact because three files desync or lose a
+    /// sibling in transit**, and moving them between machines is what a case is
+    /// for. Loose is still right when something walks the directory with
+    /// ordinary tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separate: Option<bool>,
+    /// Store the bundle's entries rather than deflating them.
+    ///
+    /// A real choice, not a debug flag: it keeps `unzip -p` cheap for whoever
+    /// walks an archive. **Errors with `separate`**, where it would be inert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncompressed: Option<bool>,
+    /// Leave the log evidence out — the document and provenance only.
+    ///
+    /// The front-matter key is then ABSENT rather than zero, which is the only
+    /// thing telling a reader "nobody shipped it" from "we looked and found
+    /// none". A loaded case refuses log questions instead of answering them with
+    /// a silence that reads like data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omit_logdata: Option<bool>,
+    /// Leave the span evidence out — see [`Self::omit_logdata`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omit_spandata: Option<bool>,
 }
 
 /// One written evidence file.

@@ -2206,6 +2206,25 @@ impl RpcHandler {
             ));
         }
 
+        // **logmon does not know the intended usage** — email, a document store,
+        // or staying local for `grep` — so the shape is the caller's. Defaults
+        // give the complete, single, compressed artifact, which is the safe
+        // thing for someone who has not thought about it.
+        let separate = opt_bool(params, "separate")?.unwrap_or(false);
+        let uncompressed = opt_bool(params, "uncompressed")?.unwrap_or(false);
+        let omit_logdata = opt_bool(params, "omit_logdata")?.unwrap_or(false);
+        let omit_spandata = opt_bool(params, "omit_spandata")?.unwrap_or(false);
+        if uncompressed && separate {
+            // Inert, and this project's own rule is that an accepted no-op reads
+            // as a thing that happened.
+            return Err(
+                "`uncompressed` has no meaning with `separate`: loose files are not \
+                 compressed either way. Drop one of them so the request says what \
+                 it means."
+                    .to_string(),
+            );
+        }
+
         let before = window_count(params, "before")?;
         let after = window_count(params, "after")?;
         let clamped = before.clamped || after.clamped;
@@ -2335,8 +2354,43 @@ impl RpcHandler {
             case_name_now.as_deref(),
             &domain_name,
         );
-        let files = crate::cases::claim(dir, &prefix, captured_at).map_err(|e| e.to_string())?;
-        let names = crate::cases::file_names(&files.stem);
+        // Claimed create-new-exclusive either way, so two concurrent captures
+        // cannot both take a stem. One file cannot be half-claimed; three need
+        // the all-or-none rule `try_claim` enforces.
+        let (loose, bundle) = if separate {
+            (
+                Some(crate::cases::claim(dir, &prefix, captured_at).map_err(|e| e.to_string())?),
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(
+                    crate::cases::claim_bundle(dir, &prefix, captured_at)
+                        .map_err(|e| e.to_string())?,
+                ),
+            )
+        };
+        let stem = loose
+            .as_ref()
+            .map(|f| f.stem.clone())
+            .or_else(|| bundle.as_ref().map(|b| b.stem.clone()))
+            .expect("one of the two");
+        // The registry file rides in `claim_paths` for the loose form even though
+        // `claim` does not create it exclusively: these paths are what
+        // `discard_claim` removes on failure, and a fourth file written but not
+        // listed would be stranded under a stem the retry then rolls past.
+        let claim_paths: Vec<std::path::PathBuf> = loose
+            .as_ref()
+            .map(|f| {
+                let mut p = f.paths.to_vec();
+                p.push(dir.join(crate::cases::bundle::registry_entry_name(&stem)));
+                p
+            })
+            .or_else(|| bundle.as_ref().map(|b| vec![b.path.clone()]))
+            .expect("one of the two");
+        let files = crate::cases::CaseFilesRef { stem: stem.clone() };
+        let names = crate::cases::file_names(&stem);
 
         // Registry writes still happen BEFORE the copy is rendered, so a key the
         // capturer supplies appears in *this* document rather than landing one
@@ -2345,7 +2399,7 @@ impl RpcHandler {
             match self.apply_case_data_entries(session_id, params.get("data")) {
                 Ok(v) => v,
                 Err(e) => {
-                    discard_claim(&files.paths);
+                    discard_claim(&claim_paths);
                     return Err(e);
                 }
             };
@@ -2378,20 +2432,23 @@ impl RpcHandler {
                 log_lost_below,
                 spans_evicted_before_window: span_evicted,
             },
-            logdata: doc::FilePointer {
+            // `None` when omitted, so the front-matter key is ABSENT rather than
+            // present-with-zero. That is the only thing telling a reader "nobody
+            // shipped it" from "we looked and found none".
+            logdata: (!omit_logdata).then(|| doc::FilePointer {
                 file: names[1].clone(),
                 records: logs.len() as u64,
                 // The verdict cannot see the unfiltered flight-recorder window,
                 // so the counts carry what it misses — see `SourceCounts`.
                 by_source: Some(doc::SourceCounts::of(&logs)),
-            },
-            spandata: doc::FilePointer {
+            }),
+            spandata: (!omit_spandata).then(|| doc::FilePointer {
                 file: names[2].clone(),
                 records: spans.len() as u64,
                 // Spans have no filter/flight-recorder split: session filters
                 // never narrow them, they are stored unconditionally.
                 by_source: None,
-            },
+            }),
             registry,
             asserted: scoped.facts,
             neighbours: neighbourhood(&logs, anchor_seq),
@@ -2404,23 +2461,84 @@ impl RpcHandler {
         // claim down with it — an archive nothing ever deletes from must not
         // accumulate empty `.md` files under stems no retry can reuse.
         let write = (|| {
-            let logdata =
-                crate::cases::write_jsonl(files.logdata, &files.paths[1], "logdata", logs.iter())?;
-            let spandata = crate::cases::write_jsonl(
-                files.spandata,
-                &files.paths[2],
-                "spandata",
-                spans.iter(),
-            )?;
+            use std::io::Write as _;
+            // Assembled in memory first, so the bundle and the loose form share
+            // one code path for everything except where the bytes land. An
+            // omitted file is not written at all — its front-matter key is
+            // already absent, and the two must agree.
+            let mut log_buf = Vec::new();
+            let logdata = if omit_logdata {
+                None
+            } else {
+                Some(crate::cases::write_jsonl(
+                    &mut log_buf,
+                    std::path::Path::new(&names[1]),
+                    "logdata",
+                    logs.iter(),
+                )?)
+            };
+            let mut span_buf = Vec::new();
+            let spandata = if omit_spandata {
+                None
+            } else {
+                Some(crate::cases::write_jsonl(
+                    &mut span_buf,
+                    std::path::Path::new(&names[2]),
+                    "spandata",
+                    spans.iter(),
+                )?)
+            };
             let rendered = doc::render(&input);
-            let document_bytes =
-                crate::cases::write_document(files.document, &files.paths[0], &rendered.body)?;
+            let doc_bytes = rendered.body.as_bytes().to_vec();
+            let registry_bytes = doc::registry_json(&input.registry);
+
+            let document_bytes = doc_bytes.len() as u64;
+            match (&loose, &bundle) {
+                (Some(f), _) => {
+                    let fail = |p: &std::path::Path, e: std::io::Error| {
+                        crate::cases::CaseWriteError::Write(p.to_path_buf(), e)
+                    };
+                    // Bulk first: if evidence fails to land the document must
+                    // not point at a file that is not there.
+                    if !omit_logdata {
+                        (&f.logdata).write_all(&log_buf).map_err(|e| fail(&f.paths[1], e))?;
+                    }
+                    if !omit_spandata {
+                        (&f.spandata).write_all(&span_buf).map_err(|e| fail(&f.paths[2], e))?;
+                    }
+                    let reg_path = dir.join(crate::cases::bundle::registry_entry_name(&stem));
+                    std::fs::write(&reg_path, &registry_bytes).map_err(|e| fail(&reg_path, e))?;
+                    (&f.document).write_all(&doc_bytes).map_err(|e| fail(&f.paths[0], e))?;
+                }
+                (_, Some(b)) => {
+                    let mut entries = vec![(names[0].clone(), doc_bytes)];
+                    if !omit_logdata {
+                        entries.push((names[1].clone(), log_buf));
+                    }
+                    if !omit_spandata {
+                        entries.push((names[2].clone(), span_buf));
+                    }
+                    entries.push((
+                        crate::cases::bundle::registry_entry_name(&stem),
+                        registry_bytes,
+                    ));
+                    crate::cases::bundle::pack(&b.file, &stem, &entries, !uncompressed).map_err(
+                        |e| {
+                            crate::cases::CaseWriteError::Write(
+                                b.path.clone(),
+                                std::io::Error::other(e.to_string()),
+                            )
+                        },
+                    )?;
+                }
+                (None, None) => unreachable!("one of the two is claimed"),
+            }
             Ok::<_, crate::cases::CaseWriteError>((logdata, spandata, rendered, document_bytes))
         })();
         let (logdata, spandata, rendered, document_bytes) = match write {
             Ok(v) => v,
             Err(e) => {
-                discard_claim(&files.paths);
+                discard_claim(&claim_paths);
                 return Err(e.to_string());
             }
         };
@@ -2453,20 +2571,21 @@ impl RpcHandler {
 
         serde_json::to_value(CasesCreateResult {
             stem: files.stem,
-            paths: files
-                .paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
+            // One path for a bundle, three for the loose form. The caller is
+            // told what was actually written rather than a fixed shape.
+            paths: claim_paths.iter().map(|p| p.display().to_string()).collect(),
             verdict,
             document_bytes,
+            // Zeroes for omitted evidence, and the document's absent key is
+            // what says which -- a reply cannot express "no file" here without
+            // changing a shipped type.
             logdata: CaseFile {
-                records: logdata.records,
-                bytes: logdata.bytes,
+                records: logdata.map_or(0, |s| s.records),
+                bytes: logdata.map_or(0, |s| s.bytes),
             },
             spandata: CaseFile {
-                records: spandata.records,
-                bytes: spandata.bytes,
+                records: spandata.map_or(0, |s| s.records),
+                bytes: spandata.map_or(0, |s| s.bytes),
             },
             notes,
             data_outcomes,

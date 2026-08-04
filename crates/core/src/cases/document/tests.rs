@@ -52,16 +52,16 @@ fn base() -> CaseInput {
             log_lost_below: 0,
             spans_evicted_before_window: None,
         },
-        logdata: FilePointer {
+        logdata: Some(FilePointer {
             file: "checkout-hang-260731-141530.logdata.jsonl".into(),
             records: 700,
             by_source: Some(SourceCounts { filter: 700, pre_trigger: 0, post_trigger: 0 }),
-        },
-        spandata: FilePointer {
+        }),
+        spandata: Some(FilePointer {
             file: "checkout-hang-260731-141530.spandata.jsonl".into(),
             records: 168,
             by_source: None,
-        },
+        }),
         registry: CORE_KEYS
             .iter()
             .map(|k| fact(k, "v", "2026-07-31T14:03:11Z"))
@@ -944,7 +944,7 @@ fn an_unfiltered_window_inside_a_filtered_range_is_stated_in_section_2() {
     // evidence than the verdict admits.
     let mut i = base();
     i.window.verdict = EvidenceVerdict::Filtered;
-    i.logdata.by_source = Some(SourceCounts {
+    i.logdata.as_mut().unwrap().by_source = Some(SourceCounts {
         filter: 680,
         pre_trigger: 15,
         post_trigger: 5,
@@ -973,7 +973,7 @@ fn a_capture_with_no_flight_recorder_window_says_nothing_about_one() {
     // every ordinary capture about a mechanism that did not fire, and a reader
     // would stop reading it.
     let mut i = base();
-    i.logdata.by_source = Some(SourceCounts {
+    i.logdata.as_mut().unwrap().by_source = Some(SourceCounts {
         filter: 700,
         pre_trigger: 0,
         post_trigger: 0,

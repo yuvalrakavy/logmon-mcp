@@ -153,10 +153,19 @@ impl Harness {
     }
 
     /// A capture with the boring parameters filled in.
+    /// Capture as LOOSE FILES.
+    ///
+    /// **`separate` is explicit here on purpose.** `cases.create` bundles by
+    /// default since 2026-08-04, and every test in this file is about the
+    /// document's contents or the three-file layout — so they exercise the loose
+    /// form, and saying so beats twenty tests each opening a zip to read one
+    /// markdown file. The bundle's own behaviour is covered by
+    /// `a_bundled_capture_*` below and by `cases::bundle`'s unit tests.
     fn capture(&self, extra: Value) -> Result<Value, String> {
         let mut params = json!({
             "reason": "hang at 20/20",
             "dir": self.dir(),
+            "separate": true,
         });
         for (k, v) in extra.as_object().expect("object").iter() {
             params[k] = v.clone();
@@ -187,7 +196,7 @@ fn a_capture_writes_three_files_and_reports_what_landed() {
     let r = h.capture(json!({ "anchor": { "seq": anchor } })).unwrap();
 
     let paths = r["paths"].as_array().expect("paths");
-    assert_eq!(paths.len(), 3, "{r}");
+    assert_eq!(paths.len(), 4, "{r}");
     for p in paths {
         let p = p.as_str().unwrap();
         assert!(
@@ -198,6 +207,9 @@ fn a_capture_writes_three_files_and_reports_what_landed() {
     assert!(paths[0].as_str().unwrap().ends_with(".md"));
     assert!(paths[1].as_str().unwrap().ends_with(".logdata.jsonl"));
     assert!(paths[2].as_str().unwrap().ends_with(".spandata.jsonl"));
+    // The fourth is the provenance the document's rendered table cannot give
+    // back: its values are flattened and its timestamps floored.
+    assert!(paths[3].as_str().unwrap().ends_with(".registry.json"));
 
     // The stem is the domain name by default — the only identity logmon has.
     assert!(r["stem"].as_str().unwrap().starts_with("default-"), "{r}");
@@ -549,8 +561,9 @@ fn a_second_capture_in_the_same_second_does_not_overwrite_the_first() {
     assert_ne!(a["stem"], b["stem"], "{a} vs {b}");
     assert_eq!(
         std::fs::read_dir(h.archive.path()).unwrap().count(),
-        6,
-        "three files each, none clobbered"
+        8,
+        "four files each — document, both evidence files and the registry — none \
+         clobbered"
     );
 }
 
@@ -730,7 +743,11 @@ fn a_capture_that_fails_after_claiming_gives_the_stem_back() {
         !stem.contains("-2."),
         "a stranded claim would push the retry onto a rolled id: {stem}"
     );
-    assert_eq!(std::fs::read_dir(h.archive.path()).unwrap().count(), 3);
+    // FOUR, not three: the loose form also writes `<stem>.registry.json`, the
+    // machine-readable provenance the document's rendered table cannot give
+    // back. It is listed in the claim so a failure removes it too — otherwise a
+    // stranded fourth file would sit under a stem the retry rolls past.
+    assert_eq!(std::fs::read_dir(h.archive.path()).unwrap().count(), 4);
 }
 
 /// The mirror, and the reason `lost_below` exists rather than `oldest_seq`: a
@@ -1000,6 +1017,143 @@ fn spans_arriving_after_the_last_log_are_captured_not_silently_dropped() {
         fm.spandata.as_ref().expect("declared, so present").records,
         3,
         "and the front matter agrees with the file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The bundle, and the options that shape it
+// ---------------------------------------------------------------------------
+
+/// Capture with the DEFAULTS — one compressed artifact.
+fn bundled(h: &Harness, extra: Value) -> Value {
+    let mut params = json!({ "reason": "hang at 20/20", "dir": h.dir() });
+    for (k, v) in extra.as_object().expect("object").iter() {
+        params[k] = v.clone();
+    }
+    h.call("cases.create", params).expect("capture")
+}
+
+#[test]
+fn a_bundled_capture_is_one_file_that_load_case_can_read() {
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    let r = bundled(&h, json!({ "anchor": { "seq": anchor } }));
+
+    let paths = r["paths"].as_array().expect("paths");
+    assert_eq!(paths.len(), 1, "one artifact, not four: {r}");
+    let p = paths[0].as_str().unwrap();
+    assert!(p.ends_with(".case.zip"), "{p}");
+    assert_eq!(
+        std::fs::read_dir(h.archive.path()).unwrap().count(),
+        1,
+        "and nothing loose beside it"
+    );
+
+    // The whole point: what was written is what the loader reads.
+    let case = logmon_broker_core::cases::load::load(std::path::Path::new(p))
+        .expect("the bundle logmon just wrote must load");
+    assert_eq!(case.stem, r["stem"].as_str().unwrap());
+    assert!(case.logs.is_some());
+    assert!(
+        case.registry.is_some(),
+        "the registry rides inside as its own entry"
+    );
+}
+
+#[test]
+fn omitted_evidence_is_absent_from_the_bundle_and_from_the_front_matter() {
+    // The two must agree: the key's presence mirrors the file's, which is what
+    // makes them unable to contradict each other.
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    let r = bundled(
+        &h,
+        json!({ "anchor": { "seq": anchor }, "omit_spandata": true }),
+    );
+    let p = r["paths"][0].as_str().unwrap();
+
+    let case = logmon_broker_core::cases::load::load(std::path::Path::new(p)).expect("loads");
+    assert!(
+        case.spans.is_none(),
+        "omitted must read as omitted, not as zero spans"
+    );
+    assert!(case.logs.is_some(), "and the other half is still there");
+    assert!(
+        case.front.spandata.is_none(),
+        "the front-matter key is absent too, or the two disagree"
+    );
+
+    // And the document says so in prose, because a reader must not have to infer
+    // it from a line that is not there.
+    let doc = String::from_utf8_lossy(&std::fs::read(p).unwrap()).len();
+    assert!(doc > 0);
+    let text = document_of_bundle(p);
+    assert!(
+        text.contains("Span evidence was OMITTED"),
+        "section 2 must state the omission: {text}"
+    );
+    assert!(
+        text.contains("Do not read \"no slow spans\""),
+        "and say what conclusion it forbids: {text}"
+    );
+}
+
+fn document_of_bundle(path: &str) -> String {
+    let stem = logmon_broker_core::cases::bundle::stem_of_bundle(std::path::Path::new(path))
+        .expect("a bundle path");
+    let f = std::fs::File::open(path).unwrap();
+    let bytes = logmon_broker_core::cases::bundle::unpack(f, &stem).unwrap();
+    String::from_utf8_lossy(&bytes.document).into_owned()
+}
+
+#[test]
+fn uncompressed_with_separate_is_refused_rather_than_ignored() {
+    // Inert, and this project's rule is that an accepted no-op reads as a thing
+    // that happened.
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    let err = h
+        .call(
+            "cases.create",
+            json!({
+                "reason": "x", "dir": h.dir(), "anchor": { "seq": anchor },
+                "separate": true, "uncompressed": true
+            }),
+        )
+        .expect_err("refused");
+    assert!(err.contains("no meaning with `separate`"), "{err}");
+}
+
+#[test]
+fn an_uncompressed_bundle_is_larger_and_still_loads() {
+    // `uncompressed` is a real choice, not a debug flag: it keeps `unzip -p`
+    // cheap for whoever walks an archive.
+    let h = harness();
+    let anchor = h.feed(Level::Error, "boom");
+    for _ in 0..40 {
+        h.feed(Level::Info, "filler filler filler filler filler filler");
+    }
+
+    let small = bundled(&h, json!({ "anchor": { "seq": anchor } }));
+    let big = bundled(
+        &h,
+        json!({ "anchor": { "seq": anchor }, "uncompressed": true, "prefix": "raw" }),
+    );
+    let size = |r: &Value| {
+        std::fs::metadata(r["paths"][0].as_str().unwrap())
+            .unwrap()
+            .len()
+    };
+    assert!(
+        size(&big) > size(&small),
+        "stored should be larger than deflated: {} vs {}",
+        size(&big),
+        size(&small)
+    );
+    let p = big["paths"][0].as_str().unwrap();
+    assert!(
+        logmon_broker_core::cases::load::load(std::path::Path::new(p)).is_ok(),
+        "and a stored bundle must still load"
     );
 }
 

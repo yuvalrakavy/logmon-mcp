@@ -204,8 +204,11 @@ pub struct CaseInput {
     pub reason: String,
     pub anchor: Anchor,
     pub window: Window,
-    pub logdata: FilePointer,
-    pub spandata: FilePointer,
+    /// `None` when the capture OMITTED this evidence. The front-matter key is
+    /// then absent too, which is how a reader tells "nobody shipped it" from
+    /// `records: 0`, "we looked and found none".
+    pub logdata: Option<FilePointer>,
+    pub spandata: Option<FilePointer>,
     pub registry: Vec<RegistryFact>,
     pub asserted: Vec<ScopedFact>,
     /// The anchor entry and its neighbours, oldest first, anchor included.
@@ -343,8 +346,13 @@ fn front_matter(s: &mut String, i: &CaseInput) {
     // Evidence keys are OMITTED when the capture omitted that evidence, which is
     // a different fact from `records: 0` ("we captured none"). The key's presence
     // mirrors the file's, so the two cannot contradict each other.
-    file_pointer(s, "logdata", &i.logdata);
-    file_pointer(s, "spandata", &i.spandata);
+    // Absent key for omitted evidence -- see `CaseInput::logdata`.
+    if let Some(p) = &i.logdata {
+        file_pointer(s, "logdata", p);
+    }
+    if let Some(p) = &i.spandata {
+        file_pointer(s, "spandata", p);
+    }
     // Empty means nothing narrowed — a real answer. ABSENT means a case written
     // before this key existed, which a reader must not read as "unfiltered".
     let ranges: Vec<String> = i
@@ -630,7 +638,29 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
     // them, so a window holding a complete unfiltered burst still grades
     // `filtered`. Saying so here is what stops the verdict being read as the
     // whole truth about the anchor's own neighbourhood.
-    if let Some(c) = i.logdata.by_source {
+    // **Omission is stated before anything it qualifies**, and stated as a
+    // choice rather than as a shortfall. `records: 0` means the capture looked
+    // and found none — a finding about the system. Omitted means nobody shipped
+    // it, a fact about the capture. A reader who cannot tell them apart reads a
+    // silence as evidence.
+    if i.logdata.is_none() {
+        let _ = writeln!(
+            s,
+            "**Log evidence was OMITTED from this capture.** It was not empty — it \
+             was not included. Nothing here can answer a question about the log \
+             records, and an empty answer from this case is not a finding about \
+             the system.\n"
+        );
+    }
+    if i.spandata.is_none() {
+        let _ = writeln!(
+            s,
+            "**Span evidence was OMITTED from this capture.** Do not read \"no slow \
+             spans\" from this case: no spans were shipped with it.\n"
+        );
+    }
+
+    if let Some(c) = i.logdata.as_ref().and_then(|l| l.by_source) {
         let unfiltered = c.pre_trigger + c.post_trigger;
         if unfiltered > 0 {
             let _ = writeln!(
@@ -640,31 +670,37 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                  were stored because they matched a filter. Any verdict of \
                  `filtered` above grades the seq range as a whole and does not \
                  know about the unfiltered window inside it.\n",
-                i.logdata.records, unfiltered, c.pre_trigger, c.post_trigger, c.filter
+                i.logdata.as_ref().map_or(0, |l| l.records),
+                unfiltered,
+                c.pre_trigger,
+                c.post_trigger,
+                c.filter
             );
         }
     }
 
     // The span line is its own, because the span ring has its own retention and
     // one verdict cannot honestly cover two stores that evict independently.
+    let span_records = i.spandata.as_ref().map_or(0, |p| p.records);
     match w.spans_evicted_before_window {
-        None => {
+        None if i.spandata.is_some() => {
             let _ = writeln!(
                 s,
-                "Spans: {} captured, and the span ring had dropped nothing below seq {}. \
-                 **Session filters never narrow spans** — they are stored unconditionally — so \
-                 whatever the verdict above says about the logs, the spans over this range are \
-                 all of them.\n",
-                i.spandata.records, w.from
+                "Spans: {span_records} captured, and the span ring had dropped nothing below \
+                 seq {}. **Session filters never narrow spans** — they are stored \
+                 unconditionally — so whatever the verdict above says about the logs, the spans \
+                 over this range are all of them.\n",
+                w.from
             );
         }
+        None => {}
         Some(gap) => {
             let _ = writeln!(
                 s,
-                "Spans: {} captured; the span ring **had** evicted below seq {} — up to {gap} \
-                 spans over this window are gone. The log verdict above does not cover this: \
-                 the two stores share a seq axis but evict independently.\n",
-                i.spandata.records, w.from
+                "Spans: {span_records} captured; the span ring **had** evicted below seq {} — up \
+                 to {gap} spans over this window are gone. The log verdict above does not cover \
+                 this: the two stores share a seq axis but evict independently.\n",
+                w.from
             );
             notes.push(Note {
                 kind: NOTE_CAPTURE_GAP,
@@ -1127,16 +1163,23 @@ fn pointers(s: &mut String, i: &CaseInput) {
     let _ = writeln!(s, "## 7. Evidence files\n");
     let _ = writeln!(s, "| file | records | first line |");
     let _ = writeln!(s, "|---|---|---|");
-    let _ = writeln!(
-        s,
-        "| `{}` | {} | `{{\"logmon_format\":{FORMAT_VERSION},\"kind\":\"logdata\"}}` |",
-        i.logdata.file, i.logdata.records
-    );
-    let _ = writeln!(
-        s,
-        "| `{}` | {} | `{{\"logmon_format\":{FORMAT_VERSION},\"kind\":\"spandata\"}}` |",
-        i.spandata.file, i.spandata.records
-    );
+    // An omitted file gets a row saying so rather than no row at all: a table
+    // that silently drops it looks like a case that had no such evidence, which
+    // is the confusion this whole distinction exists to prevent.
+    for (kind, p) in [("logdata", &i.logdata), ("spandata", &i.spandata)] {
+        match p {
+            Some(p) => {
+                let _ = writeln!(
+                    s,
+                    "| `{}` | {} | `{{\"logmon_format\":{FORMAT_VERSION},\"kind\":\"{kind}\"}}` |",
+                    p.file, p.records
+                );
+            }
+            None => {
+                let _ = writeln!(s, "| *(no `{kind}`)* | **omitted at capture** | — |");
+            }
+        }
+    }
     // Printed in full, not elided. The sentence naming the header as the
     // contract is the last place to hide it behind an ellipsis: nothing indexes
     // this archive, so this line is what a reader years from now has.

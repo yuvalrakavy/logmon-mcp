@@ -185,16 +185,16 @@ fn hostile_input() -> CaseInput {
             log_lost_below: 0,
             spans_evicted_before_window: None,
         },
-        logdata: FilePointer {
+        logdata: Some(FilePointer {
             file: "checkout-hang-260731-141530.logdata.jsonl".into(),
             records: 700,
             by_source: Some(SourceCounts { filter: 700, pre_trigger: 0, post_trigger: 0 }),
-        },
-        spandata: FilePointer {
+        }),
+        spandata: Some(FilePointer {
             file: "checkout-hang-260731-141530.spandata.jsonl".into(),
             records: 168,
             by_source: None,
-        },
+        }),
         registry: Vec::<RegistryFact>::new(),
         asserted: vec![ScopedFact {
             key: "@/capture/note".into(),
@@ -230,11 +230,11 @@ fn the_real_emitter_round_trips_through_this_parser() {
     assert_eq!(fm.seq_range.requested_after_missing, input.window.short_after);
     assert!(fm.seq_range.clamped);
     let logdata = fm.logdata.as_ref().expect("declared, so present");
-    assert_eq!(logdata.file, input.logdata.file);
-    assert_eq!(logdata.records, input.logdata.records);
+    assert_eq!(logdata.file, input.logdata.as_ref().unwrap().file);
+    assert_eq!(logdata.records, input.logdata.as_ref().unwrap().records);
     let spandata = fm.spandata.as_ref().expect("declared, so present");
-    assert_eq!(spandata.file, input.spandata.file);
-    assert_eq!(spandata.records, input.spandata.records);
+    assert_eq!(spandata.file, input.spandata.as_ref().unwrap().file);
+    assert_eq!(spandata.records, input.spandata.as_ref().unwrap().records);
     assert_eq!(
         fm.asserted.get("@/capture/note").map(String::as_str),
         Some("quoted \"thing\", with a comma"),
@@ -474,7 +474,7 @@ fn the_source_split_round_trips() {
     // The verdict cannot see the unfiltered flight-recorder window, so these
     // counts are the only place that fact survives into a loaded case.
     let mut input = hostile_input();
-    input.logdata.by_source = Some(SourceCounts {
+    input.logdata.as_mut().unwrap().by_source = Some(SourceCounts {
         filter: 680,
         pre_trigger: 15,
         post_trigger: 5,

@@ -3754,6 +3754,34 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "separate": {
+          "description": "Write loose files instead of one `<stem>.case.zip`.\n\n**The default is one artifact because three files desync or lose a\nsibling in transit**, and moving them between machines is what a case is\nfor. Loose is still right when something walks the directory with\nordinary tools.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "uncompressed": {
+          "description": "Store the bundle's entries rather than deflating them.\n\nA real choice, not a debug flag: it keeps `unzip -p` cheap for whoever\nwalks an archive. **Errors with `separate`**, where it would be inert.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "omit_logdata": {
+          "description": "Leave the log evidence out — the document and provenance only.\n\nThe front-matter key is then ABSENT rather than zero, which is the only\nthing telling a reader \"nobody shipped it\" from \"we looked and found\nnone\". A loaded case refuses log questions instead of answering them with\na silence that reads like data.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "omit_spandata": {
+          "description": "Leave the span evidence out — see [`Self::omit_logdata`].",
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,

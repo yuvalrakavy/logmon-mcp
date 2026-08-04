@@ -86,6 +86,14 @@ pub fn claim(dir: &Path, prefix: &str, at: DateTime<Utc>) -> Result<CaseFiles, C
     ))
 }
 
+/// Just the stem, for the stretch of `cases.create` that only needs the name.
+///
+/// The claim itself is one of two shapes -- three loose files or one bundle --
+/// and everything between claiming and writing cares about neither.
+pub struct CaseFilesRef {
+    pub stem: String,
+}
+
 /// A claimed bundle: one file, exclusively created.
 pub struct CaseBundleFile {
     pub stem: String,

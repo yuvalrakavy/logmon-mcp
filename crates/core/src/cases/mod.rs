@@ -44,7 +44,7 @@ pub mod write;
 pub use naming::{file_names, resolve_prefix, roll_id, stem, MAX_PREFIX_BYTES};
 pub use read::{parse_front_matter, FrontMatter, ParseError};
 pub use write::{
-    claim, claim_bundle, write_document, write_jsonl, CaseBundleFile, CaseFileStats, CaseFiles,
+    claim, claim_bundle, write_document, write_jsonl, CaseBundleFile, CaseFileStats, CaseFiles, CaseFilesRef,
     CaseWriteError,
 };
 
