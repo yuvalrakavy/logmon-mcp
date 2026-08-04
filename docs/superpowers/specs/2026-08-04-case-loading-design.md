@@ -385,6 +385,104 @@ second silently replaces the first.
 
 ---
 
+## 3.11 The bundle (user-directed 2026-08-04)
+
+Three files sharing a stem desync or lose a sibling in transit, and the design's
+own scenario is moving them between machines. So a case becomes **one artifact**.
+
+**This reverses a recorded decision, and the reason it may be reversed is the
+reason it was recorded.** `cases/mod.rs` says the archive is uncompressed because
+*"indexing belongs to whatever walks the directory, so putting a codec between
+the archive and `grep` costs more than the bytes are worth."* `grep` is no longer
+the consumer: `load_case` reads a case and MongoDB manages the collection. The
+premise expired, so the decision is re-derived rather than inherited — which is
+what writing the reason down was for.
+
+Measured on real fixture bytes, 5000-record capture, two models:
+
+| Model | Ratio |
+|---|---|
+| every message unique (floor) | **18.9×** — 1.9 MB → 100 KB |
+| repetitive service traffic | **69.5×** — 1.7 MB → 24 KB |
+
+Even the floor makes a full capture emailable, which is a stated transport.
+
+### Layout
+
+```
+<stem>.case.zip
+├── <stem>.md               document — the human half; the §5 table stays
+├── <stem>.logdata.jsonl    evidence
+├── <stem>.spandata.jsonl   evidence
+└── <stem>.registry.json    provenance, machine-readable, COMPLETE
+```
+
+Stem-prefixed entries, so `unzip` reproduces exactly the loose layout: the bundle
+is a container, not a new format. `load_case` accepts a `.case.zip` **or** the
+`.md` of an unzipped case, which it needs anyway for a case someone is working on.
+
+**The `zip` dependency sits AROUND the contract, not on it** — the asymmetry with
+the YAML crate §3.2 refused. If the crate were abandoned, every archive is still
+readable by every unzip in existence; a YAML parser would have been load-bearing
+on the format itself.
+
+### Moving the registry out of the `.md` (user-directed)
+
+Two consequences beyond tidiness:
+
+- **`REGISTRY_RENDER_CAP` stops applying to it.** That cap bounds the *document*.
+  As its own compressed entry the registry costs the document nothing, so
+  `registry.json` carries **every** fact: `dropped` is always 0 and the loader
+  restores the complete registry. §3.4.1's "restored provenance is a subset"
+  caveat disappears.
+- **It fixes a gate finding.** The table's truncation note currently advises
+  *"read them with `get_domain_data` on domain X"* — which presumes the live
+  domain still exists, the one thing the postmortem scenario guarantees it does
+  not. It now points at a sibling entry that travels inside the bundle.
+
+### Options — logmon does not know the intended usage
+
+The caller knows whether this is going by email, into a document store, or staying
+local. So `cases.create` takes:
+
+| Param | Default | Effect |
+|---|---|---|
+| `separate` | `false` | loose files instead of a bundle |
+| `uncompressed` | `false` | stored entries rather than deflated |
+| `omit_logdata` | `false` | document + provenance only, no bulk log evidence |
+| `omit_spandata` | `false` | same for spans |
+
+Defaults produce the complete, single, compressed artifact.
+
+**`uncompressed` with `separate` is inert and therefore errors**, per the rule
+already governing a sealed domain: an accepted no-op reads as a thing that
+happened.
+
+### OMITTED IS NOT EMPTY — the load-bearing rule of this section
+
+`spandata: {records: 0}` means **"we captured none"**, and the writer emits a
+38-byte header-only file precisely to say so — `write.rs`'s own test comment is
+*"Absent cannot be told from 'we captured none'."*
+
+If omission produced that same front matter, a reader could not tell **"this
+system had no traces"** (a finding about the system) from **"someone chose not to
+ship them"** (a fact about the capture). A loaded case would answer *"what was
+the slowest span three months ago?"* with a silence that looks like evidence.
+
+So:
+
+- the front matter marks omission **explicitly and separately from `records`**;
+- the document's §2 — "what this capture can and cannot show" — leads with it,
+  beside the eviction and filter facts it already leads with;
+- **`load_case` refuses span queries on a domain whose spans were omitted**,
+  naming the omission, rather than serving an empty span store. Same for logs.
+  An empty result is an answer; this is the absence of one.
+
+Omission is a choice, not a capture limitation, so it does **not** fold into
+`verdict`, which grades what the capture could vouch for.
+
+---
+
 ## 4. The writer fix (D7)
 
 `before`/`after` count records in the **shared seq space**, so one interval still
