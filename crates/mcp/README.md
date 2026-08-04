@@ -46,6 +46,8 @@ Global flags:
 | `traces` | `profile` | Same numbers over spans already buffered, without arming anything. |
 | `session` | `list` / `drop` | List or drop sessions. (Renaming the *current* session is an MCP-mode tool — `rename_session` — not a CLI verb: the CLI's per-invocation session has nothing durable to rename.) |
 | `domains` | `create` / `delete` / `list` / `clear` | Manage isolated domains (each with its own buffers, receivers, triggers). |
+| `cases` | `create` | Freeze a window to disk as one `<stem>.case.zip` — document, both evidence files, machine-readable provenance. `--dir` must be **absolute** (the broker is a service; a relative path resolves against *its* cwd). `--separate` writes loose files, `--uncompressed` stores rather than deflates, `--omit-logdata` / `--omit-spandata` leave that evidence out. |
+| `cases` | `load` | Read one back into a sealed **postmortem** domain, so every read verb answers about it via `--domain`. Nothing arrives on it: collectors, triggers, filters and clears are refused by name, and reads of evidence the capture *omitted* are refused rather than answered emptily. |
 | `status` | (no verb) | Print broker status (incl. `current_domain` + `active_filters`). Reports the broker's version alongside this CLI's. |
 
 Run `logmon-mcp <group> --help` for a group's verbs, and
