@@ -411,6 +411,13 @@ pub struct FrontMatter {
     pub logdata: Option<FileRef>,
     /// `None` when the capture omitted span evidence — see [`Self::logdata`].
     pub spandata: Option<FileRef>,
+    /// The stretches a session filter was narrowing, with the expressions.
+    ///
+    /// **`Some(vec![])` and `None` are different answers.** Empty means nothing
+    /// narrowed — a positive fact. Absent means the case predates this key, and
+    /// a loader must fall back to verdict-based seeding rather than concluding
+    /// the window was unfiltered.
+    pub narrowed_by: Option<Vec<NarrowedSpan>>,
     pub provenance: Provenance,
     /// Document-scoped `@` facts, asserted about this capture alone.
     pub asserted: BTreeMap<String, String>,
@@ -437,6 +444,31 @@ pub struct SeqRange {
 pub struct FileRef {
     pub file: String,
     pub records: u64,
+    /// How the records got stored. `None` on spandata, and on any case written
+    /// before this key existed.
+    pub by_source: Option<SourceCounts>,
+}
+
+/// The filter/flight-recorder split — see `document::SourceCounts`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceCounts {
+    pub filter: u64,
+    pub pre_trigger: u64,
+    pub post_trigger: u64,
+}
+
+/// One stretch over which a session filter was narrowing what got stored, and
+/// the expressions in force.
+///
+/// **This is what lets a `filtered` case load as filtered.** Without it the
+/// loader can only seed an unfiltered epoch (when the verdict is `complete`) or
+/// nothing at all, so every capture taken while a filter was running degrades to
+/// `cannot_verify` — which is exactly the capture a production box produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrowedSpan {
+    pub from: u64,
+    pub to: u64,
+    pub filters: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -609,10 +641,61 @@ pub fn parse_front_matter(doc: &str) -> Result<FrontMatter, ParseError> {
             return Ok(None);
         };
         let m = as_map(v, key)?;
+        // Absent on spandata by construction, and on any case written before the
+        // key existed — a missing split is unknown, never zero.
+        let by_source = match m.get("by_source") {
+            None => None,
+            Some(v) => {
+                let c = as_map(v, key)?;
+                Some(SourceCounts {
+                    filter: as_u64(sub(c, key, "filter")?, key)?,
+                    pre_trigger: as_u64(sub(c, key, "pre_trigger")?, key)?,
+                    post_trigger: as_u64(sub(c, key, "post_trigger")?, key)?,
+                })
+            }
+        };
         Ok(Some(FileRef {
             file: as_text(sub(m, key, "file")?, key)?,
             records: as_u64(sub(m, key, "records")?, key)?,
+            by_source,
         }))
+    };
+
+    let narrowed_by = match top.get("narrowed_by") {
+        None => None,
+        Some(Value::Seq(items)) => Some(
+            items
+                .iter()
+                .map(|it| {
+                    let m = as_map(it, "narrowed_by")?;
+                    let filters = match sub(m, "narrowed_by", "filters")? {
+                        Value::Seq(fs) => fs
+                            .iter()
+                            .map(|f| as_text(f, "narrowed_by"))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        other => {
+                            return Err(ParseError::WrongType {
+                                key: "narrowed_by",
+                                wanted: "a range whose `filters` is a sequence",
+                                got: other.type_name(),
+                            })
+                        }
+                    };
+                    Ok(NarrowedSpan {
+                        from: as_u64(sub(m, "narrowed_by", "from")?, "narrowed_by")?,
+                        to: as_u64(sub(m, "narrowed_by", "to")?, "narrowed_by")?,
+                        filters,
+                    })
+                })
+                .collect::<Result<Vec<_>, ParseError>>()?,
+        ),
+        Some(other) => {
+            return Err(ParseError::WrongType {
+                key: "narrowed_by",
+                wanted: "a sequence",
+                got: other.type_name(),
+            })
+        }
     };
 
     let prov_m = as_map(take(&top, "provenance")?, "provenance")?;
@@ -669,6 +752,7 @@ pub fn parse_front_matter(doc: &str) -> Result<FrontMatter, ParseError> {
         seq_range,
         logdata: file_ref("logdata")?,
         spandata: file_ref("spandata")?,
+        narrowed_by,
         provenance,
         asserted,
     })

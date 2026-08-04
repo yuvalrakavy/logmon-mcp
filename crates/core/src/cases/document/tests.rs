@@ -55,10 +55,12 @@ fn base() -> CaseInput {
         logdata: FilePointer {
             file: "checkout-hang-260731-141530.logdata.jsonl".into(),
             records: 700,
+            by_source: Some(SourceCounts { filter: 700, pre_trigger: 0, post_trigger: 0 }),
         },
         spandata: FilePointer {
             file: "checkout-hang-260731-141530.spandata.jsonl".into(),
             records: 168,
+            by_source: None,
         },
         registry: CORE_KEYS
             .iter()
@@ -922,6 +924,56 @@ fn span_named(name: &str, service: &str, ms: f64) -> SpanEntry {
         attributes: Default::default(),
         events: Vec::new(),
     }
+}
+
+#[test]
+fn an_unfiltered_window_inside_a_filtered_range_is_stated_in_section_2() {
+    // The verdict grades the seq axis and CANNOT see this: the flight recorder's
+    // flush stores entries without the epoch log observing them, so a window
+    // holding a complete unfiltered burst still grades `filtered`. Section 2 is
+    // the only place a reader learns the anchor's own neighbourhood is better
+    // evidence than the verdict admits.
+    let mut i = base();
+    i.window.verdict = EvidenceVerdict::Filtered;
+    i.logdata.by_source = Some(SourceCounts {
+        filter: 680,
+        pre_trigger: 15,
+        post_trigger: 5,
+    });
+    let body = render(&i).body;
+    let sec2 = body.split("## 2. Evidence").nth(1).unwrap();
+
+    assert!(
+        sec2.contains("**20 were captured unfiltered**"),
+        "the unfiltered count must be stated: {sec2}"
+    );
+    assert!(
+        sec2.contains("15 before, 5 after"),
+        "and split by side, since they bracket the trigger: {sec2}"
+    );
+    assert!(
+        sec2.contains("does not know about the unfiltered window inside it"),
+        "and the verdict's blind spot named, or the reader trusts the wrong \
+         number: {sec2}"
+    );
+}
+
+#[test]
+fn a_capture_with_no_flight_recorder_window_says_nothing_about_one() {
+    // The negative control. Emitting the sentence unconditionally would tell
+    // every ordinary capture about a mechanism that did not fire, and a reader
+    // would stop reading it.
+    let mut i = base();
+    i.logdata.by_source = Some(SourceCounts {
+        filter: 700,
+        pre_trigger: 0,
+        post_trigger: 0,
+    });
+    let body = render(&i).body;
+    assert!(
+        !body.contains("were captured unfiltered"),
+        "no unfiltered window means no sentence: {body}"
+    );
 }
 
 #[test]

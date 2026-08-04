@@ -32,7 +32,7 @@
 use super::FORMAT_VERSION;
 use crate::collector::document::yaml_str;
 use crate::domain_data::{render_duration, ScopedFact, CORE_KEYS};
-use crate::gelf::message::LogEntry;
+use crate::gelf::message::{LogEntry, LogSource};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::{EvidenceVerdict, NarrowedRange};
@@ -122,6 +122,39 @@ pub struct Window {
 pub struct FilePointer {
     pub file: String,
     pub records: u64,
+    /// How the records got stored. `None` for spandata, which has no such split.
+    pub by_source: Option<SourceCounts>,
+}
+
+/// The split between records stored because they matched a **filter** and those
+/// the flight recorder flushed as an **unfiltered window** around a trigger.
+///
+/// **Reported because the verdict cannot see it.** The pre-trigger flush calls
+/// `append_to_store` directly (`daemon/log_processor.rs:90`) and never reaches
+/// the `epochs().observe` on the storage-decision branch, so those seqs keep the
+/// surrounding epoch's policy — a window holding a complete unfiltered burst
+/// still grades `filtered`. That under-claims in the safe direction, but it
+/// under-claims about the anchor's own neighbourhood, which is the part a reader
+/// most needs to trust. These counts are the finer truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceCounts {
+    pub filter: u64,
+    pub pre_trigger: u64,
+    pub post_trigger: u64,
+}
+
+impl SourceCounts {
+    pub fn of(entries: &[LogEntry]) -> Self {
+        let mut c = Self::default();
+        for e in entries {
+            match e.source {
+                LogSource::Filter => c.filter += 1,
+                LogSource::PreTrigger => c.pre_trigger += 1,
+                LogSource::PostTrigger => c.post_trigger += 1,
+            }
+        }
+        c
+    }
 }
 
 /// One registry key as of `captured_at`.
@@ -307,18 +340,28 @@ fn front_matter(s: &mut String, i: &CaseInput) {
          requested_after_missing: {}, clamped: {}}}",
         i.window.from, i.window.to, i.window.short_before, i.window.short_after, i.window.clamped
     );
-    let _ = writeln!(
-        s,
-        "logdata: {{file: {}, records: {}}}",
-        yaml_str(&i.logdata.file),
-        i.logdata.records
-    );
-    let _ = writeln!(
-        s,
-        "spandata: {{file: {}, records: {}}}",
-        yaml_str(&i.spandata.file),
-        i.spandata.records
-    );
+    // Evidence keys are OMITTED when the capture omitted that evidence, which is
+    // a different fact from `records: 0` ("we captured none"). The key's presence
+    // mirrors the file's, so the two cannot contradict each other.
+    file_pointer(s, "logdata", &i.logdata);
+    file_pointer(s, "spandata", &i.spandata);
+    // Empty means nothing narrowed — a real answer. ABSENT means a case written
+    // before this key existed, which a reader must not read as "unfiltered".
+    let ranges: Vec<String> = i
+        .window
+        .narrowed_by
+        .iter()
+        .map(|n| {
+            let fs: Vec<String> = n.filters.iter().map(|f| yaml_str(f)).collect();
+            format!(
+                "{{from: {}, to: {}, filters: [{}]}}",
+                n.from_seq,
+                n.to_seq,
+                fs.join(", ")
+            )
+        })
+        .collect();
+    let _ = writeln!(s, "narrowed_by: [{}]", ranges.join(", "));
     let missing_yaml: Vec<String> = missing.iter().map(|k| yaml_str(k)).collect();
     let _ = writeln!(
         s,
@@ -336,6 +379,36 @@ fn front_matter(s: &mut String, i: &CaseInput) {
         .collect();
     let _ = writeln!(s, "asserted: {{{}}}", asserted.join(", "));
     let _ = writeln!(s, "---\n");
+}
+
+/// Emit one evidence pointer.
+///
+/// Separate from the front-matter body because the `omit_logdata` /
+/// `omit_spandata` options will make this key absent rather than empty, and the
+/// call site is where that decision belongs — not buried in a format string.
+fn file_pointer(s: &mut String, key: &str, p: &FilePointer) {
+    match p.by_source {
+        Some(c) => {
+            let _ = writeln!(
+                s,
+                "{key}: {{file: {}, records: {}, by_source: {{filter: {}, \
+                 pre_trigger: {}, post_trigger: {}}}}}",
+                yaml_str(&p.file),
+                p.records,
+                c.filter,
+                c.pre_trigger,
+                c.post_trigger
+            );
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "{key}: {{file: {}, records: {}}}",
+                yaml_str(&p.file),
+                p.records
+            );
+        }
+    }
 }
 
 fn verdict_str(v: EvidenceVerdict) -> &'static str {
@@ -550,6 +623,26 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
              capture can be. What lies beyond it was not read, and is neither present nor \
              ruled out.\n"
         );
+    }
+
+    // The verdict above grades the seq axis, and the axis cannot see this: the
+    // flight recorder's flush stores entries without the epoch log observing
+    // them, so a window holding a complete unfiltered burst still grades
+    // `filtered`. Saying so here is what stops the verdict being read as the
+    // whole truth about the anchor's own neighbourhood.
+    if let Some(c) = i.logdata.by_source {
+        let unfiltered = c.pre_trigger + c.post_trigger;
+        if unfiltered > 0 {
+            let _ = writeln!(
+                s,
+                "Of these {} record(s), **{} were captured unfiltered** — the flight \
+                 recorder's window around the trigger ({} before, {} after) — and {} \
+                 were stored because they matched a filter. Any verdict of \
+                 `filtered` above grades the seq range as a whole and does not \
+                 know about the unfiltered window inside it.\n",
+                i.logdata.records, unfiltered, c.pre_trigger, c.post_trigger, c.filter
+            );
+        }
     }
 
     // The span line is its own, because the span ring has its own retention and

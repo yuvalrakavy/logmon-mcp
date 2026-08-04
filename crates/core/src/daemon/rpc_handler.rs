@@ -2091,10 +2091,16 @@ impl RpcHandler {
             logdata: doc::FilePointer {
                 file: names[1].clone(),
                 records: logs.len() as u64,
+                // The verdict cannot see the unfiltered flight-recorder window,
+                // so the counts carry what it misses — see `SourceCounts`.
+                by_source: Some(doc::SourceCounts::of(&logs)),
             },
             spandata: doc::FilePointer {
                 file: names[2].clone(),
                 records: spans.len() as u64,
+                // Spans have no filter/flight-recorder split: session filters
+                // never narrow them, they are stored unconditionally.
+                by_source: None,
             },
             registry,
             asserted: scoped.facts,

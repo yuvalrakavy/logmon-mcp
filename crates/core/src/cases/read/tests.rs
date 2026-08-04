@@ -1,6 +1,6 @@
 use super::*;
 use crate::cases::document::{
-    render, Anchor, CaseInput, CollectorLine, FilePointer, RegistryFact, Window,
+    render, Anchor, CaseInput, CollectorLine, FilePointer, RegistryFact, SourceCounts, Window,
 };
 use crate::domain_data::ScopedFact;
 use crate::collector::document::yaml_str;
@@ -188,10 +188,12 @@ fn hostile_input() -> CaseInput {
         logdata: FilePointer {
             file: "checkout-hang-260731-141530.logdata.jsonl".into(),
             records: 700,
+            by_source: Some(SourceCounts { filter: 700, pre_trigger: 0, post_trigger: 0 }),
         },
         spandata: FilePointer {
             file: "checkout-hang-260731-141530.spandata.jsonl".into(),
             records: 168,
+            by_source: None,
         },
         registry: Vec::<RegistryFact>::new(),
         asserted: vec![ScopedFact {
@@ -464,6 +466,104 @@ fn a_brace_inside_a_quoted_value_does_not_close_the_mapping() {
     assert_eq!(
         logdata.records, 9,
         "the brace inside the string must not have ended the mapping"
+    );
+}
+
+#[test]
+fn the_source_split_round_trips() {
+    // The verdict cannot see the unfiltered flight-recorder window, so these
+    // counts are the only place that fact survives into a loaded case.
+    let mut input = hostile_input();
+    input.logdata.by_source = Some(SourceCounts {
+        filter: 680,
+        pre_trigger: 15,
+        post_trigger: 5,
+    });
+    let doc = render(&input).body;
+    let fm = parse_front_matter(&doc).unwrap();
+
+    let c = fm
+        .logdata
+        .as_ref()
+        .expect("declared")
+        .by_source
+        .expect("emitted for logdata");
+    assert_eq!((c.filter, c.pre_trigger, c.post_trigger), (680, 15, 5));
+
+    assert!(
+        fm.spandata.as_ref().expect("declared").by_source.is_none(),
+        "spans have no filter/flight-recorder split — session filters never \
+         narrow them"
+    );
+}
+
+#[test]
+fn an_absent_source_split_is_unknown_not_zero() {
+    // A case written before the key existed knows nothing about the split.
+    // Defaulting it to zeros would assert that every record matched a filter.
+    let fm = parse_front_matter(&fixture("with-spans-260803-214501")).unwrap();
+    assert!(
+        fm.logdata.as_ref().expect("declared").by_source.is_none(),
+        "the fixture predates the key, so the split must read as unknown"
+    );
+}
+
+#[test]
+fn the_narrowing_filters_round_trip_with_their_expressions() {
+    // Without these a `filtered` case can only load as `cannot_verify` — and a
+    // production capture with a session filter running is exactly that case.
+    let mut input = hostile_input();
+    input.window.narrowed_by = vec![
+        logmon_broker_protocol::NarrowedRange {
+            from_seq: 40672,
+            to_seq: 40999,
+            // A filter DSL string carrying the characters that would end a flow
+            // mapping if the scanner were a split on commas.
+            filters: vec![r#"msg:"a,b}c""#.into(), "l>=ERROR".into()],
+        },
+        logmon_broker_protocol::NarrowedRange {
+            from_seq: 41000,
+            to_seq: 41372,
+            filters: vec!["service:auth".into()],
+        },
+    ];
+    let doc = render(&input).body;
+    let fm = parse_front_matter(&doc).unwrap();
+
+    let ranges = fm.narrowed_by.as_ref().expect("emitted");
+    assert_eq!(ranges.len(), 2, "both stretches: {ranges:?}");
+    assert_eq!((ranges[0].from, ranges[0].to), (40672, 40999));
+    assert_eq!(
+        ranges[0].filters,
+        vec![r#"msg:"a,b}c""#, "l>=ERROR"],
+        "the expressions must survive verbatim, braces and commas included"
+    );
+    assert_eq!(ranges[1].filters, vec!["service:auth"]);
+}
+
+#[test]
+fn no_narrowing_and_unknown_narrowing_are_different_answers() {
+    // Empty is a positive fact: nothing narrowed. Absent means the case predates
+    // the key, and a loader must fall back to verdict-based seeding rather than
+    // concluding the window was unfiltered — which would vouch for evidence it
+    // cannot speak for.
+    let input = hostile_input(); // narrowed_by is empty
+    let doc = render(&input).body;
+    assert_eq!(
+        parse_front_matter(&doc).unwrap().narrowed_by,
+        Some(Vec::new()),
+        "the emitter states `nothing narrowed` rather than staying silent"
+    );
+
+    let old = fixture("with-spans-260803-214501");
+    assert!(
+        !old.contains("narrowed_by:"),
+        "the fixture predates the key (guards the next assertion)"
+    );
+    assert_eq!(
+        parse_front_matter(&old).unwrap().narrowed_by,
+        None,
+        "absent must stay unknown, never collapse to `nothing narrowed`"
     );
 }
 
