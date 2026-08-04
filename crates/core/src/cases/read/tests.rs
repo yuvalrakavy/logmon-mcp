@@ -227,10 +227,12 @@ fn the_real_emitter_round_trips_through_this_parser() {
     assert_eq!(fm.seq_range.requested_before_missing, input.window.short_before);
     assert_eq!(fm.seq_range.requested_after_missing, input.window.short_after);
     assert!(fm.seq_range.clamped);
-    assert_eq!(fm.logdata.file, input.logdata.file);
-    assert_eq!(fm.logdata.records, input.logdata.records);
-    assert_eq!(fm.spandata.file, input.spandata.file);
-    assert_eq!(fm.spandata.records, input.spandata.records);
+    let logdata = fm.logdata.as_ref().expect("declared, so present");
+    assert_eq!(logdata.file, input.logdata.file);
+    assert_eq!(logdata.records, input.logdata.records);
+    let spandata = fm.spandata.as_ref().expect("declared, so present");
+    assert_eq!(spandata.file, input.spandata.file);
+    assert_eq!(spandata.records, input.spandata.records);
     assert_eq!(
         fm.asserted.get("@/capture/note").map(String::as_str),
         Some("quoted \"thing\", with a comma"),
@@ -277,10 +279,12 @@ fn the_happy_path_fixture_parses() {
     assert_eq!(fm.domain, "default");
     assert_eq!(fm.incarnation.as_deref(), Some("1"));
     assert_eq!(fm.verdict, EvidenceVerdict::Complete);
-    assert_eq!(fm.logdata.records, 9);
-    assert_eq!(fm.spandata.records, 3);
-    assert_eq!(fm.logdata.file, "with-spans-260803-214501.logdata.jsonl");
-    assert_eq!(fm.spandata.file, "with-spans-260803-214501.spandata.jsonl");
+    let logdata = fm.logdata.as_ref().expect("declared, so present");
+    let spandata = fm.spandata.as_ref().expect("declared, so present");
+    assert_eq!(logdata.records, 9);
+    assert_eq!(spandata.records, 3);
+    assert_eq!(logdata.file, "with-spans-260803-214501.logdata.jsonl");
+    assert_eq!(spandata.file, "with-spans-260803-214501.spandata.jsonl");
     assert!(
         fm.seq_range.from <= fm.anchor.seq && fm.anchor.seq <= fm.seq_range.to,
         "the anchor must lie inside its own window: {:?} vs anchor {}",
@@ -295,9 +299,14 @@ fn the_zero_span_fixture_parses_and_still_says_complete() {
     // that missed every span of the trace it is about. The loader must read it
     // faithfully — it is not the reader's job to second-guess the document.
     let fm = parse_front_matter(&fixture("checkout-hang-260803-214121")).unwrap();
-    assert_eq!(fm.spandata.records, 0);
+    assert_eq!(
+        fm.spandata.as_ref().expect("declared").records,
+        0,
+        "declared with zero records is `we captured none` — NOT omitted, which \
+         is the absent key"
+    );
     assert_eq!(fm.verdict, EvidenceVerdict::Complete);
-    assert_eq!(fm.logdata.records, 6);
+    assert_eq!(fm.logdata.as_ref().expect("declared").records, 6);
 }
 
 #[test]
@@ -450,10 +459,66 @@ fn a_brace_inside_a_quoted_value_does_not_close_the_mapping() {
         yaml_str("weird}, records: 999, x.jsonl")
     );
     let fm = parse_front_matter(&doc).unwrap();
-    assert_eq!(fm.logdata.file, "weird}, records: 999, x.jsonl");
+    let logdata = fm.logdata.as_ref().expect("declared");
+    assert_eq!(logdata.file, "weird}, records: 999, x.jsonl");
     assert_eq!(
-        fm.logdata.records, 9,
+        logdata.records, 9,
         "the brace inside the string must not have ended the mapping"
+    );
+}
+
+#[test]
+fn an_absent_evidence_key_is_omitted_not_empty() {
+    // The distinction the whole omit_* option rests on. `records: 0` says the
+    // capture looked and found none — a finding about the system. An absent key
+    // says nobody looked — a fact about the capture. A reader that collapsed
+    // them would answer "what was the slowest span?" with a silence that reads
+    // like evidence.
+    let doc = fixture("with-spans-260803-214501");
+
+    let present = parse_front_matter(&doc).unwrap();
+    assert!(present.spandata.is_some(), "declared in the fixture");
+
+    let omitted_doc = doc
+        .lines()
+        .filter(|l| !l.starts_with("spandata:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let omitted = parse_front_matter(&omitted_doc)
+        .expect("an omitted-evidence case is a VALID case, not a malformed one");
+    assert!(
+        omitted.spandata.is_none(),
+        "an absent key must read as omitted rather than erroring"
+    );
+
+    // ...and the two must not be confusable in either direction.
+    let zero_doc = doc.replace(
+        r#"spandata: {file: "with-spans-260803-214501.spandata.jsonl", records: 3}"#,
+        r#"spandata: {file: "with-spans-260803-214501.spandata.jsonl", records: 0}"#,
+    );
+    let zero = parse_front_matter(&zero_doc).unwrap();
+    assert_eq!(
+        zero.spandata.map(|s| s.records),
+        Some(0),
+        "captured-none stays Some(0) and never becomes None"
+    );
+}
+
+#[test]
+fn an_absent_key_is_still_told_apart_from_a_malformed_one() {
+    // "Optional" must not slide into "ignore anything I cannot read". A key that
+    // is present but the wrong shape is corruption, and corruption is not
+    // omission.
+    let doc = fixture("with-spans-260803-214501").replace(
+        r#"spandata: {file: "with-spans-260803-214501.spandata.jsonl", records: 3}"#,
+        "spandata: not-a-mapping",
+    );
+    assert!(
+        matches!(
+            parse_front_matter(&doc),
+            Err(ParseError::WrongType { key: "spandata", .. })
+        ),
+        "a malformed key must error, not read as omitted"
     );
 }
 

@@ -469,11 +469,28 @@ system had no traces"** (a finding about the system) from **"someone chose not t
 ship them"** (a fact about the capture). A loaded case would answer *"what was
 the slowest span three months ago?"* with a silence that looks like evidence.
 
-So:
+**The encoding is the file's presence** (user-directed 2026-08-04), not a flag —
+and it is available precisely because the writer already emits a header-only file
+for a zero-record capture. Absence was previously impossible, so it is free to
+carry meaning now:
 
-- the front matter marks omission **explicitly and separately from `records`**;
-- the document's §2 — "what this capture can and cannot show" — leads with it,
-  beside the eviction and filter facts it already leads with;
+| Front matter | Entry | Means |
+|---|---|---|
+| declares `spandata` | present | evidence; `records: 0` is **"we captured none"** |
+| no `spandata` key | absent | **omitted at capture** |
+| declares `spandata` | **absent** | corrupt or desynced — an error, never a guess |
+
+Better than a flag because the front-matter key's presence mirrors the file's, so
+the two cannot contradict each other by construction; a flag can disagree with
+reality. It makes `logdata`/`spandata` **optional** keys in the parser, and the
+third row is why "optional" must not collapse into "ignore if missing".
+
+Consequently:
+
+- the document's §2 — "what this capture can and cannot show" — states the
+  omission in prose, beside the eviction and filter facts it already leads with.
+  A human reading the `.md` must not have to infer it from a line that is not
+  there;
 - **`load_case` refuses span queries on a domain whose spans were omitted**,
   naming the omission, rather than serving an empty span store. Same for logs.
   An empty result is an answer; this is the absence of one.

@@ -401,8 +401,16 @@ pub struct FrontMatter {
     pub headline: String,
     pub verdict: EvidenceVerdict,
     pub seq_range: SeqRange,
-    pub logdata: FileRef,
-    pub spandata: FileRef,
+    /// `None` when the capture **omitted** log evidence — a different fact from
+    /// `Some(FileRef { records: 0 })`, which is "we captured none".
+    ///
+    /// The key's presence mirrors the file's, so the two cannot contradict each
+    /// other. A caller resolving these must treat *declared but missing on disk*
+    /// as corruption rather than as omission: that is the third case, and it is
+    /// the one silence would get wrong.
+    pub logdata: Option<FileRef>,
+    /// `None` when the capture omitted span evidence — see [`Self::logdata`].
+    pub spandata: Option<FileRef>,
     pub provenance: Provenance,
     /// Document-scoped `@` facts, asserted about this capture alone.
     pub asserted: BTreeMap<String, String>,
@@ -593,12 +601,18 @@ pub fn parse_front_matter(doc: &str) -> Result<FrontMatter, ParseError> {
         clamped: as_bool(sub(sr, "seq_range", "clamped")?, "seq_range")?,
     };
 
-    let file_ref = |key: &'static str| -> Result<FileRef, ParseError> {
-        let m = as_map(take(&top, key)?, key)?;
-        Ok(FileRef {
+    // Absent means the capture omitted this evidence; present-with-zero means it
+    // captured none. A missing key is therefore a real answer, and the only key
+    // class here where that is true — everything else uses `take`.
+    let file_ref = |key: &'static str| -> Result<Option<FileRef>, ParseError> {
+        let Some(v) = top.get(key) else {
+            return Ok(None);
+        };
+        let m = as_map(v, key)?;
+        Ok(Some(FileRef {
             file: as_text(sub(m, key, "file")?, key)?,
             records: as_u64(sub(m, key, "records")?, key)?,
-        })
+        }))
     };
 
     let prov_m = as_map(take(&top, "provenance")?, "provenance")?;

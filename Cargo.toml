@@ -48,3 +48,9 @@ which = "6"
 dirs = "5"
 libc = "0.2"
 rand = "0.8"
+# Case bundles. Default features off: the archive needs DEFLATE and nothing
+# else, and every extra codec is surface on the one artifact that travels
+# between machines. This sits AROUND the format contract rather than on it — an
+# abandoned crate still leaves every case readable by every unzip in existence,
+# which is why it is defensible where a YAML parser was not.
+zip = { version = "2", default-features = false, features = ["deflate"] }

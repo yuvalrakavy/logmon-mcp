@@ -997,7 +997,8 @@ fn spans_arriving_after_the_last_log_are_captured_not_silently_dropped() {
          BOTH stores — that is what makes document.rs:531's sentence true"
     );
     assert_eq!(
-        fm.spandata.records, 3,
+        fm.spandata.as_ref().expect("declared, so present").records,
+        3,
         "and the front matter agrees with the file"
     );
 }
