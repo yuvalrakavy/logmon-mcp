@@ -2414,6 +2414,49 @@ pub struct StatusGetResult {
     /// drill-down for "which port is (not) receiving." (Consumer #2.)
     #[serde(default)]
     pub receiver_liveness: ReceiverLiveness,
+    /// Present when the bound domain holds a loaded case rather than a running
+    /// system.
+    ///
+    /// **Not decoration — it is what makes the frozen clock honest.** A
+    /// postmortem domain ages facts against its capture time, so every duration
+    /// in this payload describes the captured system rather than the last three
+    /// months. Without this field a reader has no way to know that, and every
+    /// figure reads as if it were about now.
+    /// **Not `skip_serializing_if`.** The daemon emits this key on every status
+    /// reply — `null` for a live domain — and a struct that skipped it would
+    /// carry a key set the daemon's JSON does not match, which is exactly what
+    /// `capability_skew` exists to catch. It caught this.
+    #[serde(default)]
+    pub postmortem: Option<PostmortemStatus>,
+}
+
+/// What `status.get` says about a domain built from a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PostmortemStatus {
+    /// The case this domain is, by stem.
+    pub case: String,
+    /// When the capture was taken — the domain's frozen clock.
+    pub captured_at: String,
+    /// Real elapsed time since, as an absolute. **Stated because the frozen
+    /// clock deliberately hides it**: a reader must not have to work out that
+    /// "idle 12s" means twelve seconds before a capture three months old.
+    pub age_secs: u64,
+    /// The capture's own verdict — `complete`, `evicted`, `filtered` or
+    /// `cannot_verify`. What this evidence can be asked to support.
+    pub verdict: String,
+    /// True when the capture OMITTED this evidence, which is a different fact
+    /// from holding zero records. One says nobody looked; the other is a finding
+    /// about the system. A query answered from an omitted store would return a
+    /// silence that reads like data.
+    pub logs_omitted: bool,
+    pub spans_omitted: bool,
+    /// Facts the capture held but its document could not carry, so the restored
+    /// provenance is a subset rather than the registry.
+    pub registry_dropped: usize,
+    /// Why the `store` counters above are not what they look like: a case is a
+    /// window cut out of a stream, so it carries no delivery record. `0 received`
+    /// means unmeasured, not perfect.
+    pub store_counters_unmeasured: bool,
 }
 
 // =============================================================================

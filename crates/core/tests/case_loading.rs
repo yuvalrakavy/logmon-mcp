@@ -484,6 +484,43 @@ fn the_loaded_records_keep_their_own_seqs() {
 }
 
 #[test]
+fn get_status_announces_the_case_so_the_frozen_clock_is_not_a_lie() {
+    // The frozen clock ages facts against the capture, which is right — and
+    // silent. Without this block "idle 12s" on three-month-old evidence is
+    // indistinguishable from a live domain, and every duration in the payload
+    // reads as if it were about now.
+    let h = sealed_harness();
+    let r = call(&h, "status.get", json!({}));
+    let pm = &r["postmortem"];
+    assert!(pm.is_object(), "a loaded domain must say so: {r}");
+    assert_eq!(pm["case"], "checkout-hang-260503-021530");
+    assert_eq!(pm["verdict"], "complete");
+    assert!(
+        pm["age_secs"].as_u64().is_some_and(|s| s > 0),
+        "the REAL elapsed time must be stated as an absolute, since the frozen \
+         clock deliberately hides it: {pm}"
+    );
+    assert_eq!(
+        pm["store_counters_unmeasured"], true,
+        "or `0 received` reads as a domain that dropped nothing: {pm}"
+    );
+    assert_eq!(pm["logs_omitted"], false);
+    assert_eq!(pm["spans_omitted"], false);
+}
+
+#[test]
+fn get_status_says_nothing_about_postmortem_on_a_live_domain() {
+    // Negative control: a block that always appeared would train a reader to
+    // skip the one that matters.
+    let h = harness(&[]);
+    let r = call(&h, "status.get", json!({}));
+    assert!(
+        r["postmortem"].is_null(),
+        "a live domain must not carry a case block: {r}"
+    );
+}
+
+#[test]
 fn a_loaded_domain_does_not_claim_it_received_what_it_holds() {
     // A case is a window cut out of a stream. Asserting `total_received == 6`
     // would claim a delivery record the case does not carry, and `get_status`

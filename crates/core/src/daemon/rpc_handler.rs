@@ -1681,6 +1681,28 @@ impl RpcHandler {
             "current_domain": current_domain,
             "active_filters": active_filters,
             "receiver_liveness": receiver_liveness,
+            // Omitted entirely for a live domain, so nothing changes for the
+            // ordinary case; present, this is what makes every duration above
+            // readable — see `PostmortemStatus`.
+            "postmortem": d.postmortem.as_ref().map(|pm| {
+                let elapsed = chrono::Utc::now()
+                    .signed_duration_since(pm.captured_at)
+                    .num_seconds()
+                    // Clock skew between a production box and a dev laptop is
+                    // this feature's own scenario, and a negative age would
+                    // underflow into something enormous.
+                    .max(0) as u64;
+                json!({
+                    "case": pm.case,
+                    "captured_at": pm.captured_at.to_rfc3339(),
+                    "age_secs": elapsed,
+                    "verdict": format!("{:?}", pm.verdict).to_lowercase(),
+                    "logs_omitted": pm.logs_omitted,
+                    "spans_omitted": pm.spans_omitted,
+                    "registry_dropped": pm.registry_dropped,
+                    "store_counters_unmeasured": true,
+                })
+            }),
         }))
     }
 

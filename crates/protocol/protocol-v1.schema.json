@@ -3738,7 +3738,7 @@
           }
         },
         "before": {
-          "description": "Stored records to capture before the anchor. Counts of **records**, not\nseq distances: one counter feeds both the log and span stores, so a\n200-seq range holds an unpredictable number of logs. Default 350, capped\nat 5000.",
+          "description": "Stored records to capture before the anchor. Counts of **records from\nEITHER store**, not seq distances and not logs alone: one counter feeds\nboth the log and span stores, so a 200-seq range holds an unpredictable\nnumber of each, and `before: 50` may return 40 logs and 10 spans.\n\nCounting logs alone was a defect, not a simplification. A span is\nexported when it ENDS, so the spans of a slow operation carry seqs above\nthe last log about it — and a window cut from the logs then excluded\nexactly the spans the case was taken for. Default 350, capped at 5000.",
           "type": [
             "integer",
             "null"
@@ -3747,7 +3747,7 @@
           "minimum": 0
         },
         "after": {
-          "description": "Stored records to capture after the anchor. Default 350, capped at 5000.",
+          "description": "Stored records to capture after the anchor, from either store — see\n[`Self::before`]. Default 350, capped at 5000.",
           "type": [
             "integer",
             "null"
@@ -4403,6 +4403,18 @@
           "description": "Per-listener last-received wall-clock for the caller's bound domain — the\ndrill-down for \"which port is (not) receiving.\" (Consumer #2.)",
           "$ref": "#/$defs/ReceiverLiveness",
           "default": {}
+        },
+        "postmortem": {
+          "description": "Present when the bound domain holds a loaded case rather than a running\nsystem.\n\n**Not decoration — it is what makes the frozen clock honest.** A\npostmortem domain ages facts against its capture time, so every duration\nin this payload describes the captured system rather than the last three\nmonths. Without this field a reader has no way to know that, and every\nfigure reads as if it were about now.\n**Not `skip_serializing_if`.** The daemon emits this key on every status\nreply — `null` for a live domain — and a struct that skipped it would\ncarry a key set the daemon's JSON does not match, which is exactly what\n`capability_skew` exists to catch. It caught this.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PostmortemStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -4610,6 +4622,57 @@
               "format": "date-time"
             }
           }
+        },
+        "PostmortemStatus": {
+          "description": "What `status.get` says about a domain built from a case.",
+          "type": "object",
+          "properties": {
+            "case": {
+              "description": "The case this domain is, by stem.",
+              "type": "string"
+            },
+            "captured_at": {
+              "description": "When the capture was taken — the domain's frozen clock.",
+              "type": "string"
+            },
+            "age_secs": {
+              "description": "Real elapsed time since, as an absolute. **Stated because the frozen\nclock deliberately hides it**: a reader must not have to work out that\n\"idle 12s\" means twelve seconds before a capture three months old.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "verdict": {
+              "description": "The capture's own verdict — `complete`, `evicted`, `filtered` or\n`cannot_verify`. What this evidence can be asked to support.",
+              "type": "string"
+            },
+            "logs_omitted": {
+              "description": "True when the capture OMITTED this evidence, which is a different fact\nfrom holding zero records. One says nobody looked; the other is a finding\nabout the system. A query answered from an omitted store would return a\nsilence that reads like data.",
+              "type": "boolean"
+            },
+            "spans_omitted": {
+              "type": "boolean"
+            },
+            "registry_dropped": {
+              "description": "Facts the capture held but its document could not carry, so the restored\nprovenance is a subset rather than the registry.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "store_counters_unmeasured": {
+              "description": "Why the `store` counters above are not what they look like: a case is a\nwindow cut out of a stream, so it carries no delivery record. `0 received`\nmeans unmeasured, not perfect.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "case",
+            "captured_at",
+            "age_secs",
+            "verdict",
+            "logs_omitted",
+            "spans_omitted",
+            "registry_dropped",
+            "store_counters_unmeasured"
+          ]
         }
       }
     },
