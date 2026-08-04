@@ -268,10 +268,23 @@ So D2 as stated is **not implementable from the current format**. Three ways out
 | (b) restore the rendered facts, labelled as a rendering | no format change; silently drops everything past 64 KiB and rounds every timestamp. Restoring a truncated registry as if whole is the class of silent-wrong this design exists to fight |
 | (c) drop D2 | contradicts a direct instruction |
 
-**Recommending (a), and it needs sign-off** because the user chose the front-matter
-route partly on "no format change". (a) is additive and does not move the version, so
-nothing that exists becomes unreadable. **Until signed off, the loader restores nothing
-and says so in its reply** — which is (b) minus the pretence.
+**(a) was chosen — user, 2026-08-04 — and is BUILT.** A fenced
+` ```json logmon-registry ` block in §5 carries `RegistryFact` verbatim; one struct
+serves the table and the block, so the two halves cannot drift. `FORMAT_VERSION` does
+not move, matching `collector/persist.rs:184`.
+
+Two consequences worth carrying into the loader:
+
+- **`Ok(None)` is a real answer.** A case written before the block existed still
+  parses, and the loader must report that provenance could not be restored rather
+  than reconstructing it from the table and presenting the rounding as exact.
+  Malformed is a *different* answer and errors, or a truncated document would restore
+  an empty registry and call it complete.
+- **`dropped` is machine-readable and may be non-zero.** `REGISTRY_RENDER_CAP` now
+  governs the whole of §5 rather than the table alone — the first draft charged only
+  the table and §5 ran to 145 KiB against a 64 KiB cap. Both halves therefore carry
+  exactly the same facts, and when `dropped > 0` the loader says the restored
+  provenance is a **subset**, never presents it as the registry.
 
 ### 3.5 What the loaded domain carries
 

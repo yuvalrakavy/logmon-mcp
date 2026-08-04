@@ -457,6 +457,184 @@ fn a_brace_inside_a_quoted_value_does_not_close_the_mapping() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The machine-readable registry block
+// ---------------------------------------------------------------------------
+
+fn fact(path: &str, value: &str, created: &str, validated: &str, ttl: Option<u64>) -> RegistryFact {
+    RegistryFact {
+        path: path.into(),
+        value: value.into(),
+        created_at: t(created),
+        validated_at: t(validated),
+        ttl_secs: ttl,
+        expired: ttl.map(|_| false),
+    }
+}
+
+#[test]
+fn the_registry_block_round_trips_exactly() {
+    let mut input = hostile_input();
+    input.registry = vec![
+        // A value the rendered table cannot give back: `|` would be escaped for
+        // the table, and a newline is flattened to a space and trimmed.
+        fact(
+            "/Build/commit",
+            "9f3a11c | dirty\nsecond line  ",
+            "2026-07-31T08:12:04Z",
+            "2026-07-31T14:03:11Z",
+            None,
+        ),
+        // Timestamps the table floors: 13 days reads as `1w`, and restoring
+        // captured_at - 1w would flip this 7-day TTL from within to elapsed.
+        fact(
+            "/Env/host",
+            "prod-web-01",
+            "2026-07-18T09:00:00Z",
+            "2026-07-18T09:00:00Z",
+            Some(7 * 24 * 3600),
+        ),
+    ];
+    let doc = render(&input).body;
+
+    let block = parse_registry(&doc)
+        .expect("the block must parse")
+        .expect("the emitter must have written one");
+
+    assert_eq!(block.dropped, 0);
+    assert_eq!(block.facts.len(), 2);
+
+    let commit = block
+        .facts
+        .iter()
+        .find(|f| f.path == "/Build/commit")
+        .expect("the fact is present");
+    assert_eq!(
+        commit.value, "9f3a11c | dirty\nsecond line  ",
+        "the pipe, the newline and the trailing spaces must all survive — the \
+         rendered table gives back none of them"
+    );
+
+    let host = block
+        .facts
+        .iter()
+        .find(|f| f.path == "/Env/host")
+        .expect("the fact is present");
+    assert_eq!(
+        host.validated_at,
+        t("2026-07-18T09:00:00Z"),
+        "the timestamp must be exact, not floored to the largest whole unit"
+    );
+    assert_eq!(host.ttl_secs, Some(7 * 24 * 3600));
+    assert_eq!(host.expired, Some(false));
+}
+
+#[test]
+fn the_rendered_table_really_is_lossy_where_the_block_is_not() {
+    // The negative control for the decision to add the block at all. If this
+    // ever goes green the block is redundant and should be removed.
+    let mut input = hostile_input();
+    input.registry = vec![fact(
+        "/Build/commit",
+        "9f3a11c | dirty\nsecond line  ",
+        "2026-07-31T08:12:04Z",
+        "2026-07-31T14:03:11Z",
+        None,
+    )];
+    let doc = render(&input).body;
+    let table_row = doc
+        .lines()
+        .find(|l| l.starts_with("| `/Build/commit`"))
+        .expect("the human table still renders the fact");
+
+    assert!(
+        !table_row.contains("second line  "),
+        "the table is expected to have flattened and trimmed this: {table_row}"
+    );
+    assert!(
+        table_row.contains(r"\|"),
+        "and to have escaped the pipe for the table: {table_row}"
+    );
+}
+
+#[test]
+fn a_case_written_before_the_block_existed_loads_with_no_registry() {
+    // The three fixtures predate this format addition, which makes them the
+    // exact input the absent-block path exists for. `Ok(None)` is the answer:
+    // not an error, and NOT a reconstruction from the rendered table.
+    for stem in [
+        "with-spans-260803-214501",
+        "checkout-hang-260803-214121",
+        "nasty-260803-214626",
+    ] {
+        let doc = fixture(stem);
+        assert!(
+            parse_front_matter(&doc).is_ok(),
+            "{stem} must still load as a case"
+        );
+        assert!(
+            parse_registry(&doc).unwrap().is_none(),
+            "{stem} has no machine block, and that must read as absent rather \
+             than as an empty registry"
+        );
+    }
+}
+
+#[test]
+fn an_empty_registry_writes_no_block() {
+    // §5 returns early when there is nothing to say, so there is no block to
+    // find — which is the same `Ok(None)` as a pre-format case. That collapse is
+    // deliberate: both mean "no provenance to restore".
+    let mut input = hostile_input();
+    input.registry = Vec::new();
+    let doc = render(&input).body;
+    assert!(parse_registry(&doc).unwrap().is_none());
+}
+
+#[test]
+fn a_newer_block_format_is_refused() {
+    let mut input = hostile_input();
+    input.registry = vec![fact(
+        "/Action",
+        "run",
+        "2026-07-31T08:12:04Z",
+        "2026-07-31T14:03:11Z",
+        None,
+    )];
+    let doc = render(&input).body.replace(
+        r#"{"logmon_format":1,"facts""#,
+        r#"{"logmon_format":2,"facts""#,
+    );
+    assert!(
+        matches!(
+            parse_registry(&doc),
+            Err(ParseError::FormatTooNew { found: 2, .. })
+        ),
+        "the block carries its own version and must check it"
+    );
+}
+
+#[test]
+fn a_corrupt_block_errors_rather_than_reading_as_absent() {
+    // Absent and malformed are different facts. Collapsing them would let a
+    // truncated document restore an empty registry and call it complete.
+    let mut input = hostile_input();
+    input.registry = vec![fact(
+        "/Action",
+        "run",
+        "2026-07-31T08:12:04Z",
+        "2026-07-31T14:03:11Z",
+        None,
+    )];
+    let doc = render(&input)
+        .body
+        .replace(r#""facts":["#, r#""facts":{"#);
+    assert!(
+        parse_registry(&doc).is_err(),
+        "a malformed block must not read as `no registry`"
+    );
+}
+
 #[test]
 fn provenance_missing_keys_are_read_as_a_list() {
     let doc = fixture("with-spans-260803-214501").replace(

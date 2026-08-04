@@ -125,7 +125,16 @@ pub struct FilePointer {
 }
 
 /// One registry key as of `captured_at`.
-#[derive(Debug, Clone)]
+///
+/// **This is the wire format as well as the render input**, and deliberately one
+/// type rather than two. The rendered table beneath §5 is lossy by design — its
+/// values pass through a presentation escaper with no inverse and its timestamps
+/// floor to the largest whole unit — so a reader that reconstructed facts from
+/// it would silently round a 13-day-old fact to `1w` and flip a 7-day TTL from
+/// elapsed to within. The machine block emitted beside it carries this struct
+/// verbatim, and `Serialize`/`Deserialize` here is what keeps the two halves
+/// from being two definitions that drift.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RegistryFact {
     pub path: String,
     pub value: String,
@@ -885,7 +894,15 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
     let header =
         "| key | kind | value | age | in force since | lifetime |\n|---|---|---|---|---|---|\n";
     s.push_str(header);
-    let start = s.len();
+    // **The budget covers BOTH halves of §5, not just the table.** It exists
+    // because §3.1 permits 1.1 MB of registry and the document renders it, so
+    // the file that could be pathological is the one that gets a number.
+    // Letting the machine block carry the same facts a second time outside that
+    // number would have doubled §5 — measured at 145 KiB against a 64 KiB cap —
+    // and quietly retired the guarantee. Charging both halves to one budget
+    // keeps the bound and keeps the two halves carrying exactly the same facts,
+    // which is what stops a reader who checks both from finding them disagree.
+    let mut used = 0usize;
     let mut rendered = 0usize;
     for f in &facts {
         let lifetime = match (f.ttl_secs, f.expired) {
@@ -906,9 +923,14 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
             age_of(i.captured_at, f.created_at),
             lifetime
         );
-        if s.len() - start + row.len() > REGISTRY_RENDER_CAP {
+        // The block writes this fact as one JSON object plus a separator; a
+        // fact that cannot be carried by both halves is carried by neither, so
+        // the table never advertises a fact `load_case` cannot restore.
+        let machine = serde_json::to_string(f).map(|j| j.len() + 1).unwrap_or(0);
+        if used + row.len() + machine > REGISTRY_RENDER_CAP {
             break;
         }
+        used += row.len() + machine;
         s.push_str(&row);
         rendered += 1;
     }
@@ -929,7 +951,50 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
             detail: format!("{dropped} registry keys exceeded the document's render budget"),
         });
     }
+
+    registry_block(s, &facts[..rendered], facts.len() - rendered);
 }
+
+/// The machine-readable half of §5 — what `load_case` restores from.
+///
+/// **The table above cannot serve this.** `cell()` runs values through
+/// `flatten()`, which collapses newlines and trims, with no inverse; `age_of`
+/// floors timestamps to the largest whole unit, so `created_at` and
+/// `validated_at` survive only to the nearest day or week; and `ttl`/`expired`
+/// arrive as a rendered verdict rather than a number and a bool. Restoring a
+/// registry from that would produce provenance that looks exact and is not —
+/// the failure mode a postmortem domain exists to avoid.
+///
+/// **It carries exactly the facts the table rendered, and the same `dropped`
+/// count.** One budget, one truncation point: a machine block that reached
+/// further than the table would make the document's two halves disagree about
+/// what was captured, and a reader who checked both would not know which to
+/// believe. `dropped` is in the block rather than only in the prose so a loader
+/// can say "this case's provenance is incomplete" instead of quietly restoring
+/// a subset.
+fn registry_block(s: &mut String, facts: &[&RegistryFact], dropped: usize) {
+    let payload = serde_json::json!({
+        "logmon_format": FORMAT_VERSION,
+        "facts": facts,
+        "dropped": dropped,
+    });
+    // One line, so the block's size is its content and a reader needs no
+    // multi-line assembly. `to_string` cannot fail on a value built from owned
+    // data, but a document is not worth aborting over if it somehow did.
+    let Ok(line) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let _ = writeln!(
+        s,
+        "The same facts, exactly, for `load_case` — values and timestamps \
+         unrounded. The table above is for reading; this is the record.\n"
+    );
+    let _ = writeln!(s, "```json {REGISTRY_BLOCK_TAG}\n{line}\n```\n");
+}
+
+/// The fence info-string that marks the machine-readable registry. Distinctive
+/// so a reader locates it by equality rather than by guessing at ```json.
+pub const REGISTRY_BLOCK_TAG: &str = "logmon-registry";
 
 // ---------------------------------------------------------------------------
 // 6. Collector state at capture

@@ -660,5 +660,54 @@ pub fn parse_front_matter(doc: &str) -> Result<FrontMatter, ParseError> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// The machine-readable registry block
+// ---------------------------------------------------------------------------
+
+/// §5's machine half — the facts `load_case` restores, unrounded.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RegistryBlock {
+    pub logmon_format: u32,
+    pub facts: Vec<super::document::RegistryFact>,
+    /// Facts the capture held but the document's budget could not carry.
+    /// **Non-zero means the restored provenance is a subset**, and a loader must
+    /// say so rather than presenting it as the registry.
+    pub dropped: usize,
+}
+
+/// Parse the registry block, if the document has one.
+///
+/// `Ok(None)` is a real answer, not a failure: a case written before this block
+/// existed is still a valid case, and the loader's job is to report that its
+/// provenance could not be restored — not to refuse the case or, worse, to
+/// reconstruct facts from the rendered table and present the rounding as exact.
+pub fn parse_registry(doc: &str) -> Result<Option<RegistryBlock>, ParseError> {
+    let fence = format!("```json {}", super::document::REGISTRY_BLOCK_TAG);
+    let mut lines = doc.lines();
+    let Some(_) = lines.find(|l| l.trim_end() == fence) else {
+        return Ok(None);
+    };
+    let Some(payload) = lines.next() else {
+        return Err(ParseError::BadFlow {
+            at: 0,
+            what: "registry block (fence opened at end of document)".into(),
+        });
+    };
+    let block: RegistryBlock =
+        serde_json::from_str(payload).map_err(|e| ParseError::BadFlow {
+            at: 0,
+            what: format!("registry block ({e})"),
+        })?;
+    // Same policy as the front matter, and checked here too: the block is its
+    // own carrier and a document could in principle be assembled from halves.
+    if block.logmon_format > FORMAT_VERSION {
+        return Err(ParseError::FormatTooNew {
+            found: block.logmon_format,
+            known: FORMAT_VERSION,
+        });
+    }
+    Ok(Some(block))
+}
+
 #[cfg(test)]
 mod tests;

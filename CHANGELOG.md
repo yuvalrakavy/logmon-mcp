@@ -5,6 +5,28 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Added — case documents carry their registry as data, not only as a table
+
+§5 of a case document now emits a fenced ` ```json logmon-registry ` block
+holding each `RegistryFact` verbatim, beside the human-readable table.
+
+The table alone could not be read back. Values pass through a presentation
+escaper that flattens newlines and trims, with no inverse; timestamps floor to
+the largest whole unit, so a fact validated 13 days before capture renders as
+`1w` and restoring `captured_at - 1w` flips a 7-day TTL from elapsed to within;
+and `ttl`/`expired` arrive as rendered prose. Provenance restored from that
+would look exact and be wrong.
+
+**Additive — `logmon_format` stays `1`.** A case written before this block
+exists still parses; a reader gets "no registry recorded" rather than an error,
+and must not reconstruct one from the table.
+
+`REGISTRY_RENDER_CAP` (64 KiB) now bounds the whole of §5 rather than the table
+alone, so a large registry drops the same facts from both halves and the two can
+never disagree about what was captured. The block's `dropped` count is
+machine-readable, so a consumer can say the provenance is a subset instead of
+presenting a truncation as complete.
+
 ### Fixed — `create_case` captured a window cut from the logs alone
 
 `before`/`after` counted **log** records and the resulting seq range was then
