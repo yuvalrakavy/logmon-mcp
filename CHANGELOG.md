@@ -5,27 +5,40 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
-### Added — case documents carry their registry as data, not only as a table
+### Added — a case is one artifact, and its registry is data
 
-§5 of a case document now emits a fenced ` ```json logmon-registry ` block
-holding each `RegistryFact` verbatim, beside the human-readable table.
+A case now travels as a single **`<stem>.case.zip`** holding four stem-prefixed
+entries: the document, the two JSONL evidence files, and
+**`<stem>.registry.json`** — provenance as data rather than as a rendered table.
+`unzip` reproduces the loose layout exactly; the bundle is a container, not a
+second format, and a reader accepts either.
 
-The table alone could not be read back. Values pass through a presentation
-escaper that flattens newlines and trims, with no inverse; timestamps floor to
-the largest whole unit, so a fact validated 13 days before capture renders as
-`1w` and restoring `captured_at - 1w` flips a 7-day TTL from elapsed to within;
-and `ttl`/`expired` arrive as rendered prose. Provenance restored from that
-would look exact and be wrong.
+**Why the registry needed its own file.** The §5 table cannot be read back:
+values pass through a presentation escaper that flattens newlines and trims,
+with no inverse; timestamps floor to the largest whole unit, so a fact validated
+13 days before capture renders as `1w`, and restoring `captured_at - 1w` flips a
+7-day TTL from elapsed to within; `ttl`/`expired` arrive as prose. Provenance
+restored from that would look exact and be wrong. As its own entry it carries
+**every** fact — `REGISTRY_RENDER_CAP` goes back to bounding only the table, and
+the table's truncation note now points at a file that travels with the case
+instead of at a live domain that a months-old case guarantees is gone.
 
-**Additive — `logmon_format` stays `1`.** A case written before this block
-exists still parses; a reader gets "no registry recorded" rather than an error,
-and must not reconstruct one from the table.
+**Why compression, reversing an earlier decision.** That decision declined a
+codec because *"indexing belongs to whatever walks the directory."* `grep` is no
+longer the consumer — `load_case` reads a case and an external store manages the
+collection — so the premise expired. Measured on real capture bytes at 5000
+records: **18.9×** when every message is unique, **69.5×** on repetitive
+traffic. A 1.9 MB capture becomes 100 KB, which is what makes email a real
+transport. The ratio is pinned by a test, so if it ever collapses the reversal
+gets revisited rather than kept out of habit.
 
-`REGISTRY_RENDER_CAP` (64 KiB) now bounds the whole of §5 rather than the table
-alone, so a large registry drops the same facts from both halves and the two can
-never disagree about what was captured. The block's `dropped` count is
-machine-readable, so a consumer can say the provenance is a subset instead of
-presenting a truncation as complete.
+Bundle entries are checked against an **allowlist derived from the stem** before
+any bytes are read, so an archive that arrived from another machine cannot name
+a path outside the case.
+
+**Additive — `logmon_format` stays `1`.** Three loose files still load, and a
+case with no registry entry reads as "no provenance recorded" rather than an
+error. A reader must not reconstruct one from the table.
 
 ### Fixed — `create_case` captured a window cut from the logs alone
 
