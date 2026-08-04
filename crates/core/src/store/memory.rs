@@ -59,6 +59,52 @@ impl InMemoryStore {
         }
     }
 
+    /// Build a store already holding `records` — how a case is loaded.
+    ///
+    /// **A constructor, not an insert path.** `append` would work: it takes each
+    /// entry's own seq and never reassigns it. But it also increments
+    /// `total_received`/`total_stored` as if the records had arrived, and leaves
+    /// `lost_below` at `0` — which claims this store can speak for the whole seq
+    /// axis down to the beginning of time. A loaded case can speak for its window
+    /// and nothing below it, and that is the difference between a truthful
+    /// postmortem domain and one that answers "nothing happened before this"
+    /// when it means "I was not there".
+    ///
+    /// `lost_below` is the window's own lower bound: everything below it is
+    /// unavailable here, whatever the reason. **`total_received`/`total_stored`
+    /// stay at 0** — a case is a window cut out of a stream, and asserting it
+    /// received exactly what it holds would claim a delivery record it does not
+    /// have. Readers of those counters must treat a postmortem domain as
+    /// unmeasured rather than as perfect.
+    ///
+    /// Records must be ascending and distinct; the caller validates, because
+    /// `entries` and `seq_set` desynchronise on a duplicate — the deque keeps
+    /// both and the set keeps one, so `len()` and `contains_seq` stop agreeing.
+    pub fn from_records(capacity: usize, records: Vec<LogEntry>, lost_below: u64) -> Self {
+        let mut entries = VecDeque::with_capacity(capacity.max(records.len()));
+        let mut seq_set = HashSet::with_capacity(records.len());
+        let mut trace_index: HashMap<u128, Vec<u64>> = HashMap::new();
+        for e in records {
+            seq_set.insert(e.seq);
+            if let Some(tid) = e.trace_id {
+                trace_index.entry(tid).or_default().push(e.seq);
+            }
+            entries.push_back(e);
+        }
+        Self {
+            max_capacity: capacity.max(entries.len()),
+            inner: RwLock::new(StoreInner {
+                entries,
+                seq_set,
+                trace_index,
+            }),
+            total_stored: AtomicU64::new(0),
+            total_received: AtomicU64::new(0),
+            malformed_count: AtomicU64::new(0),
+            lost_below: AtomicU64::new(lost_below),
+        }
+    }
+
     /// The lowest seq this store can still speak for — see [`Self::lost_below`].
     /// `0` when nothing has ever been dropped, which is the only value that
     /// licenses a completeness claim down to the start of the axis.

@@ -1,5 +1,6 @@
 use crate::engine::epoch::EpochLog;
 use crate::engine::pre_buffer::PreTriggerBuffer;
+use crate::engine::epoch::FilterPolicy;
 use crate::engine::seq_counter::SeqCounter;
 use crate::filter::parser::ParsedFilter;
 use crate::gelf::message::LogEntry;
@@ -87,6 +88,61 @@ impl LogPipeline {
             store_capacity,
             Arc::new(SeqCounter::new_with_initial(initial_seq)),
         )
+    }
+
+    /// Build a pipeline already holding a loaded case's records.
+    ///
+    /// **`epoch_origin` is a parameter, not `seq_counter.current()`, and that is
+    /// the whole point of this constructor.** Three consumers constrain a loaded
+    /// domain's seq axis and they pull against each other:
+    ///
+    /// - `logs.export` with no range takes its upper end from `current_seq()`,
+    ///   so the counter must sit at the window's TOP or the default window
+    ///   inverts and every export reports `cannot_verify`;
+    /// - `EpochLog::coverage` needs `origin <= from` to vouch for the window;
+    /// - `spans.export` floors at `max(lost_below, origin + 1)`, so an origin of
+    ///   `from` makes every span export report phantom truncation.
+    ///
+    /// One value cannot satisfy all three, and [`Self::new_with_seq_counter`]
+    /// hard-wires `EpochLog::new(seq_counter.current())`. Splitting them lets the
+    /// counter sit at `to` and the origin at `from - 1`, which satisfies all
+    /// three at once.
+    ///
+    /// `narrowing` gives the policy TRANSITIONS the case recorded: a stretch
+    /// that was filtered opens with its filters and closes by returning to
+    /// unfiltered. Empty means unfiltered throughout.
+    ///
+    /// **A baseline unfiltered epoch is always written first, and it has to be.**
+    /// `EpochLog::coverage` returns `EpochCoverage::default()` — `covered: false`
+    /// — for an EMPTY log, documented as "silence is not evidence of an
+    /// unfiltered store". So seeding only the narrowed stretches leaves an
+    /// unfiltered case with an empty log, and every export over it reports
+    /// `cannot_verify` about a window the case calls complete. Caught by the
+    /// unbounded-export test, which is the one shape that shows it.
+    pub fn from_records(
+        store_capacity: usize,
+        seq_counter: Arc<SeqCounter>,
+        epoch_origin: u64,
+        narrowing: &[(u64, FilterPolicy)],
+        records: Vec<LogEntry>,
+        lost_below: u64,
+    ) -> Self {
+        let (event_sender, _) = broadcast::channel(100);
+        let log = EpochLog::new(epoch_origin);
+        // The first observation opens its epoch at the ORIGIN rather than at the
+        // seq observed (`epoch.rs`, `None => self.origin_seq`), so this one
+        // covers everything from the window's floor upward.
+        log.observe(epoch_origin, &FilterPolicy::new(Vec::new()));
+        for (seq, policy) in narrowing {
+            log.observe(*seq, policy);
+        }
+        Self {
+            store: InMemoryStore::from_records(store_capacity, records, lost_below),
+            pre_buffer: PreTriggerBuffer::new(0),
+            seq_counter,
+            event_sender,
+            epochs: log,
+        }
     }
 
     pub fn new_with_seq_counter(store_capacity: usize, seq_counter: Arc<SeqCounter>) -> Self {

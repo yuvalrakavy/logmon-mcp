@@ -51,6 +51,37 @@ impl SpanStore {
         self.lost_below.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Build a ring already holding `spans` — how a case is loaded.
+    ///
+    /// **A constructor rather than `insert`, because `insert` overwrites the
+    /// seq** (`span.seq = self.seq_counter.next()`), and a loaded case's spans
+    /// must keep the numbers the case document's cross-references point at.
+    /// `lost_below` is the window's lower bound for the same reason as the log
+    /// store's: a case speaks for its window and nothing beneath it.
+    pub fn from_records(
+        capacity: usize,
+        seq_counter: Arc<SeqCounter>,
+        spans: Vec<SpanEntry>,
+        lost_below: u64,
+    ) -> Self {
+        let mut buffer = VecDeque::with_capacity(capacity.max(spans.len()));
+        let mut trace_index: HashMap<u128, Vec<u64>> = HashMap::new();
+        for s in spans {
+            trace_index.entry(s.trace_id).or_default().push(s.seq);
+            buffer.push_back(s);
+        }
+        let cap = capacity.max(buffer.len());
+        Self {
+            inner: RwLock::new(SpanStoreInner {
+                buffer,
+                trace_index,
+                capacity: cap,
+            }),
+            seq_counter,
+            lost_below: std::sync::atomic::AtomicU64::new(lost_below),
+        }
+    }
+
     pub fn insert(&self, mut span: SpanEntry) -> u64 {
         span.seq = self.seq_counter.next();
         let seq = span.seq;
