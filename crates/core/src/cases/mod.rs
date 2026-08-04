@@ -19,15 +19,24 @@
 //! consumers, and wanting one without the other is the common case — one mixed
 //! stream would make every consumer filter by record kind before doing anything.
 //!
-//! Not compressed, and that is a decision rather than an omission: §2's boundary
-//! is that the format is the contract and indexing belongs to whatever walks the
-//! directory, so putting a codec between the archive and `grep` costs more than
-//! the bytes are worth. Anyone wanting the space back has filesystem-level
-//! compression, which is transparent, and gzipping cold files later, which needs
-//! no change to this contract.
+//! **Bundled and compressed since 2026-08-04, reversing the decision this
+//! paragraph used to record.** It declined a codec because "indexing belongs to
+//! whatever walks the directory, so putting a codec between the archive and
+//! `grep` costs more than the bytes are worth". That reasoning was sound and its
+//! premise expired: `grep` is no longer the consumer. [`load`] reads a case and
+//! an external document store manages the collection, so the codec costs the
+//! real consumers nothing — while three loose files desync or lose a sibling in
+//! transit, which is the failure the whole postmortem scenario runs into.
+//!
+//! Measured on real capture bytes at 5000 records: 18.9× when every message is
+//! unique, 69.5× on repetitive traffic. The ratio is pinned by a test in
+//! [`bundle`], so if it ever collapses the reversal gets revisited rather than
+//! kept out of habit. `unzip` still reproduces the loose layout exactly, and
+//! [`load`] accepts either — the bundle is a container, not a second format.
 
 pub mod bundle;
 pub mod document;
+pub mod load;
 pub mod naming;
 pub mod read;
 pub mod write;
