@@ -257,6 +257,13 @@ fn evidence<T: serde::de::DeserializeOwned>(
                 if line.trim().is_empty() {
                     continue;
                 }
+                // Checked INSIDE the loop, not after it. The ceiling protects
+                // the ring, but a 40M-record file was fully parsed into a `Vec`
+                // before the check downstream rejected it — so the allocation
+                // the ceiling exists to prevent had already happened.
+                if out.len() >= MAX_CASE_RECORDS {
+                    return Err(LoadError::TooManyRecords(out.len() + 1));
+                }
                 let rec: T = serde_json::from_str(line).map_err(|e| {
                     LoadError::BadRecords(format!("`{}` record {n}: {e}", d.file))
                 })?;

@@ -87,6 +87,20 @@ fn ensure_idempotent(
     requested: &DomainPortSpec,
     stale_after_secs: u64,
 ) -> Result<Value, String> {
+    // **Before the port comparison, because it would pass.** A postmortem domain
+    // has all three ports at `0`, and `port_matches` treats an unspecified port
+    // as matching — so `create_domain {name}` against a loaded case returned
+    // success and the caller believed it had a live domain. It would then ship
+    // GELF at a port that was never bound, see nothing arrive, and read the
+    // case's months-old records as its own.
+    if let Some(pm) = &existing.postmortem {
+        return Err(format!(
+            "domain `{}` holds the loaded case `{}` rather than a running system, \
+             so it cannot be ensured as a live domain. Delete it first, or pick \
+             another name.",
+            existing.config.name, pm.case
+        ));
+    }
     let matches = port_matches(existing.config.gelf_port, requested.gelf)
         && port_matches(existing.config.otlp_grpc_port, requested.otlp_grpc)
         && port_matches(existing.config.otlp_http_port, requested.otlp_http);
@@ -233,7 +247,11 @@ impl RpcHandler {
             "domain": domain.config.name.to_string(),
             "case": case.stem,
             "captured_at": case.front.captured_at.to_rfc3339(),
-            "verdict": format!("{:?}", case.front.verdict).to_lowercase(),
+            // Through serde, NOT `{:?}`. `Debug` ignores the enum's
+            // `rename_all = "snake_case"`, so `CannotVerify` went on the wire as
+            // `"cannotverify"` — a value outside the closed four-verdict set,
+            // and invisible in testing because the other three are single words.
+            "verdict": serde_json::to_value(case.front.verdict).unwrap_or(Value::Null),
             "seq_range": { "from": case.from_seq(), "to": case.to_seq() },
             "logs": case.logs.as_ref().map(Vec::len),
             "spans": case.spans.as_ref().map(Vec::len),
@@ -264,14 +282,24 @@ impl RpcHandler {
         // only pair that satisfies all three consumers of the seq axis. See
         // `LogPipeline::from_records`.
         let seq = Arc::new(crate::engine::seq_counter::SeqCounter::new_with_initial(to));
-        let narrowing: Vec<(u64, FilterPolicy)> = case
-            .front
-            .narrowed_by
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|n| (n.from, FilterPolicy::new(n.filters.clone())))
-            .collect();
+        // **Each stretch must CLOSE, or it runs to the top of the window.**
+        // `EpochLog` gives its last epoch `epoch_end = u64::MAX`, so emitting
+        // only the opening transition reports `filtered` over every seq above a
+        // narrowing the case says ended — a filter someone turned off at seq 201
+        // would narrow the remaining 300 seqs of the window. That is wrong
+        // information rather than missing information, which is the failure the
+        // epoch log was built to prevent in the first place.
+        let mut narrowing: Vec<(u64, FilterPolicy)> = Vec::new();
+        for n in case.front.narrowed_by.as_deref().unwrap_or(&[]) {
+            narrowing.push((n.from, FilterPolicy::new(n.filters.clone())));
+            // Back to unfiltered one past the end. Saturating so a stretch
+            // declared to `u64::MAX` cannot wrap to 0 and reorder the log.
+            narrowing.push((n.to.saturating_add(1), FilterPolicy::new(Vec::new())));
+        }
+        // `observe` clamps a boundary to the previous one rather than reordering,
+        // so overlapping stretches degrade to the wider narrowing rather than
+        // scrambling the axis — but sorting keeps the common case exact.
+        narrowing.sort_by_key(|(seq, _)| *seq);
 
         let pipeline = crate::engine::pipeline::LogPipeline::from_records(
             logs.len().max(1),
@@ -355,7 +383,17 @@ impl RpcHandler {
     /// would be **inert**: accepted, silently doing nothing, and reading to the
     /// caller as a thing that happened.
     fn require_live(&self, session_id: &SessionId, op: &str) -> Result<(), String> {
-        let d = self.resolve_domain(session_id)?;
+        // **A `?` here would change six handlers' contract.** `filters.edit` and
+        // the collector verbs are session-keyed and deliberately do NOT require
+        // a resolvable bound domain — session config is global, only data is
+        // partitioned — so propagating the vanished-domain error would make
+        // `remove_collector` fail after `delete_domain`, stranding the
+        // collector's byte reservation until an unrelated `sessions.drop`.
+        //
+        // No domain means no postmortem domain, which is exactly `Ok`.
+        let Ok(d) = self.resolve_domain(session_id) else {
+            return Ok(());
+        };
         let Some(pm) = &d.postmortem else {
             return Ok(());
         };
@@ -380,10 +418,13 @@ impl RpcHandler {
                 "A live buffer refills; this one cannot. Deleting the domain is the honest way to \
                  discard a case."
             }
-            "clear_bookmarks" => {
-                "This would delete the anchor bookmark the case was loaded with, and nothing can \
-                 recreate it. Remove bookmarks individually."
-            }
+            // NOT `clear_bookmarks`. It used to be refused here on the grounds
+            // of protecting "the anchor bookmark the case was loaded with" — a
+            // bookmark nothing creates, since the anchor-bookmark idea stayed a
+            // design proposal. Bookmarks on a loaded case are the READER's own
+            // navigation, placed today with today's clock, so clearing them is
+            // theirs to do. A refusal that protects nothing is worse than none:
+            // it sends someone looking for a workaround.
             "update_domain_data" | "remove_domain_data" => {
                 "This provenance was captured with the case and describes the machine it came \
                  from. Editing it here would make the document and the domain disagree about \
@@ -1022,14 +1063,17 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        let store = self
-            .domain_data
-            .as_ref()
-            .ok_or("domain_data is not available on this broker")?;
         let d = self.resolve_domain(session_id)?;
-        let name = d.config.name.to_string();
         let prefix = opt_str(params, "prefix")?;
-        let now = chrono::Utc::now();
+        // **The frozen clock's one read-side consumer.** Ages, expiry and the
+        // `validated_before_secs` cutoff are facts about the CAPTURED system, so
+        // on a postmortem domain they are measured from the capture — otherwise
+        // every fact in a three-month-old case reads as three months stale, and
+        // a 24-hour TTL that was comfortably in force reads as long elapsed.
+        //
+        // This used to be `Utc::now()`, and `fact_clock` had no callers at all:
+        // the mechanism existed and nothing consulted it.
+        let now = d.fact_clock();
         // Checked, not cast. `chrono::Duration::seconds` PANICS out of range and
         // `s as i64` turns a large `u64` negative, so the old form could either
         // move the cutoff into the future or take the connection task down —
@@ -1049,7 +1093,13 @@ impl RpcHandler {
             ),
         };
 
-        let reg = store.for_domain(&name);
+        // **Through `resolve_domain_data`, not `for_domain`.** A postmortem
+        // domain holds its provenance in memory, and `for_domain` would both
+        // miss it and CREATE a file under the case's name — stamping this
+        // broker's version and today's `first_seen` onto a registry describing
+        // another machine, in a file that outlives the domain. Reading the
+        // restored facts was the entire point of carrying them.
+        let (name, reg) = self.resolve_domain_data(session_id)?;
         let (keys, total, missing_core) = reg.read(|r| {
             let keys: Vec<DomainDataKey> = r
                 .query(prefix, cutoff)
@@ -1696,7 +1746,9 @@ impl RpcHandler {
                     "case": pm.case,
                     "captured_at": pm.captured_at.to_rfc3339(),
                     "age_secs": elapsed,
-                    "verdict": format!("{:?}", pm.verdict).to_lowercase(),
+                    // See the note in `handle_cases_load`: `{:?}` spells
+                    // `CannotVerify` as `cannotverify`.
+                    "verdict": serde_json::to_value(pm.verdict).unwrap_or(Value::Null),
                     "logs_omitted": pm.logs_omitted,
                     "spans_omitted": pm.spans_omitted,
                     "registry_dropped": pm.registry_dropped,
@@ -2509,6 +2561,21 @@ impl RpcHandler {
                     let reg_path = dir.join(crate::cases::bundle::registry_entry_name(&stem));
                     std::fs::write(&reg_path, &registry_bytes).map_err(|e| fail(&reg_path, e))?;
                     (&f.document).write_all(&doc_bytes).map_err(|e| fail(&f.paths[0], e))?;
+                    // `claim` creates all three exclusively before the omit flags
+                    // are read, so an omitted file would be left at zero bytes —
+                    // a third state the format has no name for. `write_jsonl`'s
+                    // contract is that a file with no records still carries its
+                    // header, and `load` treats a missing header as truncation.
+                    // Remove them so the directory matches the front matter,
+                    // whose key is already absent.
+                    for (omit, path) in [
+                        (omit_logdata, &f.paths[1]),
+                        (omit_spandata, &f.paths[2]),
+                    ] {
+                        if omit {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                 }
                 (_, Some(b)) => {
                     let mut entries = vec![(names[0].clone(), doc_bytes)];
@@ -2969,7 +3036,6 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
-        self.require_live(session_id, "clear_bookmarks")?;
         let d = self.resolve_domain(session_id)?;
         // Default to the calling session if no explicit session is given — which
         // is why a wrong-typed one cannot be read as absent: it would clear the

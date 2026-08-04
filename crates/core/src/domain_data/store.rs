@@ -336,9 +336,20 @@ impl Registry {
             .collect()
     }
 
-    /// Logmon's own write path. The only route to `/logmon/*`, and it refuses
-    /// everything else so a bug here cannot quietly become an agent write.
     /// Put a fact back exactly as it was captured, timestamps and all.
+    ///
+    /// **Reserved paths are REFUSED here.** `case_registry_copy` filters
+    /// `/logmon/*` out when writing a case, so no case this build produces
+    /// carries one — permitting them only widened what a hand-edited or hostile
+    /// `registry.json` could inject. The loaded case's own incarnation is
+    /// restored separately through `set_reserved`, which is the deliberate
+    /// route.
+    ///
+    /// (The first two lines of this comment used to belong to `set_reserved`,
+    /// below, and were left stranded on top of this function when it was
+    /// inserted — claiming `restore` was "the only route to `/logmon/*`" and
+    /// that it "refuses everything else", neither of which was true of it. That
+    /// is the sentence most likely to have stopped someone adding the check.)
     ///
     /// **Not `update`, and the difference is the whole point.** `update` stamps
     /// `created_at`/`validated_at` with *now*, which is right for a fact someone
@@ -361,6 +372,9 @@ impl Registry {
         validated_at: DateTime<Utc>,
         ttl_secs: Option<u64>,
     ) {
+        if is_reserved(path) {
+            return;
+        }
         self.entries.insert(
             path.to_string(),
             Entry {

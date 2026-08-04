@@ -345,6 +345,156 @@ async fn loading_a_second_case_onto_an_occupied_name_is_refused_by_name() {
     );
 }
 
+/// Copy the fixture into a temp dir and hand back its `.md` path.
+fn scratch_case(dir: &tempfile::TempDir, stem: &str) -> std::path::PathBuf {
+    for suffix in [".md", ".logdata.jsonl", ".spandata.jsonl"] {
+        let n = format!("{stem}{suffix}");
+        std::fs::copy(
+            format!("{}/tests/fixtures/cases/{n}", env!("CARGO_MANIFEST_DIR")),
+            dir.path().join(&n),
+        )
+        .unwrap();
+    }
+    dir.path().join(format!("{stem}.md"))
+}
+
+#[tokio::test]
+async fn a_narrowed_stretch_that_ended_does_not_narrow_the_rest_of_the_window() {
+    // **The deep gate found this, and found that my own test could not.**
+    // `case_loading`'s other tests pass epochs straight to
+    // `LogPipeline::from_records`, bypassing the translation in
+    // `assemble_case_domain` entirely — and the one narrowing they use runs to
+    // the top of the window, the single shape where a missing close is
+    // invisible. So this goes through `cases.load`.
+    //
+    // The defect: only the OPENING transition was emitted, and `EpochLog` runs
+    // its last epoch to `u64::MAX`. A filter someone turned off mid-window then
+    // narrowed every seq above it — wrong information, not missing information.
+    let dir = tempfile::tempdir().unwrap();
+    let stem = "with-spans-260803-214501";
+    let md = scratch_case(&dir, stem);
+
+    // The fixture's window is 1001–1012. Narrow only 1001–1004.
+    let doc = std::fs::read_to_string(&md)
+        .unwrap()
+        .replace(
+            "narrowed_by: []",
+            r#"narrowed_by: [{from: 1001, to: 1004, filters: ["l>=ERROR"]}]"#,
+        )
+        .replace("verdict: complete", "verdict: filtered");
+    // Older fixtures predate the key; add it if the replace found nothing.
+    let doc = if doc.contains("narrowed_by:") {
+        doc
+    } else {
+        doc.replace(
+            "verdict: filtered",
+            "verdict: filtered\nnarrowed_by: [{from: 1001, to: 1004, filters: [\"l>=ERROR\"]}]",
+        )
+    };
+    std::fs::write(&md, doc).unwrap();
+
+    let h = harness(&[]);
+    let resp = h
+        .handler
+        .handle_async(
+            &h.session,
+            &RpcRequest::new(1, "cases.load", json!({ "path": md.to_str().unwrap() })),
+        )
+        .await;
+    assert!(resp.error.is_none(), "{:?}", resp.error);
+    h.handler.handle(
+        &h.session,
+        &RpcRequest::new(1, "domains.use", json!({ "name": stem })),
+    );
+
+    // Above the narrowing, the case says nothing was narrowing the store.
+    let clean = call(
+        &h,
+        "logs.export",
+        json!({ "format": "json", "from_seq": 1006, "to_seq": 1012 }),
+    );
+    assert_eq!(
+        clean["narrowed_by"].as_array().map(Vec::len),
+        Some(0),
+        "a stretch that ENDED must not narrow the rest of the window: {clean}"
+    );
+    assert_ne!(
+        clean["verdict"], "filtered",
+        "and the verdict above it must not inherit the narrowing: {clean}"
+    );
+
+    // ...while the narrowed stretch itself still reports its filter.
+    let narrowed = call(
+        &h,
+        "logs.export",
+        json!({ "format": "json", "from_seq": 1001, "to_seq": 1004 }),
+    );
+    assert_eq!(narrowed["verdict"], "filtered", "{narrowed}");
+    assert_eq!(
+        narrowed["narrowed_by"][0]["filters"][0], "l>=ERROR",
+        "{narrowed}"
+    );
+}
+
+#[test]
+fn provenance_on_a_loaded_case_is_aged_from_the_capture_not_from_today() {
+    // **`fact_clock()` had ZERO callers.** The frozen clock was designed,
+    // documented in four places, and consulted by nothing: `domain_data.get`
+    // used `Utc::now()` and opened the SHARED name-keyed store, so the restored
+    // provenance was write-only and every fact read as months stale.
+    let h = sealed_harness();
+    let reg = call(&h, "domain_data.get", json!({}));
+    // The sealed harness's registry is empty, so the observable claim is the one
+    // that matters: nothing was created under the case's name on disk, and the
+    // call resolved against the in-memory registry rather than the store.
+    assert!(
+        reg["keys"].is_array(),
+        "the postmortem registry must be readable at all: {reg}"
+    );
+    let files: Vec<_> = std::fs::read_dir(h._cfg.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !files.iter().any(|f| f.contains("domain_data")),
+        "resolving a postmortem registry must not create a file under the \
+         case's name — that file outlives the domain and the next live domain \
+         of that name would adopt it: {files:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_domain_refuses_to_hand_back_a_loaded_case_as_a_live_domain() {
+    // A postmortem domain has all three ports at 0, and `port_matches` treats an
+    // unspecified port as matching — so the idempotent-ensure path returned
+    // SUCCESS and the caller believed it had a live domain. It would then ship
+    // GELF at a port that was never bound and read the case's months-old records
+    // as its own.
+    let dir = tempfile::tempdir().unwrap();
+    let stem = "with-spans-260803-214501";
+    let md = scratch_case(&dir, stem);
+    let h = harness(&[]);
+    let loaded = h
+        .handler
+        .handle_async(
+            &h.session,
+            &RpcRequest::new(1, "cases.load", json!({ "path": md.to_str().unwrap() })),
+        )
+        .await;
+    assert!(loaded.error.is_none(), "{:?}", loaded.error);
+
+    let resp = h
+        .handler
+        .handle_async(
+            &h.session,
+            &RpcRequest::new(1, "domains.create", json!({ "name": stem })),
+        )
+        .await;
+    let msg = resp.error.expect("refused").message;
+    assert!(msg.contains(stem), "the refusal names the case: {msg}");
+}
+
 /// Tools that do not mutate THIS domain, and may therefore run on a loaded case.
 ///
 /// **The allowlist is the permitted side, deliberately, so the default is
@@ -359,6 +509,8 @@ async fn loading_a_second_case_onto_an_occupied_name_is_refused_by_name() {
 /// operation on this one, and delete is the only honest way to discard a case.
 const READ_ONLY: &[&str] = &[
     "load_case",
+    // The reader's own navigation, placed today with today's clock.
+    "clear_bookmarks",
     "get_recent_logs", "get_log_context", "export_logs", "list_log_fields", "profile_logs",
     "get_recent_traces", "get_trace", "get_trace_summary", "get_slow_spans", "get_trace_logs",
     "get_span_context", "export_spans", "profile_traces",

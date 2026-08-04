@@ -568,6 +568,93 @@ fn no_narrowing_and_unknown_narrowing_are_different_answers() {
 }
 
 #[test]
+fn a_flow_sequence_that_cannot_progress_errors_instead_of_looping_forever() {
+    // **Found by the deep gate; it was an unbounded allocation reachable from a
+    // file that arrives by email.** `bare()` stops WITHOUT consuming at `,`, `}`
+    // and `]`, so a `}` inside a sequence returned an empty scalar and left the
+    // cursor where it was — and the loop then ran forever, growing `items` until
+    // the allocator aborted the process. There is no `catch_unwind` in this
+    // workspace, so that takes every live domain's buffers with it.
+    //
+    // Reachable before the version check and under a key the parser otherwise
+    // ignores, so no amount of "we only load our own files" helps.
+    for doc in [
+        "---\nnarrowed_by: [}]\n---\n",
+        "---\nprovenance: {core: \"3 of 3\", missing: [}]}\n---\n",
+        "---\nfuture_key: [}]\ncase: x\n---\n",
+        "---\nlogmon_format: 9\nnarrowed_by: [}]\n---\n",
+    ] {
+        let got = parse_front_matter(doc);
+        assert!(
+            got.is_err(),
+            "{doc:?} must error rather than loop: {got:?}"
+        );
+    }
+
+    // ...and the guard must not have been bought by refusing legitimate input.
+    let fm = parse_front_matter(&fixture("with-spans-260803-214501"));
+    assert!(fm.is_ok(), "a real case must still parse: {fm:?}");
+}
+
+#[test]
+fn a_format_version_that_overflows_u32_is_still_refused() {
+    // `as u32` WRAPS: 4294967297 truncated to 1 and sailed past the very check
+    // whose comment says it establishes what these bytes mean.
+    for v in ["4294967297", "4294967296", "18446744073709551615"] {
+        let doc = fixture("with-spans-260803-214501")
+            .replace("logmon_format: 1", &format!("logmon_format: {v}"));
+        assert!(
+            matches!(
+                parse_front_matter(&doc),
+                Err(ParseError::FormatTooNew { .. })
+            ),
+            "logmon_format {v} must be refused, not truncated"
+        );
+    }
+}
+
+#[test]
+fn an_oversized_registry_file_is_refused() {
+    // `Registry::restore` writes straight into the map, bypassing the MAX_KEYS
+    // and MAX_VALUE_BYTES gate that every agent-sent fact passes through — and
+    // its input arrived from another machine. MAX_CASE_RECORDS counts log and
+    // span records only, so nothing else bounded this.
+    let many = (0..crate::cases::MAX_REGISTRY_FACTS + 1)
+        .map(|i| {
+            serde_json::json!({
+                "path": format!("/Big/key{i}"), "value": "v",
+                "created_at": "2026-07-31T08:12:04Z",
+                "validated_at": "2026-07-31T08:12:04Z"
+            })
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "logmon_format": 1, "facts": many, "dropped": 0
+    }))
+    .unwrap();
+    assert!(
+        parse_registry(Some(&bytes)).is_err(),
+        "a registry above the key ceiling must be refused"
+    );
+
+    let huge = serde_json::to_vec(&serde_json::json!({
+        "logmon_format": 1,
+        "facts": [{
+            "path": "/Big/one",
+            "value": "x".repeat(crate::domain_data::MAX_VALUE_BYTES + 1),
+            "created_at": "2026-07-31T08:12:04Z",
+            "validated_at": "2026-07-31T08:12:04Z"
+        }],
+        "dropped": 0
+    }))
+    .unwrap();
+    assert!(
+        parse_registry(Some(&huge)).is_err(),
+        "a value above the byte ceiling must be refused"
+    );
+}
+
+#[test]
 fn an_absent_evidence_key_is_omitted_not_empty() {
     // The distinction the whole omit_* option rests on. `records: 0` says the
     // capture looked and found none — a finding about the system. An absent key

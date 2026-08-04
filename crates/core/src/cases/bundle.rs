@@ -27,6 +27,14 @@ use super::naming::file_names;
 /// What a case is called on disk when bundled.
 pub const BUNDLE_SUFFIX: &str = ".case.zip";
 
+/// Ceiling on one entry, declared or actual.
+///
+/// A 5000-record capture is ~2 MB uncompressed, so this is two orders of
+/// magnitude of headroom over anything logmon writes — it exists to bound what
+/// an archive from elsewhere can ask this process to allocate, not to constrain
+/// legitimate cases.
+pub const MAX_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
 /// The fourth entry — provenance as data. Not a loose sibling: it exists because
 /// the bundle gave the registry somewhere to live that the document's own size
 /// budget does not govern.
@@ -158,8 +166,32 @@ pub fn unpack<R: Read + Seek>(src: R, stem: &str) -> Result<CaseBytes, BundleErr
         if !allowed.contains(&name) {
             return Err(BundleError::ForeignEntry(name));
         }
-        let mut buf = Vec::with_capacity(e.size() as usize);
-        e.read_to_end(&mut buf)?;
+        // **`e.size()` is the header's CLAIM, not a measurement**, and the
+        // header arrived from another machine. Sizing an allocation from it is
+        // the exact hazard `load::MAX_CASE_RECORDS` documents one module over:
+        // `u64::MAX` panics on `capacity overflow`, and a plausible-looking
+        // 16 GiB asks for more than the host will give and aborts the process,
+        // taking every live domain's buffers with it. A truncated transfer
+        // produces a garbage size field without anyone being hostile.
+        //
+        // So the declared size is a HINT bounded by a real ceiling, and the read
+        // is capped independently — a deflate bomb declares a small size and
+        // expands anyway.
+        if e.size() > MAX_ENTRY_BYTES {
+            return Err(BundleError::Zip(format!(
+                "entry `{name}` declares {} bytes, above the {MAX_ENTRY_BYTES}-byte ceiling",
+                e.size()
+            )));
+        }
+        let hint = e.size().min(1 << 20) as usize;
+        let mut buf = Vec::with_capacity(hint);
+        let read = e.by_ref().take(MAX_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
+        if read as u64 > MAX_ENTRY_BYTES {
+            return Err(BundleError::Zip(format!(
+                "entry `{name}` expands past the {MAX_ENTRY_BYTES}-byte ceiling; \
+                 a small entry that decompresses without bound is a bomb, not a case"
+            )));
+        }
         found.push((name, buf));
     }
 

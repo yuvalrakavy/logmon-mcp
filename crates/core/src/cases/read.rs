@@ -375,7 +375,32 @@ impl Cur {
                 Some(',') => {
                     self.i += 1;
                 }
-                _ => items.push(self.value()?),
+                _ => {
+                    // **A progress guard, not a `}` arm.** `bare()` stops
+                    // WITHOUT consuming at `,`, `}` and `]`, so a `}` here
+                    // returns an empty scalar and leaves `self.i` where it was —
+                    // and this loop then runs forever, growing `items` until the
+                    // allocator aborts the process. `[}]` anywhere in a case
+                    // document reached it, including under a key this parser
+                    // otherwise ignores, and including before the version check.
+                    //
+                    // Guarding on progress rather than on the one character that
+                    // triggered it: the invariant is "every iteration consumes
+                    // something", and that stays true if the scanner's stop set
+                    // ever changes.
+                    let before = self.i;
+                    let v = self.value()?;
+                    if self.i == before {
+                        return Err(ParseError::BadFlow {
+                            at: self.at(),
+                            what: format!(
+                                "sequence (nothing consumable at {:?})",
+                                self.peek().unwrap_or(' ')
+                            ),
+                        });
+                    }
+                    items.push(v);
+                }
             }
         }
     }
@@ -602,7 +627,11 @@ pub fn parse_front_matter(doc: &str) -> Result<FrontMatter, ParseError> {
 
     // Version first: everything below is an interpretation of bytes whose
     // meaning this check is what establishes.
-    let logmon_format = as_u64(take(&top, "logmon_format")?, "logmon_format")? as u32;
+    // Compared as `u64` and narrowed only after. `as u32` WRAPS, so
+    // `logmon_format: 4294967297` truncated to `1` and sailed past the very
+    // check the comment above says establishes what these bytes mean.
+    let declared = as_u64(take(&top, "logmon_format")?, "logmon_format")?;
+    let logmon_format = u32::try_from(declared).unwrap_or(u32::MAX);
     if logmon_format > FORMAT_VERSION {
         return Err(ParseError::FormatTooNew {
             found: logmon_format,
@@ -793,6 +822,37 @@ pub fn parse_registry(bytes: Option<&[u8]>) -> Result<Option<RegistryBlock>, Par
             at: 0,
             what: format!("registry file ({e})"),
         })?;
+    // **Bounded here, where every other case invariant is checked.**
+    // `Registry::restore` writes straight into the map, bypassing the
+    // `MAX_KEYS` / `MAX_VALUE_BYTES` / `Key::parse` gate that `apply_one`
+    // enforces for anything an agent sends — and its input is a file that
+    // arrived by scp or email. `MAX_CASE_RECORDS` counts log and span records
+    // only, so nothing else bounds this.
+    if block.facts.len() > super::MAX_REGISTRY_FACTS {
+        return Err(ParseError::BadFlow {
+            at: 0,
+            what: format!(
+                "registry file holds {} facts, above the {} a case may carry",
+                block.facts.len(),
+                super::MAX_REGISTRY_FACTS
+            ),
+        });
+    }
+    if let Some(f) = block
+        .facts
+        .iter()
+        .find(|f| f.value.len() > crate::domain_data::MAX_VALUE_BYTES)
+    {
+        return Err(ParseError::BadFlow {
+            at: 0,
+            what: format!(
+                "registry fact `{}` carries {} bytes, above the {} a value may hold",
+                f.path,
+                f.value.len(),
+                crate::domain_data::MAX_VALUE_BYTES
+            ),
+        });
+    }
     // Same policy as the front matter, and checked here too: the block is its
     // own carrier and a document could in principle be assembled from halves.
     if block.logmon_format > FORMAT_VERSION {

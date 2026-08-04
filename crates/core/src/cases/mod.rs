@@ -55,3 +55,10 @@ pub use write::{
 /// format *is* the contract a reader has years later. The collector path
 /// already carries a `FORMAT_VERSION` for the same reason.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// Registry facts one case may carry.
+///
+/// Mirrors `domain_data`'s own `MAX_KEYS`: a case's provenance is a copy of a
+/// domain registry, so it cannot legitimately hold more than one could.
+pub const MAX_REGISTRY_FACTS: usize = crate::domain_data::MAX_KEYS;
+
