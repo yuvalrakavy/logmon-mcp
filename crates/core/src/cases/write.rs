@@ -86,6 +86,51 @@ pub fn claim(dir: &Path, prefix: &str, at: DateTime<Utc>) -> Result<CaseFiles, C
     ))
 }
 
+/// A claimed bundle: one file, exclusively created.
+pub struct CaseBundleFile {
+    pub stem: String,
+    pub path: PathBuf,
+    pub file: File,
+}
+
+/// Claim `<stem>.case.zip`, re-rolling the stem on collision.
+///
+/// **Same create-new-exclusive discipline as [`claim`], and for the same
+/// reason**: between a check and a write another process can land, and in an
+/// archive nothing ever deletes from, the loser's evidence is gone with no error
+/// anywhere. One file instead of three makes the claim simpler, not weaker — a
+/// bundle cannot be half-claimed, which is the failure `try_claim` exists to
+/// prevent for the loose form.
+pub fn claim_bundle(
+    dir: &Path,
+    prefix: &str,
+    at: DateTime<Utc>,
+) -> Result<CaseBundleFile, CaseWriteError> {
+    fs::create_dir_all(dir).map_err(|e| CaseWriteError::Directory(dir.to_path_buf(), e))?;
+    let base = naming::stem(prefix, at);
+    for attempt in 0..MAX_STEM_ATTEMPTS {
+        let stem = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", naming::roll_id())
+        };
+        let path = dir.join(super::bundle::bundle_name(&stem));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok(CaseBundleFile { stem, path, file }),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(CaseWriteError::Create(path, e)),
+        }
+    }
+    Err(CaseWriteError::Exhausted(
+        dir.to_path_buf(),
+        MAX_STEM_ATTEMPTS,
+    ))
+}
+
 enum ClaimFailure {
     Taken,
     Io(PathBuf, io::Error),
@@ -151,14 +196,18 @@ struct JsonlHeader<'a> {
 ///
 /// A file with no records is still written, with its header: absent cannot be
 /// told from "we captured none".
-pub fn write_jsonl<T: Serialize>(
-    file: File,
+/// Generic over the sink so a bundle can assemble evidence in memory before
+/// compressing it. `path` stays for the error message: a caller writing to a
+/// `Vec` still names the entry the bytes were destined for, or a failure reads
+/// as coming from nowhere.
+pub fn write_jsonl<W: Write, T: Serialize>(
+    sink: W,
     path: &Path,
     kind: &str,
     records: impl IntoIterator<Item = T>,
 ) -> Result<CaseFileStats, CaseWriteError> {
     let fail = |e: io::Error| CaseWriteError::Write(path.to_path_buf(), e);
-    let mut out = BufWriter::new(file);
+    let mut out = BufWriter::new(sink);
     let mut stats = CaseFileStats::default();
 
     let header = JsonlHeader {
