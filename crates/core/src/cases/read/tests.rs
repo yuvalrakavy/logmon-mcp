@@ -660,13 +660,17 @@ fn the_registry_block_round_trips_exactly() {
             Some(7 * 24 * 3600),
         ),
     ];
-    let doc = render(&input).body;
+    let bytes = crate::cases::document::registry_json(&input.registry);
 
-    let block = parse_registry(&doc)
-        .expect("the block must parse")
+    let block = parse_registry(Some(&bytes))
+        .expect("the registry file must parse")
         .expect("the emitter must have written one");
 
-    assert_eq!(block.dropped, 0);
+    assert_eq!(
+        block.dropped, 0,
+        "its own artifact carries EVERY fact — the document's budget does not \
+         reach it"
+    );
     assert_eq!(block.facts.len(), 2);
 
     let commit = block
@@ -737,67 +741,56 @@ fn a_case_written_before_the_block_existed_loads_with_no_registry() {
             parse_front_matter(&doc).is_ok(),
             "{stem} must still load as a case"
         );
-        assert!(
-            parse_registry(&doc).unwrap().is_none(),
-            "{stem} has no machine block, and that must read as absent rather \
-             than as an empty registry"
-        );
     }
-}
-
-#[test]
-fn an_empty_registry_writes_no_block() {
-    // §5 returns early when there is nothing to say, so there is no block to
-    // find — which is the same `Ok(None)` as a pre-format case. That collapse is
-    // deliberate: both mean "no provenance to restore".
-    let mut input = hostile_input();
-    input.registry = Vec::new();
-    let doc = render(&input).body;
-    assert!(parse_registry(&doc).unwrap().is_none());
-}
-
-#[test]
-fn a_newer_block_format_is_refused() {
-    let mut input = hostile_input();
-    input.registry = vec![fact(
-        "/Action",
-        "run",
-        "2026-07-31T08:12:04Z",
-        "2026-07-31T14:03:11Z",
-        None,
-    )];
-    let doc = render(&input).body.replace(
-        r#"{"logmon_format":1,"facts""#,
-        r#"{"logmon_format":2,"facts""#,
+    // The fixtures are three loose files with no registry entry at all, which
+    // is what a pre-format case looks like to the loader.
+    assert!(
+        parse_registry(None).unwrap().is_none(),
+        "no registry entry must read as absent rather than as an empty registry"
     );
+}
+
+#[test]
+fn an_empty_registry_is_present_and_empty_not_absent() {
+    // Three-way again: no entry means the case predates the file or nobody
+    // looked; an entry with no facts means the registry really was empty at
+    // capture. The second is a finding about the system.
+    let bytes = crate::cases::document::registry_json(&[]);
+    let block = parse_registry(Some(&bytes))
+        .unwrap()
+        .expect("an empty registry still writes its file");
+    assert!(block.facts.is_empty());
+    assert_eq!(block.dropped, 0);
+}
+
+#[test]
+fn a_newer_registry_format_is_refused() {
+    let bytes = br#"{"logmon_format":2,"facts":[],"dropped":0}"#;
     assert!(
         matches!(
-            parse_registry(&doc),
+            parse_registry(Some(bytes)),
             Err(ParseError::FormatTooNew { found: 2, .. })
         ),
-        "the block carries its own version and must check it"
+        "the registry carries its own version and must check it — it is its own \
+         artifact and can arrive without the document"
     );
 }
 
 #[test]
-fn a_corrupt_block_errors_rather_than_reading_as_absent() {
+fn a_corrupt_registry_errors_rather_than_reading_as_absent() {
     // Absent and malformed are different facts. Collapsing them would let a
-    // truncated document restore an empty registry and call it complete.
-    let mut input = hostile_input();
-    input.registry = vec![fact(
-        "/Action",
-        "run",
-        "2026-07-31T08:12:04Z",
-        "2026-07-31T14:03:11Z",
-        None,
-    )];
-    let doc = render(&input)
-        .body
-        .replace(r#""facts":["#, r#""facts":{"#);
-    assert!(
-        parse_registry(&doc).is_err(),
-        "a malformed block must not read as `no registry`"
-    );
+    // truncated archive restore an empty registry and call it complete.
+    for bad in [
+        &br#"{"logmon_format":1,"facts":{},"dropped":0}"#[..],
+        &b"{"[..],
+        &b""[..],
+        &b"not json at all"[..],
+    ] {
+        assert!(
+            parse_registry(Some(bad)).is_err(),
+            "a malformed registry must not read as `no registry`"
+        );
+    }
 }
 
 #[test]

@@ -987,14 +987,11 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
     let header =
         "| key | kind | value | age | in force since | lifetime |\n|---|---|---|---|---|---|\n";
     s.push_str(header);
-    // **The budget covers BOTH halves of §5, not just the table.** It exists
-    // because §3.1 permits 1.1 MB of registry and the document renders it, so
-    // the file that could be pathological is the one that gets a number.
-    // Letting the machine block carry the same facts a second time outside that
-    // number would have doubled §5 — measured at 145 KiB against a 64 KiB cap —
-    // and quietly retired the guarantee. Charging both halves to one budget
-    // keeps the bound and keeps the two halves carrying exactly the same facts,
-    // which is what stops a reader who checks both from finding them disagree.
+    // The budget governs the TABLE, which is the document's own size risk: §3.1
+    // permits 1.1 MB of registry and this renders it. The machine-readable
+    // registry is a separate artifact and carries every fact regardless, so
+    // truncating here costs a reader nothing but scrolling — the note below says
+    // where the rest is, and it travels with the case.
     let mut used = 0usize;
     let mut rendered = 0usize;
     for f in &facts {
@@ -1016,14 +1013,10 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
             age_of(i.captured_at, f.created_at),
             lifetime
         );
-        // The block writes this fact as one JSON object plus a separator; a
-        // fact that cannot be carried by both halves is carried by neither, so
-        // the table never advertises a fact `load_case` cannot restore.
-        let machine = serde_json::to_string(f).map(|j| j.len() + 1).unwrap_or(0);
-        if used + row.len() + machine > REGISTRY_RENDER_CAP {
+        if used + row.len() > REGISTRY_RENDER_CAP {
             break;
         }
-        used += row.len() + machine;
+        used += row.len();
         s.push_str(&row);
         rendered += 1;
     }
@@ -1032,62 +1025,48 @@ fn provenance(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
         let dropped = facts.len() - rendered;
         let _ = writeln!(
             s,
-            "{dropped} further key(s) were not rendered: this document's registry budget of \
-             {} KiB was reached. Nothing was lost — read them with `get_domain_data` on domain \
-             `{}`, remembering that it reports the registry as it is *now*, not as it was at \
-             capture.\n",
+            "{dropped} further key(s) were not rendered here: this document's registry \
+             budget of {} KiB was reached. **Nothing was lost** — every fact, unrounded, \
+             is in `{}`, which travels with this case. That file is the record; this \
+             table is the reading.\n",
             REGISTRY_RENDER_CAP / 1024,
-            i.domain
+            super::bundle::registry_entry_name(&i.stem)
         );
         notes.push(Note {
             kind: NOTE_TRUNCATED,
-            detail: format!("{dropped} registry keys exceeded the document's render budget"),
+            detail: format!(
+                "{dropped} registry keys exceeded the document's render budget; \
+                 all of them are in the registry file"
+            ),
         });
     }
-
-    registry_block(s, &facts[..rendered], facts.len() - rendered);
 }
 
-/// The machine-readable half of §5 — what `load_case` restores from.
+/// The registry as its own artifact — `<stem>.registry.json`, what `load_case`
+/// restores from.
 ///
-/// **The table above cannot serve this.** `cell()` runs values through
-/// `flatten()`, which collapses newlines and trims, with no inverse; `age_of`
-/// floors timestamps to the largest whole unit, so `created_at` and
-/// `validated_at` survive only to the nearest day or week; and `ttl`/`expired`
-/// arrive as a rendered verdict rather than a number and a bool. Restoring a
-/// registry from that would produce provenance that looks exact and is not —
-/// the failure mode a postmortem domain exists to avoid.
+/// **The §5 table cannot serve this.** `cell()` runs values through `flatten()`,
+/// which collapses newlines and trims, with no inverse; `age_of` floors
+/// timestamps to the largest whole unit, so `created_at` and `validated_at`
+/// survive only to the nearest day or week; and `ttl`/`expired` arrive as a
+/// rendered verdict rather than a number and a bool. Restoring a registry from
+/// that would produce provenance that looks exact and is not — the failure mode
+/// a postmortem domain exists to avoid.
 ///
-/// **It carries exactly the facts the table rendered, and the same `dropped`
-/// count.** One budget, one truncation point: a machine block that reached
-/// further than the table would make the document's two halves disagree about
-/// what was captured, and a reader who checked both would not know which to
-/// believe. `dropped` is in the block rather than only in the prose so a loader
-/// can say "this case's provenance is incomplete" instead of quietly restoring
-/// a subset.
-fn registry_block(s: &mut String, facts: &[&RegistryFact], dropped: usize) {
+/// **It carries EVERY fact, and `dropped` is therefore always 0.** An earlier
+/// draft put this inside the document and had to share the document's 64 KiB
+/// budget, which capped what a loader could restore. Its own entry costs the
+/// document nothing, so the cap goes back to governing only the human table —
+/// and the table's truncation note points here rather than at a live domain
+/// that the postmortem scenario guarantees is gone.
+pub fn registry_json(registry: &[RegistryFact]) -> Vec<u8> {
     let payload = serde_json::json!({
         "logmon_format": FORMAT_VERSION,
-        "facts": facts,
-        "dropped": dropped,
+        "facts": registry,
+        "dropped": 0,
     });
-    // One line, so the block's size is its content and a reader needs no
-    // multi-line assembly. `to_string` cannot fail on a value built from owned
-    // data, but a document is not worth aborting over if it somehow did.
-    let Ok(line) = serde_json::to_string(&payload) else {
-        return;
-    };
-    let _ = writeln!(
-        s,
-        "The same facts, exactly, for `load_case` — values and timestamps \
-         unrounded. The table above is for reading; this is the record.\n"
-    );
-    let _ = writeln!(s, "```json {REGISTRY_BLOCK_TAG}\n{line}\n```\n");
+    serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())
 }
-
-/// The fence info-string that marks the machine-readable registry. Distinctive
-/// so a reader locates it by equality rather than by guessing at ```json.
-pub const REGISTRY_BLOCK_TAG: &str = "logmon-registry";
 
 // ---------------------------------------------------------------------------
 // 6. Collector state at capture

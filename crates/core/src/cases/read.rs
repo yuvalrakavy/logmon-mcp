@@ -773,28 +773,25 @@ pub struct RegistryBlock {
     pub dropped: usize,
 }
 
-/// Parse the registry block, if the document has one.
+/// Parse `<stem>.registry.json`.
 ///
-/// `Ok(None)` is a real answer, not a failure: a case written before this block
-/// existed is still a valid case, and the loader's job is to report that its
-/// provenance could not be restored — not to refuse the case or, worse, to
-/// reconstruct facts from the rendered table and present the rounding as exact.
-pub fn parse_registry(doc: &str) -> Result<Option<RegistryBlock>, ParseError> {
-    let fence = format!("```json {}", super::document::REGISTRY_BLOCK_TAG);
-    let mut lines = doc.lines();
-    let Some(_) = lines.find(|l| l.trim_end() == fence) else {
+/// The caller passes `None` when the case has no registry entry at all — a case
+/// written before the file existed, or one whose registry was empty at capture.
+/// **`Ok(None)` is a real answer**: the loader reports that provenance could not
+/// be restored, and specifically does NOT reconstruct facts from the document's
+/// rendered table, whose values are flattened and whose timestamps are floored.
+///
+/// A present-but-malformed entry is a *different* answer and errors. Collapsing
+/// the two would let a truncated archive restore an empty registry and call it
+/// complete.
+pub fn parse_registry(bytes: Option<&[u8]>) -> Result<Option<RegistryBlock>, ParseError> {
+    let Some(bytes) = bytes else {
         return Ok(None);
     };
-    let Some(payload) = lines.next() else {
-        return Err(ParseError::BadFlow {
-            at: 0,
-            what: "registry block (fence opened at end of document)".into(),
-        });
-    };
     let block: RegistryBlock =
-        serde_json::from_str(payload).map_err(|e| ParseError::BadFlow {
+        serde_json::from_slice(bytes).map_err(|e| ParseError::BadFlow {
             at: 0,
-            what: format!("registry block ({e})"),
+            what: format!("registry file ({e})"),
         })?;
     // Same policy as the front matter, and checked here too: the block is its
     // own carrier and a document could in principle be assembled from halves.

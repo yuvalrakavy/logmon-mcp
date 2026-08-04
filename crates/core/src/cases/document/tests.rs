@@ -295,9 +295,18 @@ fn an_oversized_registry_is_capped_with_a_count_and_a_pointer() {
         table.contains("were not rendered"),
         "a cut must be stated:\n{table}"
     );
+    // **The pointer changed on 2026-08-04, and the old one was a defect.** This
+    // used to assert `get_domain_data` — advice that presumes the live domain
+    // still exists, which is exactly what a case read months later on another
+    // machine guarantees it does not. The rest of the registry now travels with
+    // the case, so the note points at a file the reader already has.
     assert!(
-        table.contains("get_domain_data"),
+        table.contains(".registry.json"),
         "and it must say where the rest is:\n{table}"
+    );
+    assert!(
+        !table.contains("get_domain_data"),
+        "and must NOT send a postmortem reader to a domain that is gone:\n{table}"
     );
     assert!(
         r.notes.iter().any(|n| n.kind == NOTE_TRUNCATED),
