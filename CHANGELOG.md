@@ -5,6 +5,46 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Added — `load_case` (`cases.load`), reading a case back
+
+A case file becomes a sealed **postmortem domain**, and the whole existing read
+surface works against it. `profile_traces` on the loaded domain answers *"what
+was slow three months ago"*; the same call without `--domain` answers *"what is
+slow now"*. Takes an absolute path to a `.case.zip` or to the case document.
+
+**Sealed, and refusals name the reason.** `add_collector`, `add_trigger`,
+`add_filter`, `clear_logs`, `clear_domain`, `create_case` and the collector edit
+verbs all error, pointing at what does work instead. A collector armed on a case
+would report zero forever — which reads as *"I measured and nothing happened"*
+rather than *"I could not measure"*. Exhaustiveness is enforced by a test that
+walks the tool manifest and requires everything not on a read allowlist to be
+refused, so a tool added later fails the test rather than being silently
+permitted.
+
+**Time is frozen at the capture** for facts about the captured system — ages,
+TTLs, staleness — while your own actions keep the real clock, so a bookmark
+placed today is dated today. `get_status` gains a `postmortem` block with the
+case, the capture time, the **real** elapsed seconds as an absolute, and the
+capture's verdict; without it, "idle 12s" on months-old evidence would be
+indistinguishable from a live domain.
+
+**Omitted is not empty.** The block reports whether log or span evidence was
+omitted at capture, which is a different fact from a capture that looked and
+found none. And `store.total_received` is `0` on a loaded domain with
+`store_counters_unmeasured: true` beside it — a case is a window cut out of a
+stream and carries no delivery record, so the counters are unmeasured rather
+than perfect.
+
+Loading a second case into an occupied domain is an error naming its occupant,
+not a no-op: a postmortem domain is constituted by one case, since its clock,
+incarnation, registry and seq range all belong to that capture.
+
+The restored provenance keeps its **original** timestamps, from the machine-
+readable registry file rather than the document's rendered table — whose
+timestamps are floored to the largest whole unit, which would flip a 7-day TTL
+from elapsed to within. It is held in memory and never written to the shared
+`domain_data` store, whose file is keyed by domain name and outlives the domain.
+
 ### Added — a case is one artifact, and its registry is data
 
 A case now travels as a single **`<stem>.case.zip`** holding four stem-prefixed

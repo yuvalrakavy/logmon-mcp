@@ -91,6 +91,25 @@ checkout-hang-260731-021530.spandata.jsonl   ← the spans
 
 The markdown document is what you read to decide *whether this is your bug*; the JSONL is the evidence you consult once you've decided it is. The document leads with what could **not** be captured — before anything it qualifies.
 
+### And `load_case` reads it back
+
+Freezing a window is only half an argument. For most of this design's life the other half was a human one: you *read* the document, and the JSONL sat there being grep-able. That's fine for triage and useless for the question people actually ask, which is comparative — **was it always this slow?**
+
+`load_case` turns a case back into a domain. The whole read surface then works against it, so the comparison is two calls with the same tool:
+
+```
+profile_traces(domain: "checkout-hang-260731-021530")   # three months ago
+profile_traces()                                        # now
+```
+
+That makes case files an interchange format between machines, not just across time: a production box captures, `scp` moves one file, a laptop asks it questions.
+
+**The domain it loads into is sealed, and the refusals are the interesting part.** Arm a collector on it and you get an error naming the case, not zero results. That distinction is the whole design in miniature — a collector reporting `0` reads as *"I measured and nothing happened"*, when the truth is *"I could not measure."* Same for triggers, filters and clears: every operation that would be silently inert is refused out loud.
+
+Time is frozen at the capture, so a provenance key with a 24-hour TTL reads as fresh rather than three months expired. The rule that keeps that honest is worth stating: the frozen clock governs *facts about the captured system*, never *your own actions*. A bookmark you place while reading is dated today, because it was.
+
+And one distinction the format had to grow a field for: **omitted is not empty.** A capture that shipped no span evidence and a capture that looked and found none are different facts — the first about the capture, the second about the system. If they render identically, a loaded case answers *"what was the slowest span?"* with a silence that looks like data. It's the same failure the verdict exists to prevent, one level down.
+
 ### The registry: what was running when this happened
 
 A log window without provenance is a puzzle. logmon keeps a small per-domain key-value store — `update_domain_data` — and the case document renders it as of the capture:

@@ -3980,6 +3980,29 @@
         }
       }
     },
+    "CasesLoad": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CasesLoad",
+      "description": "`cases.load` — a case file back into a sealed postmortem domain.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Absolute path to a `.case.zip` or to the case document.\n\n**Absolute for the same reason `cases.create`'s `dir` is**: the broker\nruns as a service, so a relative path resolves against *its* working\ndirectory rather than yours. The evidence files are then found beside the\ndocument — or inside the bundle — and their names are checked against the\ncase's own stem, because the daemon opens them and a pointer read out of\na file that arrived from another machine must not be able to name a path.",
+          "type": "string"
+        },
+        "domain": {
+          "description": "What to call the resulting domain. Defaults to the case's own stem, so a\nreader who does not care never invents a name and two cases never collide\nby accident.\n\nAn occupied name is an error rather than a no-op: a postmortem domain is\nconstituted by ONE case — its frozen clock, incarnation, registry and seq\nrange all belong to that capture — so loading a second into it has no\ncoherent meaning.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ]
+    },
     "CaseFile": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "CaseFile",

@@ -124,6 +124,7 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "CaseAnchor":            schema_for!(CaseAnchor),
             "CasesCreate":           schema_for!(CasesCreate),
             "CasesCreateResult":     schema_for!(CasesCreateResult),
+            "CasesLoad":             schema_for!(CasesLoad),
             "CaseFile":              schema_for!(CaseFile),
             "CaseNote":              schema_for!(CaseNote),
             "BookmarksAdd":          schema_for!(BookmarksAdd),

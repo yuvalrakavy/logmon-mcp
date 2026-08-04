@@ -1106,8 +1106,8 @@ mod tests {
         // stdio and counts what it advertises — NOT a source scan in
         // `mcp/src/server.rs`, which is what this comment used to claim. There
         // is no tool list in the shim to scan: the daemon teaches it.
-        // 49 since `profile_logs` (logs.profile).
-        assert_eq!(TOOLS.len(), 49);
+        // 50 since `load_case` (cases.load).
+        assert_eq!(TOOLS.len(), 50);
         for Tool {
             name: tool, method, ..
         } in TOOLS

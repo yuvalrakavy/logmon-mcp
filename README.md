@@ -311,7 +311,7 @@ Configure your OpenTelemetry SDK to export to `http://localhost:4318` or `grpc:/
 
 ## MCP tool reference
 
-49 tools, grouped by what they're for. The broker declares them in
+50 tools, grouped by what they're for. The broker declares them in
 `crates/protocol/src/mcp_tools.rs` and serves them over `tools.manifest`, so this
 table is a convenience — the tool list your client registered is the truth, and
 `get_status` reports the broker's own list as `broker_tools`.
@@ -374,6 +374,7 @@ Full guide: [Provenance and case documents](#provenance-and-case-documents).
 | Tool | Description |
 |---|---|
 | `create_case` | Capture a window as three files on disk — a markdown document you read to decide whether this is your bug, and two JSONL evidence files you consult once you have decided it is. `reason` and `dir` are required and `dir` must be **absolute**; the anchor is tagged (`{seq}` / `{bookmark}` / `{trace_id}`) rather than sniffed, and an unresolvable one is an error rather than a document with no headline. `before`/`after` count stored **records**, not seq distances (default 350 each, capped at 5000). `data` is `update_domain_data` in the same call; a key with a leading `@` is asserted about **this capture alone** and never enters the domain registry. |
+| `load_case` | Load a case back into a sealed **postmortem domain**, so the ordinary read tools answer questions about a capture months old or from another machine. Takes an absolute path to a `.case.zip` or to the case document; the domain takes the case's own stem unless you name one. **Nothing arrives on a postmortem domain and nothing can** — collectors, triggers, filters, clears and `create_case` are refused *by name*, because armed here they would report zero forever and read as "I measured and nothing happened" rather than "I could not measure". Time is frozen at the capture, so ages and TTLs read as they did then; bookmarks you place keep today's date. The reply carries the capture's own verdict and says whether evidence was **omitted** at capture — a different fact from a capture that looked and found none. Delete the domain to discard the case. |
 | `update_domain_data` | A per-domain key/value registry recording what was true of the project while the logs were produced — the commit, the build profile, the scenario. Entries are `{path, value?, ttl?}`: a value **sets**, a key alone **validates** what is already there and never creates. Two timestamps per key, never one: set six days ago and never revisited is a guess, the same value confirmed five minutes ago is evidence. |
 | `get_domain_data` | Read it back — each key with its value, when it came into force, when it was last confirmed, and its age. A key with a stated `ttl` also gets an expiry verdict; a key without one gets an age and **no verdict**, deliberately. Also reports which recommended core keys are missing. |
 | `remove_domain_data` | Remove keys by prefix, matched on segment boundaries (`/Versions` removes `/Versions/*`; `/Ver` removes nothing). **No undo** — and re-setting a removed key resets when its value came into force, turning a months-old confirmed fact into a fresh-looking one. |
@@ -624,9 +625,8 @@ lexicographic order is chronological order and `ls` answers "what happened aroun
 then" over an archive nobody has indexed. The prefix comes from the `prefix`
 parameter, else `/case-name` in the registry, else the domain name — and a
 `/case-name` sent in the *same* call names the **next** capture, since the filename
-is claimed before anything durable happens. Nothing is compressed and nothing
-indexes the directory: the format is the contract, and whatever walks the archive
-owns the querying.
+is claimed before anything durable happens. Nothing indexes the directory: the
+format is the contract, and whatever walks the archive owns the querying.
 
 **Four things that bite:**
 
@@ -636,8 +636,12 @@ owns the querying.
   `{trace_id}` — a bookmark named `12345` and a seq are indistinguishable as bare
   strings, and the anchor's message becomes the headline, so a wrong anchor is a
   wrong document. Unresolvable is an error, not an empty headline.
-- **`before`/`after` count stored records, not seqs.** One counter feeds both the
-  log and span stores, so a 200-*seq* range holds an unpredictable number of logs.
+- **`before`/`after` count stored records from *either* store**, not seqs and not
+  logs alone. One counter feeds both, so a 200-*seq* range holds an unpredictable
+  number of each — and `before: 50` may return 40 logs and 10 spans. Counting logs
+  alone was a defect: a span is exported when it **ends**, so the spans of a slow
+  operation carry seqs above the last log about it, and a log-derived window
+  excluded exactly the spans the case was taken for.
 - **`@` scopes a key to this capture.** It reaches the document, keeps its sigil,
   and never enters the registry — otherwise the next case on this domain would
   silently inherit the last one's seed. Plain keys are facts about the *domain*;
@@ -648,6 +652,46 @@ owns the querying.
 and renders the gap, so a fact recorded twenty minutes later is visibly a fact
 about twenty minutes later. That's honest — and it's also weaker evidence than the
 same fact recorded at the time.
+
+### `load_case` — reading one back
+
+```
+load_case(path: "/abs/path/checkout-hang-260731-021530.case.zip")
+load_case(path: "/abs/path/checkout-hang-260731-021530.md")   # loose files work too
+```
+
+The case becomes a **postmortem domain** named after its own stem, and the whole
+existing read surface works against it. That's the point: `profile_traces` and
+`get_slow_spans` on the loaded domain answer *"what was slow three months ago"*,
+and the same calls without `--domain` answer *"what is slow now"*.
+
+**The domain is sealed.** Nothing arrives on it and nothing can, so every
+operation that would be *inert* is refused **by name, with the reason and the
+alternative** — collectors, triggers, filters, `clear_logs`, `clear_domain`,
+`create_case`. A collector armed on a case would report zero forever, which reads
+as *"I measured and nothing happened"* rather than *"I could not measure"*. Delete
+the domain to discard the case.
+
+**Time is frozen at the capture.** Ages, TTLs and staleness are computed against
+`captured_at`, so a fact validated an hour before the capture reads as fresh
+rather than three months expired. The rule that keeps this honest: the frozen
+clock governs *facts about the captured system*; **your own actions keep the real
+clock**, so a bookmark you place today is dated today. `get_status` carries a
+`postmortem` block naming the case, the capture time, the *real* elapsed seconds
+as an absolute, and the capture's verdict — without it, "idle 12s" on months-old
+evidence would be indistinguishable from a live domain.
+
+**Omitted is not empty.** A capture that shipped no span evidence is a different
+fact from one that looked and found none — the first is about the capture, the
+second about the system. The status block says which, so a query is never answered
+with a silence that reads like data.
+
+A case travels as one `<stem>.case.zip` holding the document, both evidence files
+and `<stem>.registry.json` — provenance as data rather than as the rendered table,
+whose values are flattened and whose timestamps are floored to the largest whole
+unit. Structured log evidence compresses 19–70×, which is what makes email a real
+transport. `unzip` reproduces the loose layout exactly; the bundle is a container,
+not a second format.
 
 ## Rendered output
 

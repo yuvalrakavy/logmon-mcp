@@ -52,6 +52,7 @@ Skip it (and say so) when:
 | Record what this run was built from | `update_domain_data([{path:"/Build/commit", value:…}, …])` |
 | Check whether the provenance has gone stale | `get_domain_data(validated_before_secs=…)` |
 | Preserve an incident before the buffer rolls | `create_case(reason=…, anchor={seq:N}, dir=…)` |
+| Ask about a capture from months ago or another machine | `load_case(path=…)` then any read tool with `--domain` |
 | Know whether a window is missing anything | any `export_logs` reply — read `verdict` |
 | See the daemon's health | `get_status` |
 
@@ -101,6 +102,7 @@ The same operations are available as `logmon-mcp <subcommand>`. Use the CLI when
 | `get_sessions` | `sessions.list` | `logmon-mcp sessions list` |
 | `document_collectors` | `collectors.document` | `logmon-mcp collectors document` |
 | `create_case` | `cases.create` | `logmon-mcp cases create` |
+| `load_case` | `cases.load` | `logmon-mcp cases load` |
 | `update_domain_data` | `domain_data.update` | `logmon-mcp domain-data update` |
 
 Note the shape: the *group* is the noun (`traces`, `collectors`, `cases`), so `get_slow_spans` is **not** `spans slow` and `profile_traces` is **not** `collectors profile`. When unsure, **ask the binary rather than guessing** — `--help` is built from the same manifest the daemon just served, so it is always current where a table can lag:
@@ -527,9 +529,11 @@ evidence you consult once you have decided it is. The document leads with what c
   since the anchor's message becomes the headline, a wrong anchor is a wrong document.
   A `trace_id` matching several entries anchors on the earliest and says so.
 - **An unresolvable anchor is an error**, not a document with an empty headline.
-- **`before`/`after` count stored RECORDS, not seqs** — one counter feeds both the log and
-  span stores, so a 200-*seq* range holds an unpredictable number of logs. Default 350
-  each, capped at 5000.
+- **`before`/`after` count stored RECORDS from EITHER store** — not seqs, and not logs
+  alone. One counter feeds both, so `before: 50` may return 40 logs and 10 spans. Counting
+  logs alone was a defect: a span is exported when it **ends**, so the spans of a slow
+  operation carry seqs *above* the last log about it, and a log-derived window excluded
+  exactly the spans the case was taken for. Default 350 each, capped at 5000.
 - **`@` scopes a key to this capture.** It reaches the document, keeps its sigil there, and
   **never enters the registry** — otherwise the next case on this domain would silently
   inherit the last one's seed. Use it for what is true of *this incident*: a seed, an
@@ -545,6 +549,48 @@ evidence you consult once you have decided it is. The document leads with what c
 renders the gap, so a fact you record twenty minutes later is visibly a fact about
 twenty minutes later. That is honest, and it is also weaker evidence than the same fact
 recorded at the time.
+
+### Reading a case back (`load_case`)
+
+```
+load_case(path: "/abs/path/checkout-hang-260731-021530.case.zip")
+load_case(path: "/abs/path/checkout-hang-260731-021530.md")   # loose files work too
+```
+
+**Reach for this when the question is historical or the evidence came from elsewhere** —
+"was this slow three months ago too?", or a case file a colleague sent from a production
+box. The case becomes a sealed **postmortem domain** named after its own stem, and every
+read tool works against it. So the comparison is two calls:
+
+```
+profile_traces(domain: "checkout-hang-260731-021530")   # then
+profile_traces()                                        # now
+```
+
+**The things that bite:**
+
+- **The domain is sealed, and refusals are loud.** `add_collector`, `add_trigger`,
+  `add_filter`, `clear_logs`, `clear_domain`, `create_case` and the collector edit verbs
+  all error, naming the case and pointing at what does work. Do not read a refusal as a
+  bug — a collector armed on a case would report zero forever, which reads as *"I measured
+  and nothing happened"* rather than *"I could not measure"*. Use `profile_traces` /
+  `profile_logs`, which project over the records already there.
+- **Time is frozen at the capture.** A TTL'd provenance key reads as it did then, not as
+  three months expired. **Your own actions keep the real clock** — a bookmark you place is
+  dated today. Check `get_status`'s `postmortem` block for the real elapsed time; the
+  frozen clock deliberately hides it, so `idle 12s` means twelve seconds *before a capture
+  that may be months old*.
+- **Omitted is not empty.** `postmortem.spans_omitted` means nobody shipped span evidence;
+  zero spans with `spans_omitted: false` means the capture looked and found none. The first
+  is a fact about the capture, the second a finding about the system — **do not report "no
+  slow spans" from a case whose spans were omitted.**
+- **`store.total_received` is 0 and that is not a measurement.** A case is a window cut out
+  of a stream and carries no delivery record; `postmortem.store_counters_unmeasured` says
+  so. Do not read it as a domain that dropped nothing.
+- **Loading a second case into the same domain is refused.** A postmortem domain is
+  constituted by one case — its clock, incarnation, registry and seq range all belong to
+  that capture. Pass `domain` to name another, or `delete_domain` to discard this one.
+- **The path must be absolute**, for the same reason `create_case`'s `dir` is.
 
 ## What a reply looks like
 
