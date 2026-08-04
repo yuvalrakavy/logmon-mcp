@@ -498,6 +498,40 @@ Consequently:
 Omission is a choice, not a capture limitation, so it does **not** fold into
 `verdict`, which grades what the capture could vouch for.
 
+### 3.11.1 The two-part log — one file, and a reporting gap
+
+A capture's logdata holds two kinds of record: entries stored because they
+matched a **filter**, and the **unfiltered window** the flight recorder flushed
+around a trigger. `LogSource { Filter, PreTrigger, PostTrigger }` is serialized
+on every entry (`gelf/message.rs:83`) and round-trips losslessly, so the
+distinction is already in the evidence.
+
+**One file, not two.** The two kinds interleave by seq, and §3.3.3 requires the
+loaded stores to receive one ascending, distinct sequence — splitting them would
+break the ordering the constructors depend on, to separate records that belong
+to one timeline.
+
+**The epoch log does not see the unfiltered window.** The flush path calls
+`pipeline.append_to_store(entry)` directly (`daemon/log_processor.rs:90, 98`),
+never reaching the `epochs().observe(seq, &decision.policy)` on the ordinary
+storage-decision branch (`:190`). So those seqs keep the surrounding epoch's
+policy, and a window containing a complete unfiltered burst still grades
+`verdict: filtered`.
+
+That under-claims, which is the safe direction — but it under-claims *precisely
+about the anchor's neighbourhood*, the part a reader most needs to trust. The
+per-record `source` is the finer truth and must be reported:
+
+- **`by_source` counts on the front matter's `logdata` entry**, machine-readable,
+  so `load_case` can say "20 of 700 records are the unfiltered window around the
+  anchor; 680 matched a filter";
+- a §2 sentence saying the same in prose, beside the eviction and filter facts.
+
+**This also settles §3.1.** `append_to_store` is not merely a public path that
+sealing cannot rely on — the pre-trigger flush *uses it in production*. It is a
+load-bearing seam, so sealing is an enforced check and could never have been
+structural.
+
 ---
 
 ## 4. The writer fix (D7)
