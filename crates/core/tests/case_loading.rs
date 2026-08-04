@@ -464,6 +464,94 @@ fn provenance_on_a_loaded_case_is_aged_from_the_capture_not_from_today() {
     );
 }
 
+/// Load the real fixture through `cases.load` and bind to it.
+///
+/// **Everything that pins a seed must go through here.** The tests above build
+/// their own pipeline with the seeds written out by hand, so they verify that
+/// `LogPipeline::from_records` behaves correctly *given* those arguments — and
+/// verify nothing at all about the arguments `assemble_case_domain` actually
+/// passes. A mutation lens proved it: changing the production `epoch_origin`
+/// from `from - 1` to `from`, and the counter from `to` to `from`, left every
+/// one of them green.
+async fn loaded_via_rpc(dir: &tempfile::TempDir) -> (H, &'static str) {
+    let stem = "with-spans-260803-214501";
+    let md = scratch_case(dir, stem);
+    let h = harness(&[]);
+    let resp = h
+        .handler
+        .handle_async(
+            &h.session,
+            &RpcRequest::new(1, "cases.load", json!({ "path": md.to_str().unwrap() })),
+        )
+        .await;
+    assert!(resp.error.is_none(), "load failed: {:?}", resp.error);
+    let bind = h.handler.handle(
+        &h.session,
+        &RpcRequest::new(1, "domains.use", json!({ "name": stem })),
+    );
+    assert!(bind.error.is_none(), "{:?}", bind.error);
+    (h, stem)
+}
+
+#[tokio::test]
+async fn the_production_epoch_origin_does_not_manufacture_a_span_eviction() {
+    // `spans.export` floors at `max(lost_below, epoch_origin + 1)`. With the
+    // origin at `from` rather than `from - 1` the floor lands one above the
+    // window's bottom, and EVERY span export over a loaded case reports a loss
+    // that never happened.
+    let dir = tempfile::tempdir().unwrap();
+    let (h, _) = loaded_via_rpc(&dir).await;
+    let r = call(&h, "spans.export", json!({ "from_seq": 1001, "to_seq": 1012 }));
+    assert!(
+        r.get("evicted_before_window").is_none_or(|v| v.is_null()),
+        "the window's own span range must not read as evicted: {r}"
+    );
+    assert_ne!(r["truncated"], json!(true), "{r}");
+}
+
+#[tokio::test]
+async fn the_production_seq_counter_puts_a_new_bookmark_at_the_top() {
+    // `bookmarks.add` defaults `start_seq` to `current_seq()`. Seeded at the
+    // window's bottom, a reader marking their place lands beneath every record
+    // in the case and re-reads the whole thing.
+    let dir = tempfile::tempdir().unwrap();
+    let (h, _) = loaded_via_rpc(&dir).await;
+    call(&h, "bookmarks.add", json!({ "name": "here" }));
+    let listed = call(&h, "bookmarks.list", json!({}));
+    let here = listed["bookmarks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["qualified_name"] == "reader/here")
+        .unwrap_or_else(|| panic!("not listed: {listed}"));
+    assert_eq!(
+        here["seq"].as_u64(),
+        Some(1012),
+        "a bookmark means `from here on`: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_loaded_case_does_not_claim_to_speak_below_its_own_window() {
+    // `lost_below` is what stops a loaded store answering "nothing happened
+    // before this" when it means "I was not there". Neither store had any test
+    // for it: passing 0 left every assertion green.
+    let dir = tempfile::tempdir().unwrap();
+    let (h, _) = loaded_via_rpc(&dir).await;
+    let r = call(
+        &h,
+        "logs.export",
+        json!({ "format": "json", "from_seq": 1, "to_seq": 1012 }),
+    );
+    assert_eq!(
+        r["evicted_before_window"].as_u64(),
+        Some(1000),
+        "a window reaching below the case must report what the case cannot \
+         speak for: {r}"
+    );
+    assert_eq!(r["truncated"], json!(true), "{r}");
+}
+
 #[tokio::test]
 async fn create_domain_refuses_to_hand_back_a_loaded_case_as_a_live_domain() {
     // A postmortem domain has all three ports at 0, and `port_matches` treats an

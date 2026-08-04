@@ -373,7 +373,8 @@ impl RpcHandler {
     /// the collector operations — never resolve a domain at all.
     ///
     /// So the exhaustiveness comes from a test, not from the shape of the code:
-    /// `postmortem_refusals.rs` walks `mcp_tools::TOOLS` and asserts every tool
+    /// `case_loading.rs`'s `every_tool_that_is_not_read_only_is_refused_on_a_loaded_case`
+    /// walks `mcp_tools::TOOLS` and asserts every tool
     /// that mutates is refused here. That test is what catches the tool nobody
     /// has added yet, and it is the claim this design actually makes — weaker
     /// than "one check", and true.

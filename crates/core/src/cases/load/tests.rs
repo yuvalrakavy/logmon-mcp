@@ -170,13 +170,52 @@ fn out_of_window_and_duplicate_seqs_are_refused() {
         "a duplicate seq must be refused"
     );
 
-    // Outside the declared window.
-    let outside = text.replace("\"seq\":1002", "\"seq\":99999");
-    std::fs::write(&p, &outside).unwrap();
-    assert!(
-        matches!(load(&md), Err(LoadError::BadRecords(_))),
-        "a seq outside the declared window must be refused"
-    );
+    // Outside the declared window — and it must be the WINDOW rule that catches
+    // it, not the ascending rule. The first draft doctored 1002 -> 99999, which
+    // is still ascending relative to 1001 but breaks ascending at the NEXT
+    // record; it asserted only `BadRecords(_)`, which both rules produce. A
+    // mutation lens proved the window rule could be deleted with that test
+    // still green.
+    //
+    // 990 is below `from` (1001) and still ascending with respect to everything
+    // after it, so only the window rule can refuse it.
+    let below = text.replace("\"seq\":1001", "\"seq\":990");
+    std::fs::write(&p, &below).unwrap();
+    match load(&md) {
+        Err(LoadError::BadRecords(m)) => assert!(
+            m.contains("outside the declared window"),
+            "the WINDOW rule must be what refuses it, not the ascending rule: {m}"
+        ),
+        other => panic!("expected BadRecords, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_inverted_window_is_refused_even_with_no_records() {
+    // The `from > to` check is subsumed by the in-window rule for any non-empty
+    // case, so a case declaring ZERO records is its only live input — and that
+    // is exactly the shape that loaded clean with the check deleted.
+    let (_d, md) = scratch(STEM);
+    let dir = md.parent().unwrap();
+    let [_, logdata, spandata] = super::super::naming::file_names(STEM);
+    for (n, kind) in [(&logdata, "logdata"), (&spandata, "spandata")] {
+        std::fs::write(
+            dir.join(n),
+            format!("{{\"logmon_format\":1,\"kind\":\"{kind}\"}}\n"),
+        )
+        .unwrap();
+    }
+    let doc = std::fs::read_to_string(&md)
+        .unwrap()
+        .replace("records: 9}", "records: 0}")
+        .replace("records: 3}", "records: 0}")
+        .replace("{from: 1001, to: 1012,", "{from: 1012, to: 1001,");
+    std::fs::write(&md, doc).unwrap();
+
+    match load(&md) {
+        Err(LoadError::BadRecords(m)) => assert!(m.contains("inverted"), "{m}"),
+        other => panic!("an inverted window must be refused, got {other:?}"),
+    }
 }
 
 #[test]
