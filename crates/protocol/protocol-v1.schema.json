@@ -3770,7 +3770,7 @@
           ]
         },
         "omit_logdata": {
-          "description": "Leave the log evidence out — the document and provenance only.\n\nThe front-matter key is then ABSENT rather than zero, which is the only\nthing telling a reader \"nobody shipped it\" from \"we looked and found\nnone\". A loaded case refuses log questions instead of answering them with\na silence that reads like data.",
+          "description": "Leave the log evidence out — the document and provenance only.\n\nThe front-matter key is then ABSENT rather than zero, which is the only\nthing telling a reader \"nobody shipped it\" from \"we looked and found\nnone\". A loaded case REFUSES log reads by name rather than answering them\nwith a silence that reads like data — enforced by `require_evidence`, not\nmerely documented.",
           "type": [
             "boolean",
             "null"

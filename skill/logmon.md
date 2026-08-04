@@ -580,10 +580,11 @@ profile_traces()                                        # now
   dated today. Check `get_status`'s `postmortem` block for the real elapsed time; the
   frozen clock deliberately hides it, so `idle 12s` means twelve seconds *before a capture
   that may be months old*.
-- **Omitted is not empty.** `postmortem.spans_omitted` means nobody shipped span evidence;
-  zero spans with `spans_omitted: false` means the capture looked and found none. The first
-  is a fact about the capture, the second a finding about the system — **do not report "no
-  slow spans" from a case whose spans were omitted.**
+- **Omitted is not empty, and the daemon enforces it.** A case whose spans were omitted
+  REFUSES `get_slow_spans`, `profile_traces` and every other span read, by name — it does
+  not answer emptily. Zero spans with `spans_omitted: false` means the capture looked and
+  found none, and that answers normally. The first is a fact about the capture, the second
+  a finding about the system, and only the second is reportable.
 - **`store.total_received` is 0 and that is not a measurement.** A case is a window cut out
   of a stream and carries no delivery record; `postmortem.store_counters_unmeasured` says
   so. Do not read it as a domain that dropped nothing.

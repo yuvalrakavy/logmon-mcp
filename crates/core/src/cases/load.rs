@@ -144,7 +144,14 @@ pub fn load(path: &Path) -> Result<LoadedCase, LoadError> {
         None => read_loose(path)?,
     };
 
-    let doc = String::from_utf8_lossy(&bytes.document).into_owned();
+    // **Not lossy.** `from_utf8_lossy` turns a flipped byte into U+FFFD and the
+    // document then parses cleanly — a case that loads "successfully" with
+    // silently wrong evidence, against this module's own promise that a case is
+    // never partially loaded. The bundle form has per-entry CRCs and would catch
+    // it first; the LOOSE form has no checksum at all, and `scp` is the design's
+    // own transport.
+    let doc = String::from_utf8(bytes.document.clone())
+        .map_err(|e| LoadError::BadRecords(format!("the case document is not valid UTF-8: {e}")))?;
     let front = read::parse_front_matter(&doc)?;
 
     // The pointers are followed by the DAEMON, so they are checked before
@@ -243,7 +250,11 @@ fn evidence<T: serde::de::DeserializeOwned>(
         (None, _) => Ok(None),
         (Some(d), None) => Err(LoadError::DeclaredButMissing(d.file.clone())),
         (Some(d), Some(raw)) => {
-            let text = String::from_utf8_lossy(raw);
+            // See the document above: a corrupted byte must be an error, not a
+            // replacement character inside a record that then parses.
+            let text = String::from_utf8(raw.clone()).map_err(|e| {
+                LoadError::BadRecords(format!("`{}` is not valid UTF-8: {e}", d.file))
+            })?;
             let mut lines = text.lines();
             // The writer emits a header even for zero records, so an absent one
             // is positive evidence of truncation rather than an empty file.

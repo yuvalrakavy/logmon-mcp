@@ -363,6 +363,42 @@ impl RpcHandler {
         ))
     }
 
+    /// Refuse a read whose evidence the capture did not include.
+    ///
+    /// **An empty result is an answer; this is the absence of one.** A case that
+    /// shipped no span evidence and a case that looked and found none are
+    /// different facts — the first about the capture, the second about the
+    /// system — and `get_slow_spans` returning `{"spans": [], "count": 0}`
+    /// renders them identically. A reader, or an agent, then reports "no slow
+    /// spans" as a finding about a production box, from a file that never
+    /// carried any.
+    ///
+    /// The `omit_logdata` / `omit_spandata` docs already promised this refusal;
+    /// a deep gate found only the MUTATORS were guarded, so the promise was the
+    /// only thing standing between a reader and that silence.
+    fn require_evidence(&self, session_id: &SessionId, spans: bool) -> Result<(), String> {
+        let Ok(d) = self.resolve_domain(session_id) else {
+            return Ok(());
+        };
+        let Some(pm) = &d.postmortem else {
+            return Ok(());
+        };
+        let omitted = if spans { pm.spans_omitted } else { pm.logs_omitted };
+        if !omitted {
+            return Ok(());
+        }
+        let what = if spans { "Span" } else { "Log" };
+        let lower = if spans { "spans" } else { "logs" };
+        Err(format!(
+            "{what} evidence was OMITTED from the case `{}` when it was captured, so this \
+             domain cannot answer questions about {lower}. That is different from a capture \
+             that found none: an empty result here would read as a finding about the system \
+             rather than a fact about the capture. Re-capture with {lower} included, or read \
+             the case's document for what it does carry.",
+            pm.case
+        ))
+    }
+
     /// Refuse an operation that would be inert on a loaded case.
     ///
     /// **Called at each mutating site rather than at one choke point, because
@@ -1203,6 +1239,7 @@ impl RpcHandler {
     /// `for_each_log`, which also avoids cloning a record per match for data
     /// folded and discarded.
     fn handle_logs_fields(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
         // `opt_usize`, not `opt_u64(..) as usize`: the `as` cast is the shape
@@ -1276,6 +1313,7 @@ impl RpcHandler {
     }
 
     fn handle_logs_profile(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, false)?;
         use crate::logs::profile::{Axis, GroupMap, MAX_KEYS};
 
         let d = self.resolve_domain(session_id)?;
@@ -1396,6 +1434,7 @@ impl RpcHandler {
     }
 
     fn handle_logs_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(50);
         let filter_str = opt_str(params, "filter")?;
@@ -1476,6 +1515,7 @@ impl RpcHandler {
     }
 
     fn handle_logs_context(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let seq = req_u64(params, "seq")?;
         let before = opt_context_window(params, "before")?.unwrap_or(10);
@@ -1485,6 +1525,7 @@ impl RpcHandler {
     }
 
     fn handle_logs_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
         let filter_str = opt_str(params, "filter")?;
@@ -1944,6 +1985,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(20);
         let filter_str = opt_str(params, "filter")?;
@@ -1975,6 +2017,7 @@ impl RpcHandler {
     }
 
     fn handle_traces_get(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let trace_id_hex = req_str(params, "trace_id")?;
         let trace_id = u128::from_str_radix(trace_id_hex, 16)
@@ -2013,6 +2056,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let trace_id_hex = req_str(params, "trace_id")?;
         let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
@@ -2085,6 +2129,7 @@ impl RpcHandler {
     }
 
     fn handle_traces_slow(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let min_duration = opt_f64(params, "min_duration_ms")?.unwrap_or(100.0);
         let count = opt_usize(params, "count")?.unwrap_or(20);
@@ -2168,6 +2213,8 @@ impl RpcHandler {
     }
 
     fn handle_traces_logs(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        // Reads LOGS, by trace id -- the tool's name says traces.
+        self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let trace_id_hex = req_str(params, "trace_id")?;
         let trace_id = u128::from_str_radix(trace_id_hex, 16).map_err(|_| "invalid trace_id")?;
@@ -2209,6 +2256,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let seq = req_u64(params, "seq")?;
         let before = opt_context_window(params, "before")?.unwrap_or(5);
@@ -2851,6 +2899,7 @@ impl RpcHandler {
     /// against the span store's own `oldest_seq`. A log window reported complete
     /// says nothing about whether the spans over that same range survived.
     fn handle_spans_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
         let filter_str = opt_str(params, "filter")?;
@@ -3760,6 +3809,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
         // Rejected BEFORE resolution, the same as `logs.fields`. Resolving

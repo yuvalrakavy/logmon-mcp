@@ -583,6 +583,120 @@ async fn create_domain_refuses_to_hand_back_a_loaded_case_as_a_live_domain() {
     assert!(msg.contains(stem), "the refusal names the case: {msg}");
 }
 
+/// A sealed domain whose evidence was omitted at capture.
+fn omitted_harness(logs_omitted: bool, spans_omitted: bool) -> H {
+    let d = loaded_domain(&[]);
+    let inner = Arc::try_unwrap(d).unwrap_or_else(|_| panic!("sole owner"));
+    harness_of(Arc::new(inner.sealed_as(PostmortemInfo {
+        case: "checkout-hang-260503-021530".into(),
+        captured_at: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
+        verdict: logmon_broker_protocol::EvidenceVerdict::Complete,
+        logs_omitted,
+        spans_omitted,
+        registry_dropped: 0,
+        registry: Arc::new(
+            logmon_broker_core::domain_data::persist::DomainRegistry::in_memory(
+                "pm".into(),
+                Default::default(),
+            ),
+        ),
+    })))
+}
+
+#[test]
+fn a_case_whose_spans_were_omitted_refuses_span_questions() {
+    // **The wrong answer this prevents, named.** Before this guard,
+    // `get_slow_spans` on an omitted-spans case returned `{"spans": [], "count":
+    // 0}` — identical to a capture that looked and found none. A reader, or an
+    // agent, then reports "no slow spans" as a finding about a production box,
+    // from a file that never carried any. An empty result is an answer; this is
+    // the absence of one.
+    //
+    // The `omit_spandata` docs promised this refusal while only the MUTATORS
+    // were guarded; a deep gate found the promise was the only thing standing
+    // between a reader and that silence.
+    let h = omitted_harness(false, true);
+    for (method, params) in [
+        ("traces.slow", json!({})),
+        ("traces.recent", json!({})),
+        ("traces.profile", json!({ "group_by": "name" })),
+        ("traces.summary", json!({})),
+        ("spans.export", json!({ "from_seq": 1001, "to_seq": 1009 })),
+        ("spans.context", json!({ "seq": 1007 })),
+    ] {
+        let resp = h
+            .handler
+            .handle(&h.session, &RpcRequest::new(1, method, params));
+        let msg = resp
+            .error
+            .unwrap_or_else(|| panic!("{method} must refuse, not answer emptily"))
+            .message;
+        assert!(
+            msg.contains("Span evidence was OMITTED"),
+            "{method}: {msg}"
+        );
+    }
+
+    // ...and the half that IS present still answers.
+    let logs = call(&h, "logs.recent", json!({ "limit": 10 }));
+    assert_eq!(logs["logs"].as_array().unwrap().len(), 6, "{logs}");
+}
+
+#[test]
+fn a_case_whose_logs_were_omitted_refuses_log_questions() {
+    let h = omitted_harness(true, false);
+    for (method, params) in [
+        ("logs.recent", json!({})),
+        ("logs.export", json!({ "format": "json" })),
+        ("logs.fields", json!({})),
+        ("logs.profile", json!({ "group_by": "level" })),
+        ("logs.context", json!({ "seq": 1002 })),
+        ("traces.logs", json!({ "trace_id": "7" })),
+    ] {
+        let resp = h
+            .handler
+            .handle(&h.session, &RpcRequest::new(1, method, params));
+        let msg = resp
+            .error
+            .unwrap_or_else(|| panic!("{method} must refuse, not answer emptily"))
+            .message;
+        assert!(msg.contains("Log evidence was OMITTED"), "{method}: {msg}");
+    }
+
+    let traces = call(&h, "traces.recent", json!({}));
+    assert!(traces["traces"].is_array(), "spans still answer: {traces}");
+}
+
+#[test]
+fn a_case_that_captured_none_still_answers_with_an_empty_result() {
+    // The negative control, and the whole point of the distinction. A capture
+    // that looked and found nothing is a FINDING about the system, and must
+    // come back as an empty result rather than a refusal — otherwise the guard
+    // has destroyed the very answer it exists to protect.
+    let h = sealed_harness(); // nothing omitted
+    let r = call(&h, "traces.slow", json!({}));
+    assert!(
+        r["spans"].is_array() || r["traces"].is_array(),
+        "a non-omitted case must answer: {r}"
+    );
+    let logs = call(&h, "logs.recent", json!({ "limit": 10 }));
+    assert_eq!(logs["logs"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn a_live_domain_is_never_refused_for_evidence() {
+    // The other negative control: the guard must key on the CASE's omission,
+    // not on emptiness, or a live domain with no spans yet would be refused.
+    let h = harness(&[]);
+    let r = h
+        .handler
+        .handle(&h.session, &RpcRequest::new(1, "traces.slow", json!({})));
+    assert!(
+        r.error.is_none_or(|e| !e.message.contains("OMITTED")),
+        "a live domain must never be refused for omitted evidence"
+    );
+}
+
 /// Tools that do not mutate THIS domain, and may therefore run on a loaded case.
 ///
 /// **The allowlist is the permitted side, deliberately, so the default is

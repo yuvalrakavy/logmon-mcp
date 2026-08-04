@@ -191,6 +191,40 @@ fn out_of_window_and_duplicate_seqs_are_refused() {
 }
 
 #[test]
+fn a_corrupted_byte_is_an_error_rather_than_a_replacement_character() {
+    // The loose form has no checksum and `scp` is this design's own transport,
+    // so a flipped byte is a real arrival. Read lossily, it became U+FFFD inside
+    // a record that then parsed cleanly — a case that loads "successfully" with
+    // silently wrong evidence, against the module's promise that a case is never
+    // partially loaded.
+    let (_d, md) = scratch(STEM);
+    let dir = md.parent().unwrap();
+    let [_, logdata, _] = super::super::naming::file_names(STEM);
+
+    // A lone 0x80 continuation byte inside a message.
+    let p = dir.join(&logdata);
+    let mut bytes = std::fs::read(&p).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] = 0x80;
+    std::fs::write(&p, &bytes).unwrap();
+    assert!(
+        matches!(load(&md), Err(LoadError::BadRecords(_))),
+        "a corrupted evidence byte must be refused, not replaced"
+    );
+
+    // ...and the same for the document.
+    let (_d2, md2) = scratch(STEM);
+    let mut doc = std::fs::read(&md2).unwrap();
+    let at = doc.len() / 2;
+    doc[at] = 0x80;
+    std::fs::write(&md2, &doc).unwrap();
+    assert!(
+        matches!(load(&md2), Err(LoadError::BadRecords(_))),
+        "a corrupted document byte must be refused"
+    );
+}
+
+#[test]
 fn an_inverted_window_is_refused_even_with_no_records() {
     // The `from > to` check is subsumed by the in-window rule for any non-empty
     // case, so a case declaring ZERO records is its only live input — and that

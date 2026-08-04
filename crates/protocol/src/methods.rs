@@ -2889,8 +2889,9 @@ pub struct CasesCreate {
     ///
     /// The front-matter key is then ABSENT rather than zero, which is the only
     /// thing telling a reader "nobody shipped it" from "we looked and found
-    /// none". A loaded case refuses log questions instead of answering them with
-    /// a silence that reads like data.
+    /// none". A loaded case REFUSES log reads by name rather than answering them
+    /// with a silence that reads like data — enforced by `require_evidence`, not
+    /// merely documented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omit_logdata: Option<bool>,
     /// Leave the span evidence out — see [`Self::omit_logdata`].
