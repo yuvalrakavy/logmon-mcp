@@ -211,6 +211,31 @@ This also closes the hole where `verdict` — a hand-editable text field — bec
 completeness guarantee: the epoch is seeded from what was actually loaded and validated,
 not from a word in the document.
 
+#### 3.3.4 The narrowing filters must travel as data (user-directed 2026-08-04)
+
+`NarrowedRange { from_seq, to_seq, filters }` already exists
+(`protocol/methods.rs:749`) and carries the expressions in force over each stretch
+— *"the union across every session bound to the domain, since any one of them
+narrowing the store narrows it for everybody."* The document body already prints
+them (`document.rs:446`). **The front matter does not**, which is the same
+human-readable-only gap §3.4.1 found for the registry.
+
+**Without the ranges as data, every non-`complete` case degrades to
+`cannot_verify`.** An earlier draft seeded one unfiltered epoch when the verdict
+was `complete` and left the log empty otherwise, reasoning that `complete` is
+*defined* as one unfiltered epoch's worth of information. True, and it silently
+wrote off every filtered case — which is precisely what a production capture with
+a session filter running produces.
+
+So the front matter carries `narrowed_by`, and the loader seeds **one epoch per
+recorded range with that range's filters**, plus unfiltered epochs for the
+stretches no range covers. A `filtered` case then reconstructs the narrowing it
+actually had, per stretch, and `logs.export` on the loaded domain reports the same
+`narrowed_by` the original did.
+
+Bounded by `EPOCH_CAPACITY` and already clamped to the window, so it does not
+threaten the front matter's "small and grep-able" job.
+
 ### 3.4 The seq axis — revision 1 was off by one in two opposite directions
 
 Three consumers constrain the seeds, and revision 1 satisfied only the one its own test
