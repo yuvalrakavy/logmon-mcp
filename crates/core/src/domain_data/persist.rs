@@ -100,6 +100,20 @@ pub struct DomainRegistry {
     path: PathBuf,
     data: RwLock<Registry>,
     write: Mutex<()>,
+    /// When true, mutations stay in memory and never reach `path`.
+    ///
+    /// **This exists for postmortem domains, and it is not a convenience.** The
+    /// registry file is keyed by domain NAME and outlives the domain — the
+    /// module docs say so: "the registry for `X` survives while its file does,
+    /// so a deleted domain that is re-created adopts its own history". Writing a
+    /// three-month-old case's provenance into that file would leave it there
+    /// after the postmortem domain is deleted, for the next live domain of the
+    /// same name to adopt as its own. Merely *resolving* it also stamps the
+    /// reader's broker version and today's `first_seen`.
+    ///
+    /// A loaded case's provenance describes a machine that is not this one. It
+    /// belongs to the domain, not to the name.
+    ephemeral: bool,
 }
 
 impl DomainRegistry {
@@ -109,6 +123,18 @@ impl DomainRegistry {
             path,
             data: RwLock::new(registry),
             write: Mutex::new(()),
+            ephemeral: false,
+        }
+    }
+
+    /// A registry that lives and dies with its domain — see [`Self::ephemeral`].
+    pub fn in_memory(domain: String, registry: Registry) -> Self {
+        Self {
+            domain,
+            path: PathBuf::new(),
+            data: RwLock::new(registry),
+            write: Mutex::new(()),
+            ephemeral: true,
         }
     }
 
@@ -136,6 +162,12 @@ impl DomainRegistry {
     /// will not survive a restart.
     pub fn mutate<T>(&self, f: impl FnOnce(&mut Registry) -> T) -> (T, Result<(), String>) {
         let _w = self.write.lock().expect("domain_data write lock poisoned");
+        if self.ephemeral {
+            // Not a swallowed failure: there is nothing to persist to, by
+            // design, so `Ok` is the truthful answer rather than a shrug.
+            let mut g = self.data.write().expect("domain_data lock poisoned");
+            return (f(&mut g), Ok(()));
+        }
         let (out, bytes) = {
             let mut g = self.data.write().expect("domain_data lock poisoned");
             let out = f(&mut g);

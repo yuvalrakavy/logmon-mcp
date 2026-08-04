@@ -132,6 +132,40 @@ pub struct Domain {
     /// holds it — the listeners stop and the processors are aborted. This is the
     /// delete-while-bound Arc-graceful teardown.
     pub receivers: Option<DomainReceivers>,
+    /// Set when this domain was built by `load_case` — see [`PostmortemInfo`].
+    ///
+    /// A `pub` field set after construction, exactly as [`Self::receivers`] is,
+    /// because widening `from_parts` would touch eleven call sites to express
+    /// something ten of them do not have.
+    pub postmortem: Option<PostmortemInfo>,
+}
+
+/// What a domain built from a case knows about itself.
+///
+/// **Sealing is an enforced check, not a structural property.** An earlier
+/// design claimed no path could add a record to a loaded domain; that was false
+/// — `InMemoryStore::append` takes an entry's own seq, it is a `pub trait`
+/// method, `LogPipeline::append_to_store` re-exposes it, and the pre-trigger
+/// flush *uses it in production*. So the guarantee has to come from refusing the
+/// operations, and from a test that finds the tool nobody has added yet.
+#[derive(Debug, Clone)]
+pub struct PostmortemInfo {
+    /// The case this domain is, by stem.
+    pub case: String,
+    /// The domain's frozen clock — every fact about the CAPTURED system is aged
+    /// against this, while the reader's own actions keep the real clock.
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    /// The capture's own verdict, so a reader is told what it can vouch for
+    /// rather than inferring it from a domain that looks live.
+    pub verdict: logmon_broker_protocol::EvidenceVerdict,
+    /// True when the capture omitted this evidence. **Distinct from holding
+    /// zero records**, which means the capture looked and found none — one is a
+    /// fact about the capture, the other a finding about the system.
+    pub logs_omitted: bool,
+    pub spans_omitted: bool,
+    /// Non-zero when the case's own provenance was truncated at write time, so
+    /// a reader is told the restored registry is a subset.
+    pub registry_dropped: usize,
 }
 
 impl Domain {
@@ -154,6 +188,32 @@ impl Domain {
             bookmarks,
             metrics,
             receivers: None,
+            postmortem: None,
+        }
+    }
+
+    /// Mark this domain as a loaded case. Called before the domain is published,
+    /// so no reader can observe it live for an instant first.
+    pub fn sealed_as(mut self, info: PostmortemInfo) -> Self {
+        self.postmortem = Some(info);
+        self
+    }
+
+    /// Whether this domain holds a case rather than a running system.
+    pub fn is_postmortem(&self) -> bool {
+        self.postmortem.is_some()
+    }
+
+    /// The clock facts about the captured system are aged against.
+    ///
+    /// **Not the clock for the reader's own actions.** A bookmark placed today
+    /// while reading a three-month-old case really was created today, and a
+    /// session's `last_seen` is about the live connection. Getting this backwards
+    /// would date the reader's navigation history at capture time.
+    pub fn fact_clock(&self) -> chrono::DateTime<chrono::Utc> {
+        match &self.postmortem {
+            Some(p) => p.captured_at,
+            None => chrono::Utc::now(),
         }
     }
 

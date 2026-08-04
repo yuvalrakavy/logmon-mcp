@@ -8,7 +8,7 @@
 #![cfg(feature = "test-support")]
 
 use logmon_broker_core::daemon::domain::{
-    Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
+    Domain, DomainConfig, DomainId, DomainRegistry, DomainSource, PostmortemInfo,
 };
 use logmon_broker_core::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use logmon_broker_core::daemon::session::{SessionId, SessionRegistry};
@@ -99,9 +99,27 @@ struct H {
 }
 
 fn harness(epochs: &[(u64, FilterPolicy)]) -> H {
+    harness_of(loaded_domain(epochs))
+}
+
+/// The same domain, marked as the case it is.
+fn sealed_harness() -> H {
+    let d = loaded_domain(&[]);
+    let inner = Arc::try_unwrap(d).unwrap_or_else(|_| panic!("sole owner"));
+    harness_of(Arc::new(inner.sealed_as(PostmortemInfo {
+        case: "checkout-hang-260503-021530".into(),
+        captured_at: chrono::DateTime::from_timestamp_nanos(1_700_000_000_000_000_000),
+        verdict: logmon_broker_protocol::EvidenceVerdict::Complete,
+        logs_omitted: false,
+        spans_omitted: false,
+        registry_dropped: 0,
+    })))
+}
+
+fn harness_of(domain: Arc<Domain>) -> H {
     let cfg = tempfile::tempdir().expect("tempdir");
     let domains = Arc::new(DomainRegistry::new());
-    domains.insert(loaded_domain(epochs));
+    domains.insert(domain);
     let sessions = Arc::new(SessionRegistry::new());
     let session = sessions.create_named("reader").expect("valid name");
     let collectors = Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new());
@@ -215,8 +233,98 @@ fn a_filtered_case_loads_as_filtered_rather_than_unverifiable() {
     );
 }
 
+/// Tools that READ, and may therefore run on a loaded case.
+///
+/// **The allowlist is the read side, deliberately, so the default is refusal.**
+/// There is no `mutates` flag on `Tool` and no choke point in dispatch, so
+/// exhaustiveness has to come from somewhere — and a list of things to REFUSE
+/// would leave the tool nobody has added yet silently permitted, which is the
+/// failure this whole section exists to avoid. Inverted, a new tool fails this
+/// test until someone classifies it on purpose.
+const READ_ONLY: &[&str] = &[
+    "get_recent_logs", "get_log_context", "export_logs", "list_log_fields", "profile_logs",
+    "get_recent_traces", "get_trace", "get_trace_summary", "get_slow_spans", "get_trace_logs",
+    "get_span_context", "export_spans", "profile_traces",
+    "get_status", "get_sessions", "list_domains", "use_domain", "get_domain_data",
+    "list_bookmarks", "add_bookmark", "remove_bookmark",
+    "get_filters", "get_triggers",
+    "list_collectors", "get_collector", "get_collector_history", "diff_collectors",
+    "document_collectors",
+    // Lifecycle: creating or deleting a DIFFERENT domain is not an operation on
+    // this one, and delete is the honest way to discard a case.
+    "create_domain", "delete_domain", "drop_session", "rename_session",
+    "get_domain_data_registry",
+];
+
 #[test]
-fn a_new_bookmark_lands_at_the_TOP_of_the_loaded_window() {
+fn every_tool_that_is_not_read_only_is_refused_on_a_loaded_case() {
+    use logmon_broker_protocol::mcp_tools::TOOLS;
+    let h = sealed_harness();
+    let mut unguarded = Vec::new();
+
+    for t in TOOLS {
+        if READ_ONLY.contains(&t.name) {
+            continue;
+        }
+        let req = RpcRequest::new(1, t.method, json!({}));
+        let resp = h.handler.handle(&h.session, &req);
+        let refused = resp
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message.contains("holds the loaded case"));
+        if !refused {
+            unguarded.push(format!(
+                "{} ({}) -> {:?}",
+                t.name,
+                t.method,
+                resp.error.map(|e| e.message).unwrap_or("OK".into())
+            ));
+        }
+    }
+
+    assert!(
+        unguarded.is_empty(),
+        "these tools mutate but are not refused on a postmortem domain. Either \
+         guard them with `require_live`, or add them to READ_ONLY if they really \
+         only read:\n  {}",
+        unguarded.join("\n  ")
+    );
+}
+
+#[test]
+fn the_refusal_names_the_case_and_the_alternative() {
+    // A refusal that only says `no` sends the reader looking for a workaround.
+    let h = sealed_harness();
+    let resp = h
+        .handler
+        .handle(&h.session, &RpcRequest::new(1, "collectors.add", json!({})));
+    let msg = resp.error.expect("refused").message;
+    assert!(msg.contains("checkout-hang-260503-021530"), "{msg}");
+    assert!(
+        msg.contains("profile_traces") || msg.contains("profile_logs"),
+        "and points at what DOES work here: {msg}"
+    );
+}
+
+#[test]
+fn a_live_domain_refuses_nothing() {
+    // The negative control. A guard that refuses everywhere would pass the
+    // exhaustiveness test above while breaking the product.
+    let h = harness(&[]);
+    let resp = h
+        .handler
+        .handle(&h.session, &RpcRequest::new(1, "filters.add", json!({ "filter": "l>=ERROR" })));
+    assert!(
+        resp.error
+            .as_ref()
+            .is_none_or(|e| !e.message.contains("holds the loaded case")),
+        "a live domain must not be refused: {:?}",
+        resp.error
+    );
+}
+
+#[test]
+fn a_new_bookmark_lands_at_the_top_of_the_loaded_window() {
     // **This is what actually pins the seq counter's seed.** The unbounded
     // export cannot: with the counter at the window's bottom its verdict window
     // collapses to a single seq, which still reads `complete` — correct about

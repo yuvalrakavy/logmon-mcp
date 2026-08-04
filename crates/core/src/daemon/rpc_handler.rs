@@ -170,6 +170,74 @@ impl RpcHandler {
             .ok_or_else(|| format!("domain \"{id}\" no longer exists — use_domain to rebind"))
     }
 
+    /// Refuse an operation that would be inert on a loaded case.
+    ///
+    /// **Called at each mutating site rather than at one choke point, because
+    /// there is no choke point.** Dispatch is a flat match with ~50 arms and no
+    /// shared pre-step; the only near-universal seam is `resolve_domain`, which
+    /// every READ also passes through, so a check there would refuse
+    /// `logs.recent` and kill the feature. Several mutators — `filters.edit`,
+    /// the collector operations — never resolve a domain at all.
+    ///
+    /// So the exhaustiveness comes from a test, not from the shape of the code:
+    /// `postmortem_refusals.rs` walks `mcp_tools::TOOLS` and asserts every tool
+    /// that mutates is refused here. That test is what catches the tool nobody
+    /// has added yet, and it is the claim this design actually makes — weaker
+    /// than "one check", and true.
+    ///
+    /// These are not about *sealing* — no code path may add a record, and that
+    /// is enforced by there being no such call. They are about operations that
+    /// would be **inert**: accepted, silently doing nothing, and reading to the
+    /// caller as a thing that happened.
+    fn require_live(&self, session_id: &SessionId, op: &str) -> Result<(), String> {
+        let d = self.resolve_domain(session_id)?;
+        let Some(pm) = &d.postmortem else {
+            return Ok(());
+        };
+        let case = &pm.case;
+        let why = match op {
+            "add_collector" | "edit_collector" | "remove_collector" | "snapshot_collector"
+            | "reset_collector" => {
+                "Collectors measure a running system. Armed on a case they would report zero \
+                 forever, which reads as `I measured and nothing happened` rather than `I could \
+                 not measure`. Use profile_traces or profile_logs, which project over the \
+                 records already here."
+            }
+            "add_trigger" | "edit_trigger" | "remove_trigger" => {
+                "A trigger that cannot fire looks like an all-clear. Nothing will arrive on this \
+                 domain to fire it."
+            }
+            "add_filter" | "edit_filter" | "remove_filter" => {
+                "Filters shape what gets STORED at ingest. With no ingest they would do nothing \
+                 while you believed the domain had been narrowed. Filter the query instead."
+            }
+            "clear_logs" | "clear_domain" => {
+                "A live buffer refills; this one cannot. Deleting the domain is the honest way to \
+                 discard a case."
+            }
+            "clear_bookmarks" => {
+                "This would delete the anchor bookmark the case was loaded with, and nothing can \
+                 recreate it. Remove bookmarks individually."
+            }
+            "update_domain_data" | "remove_domain_data" => {
+                "This provenance was captured with the case and describes the machine it came \
+                 from. Editing it here would make the document and the domain disagree about \
+                 what was true."
+            }
+            "create_case" => {
+                "These records are already an archive. Copy the case file rather than capturing \
+                 it again — a second-generation case would carry today's captured_at over \
+                 months-old evidence."
+            }
+            _ => "Nothing arrives on a postmortem domain, so this would do nothing.",
+        };
+        Err(format!(
+            "`{op}` is not available on `{}`, which holds the loaded case `{case}` rather than a \
+             running system. {why}",
+            d.config.name
+        ))
+    }
+
     /// Handle an RPC request for a given session.
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         let result = match request.method.as_str() {
@@ -724,6 +792,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "update_domain_data")?;
         let (outcomes, persist_error) =
             self.apply_data_entries(session_id, params.get("entries"))?;
         serde_json::to_value(DomainDataUpdateResult {
@@ -738,6 +807,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "remove_domain_data")?;
         let (_, reg) = self.resolve_domain_data(session_id)?;
         let patterns = opt_str_array(params, "patterns")?.unwrap_or_default();
         if patterns.is_empty() {
@@ -826,6 +896,7 @@ impl RpcHandler {
     /// its receivers alive; seq stays monotonic. (`logs.clear` is the logs-only,
     /// back-compat cousin.)
     fn handle_domains_clear(&self, session_id: &SessionId) -> Result<Value, String> {
+        self.require_live(session_id, "clear_domain")?;
         let d = self.resolve_domain(session_id)?;
         let logs_cleared = d.pipeline.clear_logs();
         let spans_cleared = d.span_store.clear();
@@ -1303,6 +1374,7 @@ impl RpcHandler {
     }
 
     fn handle_logs_clear(&self, session_id: &SessionId) -> Result<Value, String> {
+        self.require_live(session_id, "clear_logs")?;
         let d = self.resolve_domain(session_id)?;
         let cleared = d.pipeline.clear_logs();
         Ok(json!({ "cleared": cleared }))
@@ -1443,6 +1515,7 @@ impl RpcHandler {
     }
 
     fn handle_filters_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_live(session_id, "add_filter")?;
         let d = self.resolve_domain(session_id)?;
         let filter = req_str(params, "filter")?;
         // Reject bookmark filters in registered (long-lived) filters.
@@ -1463,6 +1536,7 @@ impl RpcHandler {
     }
 
     fn handle_filters_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_live(session_id, "edit_filter")?;
         let filter_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
         let desc = opt_str(params, "description")?;
@@ -1482,6 +1556,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "remove_filter")?;
         let d = self.resolve_domain(session_id)?;
         let filter_id = req_u32(params, "id")?;
         self.sessions
@@ -1517,6 +1592,7 @@ impl RpcHandler {
     }
 
     fn handle_triggers_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_live(session_id, "add_trigger")?;
         let d = self.resolve_domain(session_id)?;
         let filter = req_str(params, "filter")?;
         // Reject bookmark filters in registered (long-lived) triggers.
@@ -1551,6 +1627,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "edit_trigger")?;
         let d = self.resolve_domain(session_id)?;
         let trigger_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
@@ -1584,6 +1661,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "remove_trigger")?;
         let d = self.resolve_domain(session_id)?;
         let trigger_id = req_u32(params, "id")?;
         self.sessions
@@ -1887,6 +1965,7 @@ impl RpcHandler {
     /// a tool result puts the whole thing in the model's context, which is the
     /// outcome §5.2's document/logdata split exists to prevent.
     fn handle_cases_create(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+        self.require_live(session_id, "create_case")?;
         use crate::cases::document as doc;
 
         let d = self.resolve_domain(session_id)?;
@@ -2560,6 +2639,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "clear_bookmarks")?;
         let d = self.resolve_domain(session_id)?;
         // Default to the calling session if no explicit session is given — which
         // is why a wrong-typed one cannot be read as absent: it would clear the
@@ -2614,6 +2694,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "add_collector")?;
         let name = req_str(params, "name")?;
         if !is_valid_collector_name(name) {
             return Err(format!(
@@ -2812,6 +2893,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "edit_collector")?;
         let name = req_str(params, "name")?;
         let level = match opt_str(params, "level")? {
             None => None,
@@ -2925,6 +3007,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "snapshot_collector")?;
         let name = req_str(params, "name")?;
         let policy = SnapshotPolicy {
             per_name: opt_bool(params, "per_name")?.unwrap_or(true),
@@ -3232,6 +3315,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "reset_collector")?;
         let name = req_str(params, "name")?;
         let taken = self
             .collectors
@@ -3256,6 +3340,7 @@ impl RpcHandler {
         session_id: &SessionId,
         params: &Value,
     ) -> Result<Value, String> {
+        self.require_live(session_id, "remove_collector")?;
         let name = req_str(params, "name")?;
         self.collectors
             .remove(session_id, name)
