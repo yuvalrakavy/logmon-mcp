@@ -166,6 +166,10 @@ pub struct PostmortemInfo {
     /// Non-zero when the case's own provenance was truncated at write time, so
     /// a reader is told the restored registry is a subset.
     pub registry_dropped: usize,
+    /// The case's provenance, restored — and held HERE rather than opened from
+    /// the shared on-disk store, which is keyed by domain name and outlives the
+    /// domain. See `DomainRegistry::in_memory`.
+    pub registry: std::sync::Arc<crate::domain_data::persist::DomainRegistry>,
 }
 
 impl Domain {

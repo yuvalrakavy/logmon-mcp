@@ -539,6 +539,12 @@ pub const TOOLS: &[Tool] = &[
         cli: Cli::PLAIN,
     },
     Tool {
+        name: "load_case",
+        method: "cases.load",
+        description: "Load a case file back into a sealed POSTMORTEM domain, so the ordinary read tools answer questions about a capture months old or from another machine. Takes an absolute path to a .case.zip or to the case document; pass domain to name the result, otherwise it takes the case's own stem. The whole read surface then works against it — profile_traces and get_slow_spans for the historical half, the same calls without --domain for the current one. Nothing arrives on a postmortem domain and nothing can: collectors, triggers, filters, clears and create_case are refused by name, because armed here they would report zero forever and read as 'I measured and nothing happened' rather than 'I could not measure'. Time is frozen at the capture, so ages and TTLs read as they did then rather than as three months stale, while bookmarks you place keep today's date. The reply carries the capture's own verdict — complete, evicted, filtered or cannot_verify — and says whether log or span evidence was OMITTED at capture, which is a different fact from a capture that looked and found none. Delete the domain to discard the case.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "update_domain_data",
         method: "domain_data.update",
         description: "Record provenance for the bound domain — what was true of the project while these logs were produced. Logs without it are a dump; logs with it are evidence. Core keys: /Build/commit, /Build/profile, /Action. Also /Versions/<component>, /Env/host, /Data/seed (the one that turns \"fails 1 in 20\" into a reproduction). Send a value to set it, or a key alone to confirm what is already there. Returns one outcome per entry: created, updated, validated, unknown, or rejected.",

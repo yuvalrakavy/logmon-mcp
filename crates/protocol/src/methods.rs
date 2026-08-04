@@ -2760,6 +2760,31 @@ pub struct CaseAnchor {
     pub trace_id: Option<String>,
 }
 
+/// `cases.load` — a case file back into a sealed postmortem domain.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CasesLoad {
+    /// Absolute path to a `.case.zip` or to the case document.
+    ///
+    /// **Absolute for the same reason `cases.create`'s `dir` is**: the broker
+    /// runs as a service, so a relative path resolves against *its* working
+    /// directory rather than yours. The evidence files are then found beside the
+    /// document — or inside the bundle — and their names are checked against the
+    /// case's own stem, because the daemon opens them and a pointer read out of
+    /// a file that arrived from another machine must not be able to name a path.
+    pub path: String,
+    /// What to call the resulting domain. Defaults to the case's own stem, so a
+    /// reader who does not care never invents a name and two cases never collide
+    /// by accident.
+    ///
+    /// An occupied name is an error rather than a no-op: a postmortem domain is
+    /// constituted by ONE case — its frozen clock, incarnation, registry and seq
+    /// range all belong to that capture — so loading a second into it has no
+    /// coherent meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CasesCreate {

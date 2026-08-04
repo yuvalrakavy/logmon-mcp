@@ -170,6 +170,171 @@ impl RpcHandler {
             .ok_or_else(|| format!("domain \"{id}\" no longer exists — use_domain to rebind"))
     }
 
+    /// Load a case from disk into a sealed postmortem domain.
+    ///
+    /// **Async because it creates a domain**, and `create_lock` is a
+    /// `tokio::sync::Mutex`. `DomainRegistry::insert` is documented "insert (or
+    /// replace)", so two concurrent loads onto one name would both pass a
+    /// check-then-insert and the second would silently replace the first — a
+    /// session already bound by name would then resolve to the other case's
+    /// evidence with no error anywhere.
+    ///
+    /// **Deliberately NOT idempotent, unlike `domains.create`.** That treats an
+    /// existing domain with matching ports as a no-op; here it would hand back a
+    /// domain holding a *different* case under the name you asked for. A
+    /// postmortem domain is constituted by one case, so an occupied name is an
+    /// error naming its occupant.
+    async fn handle_cases_load(
+        &self,
+        _session_id: &SessionId,
+        params: &Value,
+    ) -> Result<Value, String> {
+        use crate::cases::load;
+
+        let raw = req_str(params, "path")?;
+        let case = load::load(std::path::Path::new(raw)).map_err(|e| e.to_string())?;
+
+        // The name defaults to the case's own stem, so a reader who does not
+        // care never invents one and two cases never collide by accident.
+        let wanted = opt_str(params, "domain")?
+            .map(str::to_string)
+            .unwrap_or_else(|| case.stem.clone());
+        let id = DomainId::new(&wanted).map_err(|e| e.to_string())?;
+
+        let _guard = self.create_lock.lock().await;
+        if let Some(existing) = self.domains.get(&id) {
+            let holds = match &existing.postmortem {
+                Some(pm) => format!("holds the case `{}`", pm.case),
+                None => "is a live domain".into(),
+            };
+            return Err(format!(
+                "domain `{id}` already exists and {holds}. A postmortem domain is \
+                 constituted by ONE case — its frozen clock, incarnation, registry \
+                 and seq range all belong to that capture — so loading a second \
+                 into it has no coherent meaning. Pass `domain` to name a new one, \
+                 or delete this first."
+            ));
+        }
+        let api_created = self
+            .domains
+            .list()
+            .iter()
+            .filter(|d| d.config.source != DomainSource::Config)
+            .count();
+        if api_created >= self.domain_policy.max_domains {
+            return Err(format!(
+                "max_domains ({}) reached — delete a domain before loading another",
+                self.domain_policy.max_domains
+            ));
+        }
+
+        let domain = self.assemble_case_domain(id, &case)?;
+        let reply = json!({
+            "domain": domain.config.name.to_string(),
+            "case": case.stem,
+            "captured_at": case.front.captured_at.to_rfc3339(),
+            "verdict": format!("{:?}", case.front.verdict).to_lowercase(),
+            "seq_range": { "from": case.from_seq(), "to": case.to_seq() },
+            "logs": case.logs.as_ref().map(Vec::len),
+            "spans": case.spans.as_ref().map(Vec::len),
+            "registry_facts": case.registry.as_ref().map_or(0, |r| r.facts.len()),
+            "registry_dropped": case.registry.as_ref().map_or(0, |r| r.dropped),
+            "anchor": { "seq": case.front.anchor.seq, "headline": case.front.headline },
+        });
+        // Published last: construction has fully succeeded, so a failure at any
+        // point above leaves no half-built domain under a name nothing can reuse.
+        self.domains.insert(domain);
+        Ok(reply)
+    }
+
+    /// Build the sealed domain from a validated case.
+    fn assemble_case_domain(
+        &self,
+        id: DomainId,
+        case: &crate::cases::load::LoadedCase,
+    ) -> Result<Arc<Domain>, String> {
+        use crate::daemon::domain::PostmortemInfo;
+        use crate::engine::epoch::FilterPolicy;
+
+        let (from, to) = (case.from_seq(), case.to_seq());
+        let logs = case.logs.clone().unwrap_or_default();
+        let spans = case.spans.clone().unwrap_or_default();
+
+        // Counter at the window's TOP, epoch origin one BELOW its bottom — the
+        // only pair that satisfies all three consumers of the seq axis. See
+        // `LogPipeline::from_records`.
+        let seq = Arc::new(crate::engine::seq_counter::SeqCounter::new_with_initial(to));
+        let narrowing: Vec<(u64, FilterPolicy)> = case
+            .front
+            .narrowed_by
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|n| (n.from, FilterPolicy::new(n.filters.clone())))
+            .collect();
+
+        let pipeline = crate::engine::pipeline::LogPipeline::from_records(
+            logs.len().max(1),
+            seq.clone(),
+            from.saturating_sub(1),
+            &narrowing,
+            logs,
+            from,
+        );
+        let span_store =
+            crate::span::store::SpanStore::from_records(spans.len().max(1), seq, spans, from);
+
+        // The provenance, restored with its ORIGINAL timestamps — the rendered
+        // table floors them to the largest whole unit, which would flip a 7-day
+        // TTL from elapsed to within.
+        let mut registry = crate::domain_data::store::Registry::default();
+        if let Some(block) = &case.registry {
+            for f in &block.facts {
+                registry.restore(&f.path, &f.value, f.created_at, f.validated_at, f.ttl_secs);
+            }
+        }
+        // The case's own era, not a freshly minted one: preserved seqs are
+        // meaningless without the incarnation they belong to.
+        if let Some(inc) = &case.front.incarnation {
+            let _ = registry.set_reserved("/logmon/incarnation", inc.clone(), case.front.captured_at);
+        }
+
+        let info = PostmortemInfo {
+            case: case.stem.clone(),
+            captured_at: case.front.captured_at,
+            verdict: case.front.verdict,
+            logs_omitted: case.logs.is_none(),
+            spans_omitted: case.spans.is_none(),
+            registry_dropped: case.registry.as_ref().map_or(0, |r| r.dropped),
+            registry: Arc::new(crate::domain_data::persist::DomainRegistry::in_memory(
+                id.to_string(),
+                registry,
+            )),
+        };
+
+        Ok(Arc::new(
+            Domain::from_parts(
+                crate::daemon::domain::DomainConfig {
+                    name: id,
+                    // A sealed domain binds nothing; verified possible in duty 0.
+                    gelf_port: 0,
+                    otlp_grpc_port: 0,
+                    otlp_http_port: 0,
+                    log_buffer_size: case.front.logdata.as_ref().map_or(0, |r| r.records) as usize,
+                    span_buffer_size: case.front.spandata.as_ref().map_or(0, |r| r.records) as usize,
+                    // Ephemeral, NOT Config: `domains.delete` refuses Config, and
+                    // deleting the domain is the only honest way to discard a case.
+                    source: DomainSource::Ephemeral,
+                },
+                Arc::new(pipeline),
+                Arc::new(span_store),
+                Arc::new(crate::store::bookmarks::BookmarkStore::new()),
+                Arc::new(crate::receiver::ReceiverMetrics::new()),
+            )
+            .sealed_as(info),
+        ))
+    }
+
     /// Refuse an operation that would be inert on a loaded case.
     ///
     /// **Called at each mutating site rather than at one choke point, because
@@ -267,6 +432,10 @@ impl RpcHandler {
                 "domains.create must be dispatched via handle_async (it binds ports asynchronously)"
                     .to_string(),
             ),
+            "cases.load" => Err(
+                "cases.load must be dispatched via handle_async (it takes the domain create lock)"
+                    .to_string(),
+            ),
             "domains.delete" => self.handle_domains_delete(&request.params),
             "domains.list" => self.handle_domains_list(),
             "domains.use" => self.handle_domains_use(session_id, &request.params),
@@ -344,6 +513,17 @@ impl RpcHandler {
     /// here; every other method — including the synchronous `domains.delete` /
     /// `domains.list` — delegates to the synchronous [`Self::handle`].
     pub async fn handle_async(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
+        if request.method == "cases.load" {
+            // Async for the same reason `domains.create` is: it creates a domain,
+            // and `create_lock` is a `tokio::sync::Mutex`. Without it two loads
+            // onto one name both pass check-then-insert and the second silently
+            // REPLACES the first, after which a session bound by name resolves
+            // to the other case's evidence with no error anywhere.
+            return match self.handle_cases_load(session_id, &request.params).await {
+                Ok(value) => RpcResponse::success(request.id, Self::maybe_render(request, value)),
+                Err(msg) => RpcResponse::error(request.id, -32601, &msg),
+            };
+        }
         if request.method == "domains.create" {
             return match self.handle_domains_create(&request.params).await {
                 // Through the same step as the sync path: `domains.create` has
@@ -688,6 +868,15 @@ impl RpcHandler {
         // gone.
         let d = self.resolve_domain(session_id)?;
         let name = d.config.name.to_string();
+        // **A postmortem domain never opens the shared store.** `for_domain` is
+        // keyed by NAME and its file outlives the domain — the module says a
+        // re-created domain adopts its predecessor's history — so a case's
+        // provenance written there would be inherited by the next live domain of
+        // that name. Merely resolving it also stamps this broker's version and
+        // today's `first_seen` onto a registry describing another machine.
+        if let Some(pm) = &d.postmortem {
+            return Ok((name, pm.registry.clone()));
+        }
         let reg = store.for_domain(&name);
         Ok((name, reg))
     }

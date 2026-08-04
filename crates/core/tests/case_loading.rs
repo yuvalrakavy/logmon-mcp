@@ -113,6 +113,12 @@ fn sealed_harness() -> H {
         logs_omitted: false,
         spans_omitted: false,
         registry_dropped: 0,
+        registry: Arc::new(
+            logmon_broker_core::domain_data::persist::DomainRegistry::in_memory(
+                "pm".into(),
+                Default::default(),
+            ),
+        ),
     })))
 }
 
@@ -233,15 +239,126 @@ fn a_filtered_case_loads_as_filtered_rather_than_unverifiable() {
     );
 }
 
-/// Tools that READ, and may therefore run on a loaded case.
+/// A real fixture, loaded through the RPC surface a client actually calls.
+#[tokio::test]
+async fn a_real_case_loads_end_to_end_and_is_then_sealed() {
+    let dir = tempfile::tempdir().unwrap();
+    let stem = "with-spans-260803-214501";
+    for n in [
+        format!("{stem}.md"),
+        format!("{stem}.logdata.jsonl"),
+        format!("{stem}.spandata.jsonl"),
+    ] {
+        std::fs::copy(
+            format!("{}/tests/fixtures/cases/{n}", env!("CARGO_MANIFEST_DIR")),
+            dir.path().join(&n),
+        )
+        .unwrap();
+    }
+    let md = dir.path().join(format!("{stem}.md"));
+
+    // A live `default` domain, so the load creates a SECOND domain rather than
+    // colliding — the shape a reader is in.
+    let h = harness(&[]);
+    let resp = h
+        .handler
+        .handle_async(
+            &h.session,
+            &RpcRequest::new(1, "cases.load", json!({ "path": md.to_str().unwrap() })),
+        )
+        .await;
+    let r = resp
+        .result
+        .unwrap_or_else(|| panic!("load failed: {:?}", resp.error));
+
+    assert_eq!(r["case"], stem);
+    assert_eq!(r["domain"], stem, "the domain takes the case's own stem");
+    assert_eq!(r["logs"], 9);
+    assert_eq!(r["spans"], 3);
+    assert_eq!(r["verdict"], "complete");
+    assert_eq!(r["anchor"]["seq"], 1012);
+
+    // Bind to it and read: the whole point is that the ordinary tools work.
+    let bind = h.handler.handle(
+        &h.session,
+        &RpcRequest::new(1, "domains.use", json!({ "name": stem })),
+    );
+    assert!(bind.error.is_none(), "{:?}", bind.error);
+
+    let logs = call(&h, "logs.recent", json!({ "limit": 100 }));
+    assert_eq!(logs["logs"].as_array().unwrap().len(), 9);
+    let traces = call(&h, "traces.recent", json!({}));
+    assert!(
+        !traces["traces"].as_array().unwrap().is_empty(),
+        "the spans came with it: {traces}"
+    );
+
+    // ...and it is sealed.
+    let refused = h.handler.handle(
+        &h.session,
+        &RpcRequest::new(1, "collectors.add", json!({ "name": "x", "filter": "l>=ERROR" })),
+    );
+    assert!(
+        refused
+            .error
+            .is_some_and(|e| e.message.contains("holds the loaded case")),
+        "a loaded domain must refuse a collector"
+    );
+}
+
+#[tokio::test]
+async fn loading_a_second_case_onto_an_occupied_name_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let stem = "with-spans-260803-214501";
+    for n in [
+        format!("{stem}.md"),
+        format!("{stem}.logdata.jsonl"),
+        format!("{stem}.spandata.jsonl"),
+    ] {
+        std::fs::copy(
+            format!("{}/tests/fixtures/cases/{n}", env!("CARGO_MANIFEST_DIR")),
+            dir.path().join(&n),
+        )
+        .unwrap();
+    }
+    let md = dir.path().join(format!("{stem}.md"));
+    let h = harness(&[]);
+    let params = json!({ "path": md.to_str().unwrap() });
+
+    let first = h
+        .handler
+        .handle_async(&h.session, &RpcRequest::new(1, "cases.load", params.clone()))
+        .await;
+    assert!(first.error.is_none(), "{:?}", first.error);
+
+    // NOT idempotent, unlike domains.create: a no-op here would hand back a
+    // domain holding a different case under the name you asked for.
+    let second = h
+        .handler
+        .handle_async(&h.session, &RpcRequest::new(1, "cases.load", params))
+        .await;
+    let msg = second.error.expect("refused").message;
+    assert!(msg.contains(stem), "the refusal names its occupant: {msg}");
+    assert!(
+        msg.contains("constituted by ONE case"),
+        "and says why, so it does not read as an arbitrary limit: {msg}"
+    );
+}
+
+/// Tools that do not mutate THIS domain, and may therefore run on a loaded case.
 ///
-/// **The allowlist is the read side, deliberately, so the default is refusal.**
-/// There is no `mutates` flag on `Tool` and no choke point in dispatch, so
-/// exhaustiveness has to come from somewhere — and a list of things to REFUSE
-/// would leave the tool nobody has added yet silently permitted, which is the
-/// failure this whole section exists to avoid. Inverted, a new tool fails this
-/// test until someone classifies it on purpose.
+/// **The allowlist is the permitted side, deliberately, so the default is
+/// refusal.** There is no `mutates` flag on `Tool` and no choke point in
+/// dispatch, so exhaustiveness has to come from somewhere — and a list of things
+/// to REFUSE would leave the tool nobody has added yet silently permitted, which
+/// is the failure this whole mechanism exists to avoid. Inverted, a new tool
+/// fails this test until someone classifies it on purpose.
+///
+/// Mostly reads. The exceptions are lifecycle operations that act on a
+/// *different* domain — creating, deleting, or loading another case is not an
+/// operation on this one, and delete is the only honest way to discard a case.
 const READ_ONLY: &[&str] = &[
+    "load_case",
     "get_recent_logs", "get_log_context", "export_logs", "list_log_fields", "profile_logs",
     "get_recent_traces", "get_trace", "get_trace_summary", "get_slow_spans", "get_trace_logs",
     "get_span_context", "export_spans", "profile_traces",

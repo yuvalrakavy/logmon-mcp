@@ -338,6 +338,44 @@ impl Registry {
 
     /// Logmon's own write path. The only route to `/logmon/*`, and it refuses
     /// everything else so a bug here cannot quietly become an agent write.
+    /// Put a fact back exactly as it was captured, timestamps and all.
+    ///
+    /// **Not `update`, and the difference is the whole point.** `update` stamps
+    /// `created_at`/`validated_at` with *now*, which is right for a fact someone
+    /// is asserting and wrong for one being restored: a case's provenance
+    /// describes when things were true on the machine that produced it, and
+    /// re-stamping it would make a three-month-old build claim it was confirmed
+    /// today. Restoring from the document's rendered table has the same problem
+    /// in reverse — `approx_age` floors to the largest whole unit, so a fact
+    /// validated 13 days before capture reads `1w`, and `captured_at - 1w` flips
+    /// a 7-day TTL from elapsed to within. Hence the machine-readable registry
+    /// file, and hence this.
+    ///
+    /// Reserved paths are permitted: the case's own `/logmon/incarnation` is
+    /// exactly the kind of thing being restored.
+    pub fn restore(
+        &mut self,
+        path: &str,
+        value: &str,
+        created_at: DateTime<Utc>,
+        validated_at: DateTime<Utc>,
+        ttl_secs: Option<u64>,
+    ) {
+        self.entries.insert(
+            path.to_string(),
+            Entry {
+                value: value.to_string(),
+                created_at,
+                // The invariant `validated_at >= created_at` is the store's, and
+                // a hand-edited case could violate it. Clamp rather than refuse:
+                // a swapped pair is not worth failing a whole load over, and an
+                // age that ran backwards would underflow downstream.
+                validated_at: validated_at.max(created_at),
+                ttl_secs,
+            },
+        );
+    }
+
     pub fn set_reserved(
         &mut self,
         path: &str,
