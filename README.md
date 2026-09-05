@@ -238,20 +238,63 @@ Add to `~/.gemini/settings.json`:
 </details>
 
 <details>
-<summary><b>OpenAI Codex CLI</b></summary>
+<summary><b>OpenAI Codex — desktop app, CLI, and IDE extension</b></summary>
 
-Add to `~/.codex/config.json`:
+Codex uses **TOML**, not `~/.codex/config.json` or the `mcpServers` JSON
+format used by some other clients. Local Codex clients on the same host share
+`~/.codex/config.toml`. See the [official Codex MCP guide](https://learn.chatgpt.com/docs/extend/mcp)
+for current configuration options.
 
-```json
-{
-  "mcpServers": {
-    "logmon": {
-      "command": "logmon-mcp",
-      "args": []
-    }
-  }
-}
+**CLI registration:**
+
+```bash
+codex mcp add logmon -- logmon-mcp
+codex mcp list
 ```
+
+If the client cannot find the binary on its PATH, use its absolute path instead
+(for example, `/home/alice/.cargo/bin/logmon-mcp`). The equivalent configuration,
+merged into `~/.codex/config.toml`, is:
+
+```toml
+[mcp_servers.logmon]
+command = "logmon-mcp"
+```
+
+For a project-only connection, put that table in the project's
+`.codex/config.toml` instead (Codex loads project configuration only for trusted
+projects). Choose one registration method; do not add a second `logmon` table to
+an existing TOML file.
+
+**Desktop app:** open **Settings → MCP servers → Add server**, name it `logmon`,
+choose **STDIO**, and enter `logmon-mcp` (or its absolute path) as the command.
+Save, then select **Restart**. In the IDE extension, open **MCP servers** from the
+gear menu and restart the extension after saving. In the CLI, start a new session
+after registration. Use `/mcp` to inspect connected servers; `codex mcp list`
+confirms configuration, not a successful live connection.
+
+Ask the assistant to call `get_status` to verify the broker connection. Logmon
+also supplies its usage guide through MCP server `instructions`, which Codex
+reads at initialization; copying a Claude skill is not required.
+
+**Parallel projects or worktrees:** use a distinct named session per simultaneous
+connection. For an existing log domain, add a session name and domain binding:
+
+```toml
+[mcp_servers.logmon]
+command = "logmon-mcp"
+args = ["--session", "codex-my-project-feature-a"]
+env = { LOGMON_DOMAIN = "my-project-feature-a" }
+```
+
+This replaces the basic table above. Create the domain before connecting; the
+shim refuses a missing domain rather than silently reading `default`. A named
+session preserves the binding across reconnects. If the project provides a
+wrapper that derives the domain and session from its working directory, configure
+that wrapper as the command and use `cwd` to select the intended checkout. A
+change of the assistant's working directory does not restart an already-running
+MCP server: verify the domain after switching worktrees. Do not reuse a session
+owned by another live assistant.
 
 </details>
 
