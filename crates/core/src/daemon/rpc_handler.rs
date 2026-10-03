@@ -2789,11 +2789,13 @@ impl RpcHandler {
                 .map_err(|_| format!("`{hex}` is not a hexadecimal trace id"))?;
             let entries = d.pipeline.logs_by_trace_id(tid);
             let n = entries.len();
-            // Earliest by seq — `logs_by_trace_id` returns stored order, which
-            // is seq-ascending — and the document says how many there were.
+            // Earliest BY SEQ, and the document says how many there were. Not
+            // simply the first returned: `logs_by_trace_id` returns stored
+            // order, and a trigger stores its pre-window's older records AFTER
+            // the record that fired it, so the first stored can be the latest.
             let e = entries
                 .into_iter()
-                .next()
+                .min_by_key(|e| e.seq)
                 .ok_or_else(|| format!("no stored log entry carries trace id `{hex}`"))?;
             ("trace_id", hex.to_string(), e, (n > 1).then_some(n))
         };

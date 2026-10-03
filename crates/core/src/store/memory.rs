@@ -92,7 +92,8 @@ impl InMemoryStore {
     ///
     /// Records must be ascending and distinct; the caller validates, because
     /// `entries` and `seq_pos` desynchronise on a duplicate — the deque keeps
-    /// both and the map keeps one, so `len()` and `contains_seq` stop agreeing.
+    /// both and the map keeps one, so `len()` and `contains_seq` stop agreeing,
+    /// and a trace lookup returns the later copy twice and the earlier never.
     pub fn from_records(capacity: usize, records: Vec<LogEntry>, lost_below: u64) -> Self {
         let mut entries = VecDeque::with_capacity(capacity.max(records.len()));
         let mut seq_pos = HashMap::with_capacity(records.len());

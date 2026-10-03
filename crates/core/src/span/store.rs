@@ -27,6 +27,19 @@ pub struct SpanStore {
 
 struct SpanStoreInner {
     buffer: VecDeque<SpanEntry>,
+    /// Every held span's seq → its ABSOLUTE position: the number of spans pushed before
+    /// it, ever. The span is `buffer[pos - popped]`. This is what lets `get_trace` read a
+    /// trace's own spans instead of walking the whole ring (the log store's `seq_pos`,
+    /// for the same reason).
+    ///
+    /// A map rather than a binary search by seq because nothing makes the ring seq-ordered:
+    /// `insert` takes its seq from the shared counter BEFORE the write lock, so two
+    /// concurrent inserts can push in the opposite order.
+    seq_pos: HashMap<u64, u64>,
+    /// Spans evicted from the front, ever. Invariant: the span at `buffer[i]` has position
+    /// `popped + i`. A `clear` empties `buffer` and `seq_pos` together, which keeps the
+    /// invariant without touching this.
+    popped: u64,
     trace_index: HashMap<u128, Vec<u64>>,
     capacity: usize,
 }
@@ -38,6 +51,8 @@ impl SpanStore {
             // first insert (see `insert`), so an idle span store holds ~0 buffer.
             inner: RwLock::new(SpanStoreInner {
                 buffer: VecDeque::new(),
+                seq_pos: HashMap::new(),
+                popped: 0,
                 trace_index: HashMap::new(),
                 capacity,
             }),
@@ -66,14 +81,18 @@ impl SpanStore {
     ) -> Self {
         let mut buffer = VecDeque::with_capacity(capacity.max(spans.len()));
         let mut trace_index: HashMap<u128, Vec<u64>> = HashMap::new();
+        let mut seq_pos: HashMap<u64, u64> = HashMap::new();
         for s in spans {
             trace_index.entry(s.trace_id).or_default().push(s.seq);
+            seq_pos.insert(s.seq, buffer.len() as u64);
             buffer.push_back(s);
         }
         let cap = capacity.max(buffer.len());
         Self {
             inner: RwLock::new(SpanStoreInner {
                 buffer,
+                seq_pos,
+                popped: 0,
                 trace_index,
                 capacity: cap,
             }),
@@ -101,6 +120,8 @@ impl SpanStore {
                     evicted.seq.saturating_add(1),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                inner.seq_pos.remove(&evicted.seq);
+                inner.popped += 1;
                 if let Some(seqs) = inner.trace_index.get_mut(&evicted.trace_id) {
                     seqs.retain(|&s| s != evicted.seq);
                     if seqs.is_empty() {
@@ -115,20 +136,27 @@ impl SpanStore {
             .entry(span.trace_id)
             .or_default()
             .push(span.seq);
+        let pos = inner.popped + inner.buffer.len() as u64;
+        inner.seq_pos.insert(seq, pos);
         inner.buffer.push_back(span);
         seq
     }
 
+    /// The trace's spans, by start time. Reads only the trace's own spans: `trace_index`
+    /// lists them in ring order (every push and eviction updates both together), and
+    /// `seq_pos` places each one, so the cost is the trace's size, not the ring's.
     pub fn get_trace(&self, trace_id: u128) -> Vec<SpanEntry> {
         let inner = self.inner.read().unwrap();
         let seqs = match inner.trace_index.get(&trace_id) {
             Some(s) => s,
             None => return vec![],
         };
-        let mut spans: Vec<SpanEntry> = inner
-            .buffer
+        let mut spans: Vec<SpanEntry> = seqs
             .iter()
-            .filter(|s| seqs.contains(&s.seq))
+            .filter_map(|seq| {
+                let pos = *inner.seq_pos.get(seq)?;
+                inner.buffer.get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
+            })
             .cloned()
             .collect();
         spans.sort_by_key(|s| s.start_time);
@@ -311,6 +339,7 @@ impl SpanStore {
             );
         }
         inner.buffer.clear();
+        inner.seq_pos.clear();
         inner.trace_index.clear();
         n
     }
@@ -398,5 +427,129 @@ mod lazy_alloc_tests {
             cap,
             "subsequent inserts do not re-allocate"
         );
+    }
+}
+
+#[cfg(test)]
+mod trace_lookup_tests {
+    //! `get_trace` reads a trace's spans by position (`seq_pos`) instead of walking the ring.
+    //! The oracle for every test here is the DEFINITION, computed without the index: the
+    //! ring's spans whose `trace_id` is the trace's, in ring order, sorted by start time.
+
+    use super::*;
+    use crate::engine::seq_counter::SeqCounter;
+    use crate::span::types::{SpanKind, SpanStatus};
+    use std::sync::Arc;
+
+    fn span(seq: u64, trace_id: u128, start_offset_ms: i64) -> SpanEntry {
+        let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("valid time");
+        let start_time = base + chrono::Duration::milliseconds(start_offset_ms);
+        SpanEntry {
+            seq,
+            trace_id,
+            span_id: 1,
+            parent_span_id: None,
+            start_time,
+            end_time: start_time,
+            duration_ms: 0.0,
+            name: "s".into(),
+            kind: SpanKind::Internal,
+            service_name: "svc".into(),
+            status: SpanStatus::Unset,
+            attributes: std::collections::HashMap::new(),
+            events: vec![],
+        }
+    }
+
+    fn seqs(spans: Vec<SpanEntry>) -> Vec<u64> {
+        spans.into_iter().map(|s| s.seq).collect()
+    }
+
+    fn by_definition(store: &SpanStore, trace_id: u128) -> Vec<u64> {
+        let inner = store.inner.read().unwrap();
+        let mut spans: Vec<&SpanEntry> =
+            inner.buffer.iter().filter(|s| s.trace_id == trace_id).collect();
+        spans.sort_by_key(|s| s.start_time);
+        spans.into_iter().map(|s| s.seq).collect()
+    }
+
+    /// Both halves of the invariant: one position per held span, each at `popped + index`.
+    fn assert_positions(store: &SpanStore) {
+        let inner = store.inner.read().unwrap();
+        assert_eq!(inner.seq_pos.len(), inner.buffer.len(), "one position per held span");
+        for (i, s) in inner.buffer.iter().enumerate() {
+            assert_eq!(
+                inner.seq_pos.get(&s.seq),
+                Some(&(inner.popped + i as u64)),
+                "span {} at ring index {i}",
+                s.seq
+            );
+        }
+    }
+
+    /// Spans held out of seq order — the shape two racing inserts leave, and what
+    /// `from_records` builds from whatever it is given — are all found, and inserting and
+    /// evicting after a load keeps every position right.
+    #[test]
+    fn spans_held_out_of_seq_order_are_found_before_and_after_evictions() {
+        let store = SpanStore::from_records(
+            6,
+            Arc::new(SeqCounter::new()),
+            vec![span(105, 1, 0), span(103, 1, 1), span(109, 2, 2), span(104, 1, 3)],
+            0,
+        );
+        assert_eq!(seqs(store.get_trace(1)), vec![105, 103, 104]);
+        assert_positions(&store);
+
+        for k in 0..4 {
+            store.insert(span(0, 1, 10 + k));
+        }
+        assert!(store.inner.read().unwrap().popped >= 2, "the inserts evicted from a 6-span ring");
+        assert_eq!(seqs(store.get_trace(1)), by_definition(&store, 1));
+        assert_eq!(seqs(store.get_trace(2)), by_definition(&store, 2));
+        assert_positions(&store);
+    }
+
+    /// xorshift64: deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// Differential: a seeded mix of inserts across three traces with start times out of
+    /// insertion order, evictions from a small ring and the odd clear — checked against the
+    /// definition and the position invariant after every step.
+    #[test]
+    fn the_lookup_matches_the_definition_under_evictions_and_clears() {
+        let store = SpanStore::new(16, Arc::new(SeqCounter::new()));
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let (mut clears, mut nonempty) = (0, 0);
+        for _ in 0..5_000 {
+            let r = rng.next();
+            if (r >> 8).is_multiple_of(400) {
+                store.clear();
+                clears += 1;
+            } else {
+                let trace = (r % 3) as u128 + 1;
+                store.insert(span(0, trace, ((r >> 16) % 5) as i64));
+            }
+            for t in 1..=3u128 {
+                let got = seqs(store.get_trace(t));
+                assert_eq!(got, by_definition(&store, t), "trace {t}");
+                if !got.is_empty() {
+                    nonempty += 1;
+                }
+            }
+            assert_positions(&store);
+        }
+        // Vacuity guards: the run must have exercised what it claims to.
+        assert!(clears > 2, "clears exercised: {clears}");
+        assert!(store.inner.read().unwrap().popped > 1_000, "evictions exercised");
+        assert!(nonempty > 1_000, "lookups that returned spans: {nonempty}");
     }
 }

@@ -96,6 +96,19 @@ Results are unchanged, in the same order — the order the records were stored,
 which is not always seq order: a trigger stores its pre-window's older records
 after the triggering one.
 
+`traces.get` (`get_trace`) had the same shape on the span buffer, with each span
+compared against the trace's whole span list, so its cost grew with the buffer
+times the trace. It reads by position now too (not measured).
+
+### Fixed — `create_case` anchored on a trace id could take the wrong record
+
+The anchor is documented as the trace's earliest record by seq, but it was the
+first record the store returned for the trace. When the trace's early records
+reached the store only through a trigger's pre-window, the trigger stored its own
+record first, so the anchor was the trace's LATEST record, and the case document
+said *"the earliest by seq (N) was taken"* with N the wrong record. The
+anchor now takes the lowest seq.
+
 ### Fixed — `create_case` captured a window cut from the logs alone
 
 `before`/`after` counted **log** records and the resulting seq range was then

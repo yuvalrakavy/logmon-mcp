@@ -346,6 +346,45 @@ fn a_trace_id_matching_many_anchors_on_the_earliest_and_says_so() {
     assert!(doc.contains("anchor: {kind: trace_id"), "{doc}");
 }
 
+/// The earliest by SEQ, not the first STORED: a trigger stores the record that
+/// fired it before its pre-window's older records, so a trace whose early
+/// records only reached the store through a trigger is stored newest-first.
+#[test]
+fn a_trace_id_anchor_takes_the_earliest_seq_when_a_trigger_stored_it_out_of_order() {
+    let h = harness();
+    // Another session keeps INFO out of storage, so the trace's INFO records
+    // reach the store only as the trigger's pre-window.
+    let noisy = h.sessions.create_named("noisy").unwrap();
+    h.sessions
+        .add_filter(&noisy, "l>=ERROR", Some("errors only"))
+        .unwrap();
+    h.call(
+        "triggers.add",
+        json!({ "filter": "l>=ERROR", "pre_window": 5, "post_window": 0 }),
+    )
+    .unwrap();
+
+    let early = h.feed_traced(Level::Info, "early in the trace", Some(0x7f3b));
+    h.feed_traced(Level::Info, "middle of the trace", Some(0x7f3b));
+    let fired = h.feed_traced(Level::Error, "the trace failed", Some(0x7f3b));
+
+    // Vacuity guard: the store holds the trace newest-first, or this test
+    // cannot tell "earliest by seq" from "first stored".
+    let stored = h
+        .call("traces.logs", json!({ "trace_id": "7f3b" }))
+        .unwrap();
+    let first_stored = stored["logs"][0]["seq"].as_u64();
+    assert_eq!(first_stored, Some(fired), "the trigger stored its record first: {stored}");
+
+    let r = h
+        .capture(json!({ "anchor": { "trace_id": "7f3b" } }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(doc.contains("# early in the trace"), "{doc}");
+    assert!(doc.contains("matched 3 entries"), "{doc}");
+    assert!(doc.contains(&format!("earliest by seq ({early})")), "{doc}");
+}
+
 /// A bookmark marks a BOUNDARY, not a record: `b>=name` selects strictly after
 /// it. The anchor is therefore the first stored entry the same `b>=name` would
 /// hand back — not an off-by-one only this call has.
