@@ -80,55 +80,78 @@ a path outside the case.
 case with no registry entry reads as "no provenance recorded" rather than an
 error. A reader must not reconstruct one from the table.
 
+### Changed — the log buffer holds records in seq order
+
+A record's **seq** is the only ordering the archive has, but the log buffer kept records
+in the order they were STORED, and a trigger breaks that: it stores the record that fired
+it, then the older records of its pre-window. Every reader that took a position in the
+buffer for a position in seq was wrong across such a stretch. The buffer now keeps itself in
+seq order — a trigger's flush is merged in where its seqs belong — and what you see changes
+wherever a trigger has fired with storage filters active:
+
+- `get_recent_logs`' newest is the newest seq; a flushed pre-window record is no longer
+  shown as the newest.
+- `get_log_context` around a trigger's record includes its pre-window, in seq order.
+- `get_trace_logs`, `get_trace`'s logs and `logs.recent` with a `trace_id` are ascending by seq.
+- `buffer_oldest_seq`/`buffer_newest_seq` and `domains.list`'s oldest/newest are the true
+  lowest and highest seq held.
+- A cursor read (`c>=`) with a `count` no longer skips held records: over a buffer stored
+  as `[91, 100, 95, 96, 97]`, `c>=` with `count: 2` used to return `[91, 100]` and never 95-97.
+  A record stored AFTER a cursor has passed its seq — a trigger's pre-window flushed later —
+  is still not returned to that cursor.
+- A bookmark anchor for `create_case` takes the lowest seq after the mark.
+- After `clear_logs`, a trigger no longer brings back records from before the clear, and a
+  record older than one already evicted is not stored. `status.get`'s `total_received` can
+  therefore exceed `total_stored`; the difference is exactly the records refused this way.
+- A trigger's pre-window reaches back at most its buffer's last N arrivals. A flush used to
+  leave older entries behind once a smaller trigger had drained newer ones, so a large
+  pre-window could pull in same-trace records far older than N.
+
 ### Fixed — `traces.logs` (`get_trace_logs`) walked the whole log buffer on every call
 
-Looking up one trace's logs found the trace's seqs in an index, then compared
-every record in the buffer against them — under the store's read lock, which
-ingestion needs as a write lock. On a full default buffer (500,000 records) a
-call for a 2,000-record trace took **15.8 ms**. A client polling per trace (a
-test harness waiting for a marker record, from many parallel lanes) asks for
-more of those per second than one core can serve, and under that load records
-were seen reaching readers seconds after they were sent.
+Looking up one trace's logs found the trace's seqs in an index, then compared every record
+in the buffer against them — under the store's read lock, which ingestion needs as a write
+lock. With 500,000 records buffered (the default is 10,000) a call for a 2,000-record trace
+took **15.8 ms**. A client polling per trace (a test harness waiting for a marker record,
+from many parallel lanes) asks for more of those per second than one core can serve, and
+under that load records were seen reaching readers seconds after they were sent.
 
-The store now keeps each record's position, and the lookup reads only the
-trace's own records: **0.28 ms** for the same call (release build, measured).
-Results are unchanged, in the same order — the order the records were stored,
-which is not always seq order: a trigger stores its pre-window's older records
-after the triggering one.
+The lookup now reads only the trace's own records, each found by binary search in the
+seq-ordered buffer. A first version of this change (a position map, O(1) per record) took
+**0.28 ms** for the same call (release build, measured); the binary search that replaced it
+was not measured separately.
 
-`traces.get` (`get_trace`) had the same shape on the span buffer, with each span
-compared against the trace's whole span list, so its cost grew with the buffer
-times the trace; `traces.recent` walked the whole span buffer once per trace it
-returned. Both read by position now (not measured). `traces.recent` also now
-gives a trace with no root span the start time of its EARLIEST span, as the
-trace summary in a span trigger's notification already did; it used to take whichever
-span the buffer held first.
+`traces.get` (`get_trace`) had the same shape on the span buffer, with each span compared
+against the trace's whole span list, so its cost grew with the buffer times the trace;
+`traces.recent` walked the whole span buffer once per trace it returned. Both read the
+trace's own spans now (not measured). `traces.recent` also gives a trace with no root span
+the start time of its EARLIEST span, and picks a root among several by start time, as
+`traces.summary` already did; it used to take whichever span the buffer held first.
 
 ### Fixed — `create_case` anchored on a trace id could take the wrong record
 
-The anchor is documented as the trace's earliest record by seq, but it was the
-first record the store returned for the trace. When the trace's early records
-reached the store only through a trigger's pre-window, the trigger stored its own
-record first, so the anchor was the record that fired the trigger rather than the
-trace's earliest, and the case document said *"the earliest by seq (N) was
-taken"* with N the wrong record. The anchor now takes the lowest seq.
+The anchor is documented as the trace's earliest record by seq, but it was the first
+record the store returned for the trace — which, before the buffer kept seq order, could be
+the record that fired a trigger rather than the trace's earliest, with the case document
+saying *"the earliest by seq (N) was taken"* about the wrong N. The anchor takes the lowest
+seq.
 
-### Fixed — a case captured across a trigger could not be loaded, and its window was cut wrong
+### Fixed — a case captured across a trigger could not be loaded, and its window could hold the wrong records
 
-A trigger stores the record that fired it before its pre-window's older records,
-so the log buffer is not always in seq order. `create_case` cut its log window by
-POSITION in the buffer and wrote the records in that order, which had two
-effects whenever the window took in such a stretch:
+`create_case` cuts its log window by position around the anchor. Before the buffer kept seq
+order, a window taking in a trigger's stored stretch was written out of seq order, which
+`load_case` refuses; and records farther from the anchor in seq could take nearer ones'
+slots, so the document could call records **gone** that were still stored. With the buffer in
+seq order, the window is the anchor's seq neighbourhood and both files are written in seq
+order.
 
-- `load_case` refused the case outright: a case's records must be in ascending
-  seq order, and these were not.
-- The window could hold the wrong records. Records farther from the anchor in seq
-  took the slots of nearer ones, and when that left the window short below the
-  anchor, the document could report records as **gone** that were still stored,
-  advising a larger `log_buffer_size`.
+### Fixed — a window's eviction was graded `complete` when spans reached below the log floor
 
-The window is now cut by seq from both stores, and both evidence files are
-written in seq order.
+The window's lower end is the lowest of the nearest records from BOTH stores, so it can be a
+span below the oldest log still held. Logs between the two had been stored and evicted, but
+the spans filled `before`, so the shortfall was 0 and the document said nothing was evicted.
+It now reports those logs as gone (whatever the verdict), and a shortfall below the window is
+called "an empty past" only when neither ring has dropped anything.
 
 ### Fixed — `create_case` captured a window cut from the logs alone
 

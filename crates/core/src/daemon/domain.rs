@@ -144,9 +144,9 @@ pub struct Domain {
 ///
 /// **Sealing is an enforced check, not a structural property.** An earlier
 /// design claimed no path could add a record to a loaded domain; that was false
-/// — `InMemoryStore::append` takes an entry's own seq, it is a `pub trait`
-/// method, `LogPipeline::append_to_store` re-exposes it, and the pre-trigger
-/// flush *uses it in production*. So the guarantee has to come from refusing the
+/// — `InMemoryStore::append` and `insert_sorted` take an entry's own seq,
+/// `LogPipeline::append_to_store`/`insert_sorted` re-expose them, and the
+/// pre-trigger flush *uses them in production*. So the guarantee has to come from refusing the
 /// operations, and from a test that finds the tool nobody has added yet.
 #[derive(Debug, Clone)]
 pub struct PostmortemInfo {

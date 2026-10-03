@@ -16,21 +16,72 @@ use std::time::Duration;
 /// load — see notes/2026-05-05-logmon-broker-rwlock-bug-findings.md).
 /// Mirrors the single-lock pattern in `SpanStore`.
 struct StoreInner {
-    entries: VecDeque<LogEntry>,
-    /// Every held record's seq → its ABSOLUTE position, a count that only grows (see
-    /// `popped` for the invariant). The record is `entries[pos - popped]`. This is what lets
-    /// `logs_by_trace_id` read a trace's own records instead of walking the whole ring.
+    /// The held records in ASCENDING SEQ ORDER, distinct. An invariant this store
+    /// establishes — `append`, `insert_sorted` and `from_records` are its only writers and each
+    /// keeps it — and every reader relies on: a position is a position in seq, `front()` and
+    /// `back()` are the lowest and highest, and a seq is found by binary search.
     ///
-    /// A map rather than a binary search because the ring is in APPEND order, not seq
-    /// order: when a trigger fires, the triggering record is appended first and the older
-    /// records of its pre-window after it (`daemon/log_processor.rs`), so a search by seq
-    /// would silently miss them.
-    seq_pos: HashMap<u64, u64>,
-    /// Records evicted from the front, ever. Invariant: the record at `entries[i]` has
-    /// position `popped + i`. A `clear` empties `entries` and `seq_pos` together, which keeps
-    /// the invariant without touching this.
-    popped: u64,
+    /// It used to be the order records were STORED, which a trigger breaks: it stores the
+    /// record that fired it, then the older records of its pre-window
+    /// (`daemon/log_processor.rs`). Every reader that took a position for a seq was then
+    /// wrong across that stretch — see the seq-ordered ring spec.
+    entries: VecDeque<LogEntry>,
+    /// Each trace's held seqs, ascending.
     trace_index: HashMap<u128, Vec<u64>>,
+}
+
+impl StoreInner {
+    /// The index of the record with this seq, if held.
+    fn position(&self, seq: u64) -> Option<usize> {
+        self.entries.binary_search_by_key(&seq, |e| e.seq).ok()
+    }
+
+    /// Whether this seq is held. The common question — the seq just assigned, which is newer
+    /// than everything held — is answered by `back()` alone.
+    fn holds(&self, seq: u64) -> bool {
+        match self.entries.back() {
+            None => false,
+            Some(newest) if seq > newest.seq => false,
+            Some(newest) if seq == newest.seq => true,
+            Some(_) => self.position(seq).is_some(),
+        }
+    }
+
+    /// Forget `seq` in its trace's list.
+    fn unindex(&mut self, trace_id: Option<u128>, seq: u64) {
+        let Some(tid) = trace_id else { return };
+        if let Some(seqs) = self.trace_index.get_mut(&tid) {
+            if let Ok(i) = seqs.binary_search(&seq) {
+                seqs.remove(i);
+            }
+            if seqs.is_empty() {
+                self.trace_index.remove(&tid);
+            }
+        }
+    }
+}
+
+/// `list` and `add`, both ascending and disjoint, merged into `list` in one pass.
+fn merge_ascending(list: &mut Vec<u64>, add: &[u64]) {
+    if add
+        .first()
+        .is_none_or(|first| list.last().is_none_or(|last| first > last))
+    {
+        list.extend_from_slice(add);
+        return;
+    }
+    let old = std::mem::take(list);
+    list.reserve(old.len() + add.len());
+    let (mut a, mut b) = (old.into_iter().peekable(), add.iter().copied().peekable());
+    loop {
+        match (a.peek(), b.peek()) {
+            (Some(x), Some(y)) if x < y => list.push(a.next().unwrap()),
+            (Some(_), Some(_)) => list.push(b.next().unwrap()),
+            (Some(_), None) => list.push(a.next().unwrap()),
+            (None, Some(_)) => list.push(b.next().unwrap()),
+            (None, None) => break,
+        }
+    }
 }
 
 pub struct InMemoryStore {
@@ -60,8 +111,6 @@ impl InMemoryStore {
             // memory — matters when many domains are created but stay idle.
             inner: RwLock::new(StoreInner {
                 entries: VecDeque::new(),
-                seq_pos: HashMap::new(),
-                popped: 0,
                 trace_index: HashMap::new(),
             }),
             max_capacity: capacity,
@@ -90,17 +139,17 @@ impl InMemoryStore {
     /// have. Readers of those counters must treat a postmortem domain as
     /// unmeasured rather than as perfect.
     ///
-    /// Records must be ascending and distinct; the caller validates, because
-    /// `entries` and `seq_pos` desynchronise on a duplicate — the deque keeps
-    /// both and the map keeps one, so `len()` and `contains_seq` stop agreeing,
-    /// and a trace lookup can return the wrong record — the later copy twice, or
-    /// another trace's record when the two copies are in different traces.
+    /// Records must be ascending and distinct — the order this store's every reader relies
+    /// on. Asserted rather than trusted: `load_case` validates first (`cases::load`), so a
+    /// violation here is a bug, and it must not become a ring that binary-searches wrong.
     pub fn from_records(capacity: usize, records: Vec<LogEntry>, lost_below: u64) -> Self {
+        assert!(
+            records.windows(2).all(|w| w[0].seq < w[1].seq),
+            "InMemoryStore::from_records: records must be in ascending, distinct seq order"
+        );
         let mut entries = VecDeque::with_capacity(capacity.max(records.len()));
-        let mut seq_pos = HashMap::with_capacity(records.len());
         let mut trace_index: HashMap<u128, Vec<u64>> = HashMap::new();
         for e in records {
-            seq_pos.insert(e.seq, entries.len() as u64);
             if let Some(tid) = e.trace_id {
                 trace_index.entry(tid).or_default().push(e.seq);
             }
@@ -110,8 +159,6 @@ impl InMemoryStore {
             max_capacity: capacity.max(entries.len()),
             inner: RwLock::new(StoreInner {
                 entries,
-                seq_pos,
-                popped: 0,
                 trace_index,
             }),
             total_stored: AtomicU64::new(0),
@@ -130,6 +177,108 @@ impl InMemoryStore {
 
     pub fn increment_malformed(&self) {
         self.malformed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Store a batch of records that may be OLDER than records already held — a trigger's
+    /// pre-window and the earlier records of its trace — keeping the ring in seq order.
+    /// Returns how many held records had to move to make room (the tail above the batch's
+    /// lowest seq), for the cost test and as a metric.
+    ///
+    /// The store owns its input, because the natural batch is not well-formed: the trigger
+    /// drains the pre-window (the newest entries) and then reads its trace's OLDER entries, so
+    /// it arrives unsorted, and a merge fed an unsorted batch would corrupt the ring with every
+    /// binary search then answering wrongly and silently. So the batch is sorted here, and a
+    /// seq repeated within it, already held, or below the floor is dropped.
+    pub fn insert_sorted(&self, batch: Vec<LogEntry>) -> usize {
+        let mut inner = self.inner.write().unwrap();
+        self.merge_locked(&mut inner, batch)
+    }
+
+    /// Evict the lowest held record: the floor rises past it and its trace forgets it.
+    fn evict_front(&self, inner: &mut StoreInner) {
+        if let Some(evicted) = inner.entries.pop_front() {
+            // The floor is raised with `fetch_max`: eviction takes the lowest seq, so this
+            // never lowers it — and if that invariant ever broke, the floor would still not
+            // move down and start claiming records it once called lost.
+            self.lost_below
+                .fetch_max(evicted.seq.saturating_add(1), Ordering::Relaxed);
+            inner.unindex(evicted.trace_id, evicted.seq);
+        }
+    }
+
+    /// Reserve the whole ring once, on the first write (§6 lazy allocation): an idle store
+    /// holds no buffer, and `pop_front` never shrinks capacity.
+    fn reserve_ring(&self, inner: &mut StoreInner) {
+        if inner.entries.capacity() == 0 {
+            inner.entries.reserve_exact(self.max_capacity);
+        }
+    }
+
+    /// `insert_sorted`'s body, under the caller's write guard. See there.
+    ///
+    /// Counters: a seq already held, or repeated in the batch, is not a new receipt and is
+    /// not counted at all; a new one counts as received, and as stored unless the floor
+    /// refuses it. So `total_received - total_stored` is exactly what the floor refused.
+    fn merge_locked(&self, inner: &mut StoreInner, mut batch: Vec<LogEntry>) -> usize {
+        batch.sort_by_key(|e| e.seq);
+        batch.dedup_by_key(|e| e.seq);
+        batch.retain(|e| !inner.holds(e.seq));
+        self.total_received
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        let floor = self.lost_below.load(Ordering::Relaxed);
+        batch.retain(|e| e.seq >= floor);
+        if batch.is_empty() {
+            return 0;
+        }
+        self.reserve_ring(inner);
+
+        // The held records above the batch's lowest seq come off, to be merged back.
+        let split = inner.entries.partition_point(|e| e.seq < batch[0].seq);
+        let tail: Vec<LogEntry> = inner.entries.drain(split..).collect();
+        let moved = tail.len();
+
+        // Each trace's list takes the batch's seqs for it in ONE merge, not a sorted insert
+        // per record — the same O(batch x tail) shape this function exists to avoid.
+        let mut by_trace: HashMap<u128, Vec<u64>> = HashMap::new();
+        for e in &batch {
+            if let Some(tid) = e.trace_id {
+                by_trace.entry(tid).or_default().push(e.seq);
+            }
+        }
+        for (tid, seqs) in by_trace {
+            merge_ascending(inner.trace_index.entry(tid).or_default(), &seqs);
+        }
+
+        let stored = batch.len() as u64;
+        let mut merged: Vec<LogEntry> = Vec::with_capacity(tail.len() + batch.len());
+        let (mut t, mut b) = (tail.into_iter().peekable(), batch.into_iter().peekable());
+        loop {
+            let take_tail = match (t.peek(), b.peek()) {
+                (Some(x), Some(y)) => x.seq < y.seq,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            merged.push(if take_tail { t.next() } else { b.next() }.unwrap());
+        }
+
+        // Capacity BEFORE pushing back: past the one-time `reserve_exact` the deque would
+        // reallocate, and never give the memory back. The lowest records leave first — the
+        // front of the ring, then the lowest of the merged run — each as an eviction.
+        let mut excess = (inner.entries.len() + merged.len()).saturating_sub(self.max_capacity);
+        while excess > 0 && !inner.entries.is_empty() {
+            self.evict_front(inner);
+            excess -= 1;
+        }
+        let mut merged = merged.into_iter();
+        for dropped in merged.by_ref().take(excess) {
+            self.lost_below
+                .fetch_max(dropped.seq.saturating_add(1), Ordering::Relaxed);
+            inner.unindex(dropped.trace_id, dropped.seq);
+        }
+        inner.entries.extend(merged);
+        self.total_stored.fetch_add(stored, Ordering::Relaxed);
+        moved
     }
 
     /// Like the `recent` query, but also returns how many buffered records were
@@ -228,48 +377,43 @@ pub struct ScanCounts {
 }
 
 impl LogStore for InMemoryStore {
+    /// Store one record, keeping the ring in seq order (see `StoreInner::entries`). The
+    /// normal case — the seq just assigned, newer than everything held — is a `push_back`; a
+    /// record older than the newest held goes through the same merge `insert_sorted` uses.
+    /// A seq already held is skipped and not counted (it is not a new receipt); a seq below
+    /// the floor — older than something already evicted or cleared — is counted as received
+    /// and refused.
     fn append(&self, entry: LogEntry) {
-        self.total_received.fetch_add(1, Ordering::Relaxed);
-        self.total_stored.fetch_add(1, Ordering::Relaxed);
-
-        let seq = entry.seq;
-        let trace_id = entry.trace_id;
         let mut inner = self.inner.write().unwrap();
-
-        // Lazy allocation (§6): reserve the full ring capacity ONCE, on the first
-        // append. `reserve_exact` on an empty deque allocates exactly the ring;
-        // subsequent appends see a non-zero capacity and skip this. `pop_front`
-        // never shrinks capacity, so the guard stays false thereafter.
-        if inner.entries.capacity() == 0 {
-            inner.entries.reserve_exact(self.max_capacity);
+        if !inner
+            .entries
+            .back()
+            .is_none_or(|newest| entry.seq > newest.seq)
+        {
+            // Older than the newest held (or equal to it): the merge handles held seqs, the
+            // floor and the counters for this case.
+            self.merge_locked(&mut inner, vec![entry]);
+            return;
+        }
+        self.total_received.fetch_add(1, Ordering::Relaxed);
+        // The floor before the fast path's push: after a `clear` the ring is empty while the
+        // floor is not.
+        if entry.seq < self.lost_below.load(Ordering::Relaxed) {
+            return;
         }
 
+        self.reserve_ring(&mut inner);
         if inner.entries.len() >= self.max_capacity {
-            if let Some(evicted) = inner.entries.pop_front() {
-                inner.seq_pos.remove(&evicted.seq);
-                inner.popped += 1;
-                // The one place a record actually leaves. Recorded under the
-                // same write guard that removes it, so the boundary and the
-                // removal cannot be observed out of step.
-                self.lost_below
-                    .store(evicted.seq.saturating_add(1), Ordering::Relaxed);
-                if let Some(evicted_trace) = evicted.trace_id {
-                    if let Some(seqs) = inner.trace_index.get_mut(&evicted_trace) {
-                        seqs.retain(|&s| s != evicted.seq);
-                        if seqs.is_empty() {
-                            inner.trace_index.remove(&evicted_trace);
-                        }
-                    }
-                }
-            }
+            // The one place a record leaves in the normal path, under the same write guard
+            // that removes it, so the floor and the removal cannot be observed out of step.
+            self.evict_front(&mut inner);
         }
-
-        let pos = inner.popped + inner.entries.len() as u64;
+        if let Some(tid) = entry.trace_id {
+            // The newest seq, so the list stays ascending.
+            inner.trace_index.entry(tid).or_default().push(entry.seq);
+        }
         inner.entries.push_back(entry);
-        inner.seq_pos.insert(seq, pos);
-        if let Some(tid) = trace_id {
-            inner.trace_index.entry(tid).or_default().push(seq);
-        }
+        self.total_stored.fetch_add(1, Ordering::Relaxed);
     }
 
     fn recent(
@@ -284,10 +428,10 @@ impl LogStore for InMemoryStore {
     fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<LogEntry> {
         let inner = self.inner.read().unwrap();
 
-        // Find index of the entry with the given seq
-        let idx = match inner.entries.iter().position(|e| e.seq == seq) {
-            Some(i) => i,
-            None => return Vec::new(),
+        // The ring is in seq order, so this is the anchor's place by seq as well as by
+        // position, and the slice around it is its seq neighbourhood.
+        let Some(idx) = inner.position(seq) else {
+            return Vec::new();
         };
 
         let start = idx.saturating_sub(before);
@@ -315,14 +459,14 @@ impl LogStore for InMemoryStore {
     }
 
     fn contains_seq(&self, seq: u64) -> bool {
-        self.inner.read().unwrap().seq_pos.contains_key(&seq)
+        self.inner.read().unwrap().holds(seq)
     }
 
-    /// A trace's records in the order they were stored (append order — see `seq_pos`).
+    /// A trace's records in seq order.
     ///
-    /// Reads only the trace's own records, by position: O(records in the trace), not
+    /// Reads only the trace's own records, each found by binary search: O(k log n), not
     /// O(ring). It used to walk the whole ring under the read lock, which on a full
-    /// 500,000-record domain made every call cost the whole ring while ingestion waited for
+    /// 500,000-record buffer made every call cost the whole ring while ingestion waited for
     /// the write lock — and a client that polls this per trace (a test harness waiting for a
     /// marker record) issues many such calls a second.
     fn logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
@@ -331,12 +475,7 @@ impl LogStore for InMemoryStore {
             return Vec::new();
         };
         seqs.iter()
-            .filter_map(|seq| {
-                let pos = *inner.seq_pos.get(seq)?;
-                inner
-                    .entries
-                    .get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
-            })
+            .filter_map(|&seq| inner.entries.get(inner.position(seq)?))
             .cloned()
             .collect()
     }
@@ -355,10 +494,9 @@ impl LogStore for InMemoryStore {
         // afterwards must not read the emptied range as never-having-existed.
         if let Some(newest) = inner.entries.back().map(|e| e.seq) {
             self.lost_below
-                .store(newest.saturating_add(1), Ordering::Relaxed);
+                .fetch_max(newest.saturating_add(1), Ordering::Relaxed);
         }
         inner.entries.clear();
-        inner.seq_pos.clear();
         inner.trace_index.clear();
     }
 
@@ -413,7 +551,9 @@ mod full_walk_tests {
         let store = InMemoryStore::new(10_000);
         const N: usize = 2_000;
         for i in 0..N {
-            store.append(LogEntry::synthetic(Level::Info, &format!("m{i}")));
+            let mut e = LogEntry::synthetic(Level::Info, &format!("m{i}"));
+            e.seq = i as u64 + 1;
+            store.append(e);
         }
 
         let mut seen = 0usize;
@@ -441,7 +581,9 @@ mod full_walk_tests {
         let store = InMemoryStore::new(1_000);
         for i in 0..100 {
             let lvl = if i % 10 == 0 { Level::Error } else { Level::Info };
-            store.append(LogEntry::synthetic(lvl, "m"));
+            let mut e = LogEntry::synthetic(lvl, "m");
+            e.seq = i + 1;
+            store.append(e);
         }
         let f = parse_filter("l>=ERROR").expect("filter parses");
 
@@ -469,11 +611,15 @@ mod lazy_alloc_tests {
             "a freshly-created store reserves no buffer"
         );
 
-        store.append(LogEntry::synthetic(Level::Info, "first"));
+        let mut first = LogEntry::synthetic(Level::Info, "first");
+        first.seq = 1;
+        store.append(first);
         let cap = store.inner.read().unwrap().entries.capacity();
         assert!(cap >= 10_000, "first append reserves the full ring: {cap}");
 
-        store.append(LogEntry::synthetic(Level::Info, "second"));
+        let mut second = LogEntry::synthetic(Level::Info, "second");
+        second.seq = 2;
+        store.append(second);
         assert_eq!(
             store.inner.read().unwrap().entries.capacity(),
             cap,
@@ -690,15 +836,16 @@ mod concurrency_tests {
 }
 
 #[cfg(test)]
-mod trace_lookup_tests {
-    //! `logs_by_trace_id` reads a trace's records by position (`seq_pos`) instead of walking
-    //! the ring. The oracle for every test here is the DEFINITION, computed without the
-    //! index: the ring's records whose `trace_id` is the trace's, in ring order.
+mod seq_order_tests {
+    //! The ring holds records in seq order (`StoreInner::entries`). The oracle for the
+    //! differential below is a MODEL kept beside the store — the records that should be held,
+    //! the exact floor, the counters — never a scan of the ring itself, which a merge that
+    //! silently dropped records would still pass.
 
     use super::*;
     use crate::gelf::message::{Level, LogEntry, LogSource};
     use chrono::Utc;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn entry(seq: u64, trace_id: Option<u128>) -> LogEntry {
         LogEntry {
@@ -719,90 +866,121 @@ mod trace_lookup_tests {
         }
     }
 
-    fn seqs(entries: Vec<LogEntry>) -> Vec<u64> {
-        entries.into_iter().map(|e| e.seq).collect()
-    }
-
-    fn by_definition(store: &InMemoryStore, trace: u128) -> Vec<u64> {
-        let inner = store.inner.read().unwrap();
-        inner
+    fn ring(store: &InMemoryStore) -> Vec<u64> {
+        store
+            .inner
+            .read()
+            .unwrap()
             .entries
             .iter()
-            .filter(|e| e.trace_id == Some(trace))
             .map(|e| e.seq)
             .collect()
     }
 
-    /// The structure's own invariant: every held record is indexed at `popped + i`, and the
-    /// index holds nothing else.
-    fn assert_positions(store: &InMemoryStore) {
-        let inner = store.inner.read().unwrap();
-        assert_eq!(
-            inner.seq_pos.len(),
-            inner.entries.len(),
-            "one index entry per held record"
-        );
-        for (i, e) in inner.entries.iter().enumerate() {
-            assert_eq!(
-                inner.seq_pos.get(&e.seq),
-                Some(&(inner.popped + i as u64)),
-                "seq {}",
-                e.seq
-            );
-        }
+    fn seqs(entries: Vec<LogEntry>) -> Vec<u64> {
+        entries.into_iter().map(|e| e.seq).collect()
     }
 
-    /// The trigger path's shape: the triggering record is stored first and its older
-    /// pre-window record after it, so the ring is not in seq order.
+    /// The trigger's batch: unsorted (the trace read returns entries OLDER than the drained
+    /// window), with a repeat and a seq already held. It lands in seq order, and the records
+    /// above its lowest seq are the only ones moved.
     #[test]
-    fn a_record_stored_out_of_seq_order_is_found_in_stored_order() {
-        let store = InMemoryStore::new(10);
+    fn an_unsorted_batch_with_repeats_lands_in_seq_order() {
+        let store = InMemoryStore::new(16);
+        for s in [1, 2, 10] {
+            store.append(entry(s, None));
+        }
+        let moved = store.insert_sorted(vec![
+            entry(8, Some(7)),
+            entry(5, Some(7)),
+            entry(5, Some(7)),
+            entry(2, None),
+        ]);
+        assert_eq!(ring(&store), vec![1, 2, 5, 8, 10]);
+        assert_eq!(
+            moved, 1,
+            "only the record above the batch's lowest seq (10) moved"
+        );
+        assert_eq!(
+            seqs(store.logs_by_trace_id(7)),
+            vec![5, 8],
+            "the trace reads in seq order"
+        );
+        let stats = store.stats();
+        assert_eq!(
+            (stats.total_received, stats.total_stored),
+            (5, 5),
+            "the repeat and the held seq are not new receipts"
+        );
+    }
+
+    /// A merge past capacity drops the LOWEST records — the front first, then the lowest of
+    /// the merged run — and each raises the floor, before anything is pushed back.
+    #[test]
+    fn a_merge_past_capacity_drops_the_lowest_and_raises_the_floor() {
+        let store = InMemoryStore::new(4);
+        for s in [3, 4, 10] {
+            store.append(entry(s, Some(1)));
+        }
+        store.insert_sorted(vec![entry(6, Some(1)), entry(5, Some(1))]);
+        assert_eq!(ring(&store), vec![4, 5, 6, 10]);
+        assert_eq!(store.lost_below(), 4, "3 was evicted");
+        assert_eq!(
+            seqs(store.logs_by_trace_id(1)),
+            vec![4, 5, 6, 10],
+            "and unindexed"
+        );
+        assert!(
+            store.inner.read().unwrap().entries.capacity() < 8,
+            "the ring did not grow past its one reservation"
+        );
+
+        // A batch entirely below what the ring keeps after the merge.
+        store.insert_sorted(vec![entry(7, None), entry(8, None), entry(9, None)]);
+        assert_eq!(
+            ring(&store),
+            vec![7, 8, 9, 10],
+            "the lowest four of all seven are kept"
+        );
+        assert_eq!(store.lost_below(), 7);
+    }
+
+    /// After a clear the floor is the newest seq held then, plus one, and the ring is empty:
+    /// the floor is checked before the fast path, so an older record is refused — counted as
+    /// received, not stored — and a newer one is stored.
+    #[test]
+    fn after_a_clear_an_older_record_is_refused() {
+        let store = InMemoryStore::new(16);
+        for s in 5..=7 {
+            store.append(entry(s, None));
+        }
+        store.clear();
+        assert_eq!(store.lost_below(), 8);
+        store.append(entry(3, None));
+        assert_eq!(ring(&store), Vec::<u64>::new(), "below the floor: refused");
+        store.append(entry(9, None));
+        assert_eq!(ring(&store), vec![9]);
+        let stats = store.stats();
+        assert_eq!((stats.total_received, stats.total_stored), (5, 4));
+    }
+
+    /// The case that used to read `[10, 5]` (the order stored): seq order now.
+    #[test]
+    fn a_record_appended_out_of_seq_order_is_held_in_seq_order() {
+        let store = InMemoryStore::new(16);
         store.append(entry(10, Some(7)));
         store.append(entry(5, Some(7)));
         store.append(entry(11, Some(8)));
-        assert_eq!(seqs(store.logs_by_trace_id(7)), vec![10, 5]);
-        assert_eq!(seqs(store.logs_by_trace_id(8)), vec![11]);
-        assert!(store.contains_seq(5));
-        assert_positions(&store);
+        assert_eq!(ring(&store), vec![5, 10, 11]);
+        assert_eq!(seqs(store.logs_by_trace_id(7)), vec![5, 10]);
+        assert_eq!(seqs(store.context_by_seq(10, 1, 1)), vec![5, 10, 11]);
     }
 
+    /// The constructor owns the invariant too: an unsorted case is a bug, not a ring.
     #[test]
-    fn eviction_keeps_every_position_right() {
-        let store = InMemoryStore::new(3);
-        for s in 1..=5 {
-            store.append(entry(s, Some(1)));
-        }
-        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![3, 4, 5]);
-        assert!(!store.contains_seq(2) && store.contains_seq(3));
-        assert_positions(&store);
-    }
-
-    #[test]
-    fn a_clear_then_more_appends_keeps_every_position_right() {
-        let store = InMemoryStore::new(10);
-        store.append(entry(1, Some(1)));
-        store.append(entry(2, Some(1)));
-        store.clear();
-        assert!(store.logs_by_trace_id(1).is_empty());
-        store.append(entry(3, Some(1)));
-        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![3]);
-        assert!(!store.contains_seq(1) && store.contains_seq(3));
-        assert_positions(&store);
-    }
-
-    /// A case loads through `from_records`, not `append`: its positions must be right too.
-    #[test]
-    fn a_store_built_from_records_finds_its_traces_and_then_appends() {
-        let store = InMemoryStore::from_records(
-            10,
-            vec![entry(1, Some(1)), entry(2, Some(2)), entry(3, Some(1))],
-            1,
-        );
-        assert_positions(&store);
-        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![1, 3]);
-        store.append(entry(4, Some(1)));
-        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![1, 3, 4]);
-        assert_positions(&store);
+    #[should_panic(expected = "ascending, distinct seq order")]
+    fn from_records_refuses_records_out_of_seq_order() {
+        let _ = InMemoryStore::from_records(16, vec![entry(2, None), entry(1, None)], 0);
     }
 
     /// xorshift64: deterministic, no dependency.
@@ -816,17 +994,60 @@ mod trace_lookup_tests {
         }
     }
 
-    /// Differential: a seeded mix of in-order appends, LATE appends of a seq assigned earlier
-    /// and held back (the trigger path's shape), untraced records, evictions from a small ring
-    /// and the odd clear — checked against the definition and the position invariant after
-    /// every step.
+    /// The model: what should be held, the exact floor, the counters.
+    #[derive(Default)]
+    struct Model {
+        held: BTreeMap<u64, Option<u128>>,
+        floor: u64,
+        received: u64,
+        stored: u64,
+    }
+
+    impl Model {
+        fn offer(&mut self, batch: &[(u64, Option<u128>)], cap: usize) {
+            let mut fresh: BTreeMap<u64, Option<u128>> = BTreeMap::new();
+            for &(s, t) in batch {
+                if !self.held.contains_key(&s) {
+                    fresh.entry(s).or_insert(t);
+                }
+            }
+            self.received += fresh.len() as u64;
+            for (s, t) in fresh {
+                if s >= self.floor {
+                    self.held.insert(s, t);
+                    self.stored += 1;
+                }
+            }
+            while self.held.len() > cap {
+                let (s, _) = self.held.pop_first().unwrap();
+                self.floor = self.floor.max(s + 1);
+            }
+        }
+
+        fn clear(&mut self) {
+            if let Some((&newest, _)) = self.held.last_key_value() {
+                self.floor = self.floor.max(newest + 1);
+            }
+            self.held.clear();
+        }
+    }
+
+    /// Differential: a seeded mix of in-order appends, single late appends, unsorted batches
+    /// with repeats and held seqs (the trigger shape), below-floor arrivals, merges that
+    /// overflow a small ring, and clears — checked against the model after every step.
+    ///
+    /// In-order appends skip seqs, as a real ring does (records a filter kept out), because
+    /// those gaps are what a trigger's flush fills; with no gaps every late record is either
+    /// held already or below the floor, and almost no merge moves anything.
     #[test]
-    fn the_lookup_matches_the_definition_under_late_appends_evictions_and_clears() {
-        let store = InMemoryStore::new(16);
+    fn the_ring_matches_the_model_under_every_writer() {
+        const CAP: usize = 16;
+        let store = InMemoryStore::new(CAP);
+        let mut model = Model::default();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let mut next_seq = 1_000u64;
-        let mut held_back: Vec<u64> = Vec::new();
-        let (mut late, mut clears, mut nonempty) = (0, 0, 0);
+        let (mut late, mut batches, mut moved_any, mut refused, mut clears, mut nonempty) =
+            (0, 0, 0, 0, 0, 0);
         for _ in 0..5_000 {
             let r = rng.next();
             let trace = match r % 4 {
@@ -834,43 +1055,105 @@ mod trace_lookup_tests {
                 k => Some(k as u128),
             };
             match (r >> 8) % 10 {
-                0 if !held_back.is_empty() => {
-                    let i = (r >> 16) as usize % held_back.len();
-                    store.append(entry(held_back.swap_remove(i), trace));
+                // A batch reaching back up to 40 seqs: older than the newest held, some held
+                // already, some repeated, some (after evictions) below the floor.
+                0..=2 => {
+                    let n = 1 + (r >> 16) % 6;
+                    let batch: Vec<(u64, Option<u128>)> = (0..n)
+                        .map(|i| {
+                            let back = (rng.next() % 40) + 1;
+                            let t = if i % 2 == 0 { trace } else { None };
+                            (next_seq.saturating_sub(back), t)
+                        })
+                        .collect();
+                    let floor_before = model.floor;
+                    refused += batch.iter().filter(|(s, _)| *s < floor_before).count();
+                    model.offer(&batch, CAP);
+                    let moved =
+                        store.insert_sorted(batch.iter().map(|&(s, t)| entry(s, t)).collect());
+                    if moved > 0 {
+                        moved_any += 1;
+                    }
+                    batches += 1;
+                }
+                // A single record older than the newest: `append`'s merge path.
+                3 => {
+                    let s = next_seq.saturating_sub((r >> 16) % 30 + 1);
+                    model.offer(&[(s, trace)], CAP);
+                    store.append(entry(s, trace));
                     late += 1;
                 }
-                1 => {
-                    held_back.push(next_seq);
-                    next_seq += 1;
-                }
-                2 if (r >> 16).is_multiple_of(40) => {
+                4 if (r >> 16).is_multiple_of(25) => {
+                    model.clear();
                     store.clear();
                     clears += 1;
                 }
                 _ => {
+                    model.offer(&[(next_seq, trace)], CAP);
                     store.append(entry(next_seq, trace));
-                    next_seq += 1;
+                    next_seq += 1 + (r >> 20) % 3;
                 }
             }
+
+            let expect: Vec<u64> = model.held.keys().copied().collect();
+            assert_eq!(
+                ring(&store),
+                expect,
+                "the ring holds exactly the model's records, ascending"
+            );
+            assert_eq!(store.lost_below(), model.floor, "the floor is exact");
+            let stats = store.stats();
+            assert_eq!(
+                (stats.total_received, stats.total_stored),
+                (model.received, model.stored),
+                "the counters"
+            );
             for t in 1..=3u128 {
+                let by_model: Vec<u64> = model
+                    .held
+                    .iter()
+                    .filter(|(_, &tt)| tt == Some(t))
+                    .map(|(&s, _)| s)
+                    .collect();
                 let got = seqs(store.logs_by_trace_id(t));
-                assert_eq!(got, by_definition(&store, t), "trace {t}");
+                assert_eq!(got, by_model, "trace {t}");
+                assert_eq!(
+                    store.count_by_trace_id(t),
+                    by_model.len(),
+                    "trace {t} count"
+                );
                 if !got.is_empty() {
                     nonempty += 1;
                 }
             }
-            assert_positions(&store);
+            let probe = next_seq.saturating_sub(rng.next() % 50);
+            assert_eq!(
+                store.contains_seq(probe),
+                model.held.contains_key(&probe),
+                "contains {probe}"
+            );
+            if let Some(&anchor) = expect.get(expect.len() / 2) {
+                let i = expect.len() / 2;
+                let want = &expect[i.saturating_sub(2)..(i + 3).min(expect.len())];
+                assert_eq!(
+                    seqs(store.context_by_seq(anchor, 2, 2)),
+                    want,
+                    "context around {anchor}"
+                );
+            }
         }
-        // Vacuity guards: the run must have exercised what it claims to.
-        assert!(late > 100, "late appends exercised: {late}");
-        assert!(clears > 2, "clears exercised: {clears}");
+        // Vacuity guards: the run exercised what it claims to.
+        assert!(late > 100, "late appends: {late}");
+        assert!(batches > 500, "batches: {batches}");
         assert!(
-            store.inner.read().unwrap().popped > 1_000,
-            "evictions exercised"
+            moved_any > 100,
+            "merges that moved held records: {moved_any}"
         );
+        assert!(refused > 50, "below-floor offers: {refused}");
+        assert!(clears > 2, "clears: {clears}");
         assert!(
             nonempty > 1_000,
-            "lookups that returned records: {nonempty}"
+            "trace lookups that returned records: {nonempty}"
         );
     }
 }

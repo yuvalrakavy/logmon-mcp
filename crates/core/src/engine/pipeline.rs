@@ -214,6 +214,12 @@ impl LogPipeline {
         self.store.append(entry);
     }
 
+    /// Store records that may be older than records already held, keeping the ring in seq
+    /// order. Returns how many held records moved. See `InMemoryStore::insert_sorted`.
+    pub fn insert_sorted(&self, batch: Vec<LogEntry>) -> usize {
+        self.store.insert_sorted(batch)
+    }
+
     pub fn contains_seq(&self, seq: u64) -> bool {
         self.store.contains_seq(seq)
     }

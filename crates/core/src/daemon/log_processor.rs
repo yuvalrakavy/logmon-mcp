@@ -90,25 +90,22 @@ pub fn process_entry_for_domain(
                 pipeline.append_to_store(trigger_entry);
             }
 
-            // Copy pre_window entries from pre-buffer into store
-            let pre_entries = pipeline.pre_buffer_copy(trigger_max_pre as usize);
-            for mut pre_entry in pre_entries {
-                if !pipeline.contains_seq(pre_entry.seq) {
-                    pre_entry.source = LogSource::PreTrigger;
-                    pipeline.append_to_store(pre_entry);
-                }
-            }
-
-            // Additionally, copy logs from the same trace_id
+            // The pre-window, then the trace's other entries still in the pre-buffer — in that
+            // order, since the copy drains what the trace read would otherwise return twice —
+            // stored as ONE batch. Both are OLDER than the record just stored, and the batch is
+            // not sorted (the trace read returns entries older than the drained window), so the
+            // store merges it into the ring in seq order (`InMemoryStore::insert_sorted`), and
+            // skips anything already held — a record a filter stored earlier keeps its own
+            // `source`. One merge per firing session, before that session's `context_before`
+            // below reads the ring.
+            let mut flushed = pipeline.pre_buffer_copy(trigger_max_pre as usize);
             if let Some(tid) = entry.trace_id {
-                let trace_entries = pipeline.pre_buffer_entries_by_trace_id(tid);
-                for mut trace_entry in trace_entries {
-                    if !pipeline.contains_seq(trace_entry.seq) {
-                        trace_entry.source = LogSource::PreTrigger;
-                        pipeline.append_to_store(trace_entry);
-                    }
-                }
+                flushed.extend(pipeline.pre_buffer_entries_by_trace_id(tid));
             }
+            for e in &mut flushed {
+                e.source = LogSource::PreTrigger;
+            }
+            pipeline.insert_sorted(flushed);
 
             // Activate post-window for this session. EXTEND rather than set:
             // a match can now land inside an already-open window, and a small

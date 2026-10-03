@@ -2223,10 +2223,10 @@ impl RpcHandler {
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
 
-        // logs_by_trace_id returns logs in STORED order, which is append order and
-        // usually seq-ascending — but not always: a trigger appends its pre-window's
-        // older records after the triggering one (`daemon/log_processor.rs`), so a
-        // cursor that has already passed a seq does not see a lower one stored later.
+        // logs_by_trace_id returns logs in seq order (the ring is seq-ordered). A cursor
+        // commits the highest seq it returned, so it still never sees a lower seq that is
+        // STORED LATER — a trigger's pre-window, flushed after the read: late arrival, a
+        // semantic question this order does not change.
         let mut logs = d.pipeline.logs_by_trace_id(trace_id);
         if let Some(f) = resolved.as_ref() {
             logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
@@ -2346,36 +2346,28 @@ impl RpcHandler {
         // 1007–1009, zero spans captured, and those spans were stored 95 seconds
         // BEFORE the capture ran. Counting both stores makes that sentence true
         // as well as filling the file.
-        // `resolve_case_anchor` already proved the anchor is stored, so a missing
-        // one means it was evicted between the two reads.
-        if !d.pipeline.contains_seq(anchor.seq) {
+        let log_ctx = d
+            .pipeline
+            .context_by_seq(anchor.seq, before.value, after.value);
+        if log_ctx.is_empty() {
+            // `resolve_case_anchor` already proved the anchor is stored, so an
+            // empty neighbourhood means it was evicted between the two reads.
             return Err(format!(
                 "the anchor entry at seq {} was evicted while the capture was being taken",
                 anchor.seq
             ));
         }
 
-        // Candidate seqs either side of the anchor, from both stores, BY SEQ —
-        // the archive's only ordering. Not a positional slice of the log ring:
-        // the ring is in the order records were STORED, and a trigger stores its
-        // own record before its pre-window's older ones, so the records nearest
-        // the anchor in seq can sit far from it in the ring. A positional slice
-        // then let farther records take the window's slots, and wrote the log
-        // file out of seq order, which `cases.load` refuses.
+        // Candidate seqs either side of the anchor, from both stores. The log
+        // side needs no more than its own `before`/`after`: adding spans can
+        // only make the merged window NARROWER in seq terms, never wider, so the
+        // logs already reach at least as far as the answer does.
         //
-        // Both scans are unfiltered because the range they would be filtered by
-        // is the thing being computed. They are bounded by the rings, and a
-        // capture is a deliberate one-shot action rather than a query on a hot
-        // path.
-        let mut below: Vec<u64> = Vec::new();
-        let mut above: Vec<u64> = Vec::new();
-        d.pipeline.for_each_log(None, |e| {
-            if e.seq < anchor.seq {
-                below.push(e.seq);
-            } else if e.seq > anchor.seq {
-                above.push(e.seq);
-            }
-        });
+        // The span scan is unfiltered because the range it would be filtered by
+        // is the thing being computed. It is bounded by the ring, and a capture
+        // is a deliberate one-shot action rather than a query on a hot path.
+        let mut below: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s < anchor.seq).collect();
+        let mut above: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s > anchor.seq).collect();
         d.span_store.for_each_matching(None, |s| {
             if s.seq < anchor.seq {
                 below.push(s.seq);
@@ -2394,19 +2386,20 @@ impl RpcHandler {
         let from = below.last().copied().unwrap_or(anchor.seq);
         let to = above.last().copied().unwrap_or(anchor.seq);
 
-        // The logs the window contains, in seq order — the order a case is read
-        // back in (`cases::load` refuses anything else).
-        let log_filter = lower_seq_range(None, Some(from), Some(to));
-        let mut logs = Vec::new();
-        d.pipeline
-            .for_each_log(log_filter.as_ref(), |e| logs.push(e.clone()));
-        logs.sort_by_key(|e: &LogEntry| e.seq);
+        // The logs the window actually contains — a subset of `log_ctx` by
+        // construction, since any log within `[from, to]` is among the
+        // `before`/`after` nearest the anchor.
+        let logs: Vec<_> = log_ctx
+            .into_iter()
+            .filter(|e| e.seq >= from && e.seq <= to)
+            .collect();
 
         // How much of what was ASKED for came back.
         //
-        // The window holds every stored record in `[from, to]`, so it is never
-        // internally cut — but it can be narrower at either end than the caller
-        // requested, and the two reasons for that
+        // The ring is in seq order, so `context_by_seq`'s slice is the anchor's
+        // seq neighbourhood and every log the window holds is in it. The window
+        // can be narrower at either end than the caller requested, and the two
+        // reasons for that
         // are not the same fact. The ring having dropped records is a LOSS; the
         // domain simply not having that much history yet is not. Only
         // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
@@ -2418,16 +2411,20 @@ impl RpcHandler {
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //
-        // **No count travels with this.** `lost_below - from` is zero by
-        // construction — `from` is the first surviving seq and so is
-        // `lost_below`, which is exactly why measuring from the window's own
-        // lower end could never fire — and `short_before` is bounded by
-        // `before`, not by what the ring dropped. Passing the shortfall off as
-        // records-lost made a ring of 30 that had ever received 32 records
-        // report 71 of them gone. The document gets both numbers and multiplies
-        // neither into the other.
+        // **No count travels with the shortfall.** `short_before` is bounded by
+        // `before`, not by what the ring dropped; passing it off as records-lost
+        // made a ring of 30 that had ever received 32 records report 71 of them
+        // gone. The document gets both numbers and multiplies neither into the
+        // other.
+        //
+        // And logs can be gone from INSIDE the window: `from` is the lowest of
+        // the nearest records from BOTH stores, so it can be a span below the log
+        // floor. Then spans filled `before`, `short_before` is 0, and only the
+        // floor sitting above `from` says the logs there are gone.
         let log_lost_below = d.pipeline.lost_below();
-        let log_evicted = short_before > 0 && log_lost_below > 0;
+        let logs_evicted_before_window = crate::filter::parser::evicted_below(from, log_lost_below);
+        let log_evicted =
+            (short_before > 0 && log_lost_below > 0) || logs_evicted_before_window.is_some();
 
         let coverage = d.pipeline.epochs().coverage(from, to);
         let verdict = crate::engine::epoch::evidence_verdict(
@@ -2448,10 +2445,8 @@ impl RpcHandler {
         d.span_store.for_each_matching(span_filter.as_ref(), |s| {
             spans.push(s.clone());
         });
-        // Seq order for the same reason as the logs: nothing makes the span ring
-        // seq-ordered (`SpanStore::insert` takes its seq before its write lock).
-        spans.sort_by_key(|s| s.seq);
-        let span_evicted = crate::filter::parser::evicted_below(from, d.span_store.lost_below());
+        let span_lost_below = d.span_store.lost_below();
+        let span_evicted = crate::filter::parser::evicted_below(from, span_lost_below);
 
         let domain_name = d.config.name.to_string();
         let collectors = self.case_collector_lines(&d.config.name);
@@ -2543,7 +2538,9 @@ impl RpcHandler {
                 short_before,
                 short_after,
                 log_lost_below,
+                logs_evicted_before_window,
                 spans_evicted_before_window: span_evicted,
+                span_lost_below,
             },
             // `None` when omitted, so the front-matter key is ABSENT rather than
             // present-with-zero. That is the only thing telling a reader "nobody

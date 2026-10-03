@@ -346,9 +346,165 @@ fn a_trace_id_matching_many_anchors_on_the_earliest_and_says_so() {
     assert!(doc.contains("anchor: {kind: trace_id"), "{doc}");
 }
 
-/// The earliest by SEQ, not the first STORED: a trigger stores the record that
-/// fired it before its pre-window's older records, so a trace whose early
-/// records only reached the store through a trigger is stored newest-first.
+fn seqs_of(v: &Value) -> Vec<u64> {
+    v["logs"]
+        .as_array()
+        .expect("a logs array")
+        .iter()
+        .filter_map(|l| l["seq"].as_u64())
+        .collect()
+}
+
+/// End to end through a real trigger: an "errors only" filter keeps INFO out, so the
+/// trigger stores its own ERROR record and THEN the older INFO records of its pre-window.
+/// Every reader sees them in seq order. Each check names what the stored order gave.
+#[test]
+fn readers_see_a_triggers_stored_stretch_in_seq_order() {
+    let h = harness();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+    h.sessions
+        .add_filter(&noisy, "l>=ERROR", Some("errors only"))
+        .unwrap();
+    h.call(
+        "triggers.add",
+        json!({ "filter": "l>=ERROR", "pre_window": 5, "post_window": 0 }),
+    )
+    .unwrap();
+    h.call("bookmarks.add", json!({ "name": "mark" })).unwrap();
+
+    let a = h.feed(Level::Info, "first before the error");
+    let b = h.feed(Level::Info, "second before the error");
+    let boom = h.feed(Level::Error, "boom");
+
+    // Newest first: the trigger's own record (stored order made `b` the newest).
+    let newest = h.call("logs.recent", json!({ "count": 1 })).unwrap();
+    assert_eq!(seqs_of(&newest), vec![boom], "{newest}");
+
+    // Context around the trigger's record includes its pre-window (stored order put the
+    // trigger's record FIRST, with nothing before it).
+    let ctx = h
+        .call(
+            "logs.context",
+            json!({ "seq": boom, "before": 5, "after": 0 }),
+        )
+        .unwrap();
+    assert_eq!(seqs_of(&ctx), vec![a, b, boom], "{ctx}");
+
+    // A count-limited cursor read returns every held record, in seq order (stored order
+    // returned [boom, a], committed `boom`, and never returned `b`).
+    let first = h
+        .call("logs.recent", json!({ "filter": "c>=cur", "count": 2 }))
+        .unwrap();
+    let second = h
+        .call("logs.recent", json!({ "filter": "c>=cur", "count": 2 }))
+        .unwrap();
+    assert_eq!(
+        [seqs_of(&first), seqs_of(&second)].concat(),
+        vec![a, b, boom],
+        "{first} then {second}"
+    );
+
+    // A bookmark anchor takes the lowest seq after the mark (stored order took `boom`).
+    let r = h
+        .capture(json!({ "anchor": { "bookmark": "mark" } }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(doc.contains(&format!("seq: {a}")), "{doc}");
+}
+
+/// A trigger also flushes its trace's records from the pre-buffer when they are older than
+/// its pre-window — the second half of its batch, which arrives BELOW the first half, so the
+/// store must sort it — and every record a trigger stores is marked `pre_trigger`.
+///
+/// The default triggers are removed first: their 500-record pre-window flushes the whole
+/// buffer on any ERROR, which makes the trace read redundant and hides it.
+#[test]
+fn a_trigger_flushes_its_traces_older_records_beyond_its_pre_window() {
+    let h = harness();
+    let listed = h.call("triggers.list", json!({})).unwrap();
+    for t in listed["triggers"].as_array().expect("a triggers array") {
+        h.call("triggers.remove", json!({ "id": t["id"] })).unwrap();
+    }
+    h.sessions
+        .add_filter(&h.session, "l>=ERROR", Some("errors only"))
+        .unwrap();
+    // The pre-buffer is sized to the largest pre-window in the domain: a trigger that
+    // never fires keeps it at 10, so the trace's early record is still buffered when the
+    // failure arrives.
+    h.call(
+        "triggers.add",
+        json!({ "filter": "m=never-fires", "pre_window": 10, "post_window": 0 }),
+    )
+    .unwrap();
+    // The pre-buffer already holds the triggering record, so a pre-window of 2 is that
+    // record and the one before it.
+    h.call(
+        "triggers.add",
+        json!({ "filter": "l>=ERROR", "pre_window": 2, "post_window": 0 }),
+    )
+    .unwrap();
+
+    let early = h.feed_traced(Level::Info, "early in the trace", Some(0x51));
+    let other = h.feed(Level::Info, "another request");
+    let last = h.feed(Level::Info, "just before the failure");
+    let fired = h.feed_traced(Level::Error, "the trace failed", Some(0x51));
+
+    let ctx = h
+        .call(
+            "logs.context",
+            json!({ "seq": fired, "before": 10, "after": 0 }),
+        )
+        .unwrap();
+    assert_eq!(
+        seqs_of(&ctx),
+        vec![early, last, fired],
+        "the pre-window brought {last}, the trace brought {early}, and {other} is in \
+         neither: {ctx}"
+    );
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": fired }, "before": 10, "after": 0 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("filter: 0, pre_trigger: 3, post_trigger: 0}"),
+        "every record the trigger stored is pre_trigger: {doc}"
+    );
+}
+
+/// A window reaching below the LOG ring's floor through a span reports the logs gone
+/// from inside it — `short_before` is 0 there (the span filled `before`), so before this
+/// the document said nothing was evicted.
+#[test]
+fn a_window_spanning_below_the_log_floor_reports_the_logs_gone() {
+    let h = harness_with_log_capacity(3);
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    d.span_store.insert(a_span());
+    for i in 1..=5 {
+        h.feed(Level::Info, &format!("log {i}"));
+    }
+    let anchor = h.feed(Level::Info, "anchor");
+
+    // The span is seq 1, the ring of 3 holds logs 5-7 (2-4 evicted). `before: 3` is
+    // filled by logs 5, 6 and the span — so `short_before` is 0, and only the log floor
+    // (5) sitting above `from` (1) says logs 2-4 are gone.
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 3, "after": 0 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("seq_range: {from: 1, to: 7, requested_before_missing: 0,"),
+        "vacuity: the span is the window's lower end and nothing is short: {doc}"
+    );
+    assert_eq!(r["verdict"], "evicted", "{r}");
+    assert!(doc.contains("log records over seqs"), "{doc}");
+    assert!(doc.contains("are **gone**"), "{doc}");
+}
+
+/// The earliest by SEQ, though a trigger stores the record that fired it before
+/// its pre-window's older records: a trace whose early records only reached the
+/// store through a trigger still anchors on its earliest, because the store
+/// keeps them in seq order (and the anchor takes the lowest seq besides).
 #[test]
 fn a_trace_id_anchor_takes_the_earliest_seq_when_a_trigger_stored_it_out_of_order() {
     let h = harness();
@@ -368,16 +524,23 @@ fn a_trace_id_anchor_takes_the_earliest_seq_when_a_trigger_stored_it_out_of_orde
     h.feed_traced(Level::Info, "middle of the trace", Some(0x7f3b));
     let fired = h.feed_traced(Level::Error, "the trace failed", Some(0x7f3b));
 
-    // Vacuity guard: the store holds the trace newest-first, or this test
-    // cannot tell "earliest by seq" from "first stored".
+    // Vacuity guard: the trace's INFO records are held at all. The "errors only"
+    // filter keeps INFO out, so only the trigger's flush can have stored them —
+    // AFTER its own record. The store keeps them in seq order regardless (the
+    // seq-ordered ring), which is why the anchor below is the earliest.
     let stored = h
         .call("traces.logs", json!({ "trace_id": "7f3b" }))
         .unwrap();
-    let first_stored = stored["logs"][0]["seq"].as_u64();
+    let held: Vec<u64> = stored["logs"]
+        .as_array()
+        .expect("a logs array")
+        .iter()
+        .filter_map(|l| l["seq"].as_u64())
+        .collect();
     assert_eq!(
-        first_stored,
-        Some(fired),
-        "the trigger stored its record first: {stored}"
+        held,
+        vec![early, early + 1, fired],
+        "the flush stored the INFO records, in seq order: {stored}"
     );
 
     let r = h
@@ -874,7 +1037,10 @@ fn a_young_domain_is_not_reported_as_having_lost_anything() {
         !doc.contains("are gone"),
         "nothing was ever dropped, so nothing may be reported gone:\n{doc}"
     );
-    assert!(doc.contains("dropped nothing below seq"), "{doc}");
+    assert!(
+        doc.contains("the span ring has never dropped a span"),
+        "{doc}"
+    );
 }
 
 /// Bookmarks are session-scoped, and `b>=name` resolves them that way. A bare
@@ -1287,6 +1453,44 @@ fn a_span_ring_that_dropped_spans_says_so_in_the_document() {
             .iter()
             .any(|n| n["detail"].as_str().unwrap().contains("span ring")),
         "{r}"
+    );
+}
+
+/// A span ring that dropped spans only BELOW the window says so, and the shortfall below
+/// the window is not passed off as an empty past: the log ring has dropped nothing, but the
+/// spans under the span floor were real.
+#[test]
+fn a_span_floor_below_the_window_is_not_an_empty_past() {
+    let h = harness();
+    h.domains.insert(make_domain_spans("default", 2));
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for _ in 0..5 {
+        d.span_store.insert(a_span());
+    }
+    for i in 1..=3 {
+        h.feed(Level::Info, &format!("log {i}"));
+    }
+    let anchor = h.feed(Level::Info, "anchor");
+
+    // Spans 1-5 into a ring of 2 leave 4 and 5 held and the span floor at 4; the logs are
+    // 6-9. `before: 50` reaches down to span 4 and comes back 45 short, and the log ring
+    // has dropped nothing.
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 50, "after": 0 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("seq_range: {from: 4, to: 9, requested_before_missing: 45,"),
+        "vacuity: the window starts at the lowest held span and is short below: {doc}"
+    );
+    assert!(
+        doc.contains("the span ring has dropped everything under seq 4"),
+        "{doc}"
+    );
+    assert!(!doc.contains("neither ring has dropped anything"), "{doc}");
+    assert!(
+        doc.contains("the span ring has dropped only spans below seq 4, outside this window"),
+        "{doc}"
     );
 }
 

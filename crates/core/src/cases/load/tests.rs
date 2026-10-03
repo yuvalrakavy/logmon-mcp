@@ -161,8 +161,8 @@ fn out_of_window_and_duplicate_seqs_are_refused() {
     let p = md.parent().unwrap().join(&logdata);
     let text = std::fs::read_to_string(&p).unwrap();
 
-    // A duplicate: the deque keeps both and `seq_pos` keeps one, after which
-    // `len()` and `contains_seq` disagree and every windowed read is wrong.
+    // A duplicate: the store's `from_records` asserts ascending, distinct seqs, so
+    // the loader must refuse this with a reason rather than let the daemon panic.
     let dup = text.replace("\"seq\":1002", "\"seq\":1001");
     std::fs::write(&p, &dup).unwrap();
     assert!(
