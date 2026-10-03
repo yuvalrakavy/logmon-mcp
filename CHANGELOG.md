@@ -201,6 +201,14 @@ at once, and a log stored between them could be missing from the file of a windo
 `complete`, or be in the file while the document said the window was short of it. The span
 eviction line also no longer counts spans gone ABOVE the window as gone from it.
 
+### Fixed — `edit_filter` and `edit_trigger` accepted a bookmark or cursor
+
+`add_filter` and `add_trigger` refuse a bookmark or cursor qualifier (`b>=`, `b<=`, `c>=`):
+only query tools resolve one, and in a registered filter it never matches. The edits did not
+check. Editing a session's filter to `b>=mark` silently stopped the domain storing what that
+filter had matched, and a trigger edited to one never fired. Both edits now refuse it with
+the same error as the adds.
+
 ### Fixed — a span trigger's notification said seq 0
 
 The span processor stored a copy of each span and passed on the receiver's own, which still

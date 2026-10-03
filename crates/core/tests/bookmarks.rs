@@ -92,6 +92,59 @@ fn call(
     }
 }
 
+/// The registration guard holds on EDIT as on add. A bookmark or cursor qualifier in a
+/// registered filter never matches, so editing a session's filter to `b>=mark` silently
+/// stopped the domain storing what that filter had matched — and a trigger edited to one
+/// never fired.
+#[test]
+fn editing_a_filter_or_trigger_to_a_bookmark_is_refused() {
+    let (handler, pipeline, sessions) = build_handler();
+    let sid = sessions.create_named("A").expect("create session A");
+    call(&handler, &sid, "bookmarks.add", json!({ "name": "mark" })).unwrap();
+
+    let f = call(
+        &handler,
+        &sid,
+        "filters.add",
+        json!({ "filter": "l>=INFO" }),
+    )
+    .unwrap();
+    let err = call(
+        &handler,
+        &sid,
+        "filters.edit",
+        json!({ "id": f["id"], "filter": "b>=mark" }),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("not allowed in registered filters"),
+        "got: {err}"
+    );
+    // The filter is unchanged, so it still stores what it matched.
+    let mut e = make_entry(Level::Info, "still stored");
+    process_entry(&mut e, &pipeline, &sessions);
+    assert!(pipeline.contains_seq(e.seq));
+
+    let t = call(
+        &handler,
+        &sid,
+        "triggers.add",
+        json!({ "filter": "l>=ERROR" }),
+    )
+    .unwrap();
+    let err = call(
+        &handler,
+        &sid,
+        "triggers.edit",
+        json!({ "id": t["id"], "filter": "c>=cur" }),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("not allowed in registered filters"),
+        "got: {err}"
+    );
+}
+
 #[test]
 fn bookmarks_end_to_end() {
     let (handler, pipeline, sessions) = build_handler();

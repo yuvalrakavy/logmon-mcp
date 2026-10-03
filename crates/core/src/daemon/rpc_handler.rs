@@ -1828,14 +1828,7 @@ impl RpcHandler {
         self.require_live(session_id, "add_filter")?;
         let d = self.resolve_domain(session_id)?;
         let filter = req_str(params, "filter")?;
-        // Reject bookmark filters in registered (long-lived) filters.
-        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
-        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
-            return Err(
-                "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
-                    .to_string(),
-            );
-        }
+        refuse_bookmark_qualifier(filter)?;
         let desc = opt_str(params, "description")?;
         let id = self
             .sessions
@@ -1849,6 +1842,9 @@ impl RpcHandler {
         self.require_live(session_id, "edit_filter")?;
         let filter_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
+        if let Some(f) = filter {
+            refuse_bookmark_qualifier(f)?;
+        }
         let desc = opt_str(params, "description")?;
         let info = self
             .sessions
@@ -1905,14 +1901,7 @@ impl RpcHandler {
         self.require_live(session_id, "add_trigger")?;
         let d = self.resolve_domain(session_id)?;
         let filter = req_str(params, "filter")?;
-        // Reject bookmark filters in registered (long-lived) triggers.
-        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
-        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
-            return Err(
-                "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
-                    .to_string(),
-            );
-        }
+        refuse_bookmark_qualifier(filter)?;
         // Omitted windows default to 500/200/5 (§6, decision #4) so an ad-hoc
         // trigger captures context by default. An EXPLICIT value — including 0 —
         // is honored (only an absent or null value defaults).
@@ -1941,6 +1930,9 @@ impl RpcHandler {
         let d = self.resolve_domain(session_id)?;
         let trigger_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
+        if let Some(f) = filter {
+            refuse_bookmark_qualifier(f)?;
+        }
         let pre = opt_u32(params, "pre_window")?;
         let post = opt_u32(params, "post_window")?;
         let ctx = opt_u32(params, "notify_context")?;
@@ -4308,6 +4300,22 @@ fn missing(key: &str) -> String {
 
 fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
     opt_of(params, key, "a string", Value::as_str)
+}
+
+/// Refuse a bookmark or cursor qualifier in a REGISTERED filter or trigger. Only query tools
+/// resolve them; a registered one never matches, so a session filter of `b>=mark` silently
+/// stops the domain storing what it matched, and a trigger of one never fires. Every handler
+/// that sets a registered filter calls this — `add` and `edit` alike: the edits once skipped
+/// it.
+fn refuse_bookmark_qualifier(filter: &str) -> Result<(), String> {
+    let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
+    if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
+        return Err(
+            "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
