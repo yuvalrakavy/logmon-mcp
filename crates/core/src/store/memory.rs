@@ -1064,6 +1064,55 @@ mod seq_order_tests {
         assert_eq!(seqs(records), vec![4, 6, 8, 10]);
     }
 
+    /// A loaded case's records are reachable by trace: `from_records` builds the trace index
+    /// the readers use, not just the ring.
+    #[test]
+    fn a_loaded_store_reads_by_trace() {
+        let store = InMemoryStore::from_records(
+            16,
+            vec![entry(1, Some(7)), entry(2, None), entry(3, Some(7))],
+            1,
+        );
+        assert_eq!(seqs(store.logs_by_trace_id(7)), vec![1, 3]);
+        assert_eq!(store.count_by_trace_id(7), 2);
+    }
+
+    /// A trace whose last record is evicted leaves no entry behind in the index: one leaked
+    /// key per trace ever evicted would grow without bound.
+    #[test]
+    fn evicting_a_traces_last_record_removes_the_trace() {
+        let store = InMemoryStore::new(2);
+        store.append(entry(1, Some(7)));
+        store.append(entry(2, Some(8)));
+        store.append(entry(3, Some(8)));
+        assert_eq!(store.count_by_trace_id(7), 0);
+        let inner = store.inner.read().unwrap();
+        assert!(
+            !inner.trace_index.contains_key(&7),
+            "no empty list for trace 7"
+        );
+        assert_eq!(inner.trace_index.len(), 1);
+    }
+
+    /// The full walk is oldest first — by seq, including records merged in out of order.
+    #[test]
+    fn the_full_walk_is_in_seq_order() {
+        let store = InMemoryStore::new(16);
+        for s in [1, 5, 3] {
+            store.append(entry(s, None));
+        }
+        let mut seen = Vec::new();
+        store.for_each_matching(None, |e| seen.push(e.seq));
+        assert_eq!(seen, vec![1, 3, 5]);
+    }
+
+    /// A repeated seq is a bug, not a ring, whichever order it arrives in.
+    #[test]
+    #[should_panic(expected = "ascending, distinct seq order")]
+    fn from_records_refuses_a_repeated_seq() {
+        let _ = InMemoryStore::from_records(16, vec![entry(1, None), entry(1, None)], 0);
+    }
+
     /// The case that used to read `[10, 5]` (the order stored): seq order now.
     #[test]
     fn a_record_appended_out_of_seq_order_is_held_in_seq_order() {

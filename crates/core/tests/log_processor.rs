@@ -369,6 +369,67 @@ fn a_notification_carries_notify_context_records_before_the_match() {
     );
 }
 
+/// With a filter keeping the records before the match out of the buffer, the notification's
+/// context still holds them: the trigger's flush stores them BEFORE the context is read.
+#[test]
+fn a_notifications_context_includes_records_its_own_flush_stored() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_named("watcher").unwrap();
+    for t in sessions.list_triggers(&sid) {
+        sessions.remove_trigger(&sid, t.id).unwrap();
+    }
+    sessions.add_filter(&sid, "l>=ERROR", None).unwrap();
+    sessions
+        .add_trigger(&sid, "l>=ERROR", 10, 0, 2, None, false)
+        .unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
+    sessions.disconnect(&sid);
+
+    let mut before = Vec::new();
+    for i in 0..3 {
+        let mut e = make_entry(Level::Info, &format!("kept out {i}"));
+        process_entry(&mut e, &pipeline, &sessions);
+        before.push(e.seq);
+    }
+    assert_eq!(pipeline.store_len(), 0, "vacuity: the filter kept them out");
+    let mut boom = make_entry(Level::Error, "boom");
+    process_entry(&mut boom, &pipeline, &sessions);
+
+    let queued = sessions.drain_notifications(&sid);
+    let ctx: Vec<u64> = queued[0].context_before.iter().map(|e| e.seq).collect();
+    assert_eq!(ctx, before[1..].to_vec());
+}
+
+/// A trigger stores the record that fired it, as a trigger's record, even with no pre-window
+/// to flush it in and a filter keeping it out. The post-window storage after it would hold
+/// the record too, but labelled `PostTrigger` — which a case's `by_source` counts report.
+#[test]
+fn a_trigger_stores_its_own_record_with_no_pre_window() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_named("watcher").unwrap();
+    for t in sessions.list_triggers(&sid) {
+        sessions.remove_trigger(&sid, t.id).unwrap();
+    }
+    sessions.add_filter(&sid, "m=never-matches", None).unwrap();
+    sessions
+        .add_trigger(&sid, "l>=ERROR", 0, 0, 0, None, false)
+        .unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
+
+    let mut boom = make_entry(Level::Error, "boom");
+    process_entry(&mut boom, &pipeline, &sessions);
+    assert_eq!(pipeline.store_len(), 1);
+    let held = pipeline.context_by_seq(boom.seq, 0, 0);
+    assert_eq!(held.len(), 1, "the record is held");
+    assert!(
+        matches!(held[0].source, LogSource::PreTrigger),
+        "stored by the trigger, not by the post-window after it: {:?}",
+        held[0].source
+    );
+}
+
 #[test]
 fn test_zero_sessions_stores_everything() {
     let pipeline = Arc::new(LogPipeline::new(1000));

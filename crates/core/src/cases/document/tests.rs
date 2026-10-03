@@ -479,6 +479,28 @@ fn logs_evicted_inside_the_window_are_reported_whatever_the_verdict() {
     );
 }
 
+/// With BOTH rings dropped, a shortfall below the window is the log ring's loss: the
+/// sentence that says the log ring has dropped nothing must not be the one chosen.
+#[test]
+fn a_shortfall_with_both_rings_dropped_names_the_log_floor() {
+    let mut i = base();
+    i.window.short_before = 5;
+    i.window.log_lost_below = 40_600;
+    i.window.span_lost_below = 40_650;
+    let r = render(&i);
+    assert!(
+        r.body
+            .contains("the log ring has dropped everything under seq 40600"),
+        "{}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("the log ring has dropped nothing"),
+        "{}",
+        r.body
+    );
+}
+
 /// The span line names the span ring's own floor as the boundary, not the window's start:
 /// spans from `from` up to the floor are the ones gone.
 #[test]

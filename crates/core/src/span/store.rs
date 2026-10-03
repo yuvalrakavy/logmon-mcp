@@ -576,6 +576,73 @@ mod trace_lookup_tests {
         assert!(spans.is_empty());
     }
 
+    /// A trace whose last span is evicted leaves no entry behind in the index, and is no
+    /// longer counted as a trace.
+    #[test]
+    fn evicting_a_traces_last_span_removes_the_trace() {
+        let store = SpanStore::new(2, Arc::new(SeqCounter::new()));
+        store.insert(span(0, 1, 0));
+        store.insert(span(0, 2, 0));
+        store.insert(span(0, 2, 1));
+        let inner = store.inner.read().unwrap();
+        assert!(
+            !inner.trace_index.contains_key(&1),
+            "no empty list for trace 1"
+        );
+        assert_eq!(inner.trace_index.len(), 1);
+    }
+
+    /// Context reaching past either end of the ring is clamped, never a panic: `spans.context`
+    /// passes the caller's `after` straight through.
+    #[test]
+    fn span_context_past_the_ring_end_is_clamped() {
+        let store = SpanStore::new(10, Arc::new(SeqCounter::new()));
+        for k in 0..3 {
+            store.insert(span(0, 1, k));
+        }
+        assert_eq!(seqs(store.context_by_seq(3, 0, 5)), vec![3]);
+        assert_eq!(seqs(store.context_by_seq(1, 5, 0)), vec![1]);
+    }
+
+    /// Ties in start time keep seq order on a trace large enough that an unstable sort would
+    /// reorder them (a handful of elements stays inside an insertion sort either way).
+    #[test]
+    fn a_traces_start_time_ties_keep_seq_order() {
+        let store = SpanStore::new(1_000, Arc::new(SeqCounter::new()));
+        for k in 0..400 {
+            store.insert(span(0, 1, (k * 7) % 5));
+        }
+        let mut expect: Vec<(i64, u64)> =
+            (0..400u64).map(|k| (((k as i64) * 7) % 5, k + 1)).collect();
+        expect.sort_by_key(|&(start, _)| start);
+        let expect: Vec<u64> = expect.into_iter().map(|(_, seq)| seq).collect();
+        assert_eq!(seqs(store.get_trace(1)), expect);
+    }
+
+    /// A loaded case keeps the floor it was given: it speaks for its window and nothing below.
+    #[test]
+    fn a_loaded_span_store_keeps_its_floor() {
+        let store = SpanStore::from_records(
+            6,
+            Arc::new(SeqCounter::new()),
+            vec![span(103, 1, 0), span(104, 1, 1)],
+            103,
+        );
+        assert_eq!(store.lost_below(), 103);
+    }
+
+    /// A repeated seq is refused like an out-of-order one.
+    #[test]
+    #[should_panic(expected = "ascending, distinct seq order")]
+    fn span_from_records_refuses_a_repeated_seq() {
+        let _ = SpanStore::from_records(
+            6,
+            Arc::new(SeqCounter::new()),
+            vec![span(103, 1, 0), span(103, 1, 0)],
+            0,
+        );
+    }
+
     /// The constructor owns the invariant: spans out of seq order are a bug, not a ring.
     #[test]
     #[should_panic(expected = "ascending, distinct seq order")]

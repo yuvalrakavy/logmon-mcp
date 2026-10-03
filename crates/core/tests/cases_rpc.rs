@@ -1498,6 +1498,37 @@ fn a_span_ring_that_dropped_spans_says_so_in_the_document() {
     );
 }
 
+/// `before`/`after` count records from BOTH stores, nearest the anchor first, and the files
+/// hold exactly what falls inside the window that leaves: spans nearer the anchor than the
+/// logs take the slots, so the logs beyond them are outside the window and not captured.
+#[test]
+fn the_window_takes_the_nearest_records_of_both_stores_and_nothing_beyond() {
+    let h = harness();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    h.feed(Level::Info, "far below");
+    h.feed(Level::Info, "below");
+    d.span_store.insert(a_span());
+    d.span_store.insert(a_span());
+    let anchor = h.feed(Level::Info, "anchor");
+    d.span_store.insert(a_span());
+    d.span_store.insert(a_span());
+    h.feed(Level::Info, "above");
+    h.feed(Level::Info, "far above");
+
+    // Seqs 1-2 logs, 3-4 spans, 5 the anchor, 6-7 spans, 8-9 logs. Two either side are the
+    // spans, so the window is 3-7 and its only log is the anchor.
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 2, "after": 2 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("seq_range: {from: 3, to: 7,"),
+        "vacuity: the spans set the window's ends: {doc}"
+    );
+    assert_eq!(r["logdata"]["records"], 1, "{r}");
+    assert_eq!(r["spandata"]["records"], 4, "{r}");
+}
+
 /// A span ring that dropped spans only BELOW the window says so, and the shortfall below
 /// the window is not passed off as an empty past: the log ring has dropped nothing, but the
 /// spans under the span floor were real.
