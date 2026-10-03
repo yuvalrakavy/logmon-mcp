@@ -90,9 +90,10 @@ buffer. Every reader that took a position in the buffer for a position in seq wa
 across such a stretch. The buffer now keeps itself in seq order: a trigger's flush is merged
 in where its seqs belong.
 
-What you see changes only where a trigger has fired while a **session filter** was keeping
-records out of the buffer. With no filters every record is stored as it arrives, a trigger
-finds its pre-window already held, and the buffer was in seq order already. Where it applies:
+The ORDER you see changes only where a trigger has fired while a **session filter** was
+keeping records out of the buffer. With no filters every record is stored as it arrives, a
+trigger finds its pre-window already held, and the buffer was in seq order already. Where it
+applies:
 
 - `logs.recent` (`get_recent_logs`): the newest is the newest seq; a flushed pre-window
   record is no longer shown as the newest. Results are still newest-first.
@@ -112,12 +113,15 @@ finds its pre-window already held, and the buffer was in seq order already. Wher
   cursor.
 - `cases.create` (`create_case`) anchored on a bookmark takes the lowest seq after the
   bookmark's.
+
+What the buffer ADMITS changes with or without filters:
+
 - `logs.clear` (`clear_logs`) refuses, from then on, every record that arrived before it,
   stored or not. A trigger firing after a clear used to flush back the records the clear had
   emptied, and records a filter had kept out that were still in the pre-trigger buffer.
-- A record older than one the buffer has already evicted or cleared is not stored: in a
-  full buffer it would be the oldest record, evicted first. A trigger's flush can offer one,
-  as can a record still on its way to the buffer when it is cleared. So `status.get`'s (`get_status`) `store.total_received` — the records OFFERED to the
+- A record older than one the buffer has already evicted is not stored either: in a full
+  buffer it would be the oldest record, evicted first. A trigger's flush can offer one.
+- So `status.get`'s (`get_status`) `store.total_received` — the records OFFERED to the
   buffer, which leaves out those a session filter kept out — can now exceed
   `store.total_stored`. The difference counts refused offers: a record offered by two
   flushes counts twice.
@@ -191,17 +195,18 @@ outranks `evicted`, the document still says so. A shortfall below the window is 
 empty past" only when neither buffer has dropped anything.
 
 The capture also reads each buffer's records over the window together with that buffer's
-eviction floor, under one lock. Read apart, a log evicted between the two reads could be in
-the log file and reported gone at once, and a log stored between them could be missing from
-the file of a window graded `complete`.
+eviction floor, under one lock, and counts the shortfall it reports from those same reads.
+Read apart, a log evicted between the two reads could be in the log file and reported gone
+at once, and a log stored between them could be missing from the file of a window graded
+`complete`, or be in the file while the document said the window was short of it. The span
+eviction line also no longer counts spans gone ABOVE the window as gone from it.
 
 ### Fixed — a span trigger's notification said seq 0
 
 The span processor stored a copy of each span and passed on the receiver's own, which still
-carried the placeholder seq 0. So every span trigger notification reported `seq: 0` for its
-matched span, and a seq qualifier (`b>=`, `c>=`) in a span trigger or a collector's filter
-compared against 0. Everything after the store now sees the span with the seq it was stored
-under.
+carried the placeholder seq 0, so every span trigger notification reported `seq: 0` for its
+matched span — a seq that points nowhere, where the stored one can be handed to
+`get_span_context`. The notification now carries the seq the span was stored under.
 
 ### Fixed — `create_case` captured a window cut from the logs alone
 

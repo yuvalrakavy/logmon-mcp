@@ -454,6 +454,36 @@ fn a_trigger_after_a_clear_brings_back_nothing_from_before_it() {
     );
 }
 
+/// A clear refuses what arrived before it without claiming those seqs as LOST logs: a case
+/// after a clear, over a window whose lower end is spans, is complete. The clear once raised
+/// the loss floor to the shared counter, so the spans' seqs read as logs gone.
+#[test]
+fn a_case_after_a_clear_does_not_call_spans_lost_logs() {
+    let h = harness();
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    for i in 1..=3 {
+        h.feed(Level::Info, &format!("log {i}"));
+    }
+    for _ in 0..3 {
+        d.span_store.insert(a_span());
+    }
+    h.call("logs.clear", json!({})).unwrap();
+    let anchor = h.feed(Level::Info, "after the clear");
+
+    // Logs 1-3 were held and cleared (loss floor 4); spans 4-6 were never logs; the anchor
+    // is 7. `before: 3` is filled by the spans.
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 3, "after": 0 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("seq_range: {from: 4, to: 7, requested_before_missing: 0,"),
+        "vacuity: the spans fill the window below the anchor: {doc}"
+    );
+    assert_eq!(r["verdict"], "complete", "{doc}");
+    assert!(!doc.contains("are **gone**"), "{doc}");
+}
+
 /// A trigger also flushes its trace's records from the pre-buffer when they are older than
 /// its pre-window — the second half of its batch, which arrives BELOW the first half, so the
 /// store must sort it — and every record a trigger stores is marked `pre_trigger`.
@@ -1527,6 +1557,38 @@ fn the_window_takes_the_nearest_records_of_both_stores_and_nothing_beyond() {
     );
     assert_eq!(r["logdata"]["records"], 1, "{r}");
     assert_eq!(r["spandata"]["records"], 4, "{r}");
+}
+
+/// Spans the span ring dropped ABOVE the window are not spans gone from it: the gap the
+/// document reports is bounded by the window, not by how far the span floor has risen.
+#[test]
+fn spans_dropped_above_the_window_are_not_counted_as_gone_from_it() {
+    let h = harness();
+    h.domains.insert(make_domain_spans("default", 2));
+    let d = h.domains.get(&DomainId::default_domain()).unwrap();
+    h.feed(Level::Info, "1");
+    h.feed(Level::Info, "2");
+    let anchor = h.feed(Level::Info, "anchor");
+    h.feed(Level::Info, "4");
+    h.feed(Level::Info, "5");
+    for _ in 0..20 {
+        d.span_store.insert(a_span());
+    }
+
+    // Logs 1-5, spans 6-25 into a ring of 2 (floor 24). The window is the logs, 1-5: at
+    // most 5 of its seqs could have been spans, not the 23 below the span floor.
+    let r = h
+        .capture(json!({ "anchor": { "seq": anchor }, "before": 2, "after": 2 }))
+        .unwrap();
+    let doc = document_of(&r);
+    assert!(
+        doc.contains("seq_range: {from: 1, to: 5,"),
+        "vacuity: {doc}"
+    );
+    assert!(
+        doc.contains("the span ring **had** evicted below seq 24 — up to 5 spans over this window"),
+        "{doc}"
+    );
 }
 
 /// A span ring that dropped spans only BELOW the window says so, and the shortfall below

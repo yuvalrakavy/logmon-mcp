@@ -111,6 +111,14 @@ impl SpanStore {
         span.seq = self.seq_counter.next();
         let seq = span.seq;
 
+        if inner.capacity == 0 {
+            // A ring of no spans stores and evicts at once, as the log ring does: the push
+            // below would otherwise hold one span past a capacity of zero.
+            self.lost_below
+                .fetch_max(seq.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+            return seq;
+        }
+
         // Lazy allocation (§6): reserve the full ring ONCE, on the first insert.
         if inner.buffer.capacity() == 0 {
             let cap = inner.capacity;
@@ -560,8 +568,18 @@ mod trace_lookup_tests {
         assert_seq_ordered(&store);
     }
 
-    /// The range read is inclusive at both ends and ascending, and carries the floor read in
-    /// the same lock.
+    /// A ring of capacity 0 holds no span, as the log ring holds no record — the span still
+    /// gets its seq, and the floor rises past it.
+    #[test]
+    fn a_span_ring_of_capacity_zero_holds_nothing() {
+        let store = SpanStore::new(0, Arc::new(SeqCounter::new()));
+        assert_eq!(store.insert(span(0, 1, 0)), 1);
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.lost_below(), 2);
+    }
+
+    /// The range read is inclusive at both ends and ascending, and returns the floor. (That
+    /// the two come from ONE lock is structural — no single-threaded test can tell.)
     #[test]
     fn a_span_range_read_returns_the_held_spans_and_the_floor_together() {
         let store = SpanStore::new(3, Arc::new(SeqCounter::new()));

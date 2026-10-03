@@ -94,13 +94,18 @@ comparing with `back().seq` in O(1), and binary-searches only otherwise.
 ### 3.3 Records the store refuses, and the counters
 
 - **Below the floor** (`seq < lost_below`): older than something already evicted, or than a
-  `clear`. Refused. **Behaviour change, stated:** after `logs.clear` the floor is the seq
-  counter's value at clear time plus one (`InMemoryStore::clear_through`), so a trigger firing
-  later can no longer bring back records from before the clear (today it re-appends them,
-  cleared records included). *As built:* the first version raised the floor only past the
-  newest seq HELD, which still let a trigger flush in records a filter had kept out before the
-  clear — they wait in the pre-trigger buffer, above that floor (deep gate, two finders
-  independently). On a small, densely
+  `clear`. Refused. **Behaviour change, stated:** after `logs.clear` a trigger firing later can
+  no longer bring back records from before the clear (today it re-appends them, cleared
+  records included). *As built, after two gate rounds:* the store has TWO floors. `lost_below`
+  is the loss claim every reader grades eviction from, and a clear raises it past the newest
+  record held, as an eviction would. `admit_from` is an admission floor only: a clear
+  (`InMemoryStore::clear_through`) raises it to the seq counter plus one, so a record that
+  arrived before the clear is refused even if it was never held. The first version raised only
+  `lost_below`, past the newest held, which still let a trigger flush in records a filter had
+  kept out before the clear (deep gate, two finders independently). The second raised
+  `lost_below` to the counter, which claimed logs LOST over seqs that were spans, or nothing —
+  a clean domain cleared at the start of a run graded its first case `evicted` (re-gate, two
+  finders independently). On a small, densely
   stored ring, today's code re-appends records that had been evicted, pushing out newer ones —
   even the trigger's own record; that stops too.
 - **Counters:** `total_received` counts every record offered to the store; `total_stored` every

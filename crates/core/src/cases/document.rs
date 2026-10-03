@@ -110,7 +110,7 @@ pub struct Window {
     pub log_lost_below: u64,
     /// Logs gone from INSIDE `[from, to]`, as an upper bound: `Some` when the log
     /// floor is above `from` — because spans reach further back than the logs
-    /// still do (then `short_before` is 0: the spans filled `before`), or because
+    /// still do (typically with spans filling `before`, so `short_before` is 0), or because
     /// the lowest log was evicted while the capture was taken. Nothing else in
     /// the window says logs are missing from it.
     pub logs_evicted_before_window: Option<u64>,
@@ -918,7 +918,11 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
         ),
         EvidenceVerdict::Complete => {}
     }
-    let dropped_inside = i.window.logs_evicted_before_window.is_some();
+    // Under an `evicted` verdict its own item above already says the ring dropped part of
+    // the window; the in-window item is for the verdicts that outrank it (`filtered`), where
+    // nothing else would.
+    let dropped_inside = i.window.logs_evicted_before_window.is_some()
+        && i.window.verdict != EvidenceVerdict::Evicted;
     let dropped_below = i.window.short_before > 0 && i.window.log_lost_below > 0;
     if dropped_inside {
         item(
@@ -937,7 +941,7 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
              now."
                 .into(),
         );
-    } else if i.window.clamped && !dropped_inside {
+    } else if i.window.clamped && i.window.logs_evicted_before_window.is_none() {
         item(
             s,
             "**`before`/`after` hit the maximum.** A larger value will not widen this window; \

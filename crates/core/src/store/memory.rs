@@ -101,6 +101,12 @@ pub struct InMemoryStore {
     /// boundary reports loss on any domain that logged before it traced, which
     /// is the ordinary shape rather than an edge case.
     lost_below: AtomicU64,
+    /// The lowest seq this store will still ADMIT, beyond `lost_below`: a clear raises it to
+    /// one past every seq handed out, so nothing that arrived before the clear is stored after
+    /// it. Kept apart from `lost_below` on purpose — that one is a LOSS claim every reader
+    /// grades eviction from, and the seqs between the newest held log and the counter belong
+    /// to spans or to logs a filter kept out, none of which this store ever held or lost.
+    admit_from: AtomicU64,
 }
 
 impl InMemoryStore {
@@ -118,6 +124,7 @@ impl InMemoryStore {
             total_received: AtomicU64::new(0),
             malformed_count: AtomicU64::new(0),
             lost_below: AtomicU64::new(0),
+            admit_from: AtomicU64::new(0),
         }
     }
 
@@ -165,6 +172,7 @@ impl InMemoryStore {
             total_received: AtomicU64::new(0),
             malformed_count: AtomicU64::new(0),
             lost_below: AtomicU64::new(lost_below),
+            admit_from: AtomicU64::new(0),
         }
     }
 
@@ -201,12 +209,22 @@ impl InMemoryStore {
     ///
     /// The plain `clear` raises the floor only past the newest record HELD, so a trigger
     /// firing after it could still flush, from the pre-trigger buffer, records that arrived
-    /// before the clear but had been kept out by a filter.
+    /// before the clear but had been kept out by a filter. This raises the ADMISSION floor
+    /// past the counter, and the loss floor (`lost_below`) only past what was held — raising
+    /// the loss floor to the counter claimed logs lost over seqs that were spans, or nothing.
     pub fn clear_through(&self, newest_assigned: u64) {
         let mut inner = self.inner.write().unwrap();
         self.clear_locked(&mut inner);
-        self.lost_below
+        self.admit_from
             .fetch_max(newest_assigned.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// The lowest seq a write may store: below the loss floor (older than something evicted
+    /// or cleared) or below the admission floor (arrived before a clear) is refused.
+    fn refuse_below(&self) -> u64 {
+        self.lost_below
+            .load(Ordering::Relaxed)
+            .max(self.admit_from.load(Ordering::Relaxed))
     }
 
     /// `clear`'s body, under the caller's write guard: a clear loses records exactly as an
@@ -266,7 +284,7 @@ impl InMemoryStore {
         batch.retain(|e| !inner.holds(e.seq));
         self.total_received
             .fetch_add(batch.len() as u64, Ordering::Relaxed);
-        let floor = self.lost_below.load(Ordering::Relaxed);
+        let floor = self.refuse_below();
         batch.retain(|e| e.seq >= floor);
         if batch.is_empty() {
             return 0;
@@ -437,9 +455,9 @@ impl LogStore for InMemoryStore {
             return;
         }
         self.total_received.fetch_add(1, Ordering::Relaxed);
-        // The floor before the fast path's push: after a `clear` the ring is empty while the
-        // floor is not.
-        if entry.seq < self.lost_below.load(Ordering::Relaxed) {
+        // The floors before the fast path's push: after a `clear` the ring is empty while the
+        // floors are not.
+        if entry.seq < self.refuse_below() {
             return;
         }
         if self.max_capacity == 0 {
@@ -551,9 +569,10 @@ impl LogStore for InMemoryStore {
         self.inner.read().unwrap().entries.len()
     }
 
-    /// Read under the ring's lock: every writer moves the counters under the write guard, so
-    /// the pair is never caught between a writer's two increments (which could show more
-    /// stored than received).
+    /// Read under the ring's lock: every writer moves `total_received` and `total_stored` under
+    /// the write guard, so the pair is never caught between a writer's two increments (which
+    /// could show more stored than received). `malformed_count` is a lone counter, written
+    /// without the lock.
     fn stats(&self) -> StoreStats {
         let _guard = self.inner.read().unwrap();
         StoreStats {
@@ -1026,12 +1045,24 @@ mod seq_order_tests {
         store.clear_through(8);
         assert_eq!(
             store.lost_below(),
-            9,
-            "past the counter (8), not just past the newest held (5)"
+            6,
+            "the LOSS floor rises past what was held (5) only — 6-8 were never held, so \
+             nothing was lost there"
         );
         store.insert_sorted(vec![entry(6, None), entry(7, None), entry(8, None)]);
         store.append(entry(9, None));
         assert_eq!(ring(&store), vec![9], "only what arrived after the clear");
+    }
+
+    /// Clearing a ring that never held anything claims no loss: the loss floor stays 0, so a
+    /// capture taken afterwards does not read an empty past as an evicted one.
+    #[test]
+    fn clearing_a_ring_that_held_nothing_claims_no_loss() {
+        let store = InMemoryStore::new(16);
+        store.clear_through(40);
+        assert_eq!(store.lost_below(), 0);
+        store.append(entry(41, None));
+        assert_eq!(ring(&store), vec![41]);
     }
 
     /// A ring of capacity 0 holds nothing on EITHER write path. The fast path used to evict
@@ -1047,8 +1078,9 @@ mod seq_order_tests {
         assert!(!store.contains_seq(10));
     }
 
-    /// The range and the floor come from one read: inclusive at both ends, ascending, and
-    /// empty (with the floor) for a range that holds nothing.
+    /// The range read is inclusive at both ends, ascending, empty for a range that holds
+    /// nothing, and returns the floor. (That the two come from ONE lock is structural — no
+    /// single-threaded test can tell.)
     #[test]
     fn a_range_read_returns_the_held_records_and_the_floor_together() {
         let store = InMemoryStore::new(4);

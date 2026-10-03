@@ -75,8 +75,7 @@ fn test_span_trigger_fires() {
 
 /// A span trigger's notification carries the seq the store gave the span. The receivers hand
 /// a span over with a placeholder 0, and the processor used to pass THAT copy on after storing
-/// another one — so every span notification said seq 0, and a seq qualifier (`b>=`, `c>=`) in
-/// a span trigger or a collector filter compared against 0.
+/// another one — so every span notification said seq 0.
 #[test]
 fn a_span_triggers_notification_carries_the_stored_seq() {
     let store = Arc::new(SpanStore::new(

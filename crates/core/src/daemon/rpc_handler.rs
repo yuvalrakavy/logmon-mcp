@@ -1291,8 +1291,11 @@ impl RpcHandler {
             fields.retain(|f| f.coverage_pct >= min_coverage_pct);
         }
 
+        // Read ONCE: the reply states the floor and a verdict derived from it, and two reads
+        // could straddle an eviction and disagree with each other.
+        let lost_below = d.pipeline.lost_below();
         let evicted_before_window =
-            crate::filter::parser::evicted_before_window(&resolved, d.pipeline.lost_below());
+            crate::filter::parser::evicted_before_window(&resolved, lost_below);
 
         Ok(json!({
             "fields": fields,
@@ -1305,7 +1308,7 @@ impl RpcHandler {
             // structurally false however much rolled off.
             "buffer_oldest_seq": stats.buffer_oldest_seq,
             "buffer_newest_seq": stats.buffer_newest_seq,
-            "lost_below": d.pipeline.lost_below(),
+            "lost_below": lost_below,
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
             "names_capped": names_capped,
@@ -1405,8 +1408,10 @@ impl RpcHandler {
         let capped = map.cardinality_capped();
         let (groups, groups_total) = map.finish(top_n);
 
+        // Read ONCE, as `logs.fields` does: the floor and the verdict from it must agree.
+        let lost_below = d.pipeline.lost_below();
         let evicted_before_window =
-            crate::filter::parser::evicted_before_window(&resolved, d.pipeline.lost_below());
+            crate::filter::parser::evicted_before_window(&resolved, lost_below);
 
         Ok(json!({
             "groups": groups,
@@ -1426,7 +1431,7 @@ impl RpcHandler {
             "last_time": bounds.last_time,
             "buffer_oldest_seq": stats.buffer_oldest_seq,
             "buffer_newest_seq": stats.buffer_newest_seq,
-            "lost_below": d.pipeline.lost_below(),
+            "lost_below": lost_below,
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
             "suppressed": suppressed,
@@ -2401,17 +2406,36 @@ impl RpcHandler {
             ));
         }
 
+        // Spans over the SAME resolved range, so the two files describe one
+        // interval by construction rather than by two window parameters that
+        // could disagree — with the span floor read in the same lock, as the
+        // log floor is.
+        let (spans, span_lost_below) = d.span_store.range_with_floor(from, to);
+        // Clamped to the window: the span floor can sit far above `to` (unlike the log
+        // floor, which the held anchor bounds), and spans gone above the window are not
+        // spans gone from it.
+        let span_evicted =
+            crate::filter::parser::evicted_below(from, span_lost_below.min(to.saturating_add(1)));
+
         // How much of what was ASKED for came back.
         //
         // The window can be narrower at either end than the caller requested,
-        // and the two reasons for that are not the same fact. The ring having dropped records is a LOSS; the
-        // domain simply not having that much history yet is not. Only
-        // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
-        // would call the second one eviction on every young domain.
-        // Counted in the same merged space the window was cut from, or the two
-        // numbers would describe different axes.
-        let short_before = before.value.saturating_sub(below.len());
-        let short_after = after.value.saturating_sub(above.len());
+        // and the two reasons for that are not the same fact. The ring having
+        // dropped records is a LOSS; the domain simply not having that much
+        // history yet is not. Only `lost_below` can tell them apart, and reading
+        // `oldest_log_seq` for it would call the second one eviction on every
+        // young domain.
+        //
+        // Counted from what the FILES hold, in the same merged space the window
+        // was cut from: a record stored or evicted between the cut and the
+        // second read (a trigger's flush, an eviction) would otherwise leave the
+        // counts describing one instant and the files another.
+        let held_below = logs.iter().filter(|e| e.seq < anchor.seq).count()
+            + spans.iter().filter(|s| s.seq < anchor.seq).count();
+        let held_above = logs.iter().filter(|e| e.seq > anchor.seq).count()
+            + spans.iter().filter(|s| s.seq > anchor.seq).count();
+        let short_before = before.value.saturating_sub(held_below);
+        let short_after = after.value.saturating_sub(held_above);
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //
@@ -2423,9 +2447,10 @@ impl RpcHandler {
         //
         // And logs can be gone from INSIDE the window: `from` is the lowest of
         // the nearest records from BOTH stores, so it can be a span below the log
-        // floor (spans filled `before`, so `short_before` is 0), or a log evicted
-        // since `log_ctx` was read. Either way only the floor sitting above
-        // `from` says the logs there are gone — and it was read with `logs`.
+        // floor (typically with spans filling `before`, so `short_before` is 0),
+        // or a log evicted since `log_ctx` was read. Either way only the floor
+        // sitting above `from` says the logs there are gone — and it was read
+        // with `logs`.
         let logs_evicted_before_window = crate::filter::parser::evicted_below(from, log_lost_below);
         let log_evicted =
             (short_before > 0 && log_lost_below > 0) || logs_evicted_before_window.is_some();
@@ -2440,13 +2465,6 @@ impl RpcHandler {
             // one — see `Window::clamped`.
             false,
         );
-
-        // Spans over the SAME resolved range, so the two files describe one
-        // interval by construction rather than by two window parameters that
-        // could disagree — with the span floor read in the same lock, as the
-        // log floor is.
-        let (spans, span_lost_below) = d.span_store.range_with_floor(from, to);
-        let span_evicted = crate::filter::parser::evicted_below(from, span_lost_below);
 
         let domain_name = d.config.name.to_string();
         let collectors = self.case_collector_lines(&d.config.name);

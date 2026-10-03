@@ -448,8 +448,14 @@ fn logs_evicted_inside_the_window_are_reported_whatever_the_verdict() {
     );
     assert!(
         r.body
-            .contains("Logs inside this window had already been dropped"),
+            .contains("The ring had already dropped part of this window"),
         "{}",
+        r.body
+    );
+    assert!(
+        !r.body
+            .contains("Logs inside this window had already been dropped"),
+        "under `evicted` the verdict's own next step says it; not twice: {}",
         r.body
     );
     assert!(

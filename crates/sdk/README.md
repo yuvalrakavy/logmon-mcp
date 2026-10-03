@@ -519,7 +519,7 @@ pub struct TriggerInfo {
     pub filter: String,                      // The DSL string as registered.
     pub pre_window: u32,                     // Pre-trigger context capacity.
     pub post_window: u32,                    // Post-trigger capture window.
-    pub notify_context: u32,                 // How many pre-window entries to include in the notification.
+    pub notify_context: u32,                 // How many records just before the match to include in the notification.
     pub description: Option<String>,
     pub match_count: u64,                    // Lifetime fire count.
     pub oneshot: bool,                       // Auto-removes after the first match if true.

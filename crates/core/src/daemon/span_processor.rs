@@ -37,10 +37,9 @@ pub fn spawn_span_processor(
 /// must not fire on — nor deliver — an A-domain span (spec §2, §9.1 site 3).
 ///
 /// `span` comes back carrying the seq the store assigned it. The receivers hand a span over
-/// with a placeholder 0, and everything after the store — collectors, span triggers, the
-/// notification — must see the span as stored, or a seq qualifier compares against 0 and a
-/// notification reports seq 0. Taken `&mut` rather than cloned again, because this is the
-/// span ingest hot path (`benches/span_ingest.rs`).
+/// with a placeholder 0, and everything after the store sees the span as stored — the visible
+/// case is the trigger notification, which reported seq 0. Taken `&mut` rather than cloned
+/// again, because this is the span ingest hot path (`benches/span_ingest.rs`).
 pub fn process_span_for_domain(
     span: &mut SpanEntry,
     store: &SpanStore,
