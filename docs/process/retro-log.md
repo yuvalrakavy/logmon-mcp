@@ -658,3 +658,57 @@ then produced the highest-value S3 of the `logs.profile` window — a reply that
 told the caller a field did not exist when it was on every record. The demotion
 bar is zero S3s across 5+ features; it just cleared it in the wrong direction.
 Kept unchanged.
+
+## 2026-10-03/04 the seq-ordered log ring (T2) — from a perf fix to a store invariant
+
+- scope: began as `traces.logs` walking the whole buffer (a polling harness's latency); the
+  root cause the user chose to fix was that the log ring held STORED order, which a trigger
+  breaks. The ring now holds seq order as an invariant the store owns; every reader moved to
+  binary search. Owner-approved spec rev 2.
+- time: design and the first build ~30%, gates and remediation ~70% — four review rounds
+  after the first deep gate, each over the previous round's fixes.
+- catches: self-review/controls ≈ 8, gate (4 lenses) ≈ 50, re-gate 1 ≈ 8, re-gate 2 ≈ 10,
+  re-gate 3 ≈ 7, user = 1 (the `notify_context` contract decision). Re-gate 3 found nothing
+  on the four computations it was aimed at; one medium (restored collectors skipped the new
+  guard — the third sibling of the same fix) and wording. Stopped there: severity had fallen
+  round on round, and the remaining finding class was prose.
+  - **my own negative controls found 5 vacuous fixtures or gaps before any finder did**:
+    three behaviours untested anywhere in the suite (a trigger's trace flush, its
+    `PreTrigger` marking, the span floor reaching the document); a clear test whose default
+    triggers' post-window stored the very record the test said a filter kept out; and a
+    green control that was MY HARNESS's lie (a `--lib` name filter dropped the new test).
+  - **gate**: the cross-file lens found the worst — `create_case` read the floor long after
+    the window snapshot, so under steady ingestion the new in-window paragraph called records
+    in the file "gone". The mutation lens ran 136 mutations: 26 genuine gaps, one of them a
+    real off-by-one in a setting's meaning (`pre_window = N` flushes N-1 records before the
+    match). The cold reader caught a perf headline measured at 50x the default buffer, where
+    the old cost was already ~0.3 ms.
+  - **re-gate 1 — my fix introduced the round's worst defect**, found by both finders
+    independently: to make a clear refuse pre-clear records I raised the LOSS floor to the
+    shared seq counter, so every reader graded seqs that were spans as lost logs, and a domain
+    cleared at the start of a test run graded its first case `evicted`.
+  - **re-gate 2 — my fix of a re-gate-1 LOW introduced a regression**: recounting the
+    shortfall from the second read turned a span evicted between reads into a false "the
+    stores had nothing more" and a verdict flip. Reverted; the LOW it fixed is the smaller
+    harm. Plus three sibling paths of the bookmark guard (collectors, session restore) and of
+    the admission floor (`logs.export`).
+- DG — IG ≈ 100 SG ≈ 13 post-merge — (not merged). See gate-kpi.md.
+- improve:
+  1. **One number, two meanings, is a defect generator.** `lost_below` was both "refuse below
+     this" and "records below this were lost". The first fix moved it for the first meaning
+     and broke every reader of the second. Before changing a value that many readers
+     interpret, list the readers and what each takes it to MEAN — the split into
+     `admit_from` + `lost_below` is what that list would have produced in round 0.
+  2. **A fix's sibling paths are the next round's findings.** Every re-gate's findings were the
+     same mechanism on a path the fix did not visit: capacity 0 fixed on the log ring, not the
+     span ring; the read-apart fixed in `create_case`, not `logs.fields`; the bookmark guard
+     added to edits, not collectors or restore. Hazard symmetry was in the brief and still
+     missed three times — enumerate the sibling paths by grep (every writer of the field,
+     every caller of the guard's twin) BEFORE committing the fix, not after the finder does.
+  3. **A fix for a LOW can cost more than the LOW.** The shortfall recount was aimed at a
+     microsecond race and created a reachable false statement. When a fix changes what a
+     sentence in user-facing output is computed from, check every sentence that reads it.
+  4. **Documented-but-untested contracts drift.** `notify_context` was the original design's
+     bound (`plans/2026-03-27-multi-session.md:1165`), documented in the protocol and the SDK
+     README, and quietly became the whole pre-window; nothing pinned it. Same shape as the
+     `pre_window` off-by-one the mutation lens found.

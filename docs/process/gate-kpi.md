@@ -35,6 +35,7 @@ process skipped.
 | 2026-08-02/03 | daemon-served skill | T2 | — | *low, not weighted* | — | 0 | 1 | — |
 | 2026-08-02/03 | `logs.fields` | T2 | *skipped — see note* | ≈70 | — | 0 | 1 | — |
 | 2026-08-03 | `logs.profile` | T2 | ≈90 | ≈84 | ≈6 | 0 | 2 | ~1.6M |
+| 2026-10-03/04 | seq-ordered log ring (+ `traces.logs` perf) | T2 | *not recorded* | ≈105 | ≈13 | *pending* | 2 | ~3.1M |
 
 **Seeded 2026-08-03 from `retro-log.md` entries.** Rows before `logs.profile`
 are reconstructed from those entries and are marked where a number cannot be
@@ -43,6 +44,13 @@ defended — the case-documents design gate ran before this ledger existed, and
 
 ### Notes on the rows
 
+- **seq-ordered log ring**: IG counts the deep gate plus the re-gates of its fixes,
+  because two of the re-gates' worst findings were defects the FIXES introduced — an
+  S3 (a clear raised the loss floor to the counter, so spans' seqs read as lost logs)
+  and an S2 regression (a shortfall recount that turned a span eviction into a false
+  "nothing more at that end"). A gate that scored only the original diff would hide
+  exactly the escape the re-gate exists for. DG is not recorded — no design-gate tally
+  survives for this spec, and "0" would claim a measurement that was not taken.
 - **`_display`** is the only **post-merge = 1** in the window: `cargo install`
   ignores `Cargo.lock` without `--locked`, so the tagged release failed to build
   for a user on a commit where the whole suite and clippy were green. No test
