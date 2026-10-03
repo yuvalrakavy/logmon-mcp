@@ -332,7 +332,9 @@ impl LogStore for InMemoryStore {
         seqs.iter()
             .filter_map(|seq| {
                 let pos = *inner.seq_pos.get(seq)?;
-                inner.entries.get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
+                inner
+                    .entries
+                    .get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
             })
             .cloned()
             .collect()
@@ -722,16 +724,30 @@ mod trace_lookup_tests {
 
     fn by_definition(store: &InMemoryStore, trace: u128) -> Vec<u64> {
         let inner = store.inner.read().unwrap();
-        inner.entries.iter().filter(|e| e.trace_id == Some(trace)).map(|e| e.seq).collect()
+        inner
+            .entries
+            .iter()
+            .filter(|e| e.trace_id == Some(trace))
+            .map(|e| e.seq)
+            .collect()
     }
 
     /// The structure's own invariant: every held record is indexed at `popped + i`, and the
     /// index holds nothing else.
     fn assert_positions(store: &InMemoryStore) {
         let inner = store.inner.read().unwrap();
-        assert_eq!(inner.seq_pos.len(), inner.entries.len(), "one index entry per held record");
+        assert_eq!(
+            inner.seq_pos.len(),
+            inner.entries.len(),
+            "one index entry per held record"
+        );
         for (i, e) in inner.entries.iter().enumerate() {
-            assert_eq!(inner.seq_pos.get(&e.seq), Some(&(inner.popped + i as u64)), "seq {}", e.seq);
+            assert_eq!(
+                inner.seq_pos.get(&e.seq),
+                Some(&(inner.popped + i as u64)),
+                "seq {}",
+                e.seq
+            );
         }
     }
 
@@ -847,7 +863,13 @@ mod trace_lookup_tests {
         // Vacuity guards: the run must have exercised what it claims to.
         assert!(late > 100, "late appends exercised: {late}");
         assert!(clears > 2, "clears exercised: {clears}");
-        assert!(store.inner.read().unwrap().popped > 1_000, "evictions exercised");
-        assert!(nonempty > 1_000, "lookups that returned records: {nonempty}");
+        assert!(
+            store.inner.read().unwrap().popped > 1_000,
+            "evictions exercised"
+        );
+        assert!(
+            nonempty > 1_000,
+            "lookups that returned records: {nonempty}"
+        );
     }
 }

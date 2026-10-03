@@ -155,7 +155,9 @@ impl SpanStore {
             .iter()
             .filter_map(|seq| {
                 let pos = *inner.seq_pos.get(seq)?;
-                inner.buffer.get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
+                inner
+                    .buffer
+                    .get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
             })
             .cloned()
             .collect();
@@ -467,8 +469,11 @@ mod trace_lookup_tests {
 
     fn by_definition(store: &SpanStore, trace_id: u128) -> Vec<u64> {
         let inner = store.inner.read().unwrap();
-        let mut spans: Vec<&SpanEntry> =
-            inner.buffer.iter().filter(|s| s.trace_id == trace_id).collect();
+        let mut spans: Vec<&SpanEntry> = inner
+            .buffer
+            .iter()
+            .filter(|s| s.trace_id == trace_id)
+            .collect();
         spans.sort_by_key(|s| s.start_time);
         spans.into_iter().map(|s| s.seq).collect()
     }
@@ -476,7 +481,11 @@ mod trace_lookup_tests {
     /// Both halves of the invariant: one position per held span, each at `popped + index`.
     fn assert_positions(store: &SpanStore) {
         let inner = store.inner.read().unwrap();
-        assert_eq!(inner.seq_pos.len(), inner.buffer.len(), "one position per held span");
+        assert_eq!(
+            inner.seq_pos.len(),
+            inner.buffer.len(),
+            "one position per held span"
+        );
         for (i, s) in inner.buffer.iter().enumerate() {
             assert_eq!(
                 inner.seq_pos.get(&s.seq),
@@ -495,7 +504,12 @@ mod trace_lookup_tests {
         let store = SpanStore::from_records(
             6,
             Arc::new(SeqCounter::new()),
-            vec![span(105, 1, 0), span(103, 1, 1), span(109, 2, 2), span(104, 1, 3)],
+            vec![
+                span(105, 1, 0),
+                span(103, 1, 1),
+                span(109, 2, 2),
+                span(104, 1, 3),
+            ],
             0,
         );
         assert_eq!(seqs(store.get_trace(1)), vec![105, 103, 104]);
@@ -504,7 +518,10 @@ mod trace_lookup_tests {
         for k in 0..4 {
             store.insert(span(0, 1, 10 + k));
         }
-        assert!(store.inner.read().unwrap().popped >= 2, "the inserts evicted from a 6-span ring");
+        assert!(
+            store.inner.read().unwrap().popped >= 2,
+            "the inserts evicted from a 6-span ring"
+        );
         assert_eq!(seqs(store.get_trace(1)), by_definition(&store, 1));
         assert_eq!(seqs(store.get_trace(2)), by_definition(&store, 2));
         assert_positions(&store);
@@ -549,7 +566,10 @@ mod trace_lookup_tests {
         }
         // Vacuity guards: the run must have exercised what it claims to.
         assert!(clears > 2, "clears exercised: {clears}");
-        assert!(store.inner.read().unwrap().popped > 1_000, "evictions exercised");
+        assert!(
+            store.inner.read().unwrap().popped > 1_000,
+            "evictions exercised"
+        );
         assert!(nonempty > 1_000, "lookups that returned spans: {nonempty}");
     }
 }

@@ -374,7 +374,11 @@ fn a_trace_id_anchor_takes_the_earliest_seq_when_a_trigger_stored_it_out_of_orde
         .call("traces.logs", json!({ "trace_id": "7f3b" }))
         .unwrap();
     let first_stored = stored["logs"][0]["seq"].as_u64();
-    assert_eq!(first_stored, Some(fired), "the trigger stored its record first: {stored}");
+    assert_eq!(
+        first_stored,
+        Some(fired),
+        "the trigger stored its record first: {stored}"
+    );
 
     let r = h
         .capture(json!({ "anchor": { "trace_id": "7f3b" } }))
