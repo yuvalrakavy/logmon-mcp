@@ -1,6 +1,5 @@
 use crate::gelf::message::LogEntry;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// The last `capacity` ARRIVALS, minus whatever a trigger has already flushed.
@@ -15,7 +14,6 @@ use std::sync::Mutex;
 /// ever reaches back `capacity` records.
 pub struct PreTriggerBuffer {
     inner: Mutex<Inner>,
-    capacity: AtomicUsize,
 }
 
 struct Inner {
@@ -23,6 +21,11 @@ struct Inner {
     entries: VecDeque<(u64, LogEntry)>,
     /// Entries ever appended (the next arrival index).
     arrivals: u64,
+    /// Under the same lock as the entries, not beside them: an `append` that read the
+    /// capacity, lost a race to `resize(0)`, and then pushed would strand its entry — no
+    /// later append runs `expire` at capacity 0, so it would outlive any number of arrivals
+    /// and come back with the next trigger.
+    capacity: usize,
 }
 
 impl Inner {
@@ -41,17 +44,17 @@ impl PreTriggerBuffer {
             inner: Mutex::new(Inner {
                 entries: VecDeque::new(),
                 arrivals: 0,
+                capacity,
             }),
-            capacity: AtomicUsize::new(capacity),
         }
     }
 
     pub fn append(&self, entry: LogEntry) {
-        let cap = self.capacity.load(Ordering::Relaxed);
+        let mut inner = self.inner.lock().unwrap();
+        let cap = inner.capacity;
         if cap == 0 {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
         let arrival = inner.arrivals;
         inner.arrivals += 1;
         inner.entries.push_back((arrival, entry));
@@ -74,8 +77,9 @@ impl PreTriggerBuffer {
     }
 
     pub fn resize(&self, new_capacity: usize) {
-        self.capacity.store(new_capacity, Ordering::Relaxed);
-        self.inner.lock().unwrap().expire(new_capacity);
+        let mut inner = self.inner.lock().unwrap();
+        inner.capacity = new_capacity;
+        inner.expire(new_capacity);
     }
 
     pub fn len(&self) -> usize {

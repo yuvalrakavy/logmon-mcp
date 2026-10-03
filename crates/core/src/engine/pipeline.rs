@@ -224,10 +224,19 @@ impl LogPipeline {
         self.store.contains_seq(seq)
     }
 
+    /// Empty the log ring, and refuse from now on every record that ARRIVED before the clear
+    /// — including records a filter kept out, which a trigger firing later would otherwise
+    /// flush in from the pre-trigger buffer. See `InMemoryStore::clear_through`.
     pub fn clear_logs(&self) -> usize {
         let count = self.store.len();
-        self.store.clear();
+        self.store.clear_through(self.seq_counter.current());
         count
+    }
+
+    /// The held logs over `[from, to]` and the log floor, read together. See
+    /// `InMemoryStore::range_with_floor`.
+    pub fn logs_in_range_with_floor(&self, from: u64, to: u64) -> (Vec<LogEntry>, u64) {
+        self.store.range_with_floor(from, to)
     }
 
     pub fn recent_logs(

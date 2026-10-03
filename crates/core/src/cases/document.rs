@@ -109,9 +109,10 @@ pub struct Window {
     /// `logs_evicted_before_window`.
     pub log_lost_below: u64,
     /// Logs gone from INSIDE `[from, to]`, as an upper bound: `Some` when the log
-    /// floor is above `from`, which happens when spans reach further back than
-    /// the logs still do. Then `short_before` is 0 — the spans filled `before` —
-    /// and nothing else in the window says logs are missing from it.
+    /// floor is above `from` — because spans reach further back than the logs
+    /// still do (then `short_before` is 0: the spans filled `before`), or because
+    /// the lowest log was evicted while the capture was taken. Nothing else in
+    /// the window says logs are missing from it.
     pub logs_evicted_before_window: Option<u64>,
     /// The SPAN ring's own eviction, as an upper bound on spans gone from
     /// inside `[from, to]`. Separate because the two stores share a seq axis
@@ -555,13 +556,12 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                 let _ = writeln!(
                     s,
                     "**`evicted`** — this window reaches below what the log ring still \
-                     holds. It starts at seq {} (spans reach that far back), but the log \
-                     ring has dropped everything below seq {}: up to {gap} log records over \
-                     seqs {}–{} are **gone**.\n",
+                     holds. It starts at seq {}, but the log ring has dropped everything \
+                     below seq {}: up to {gap} log records over seqs {}–{} are **gone**.\n",
                     w.from,
                     w.log_lost_below,
                     w.from,
-                    w.log_lost_below - 1
+                    w.log_lost_below.saturating_sub(1)
                 );
                 notes.push(Note {
                     kind: NOTE_CAPTURE_GAP,
@@ -662,12 +662,12 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
     ) {
         let _ = writeln!(
             s,
-            "Logs inside the window: the log ring has dropped everything below seq {}, so up \
-             to {gap} log records over seqs {}–{} are **gone** (spans reach further back than \
-             the logs still do).\n",
+            "Logs inside the window: it reaches below the oldest log still held — the log \
+             ring has dropped everything below seq {}, so up to {gap} log records over seqs \
+             {}–{} are **gone**.\n",
             w.log_lost_below,
             w.from,
-            w.log_lost_below - 1
+            w.log_lost_below.saturating_sub(1)
         );
     }
     if w.short_after > 0 {
@@ -761,13 +761,13 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                 "Spans: {span_records} captured; the span ring **had** evicted below seq {} — up \
                  to {gap} spans over this window are gone. The log verdict above does not cover \
                  this: the two stores share a seq axis but evict independently.\n",
-                w.from
+                w.span_lost_below
             );
             notes.push(Note {
                 kind: NOTE_CAPTURE_GAP,
                 detail: format!(
                     "the span ring evicted below seq {}; up to {gap} spans are gone",
-                    w.from
+                    w.span_lost_below
                 ),
             });
         }
@@ -918,9 +918,18 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
         ),
         EvidenceVerdict::Complete => {}
     }
-    if (i.window.short_before > 0 && i.window.log_lost_below > 0)
-        || i.window.logs_evicted_before_window.is_some()
-    {
+    let dropped_inside = i.window.logs_evicted_before_window.is_some();
+    let dropped_below = i.window.short_before > 0 && i.window.log_lost_below > 0;
+    if dropped_inside {
+        item(
+            s,
+            "**Logs inside this window had already been dropped** — it reaches below the \
+             oldest log still held. Raise the domain's `log_buffer_size`, or capture sooner \
+             after the event — nothing can recover them now."
+                .into(),
+        );
+    }
+    if dropped_below {
         item(
             s,
             "**Records below this window had already been dropped.** Raise the domain's \
@@ -928,7 +937,7 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
              now."
                 .into(),
         );
-    } else if i.window.clamped {
+    } else if i.window.clamped && !dropped_inside {
         item(
             s,
             "**`before`/`after` hit the maximum.** A larger value will not widen this window; \

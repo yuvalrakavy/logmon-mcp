@@ -448,8 +448,13 @@ fn logs_evicted_inside_the_window_are_reported_whatever_the_verdict() {
     );
     assert!(
         r.body
-            .contains("Records below this window had already been dropped"),
+            .contains("Logs inside this window had already been dropped"),
         "{}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("Records below this window"),
+        "nothing below the window was asked for and missing (`short_before` is 0): {}",
         r.body
     );
 
@@ -461,13 +466,30 @@ fn logs_evicted_inside_the_window_are_reported_whatever_the_verdict() {
     }];
     let r = render(&i);
     assert!(
-        r.body.contains("Logs inside the window: the log ring has dropped everything below seq 40700, so up to 28 log records over seqs 40672–40699 are **gone**"),
+        r.body.contains("the log ring has dropped everything below seq 40700, so up to 28 log records over seqs 40672–40699 are **gone**"),
         "{}",
         r.body
     );
+    assert!(r.body.contains("Logs inside the window:"), "{}", r.body);
     assert!(
         r.body
-            .contains("Records below this window had already been dropped"),
+            .contains("Logs inside this window had already been dropped"),
+        "{}",
+        r.body
+    );
+}
+
+/// The span line names the span ring's own floor as the boundary, not the window's start:
+/// spans from `from` up to the floor are the ones gone.
+#[test]
+fn the_span_eviction_line_names_the_span_floor() {
+    let mut i = base();
+    i.window.span_lost_below = 40_690;
+    i.window.spans_evicted_before_window = Some(18);
+    let r = render(&i);
+    assert!(
+        r.body
+            .contains("the span ring **had** evicted below seq 40690 — up to 18 spans"),
         "{}",
         r.body
     );

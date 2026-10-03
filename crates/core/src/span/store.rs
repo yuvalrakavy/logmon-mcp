@@ -278,6 +278,21 @@ impl SpanStore {
             .collect()
     }
 
+    /// The held spans with seqs in `[from, to]`, ascending, and the floor — read under ONE
+    /// lock, so the two describe the same instant (the log store's `range_with_floor`, for
+    /// the same reason: a span read and then evicted before a separate floor read would be
+    /// handed out and reported gone).
+    pub fn range_with_floor(&self, from: u64, to: u64) -> (Vec<SpanEntry>, u64) {
+        let inner = self.inner.read().unwrap();
+        let start = inner.buffer.partition_point(|s| s.seq < from);
+        let end = inner.buffer.partition_point(|s| s.seq <= to);
+        let spans = inner.buffer.range(start..end.max(start)).cloned().collect();
+        (
+            spans,
+            self.lost_below.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     pub fn context_by_seq(&self, seq: u64, before: usize, after: usize) -> Vec<SpanEntry> {
         let inner = self.inner.read().unwrap();
         // Seq-ordered ring: the slice around the anchor is its seq neighbourhood.
@@ -543,6 +558,22 @@ mod trace_lookup_tests {
         assert_eq!(seqs(store.get_trace(1)), by_definition(&store, 1));
         assert_eq!(seqs(store.get_trace(2)), by_definition(&store, 2));
         assert_seq_ordered(&store);
+    }
+
+    /// The range read is inclusive at both ends and ascending, and carries the floor read in
+    /// the same lock.
+    #[test]
+    fn a_span_range_read_returns_the_held_spans_and_the_floor_together() {
+        let store = SpanStore::new(3, Arc::new(SeqCounter::new()));
+        for k in 0..5 {
+            store.insert(span(0, 1, k));
+        }
+        // Seqs 1-5 into a ring of 3: 3, 4 and 5 held, floor 3.
+        let (spans, floor) = store.range_with_floor(2, 4);
+        assert_eq!(seqs(spans), vec![3, 4]);
+        assert_eq!(floor, 3);
+        let (spans, _) = store.range_with_floor(6, 9);
+        assert!(spans.is_empty());
     }
 
     /// The constructor owns the invariant: spans out of seq order are a bug, not a ring.

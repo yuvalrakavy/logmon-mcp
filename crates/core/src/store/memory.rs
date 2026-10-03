@@ -179,6 +179,47 @@ impl InMemoryStore {
         self.malformed_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The held records with seqs in `[from, to]`, ascending, and the floor — read under ONE
+    /// lock, so the two describe the same instant. A caller that read the records and then
+    /// the floor separately could see a record it holds evicted in between, and report it
+    /// gone while handing it out.
+    pub fn range_with_floor(&self, from: u64, to: u64) -> (Vec<LogEntry>, u64) {
+        let inner = self.inner.read().unwrap();
+        let start = inner.entries.partition_point(|e| e.seq < from);
+        let end = inner.entries.partition_point(|e| e.seq <= to);
+        let records = inner
+            .entries
+            .range(start..end.max(start))
+            .cloned()
+            .collect();
+        (records, self.lost_below.load(Ordering::Relaxed))
+    }
+
+    /// Empty the ring, and refuse from now on every record that arrived before this call —
+    /// held or not. `newest_assigned` is the highest seq handed out so far; a record still in
+    /// the pre-trigger buffer, or still on its way to the store, carries a seq at or below it.
+    ///
+    /// The plain `clear` raises the floor only past the newest record HELD, so a trigger
+    /// firing after it could still flush, from the pre-trigger buffer, records that arrived
+    /// before the clear but had been kept out by a filter.
+    pub fn clear_through(&self, newest_assigned: u64) {
+        let mut inner = self.inner.write().unwrap();
+        self.clear_locked(&mut inner);
+        self.lost_below
+            .fetch_max(newest_assigned.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// `clear`'s body, under the caller's write guard: a clear loses records exactly as an
+    /// eviction does, so the floor rises past the newest held.
+    fn clear_locked(&self, inner: &mut StoreInner) {
+        if let Some(newest) = inner.entries.back().map(|e| e.seq) {
+            self.lost_below
+                .fetch_max(newest.saturating_add(1), Ordering::Relaxed);
+        }
+        inner.entries.clear();
+        inner.trace_index.clear();
+    }
+
     /// Store a batch of records that may be OLDER than records already held — a trigger's
     /// pre-window and the earlier records of its trace — keeping the ring in seq order.
     /// Returns how many held records had to move to make room (the tail above the batch's
@@ -401,6 +442,15 @@ impl LogStore for InMemoryStore {
         if entry.seq < self.lost_below.load(Ordering::Relaxed) {
             return;
         }
+        if self.max_capacity == 0 {
+            // A ring of no records stores and evicts at once, as the merge does with the run
+            // it has no room for — so both write paths agree that it holds nothing (the push
+            // below would otherwise hold one record past a capacity of zero).
+            self.lost_below
+                .fetch_max(entry.seq.saturating_add(1), Ordering::Relaxed);
+            self.total_stored.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         self.reserve_ring(&mut inner);
         if inner.entries.len() >= self.max_capacity {
@@ -488,23 +538,24 @@ impl LogStore for InMemoryStore {
             .map_or(0, |seqs| seqs.len())
     }
 
+    /// A clear loses records exactly as an eviction does, and a capture taken afterwards must
+    /// not read the emptied range as never-having-existed. The daemon clears through
+    /// [`InMemoryStore::clear_through`], which also refuses records that arrived before the
+    /// clear and were never held.
     fn clear(&self) {
         let mut inner = self.inner.write().unwrap();
-        // A clear loses records exactly as an eviction does, and a capture taken
-        // afterwards must not read the emptied range as never-having-existed.
-        if let Some(newest) = inner.entries.back().map(|e| e.seq) {
-            self.lost_below
-                .fetch_max(newest.saturating_add(1), Ordering::Relaxed);
-        }
-        inner.entries.clear();
-        inner.trace_index.clear();
+        self.clear_locked(&mut inner);
     }
 
     fn len(&self) -> usize {
         self.inner.read().unwrap().entries.len()
     }
 
+    /// Read under the ring's lock: every writer moves the counters under the write guard, so
+    /// the pair is never caught between a writer's two increments (which could show more
+    /// stored than received).
     fn stats(&self) -> StoreStats {
+        let _guard = self.inner.read().unwrap();
         StoreStats {
             total_received: self.total_received.load(Ordering::Relaxed),
             total_stored: self.total_stored.load(Ordering::Relaxed),
@@ -962,6 +1013,55 @@ mod seq_order_tests {
         assert_eq!(ring(&store), vec![9]);
         let stats = store.stats();
         assert_eq!((stats.total_received, stats.total_stored), (5, 4));
+    }
+
+    /// `clear_through` refuses every record that arrived before the clear — the seq counter's
+    /// value, not just the newest HELD — so a record a filter kept out, still in the
+    /// pre-trigger buffer, cannot be flushed in after the clear.
+    #[test]
+    fn a_clear_through_the_counter_refuses_records_never_held() {
+        let store = InMemoryStore::new(16);
+        store.append(entry(5, None));
+        // 6-8 arrived (seq assigned) and were never stored.
+        store.clear_through(8);
+        assert_eq!(
+            store.lost_below(),
+            9,
+            "past the counter (8), not just past the newest held (5)"
+        );
+        store.insert_sorted(vec![entry(6, None), entry(7, None), entry(8, None)]);
+        store.append(entry(9, None));
+        assert_eq!(ring(&store), vec![9], "only what arrived after the clear");
+    }
+
+    /// A ring of capacity 0 holds nothing on EITHER write path. The fast path used to evict
+    /// nothing from the empty ring and push, holding one record the merge path never would.
+    #[test]
+    fn a_ring_of_capacity_zero_holds_nothing_on_either_path() {
+        let store = InMemoryStore::new(0);
+        store.append(entry(10, None));
+        assert_eq!(ring(&store), Vec::<u64>::new(), "the fast path");
+        assert_eq!(store.lost_below(), 11, "stored and evicted at once");
+        store.insert_sorted(vec![entry(12, None), entry(11, None)]);
+        assert_eq!(ring(&store), Vec::<u64>::new(), "the merge path");
+        assert!(!store.contains_seq(10));
+    }
+
+    /// The range and the floor come from one read: inclusive at both ends, ascending, and
+    /// empty (with the floor) for a range that holds nothing.
+    #[test]
+    fn a_range_read_returns_the_held_records_and_the_floor_together() {
+        let store = InMemoryStore::new(4);
+        for s in [2, 4, 6, 8, 10] {
+            store.append(entry(s, None));
+        }
+        let (records, floor) = store.range_with_floor(4, 8);
+        assert_eq!(seqs(records), vec![4, 6, 8]);
+        assert_eq!(floor, 3, "2 was evicted");
+        let (records, _) = store.range_with_floor(5, 5);
+        assert!(records.is_empty());
+        let (records, _) = store.range_with_floor(0, 100);
+        assert_eq!(seqs(records), vec![4, 6, 8, 10]);
     }
 
     /// The case that used to read `[10, 5]` (the order stored): seq order now.

@@ -412,6 +412,48 @@ fn readers_see_a_triggers_stored_stretch_in_seq_order() {
     assert!(doc.contains(&format!("seq: {a}")), "{doc}");
 }
 
+/// After `logs.clear`, a trigger brings back nothing that arrived before the clear — not the
+/// records the clear emptied, and not the ones a filter had kept out, which sit in the
+/// pre-trigger buffer and used to be flushed in by the next trigger.
+#[test]
+fn a_trigger_after_a_clear_brings_back_nothing_from_before_it() {
+    let h = harness();
+    // The default triggers open a post-window on every ERROR, which stores the INFO records
+    // after it unconditionally — the filter would keep nothing out, and the case this test
+    // is about would never arise.
+    let listed = h.call("triggers.list", json!({})).unwrap();
+    for t in listed["triggers"].as_array().expect("a triggers array") {
+        h.call("triggers.remove", json!({ "id": t["id"] })).unwrap();
+    }
+    h.sessions
+        .add_filter(&h.session, "l>=ERROR", Some("errors only"))
+        .unwrap();
+    h.call(
+        "triggers.add",
+        json!({ "filter": "l>=ERROR", "pre_window": 5, "post_window": 0 }),
+    )
+    .unwrap();
+
+    let held = h.feed(Level::Error, "an error before the clear");
+    let kept_out = h.feed(Level::Info, "filtered out before the clear");
+    // Vacuity guard: the filter really kept it out, so only a flush could store it.
+    let before_clear = h.call("logs.recent", json!({ "count": 10 })).unwrap();
+    assert_eq!(seqs_of(&before_clear), vec![held], "{before_clear}");
+    h.call("logs.clear", json!({})).unwrap();
+    let after = h.feed(Level::Info, "filtered out after the clear");
+    let boom = h.feed(Level::Error, "boom");
+
+    let recent = h.call("logs.recent", json!({ "count": 10 })).unwrap();
+    let mut got = seqs_of(&recent);
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![after, boom],
+        "the trigger's pre-window reached {kept_out}, which arrived before the clear (as did \
+         {held}, which the clear emptied): {recent}"
+    );
+}
+
 /// A trigger also flushes its trace's records from the pre-buffer when they are older than
 /// its pre-window — the second half of its batch, which arrives BELOW the first half, so the
 /// store must sort it — and every record a trigger stores is marked `pre_trigger`.

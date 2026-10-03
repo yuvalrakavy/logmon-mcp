@@ -2386,21 +2386,25 @@ impl RpcHandler {
         let from = below.last().copied().unwrap_or(anchor.seq);
         let to = above.last().copied().unwrap_or(anchor.seq);
 
-        // The logs the window actually contains — a subset of `log_ctx` by
-        // construction, since any log within `[from, to]` is among the
-        // `before`/`after` nearest the anchor.
-        let logs: Vec<_> = log_ctx
-            .into_iter()
-            .filter(|e| e.seq >= from && e.seq <= to)
-            .collect();
+        // The logs the window contains, and the log floor, read TOGETHER under
+        // one lock once the window is cut. `log_ctx` only cut it: the stores
+        // were read separately, so a log stored after `log_ctx` (and below a
+        // span the span scan saw) is inside `[from, to]` without being in
+        // `log_ctx`, and a log in `log_ctx` may since have been evicted. Read
+        // apart, the file and the floor could describe different instants —
+        // and the floor would call a record gone that the file holds.
+        let (logs, log_lost_below) = d.pipeline.logs_in_range_with_floor(from, to);
+        if logs.binary_search_by_key(&anchor.seq, |e| e.seq).is_err() {
+            return Err(format!(
+                "the anchor entry at seq {} was evicted while the capture was being taken",
+                anchor.seq
+            ));
+        }
 
         // How much of what was ASKED for came back.
         //
-        // The ring is in seq order, so `context_by_seq`'s slice is the anchor's
-        // seq neighbourhood and every log the window holds is in it. The window
-        // can be narrower at either end than the caller requested, and the two
-        // reasons for that
-        // are not the same fact. The ring having dropped records is a LOSS; the
+        // The window can be narrower at either end than the caller requested,
+        // and the two reasons for that are not the same fact. The ring having dropped records is a LOSS; the
         // domain simply not having that much history yet is not. Only
         // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
         // would call the second one eviction on every young domain.
@@ -2419,9 +2423,9 @@ impl RpcHandler {
         //
         // And logs can be gone from INSIDE the window: `from` is the lowest of
         // the nearest records from BOTH stores, so it can be a span below the log
-        // floor. Then spans filled `before`, `short_before` is 0, and only the
-        // floor sitting above `from` says the logs there are gone.
-        let log_lost_below = d.pipeline.lost_below();
+        // floor (spans filled `before`, so `short_before` is 0), or a log evicted
+        // since `log_ctx` was read. Either way only the floor sitting above
+        // `from` says the logs there are gone — and it was read with `logs`.
         let logs_evicted_before_window = crate::filter::parser::evicted_below(from, log_lost_below);
         let log_evicted =
             (short_before > 0 && log_lost_below > 0) || logs_evicted_before_window.is_some();
@@ -2439,13 +2443,9 @@ impl RpcHandler {
 
         // Spans over the SAME resolved range, so the two files describe one
         // interval by construction rather than by two window parameters that
-        // could disagree.
-        let span_filter = lower_seq_range(None, Some(from), Some(to));
-        let mut spans = Vec::new();
-        d.span_store.for_each_matching(span_filter.as_ref(), |s| {
-            spans.push(s.clone());
-        });
-        let span_lost_below = d.span_store.lost_below();
+        // could disagree — with the span floor read in the same lock, as the
+        // log floor is.
+        let (spans, span_lost_below) = d.span_store.range_with_floor(from, to);
         let span_evicted = crate::filter::parser::evicted_below(from, span_lost_below);
 
         let domain_name = d.config.name.to_string();
@@ -2797,10 +2797,11 @@ impl RpcHandler {
                 .map_err(|_| format!("`{hex}` is not a hexadecimal trace id"))?;
             let entries = d.pipeline.logs_by_trace_id(tid);
             let n = entries.len();
-            // Earliest BY SEQ, and the document says how many there were. Not
-            // simply the first returned: `logs_by_trace_id` returns stored
-            // order, and a trigger stores its pre-window's older records AFTER
-            // the record that fired it, so the first stored can be the latest.
+            // Earliest BY SEQ, and the document says how many there were.
+            // `logs_by_trace_id` returns seq order, so this is its first entry;
+            // the `min_by_key` states the requirement rather than leaning on
+            // that order (which it once did not have: a trigger stored its
+            // pre-window's older records AFTER the record that fired it).
             let e = entries
                 .into_iter()
                 .min_by_key(|e| e.seq)

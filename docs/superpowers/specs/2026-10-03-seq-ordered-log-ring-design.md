@@ -94,9 +94,13 @@ comparing with `back().seq` in O(1), and binary-searches only otherwise.
 ### 3.3 Records the store refuses, and the counters
 
 - **Below the floor** (`seq < lost_below`): older than something already evicted, or than a
-  `clear`. Refused. **Behaviour change, stated:** after `logs.clear` the floor is the newest seq
-  held at clear time plus one, so a trigger firing later can no longer bring back records from
-  before the clear (today it re-appends them, cleared records included). On a small, densely
+  `clear`. Refused. **Behaviour change, stated:** after `logs.clear` the floor is the seq
+  counter's value at clear time plus one (`InMemoryStore::clear_through`), so a trigger firing
+  later can no longer bring back records from before the clear (today it re-appends them,
+  cleared records included). *As built:* the first version raised the floor only past the
+  newest seq HELD, which still let a trigger flush in records a filter had kept out before the
+  clear — they wait in the pre-trigger buffer, above that floor (deep gate, two finders
+  independently). On a small, densely
   stored ring, today's code re-appends records that had been evicted, pushing out newer ones —
   even the trigger's own record; that stops too.
 - **Counters:** `total_received` counts every record offered to the store; `total_stored` every
