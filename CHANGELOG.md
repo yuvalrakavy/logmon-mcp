@@ -185,6 +185,14 @@ eviction floor, under one lock. Read apart, a log evicted between the two reads 
 the log file and reported gone at once, and a log stored between them could be missing from
 the file of a window graded `complete`.
 
+### Fixed — a span trigger's notification said seq 0
+
+The span processor stored a copy of each span and passed on the receiver's own, which still
+carried the placeholder seq 0. So every span trigger notification reported `seq: 0` for its
+matched span, and a seq qualifier (`b>=`, `c>=`) in a span trigger or a collector's filter
+compared against 0. Everything after the store now sees the span with the seq it was stored
+under.
+
 ### Fixed — `create_case` captured a window cut from the logs alone
 
 `before`/`after` counted **log** records and the resulting seq range was then

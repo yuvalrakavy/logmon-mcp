@@ -158,7 +158,7 @@ impl Harness {
         let id = DomainId::new(domain).expect("valid domain name");
         let d = self.domains.get(&id).expect("domain exists");
         process_span_for_domain(
-            span,
+            &mut span.clone(),
             &d.span_store,
             &self.sessions,
             &self.pipeline,

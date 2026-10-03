@@ -146,7 +146,7 @@ impl Harness {
         let id = DomainId::default_domain();
         let d = self.domains.get(&id).expect("default domain");
         process_span_for_domain(
-            span,
+            &mut span.clone(),
             &d.span_store,
             &self.sessions,
             &self.pipeline,

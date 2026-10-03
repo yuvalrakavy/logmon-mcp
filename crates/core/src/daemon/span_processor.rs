@@ -19,9 +19,9 @@ pub fn spawn_span_processor(
     domain: DomainId,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(span) = receiver.recv().await {
+        while let Some(mut span) = receiver.recv().await {
             process_span_for_domain(
-                &span,
+                &mut span,
                 &span_store,
                 &sessions,
                 &pipeline,
@@ -35,16 +35,23 @@ pub fn spawn_span_processor(
 /// Process one span against `domain`: store it, then evaluate the span triggers
 /// of the sessions bound to `domain` only. A B-bound session's span trigger
 /// must not fire on — nor deliver — an A-domain span (spec §2, §9.1 site 3).
+///
+/// `span` comes back carrying the seq the store assigned it. The receivers hand a span over
+/// with a placeholder 0, and everything after the store — collectors, span triggers, the
+/// notification — must see the span as stored, or a seq qualifier compares against 0 and a
+/// notification reports seq 0. Taken `&mut` rather than cloned again, because this is the
+/// span ingest hot path (`benches/span_ingest.rs`).
 pub fn process_span_for_domain(
-    span: &SpanEntry,
+    span: &mut SpanEntry,
     store: &SpanStore,
     sessions: &SessionRegistry,
     pipeline: &LogPipeline,
     collectors: &CollectorRegistry,
     domain: &DomainId,
 ) {
-    // 1. Store unconditionally (SpanStore assigns seq)
-    store.insert(span.clone());
+    // 1. Store unconditionally. The store assigns the seq; this copy takes it too.
+    span.seq = store.insert(span.clone());
+    let span: &SpanEntry = span;
 
     // 2. Fold into any collector pinned to this domain whose filter matches.
     //
@@ -88,9 +95,9 @@ pub fn process_span_for_domain(
 }
 
 /// Convenience: process one span in the `default` domain. Used by single-domain
-/// unit tests.
+/// unit tests. Like [`process_span_for_domain`], it leaves the stored seq on `span`.
 pub fn process_span(
-    span: &SpanEntry,
+    span: &mut SpanEntry,
     store: &SpanStore,
     sessions: &SessionRegistry,
     pipeline: &LogPipeline,
