@@ -299,8 +299,9 @@ impl LogPipeline {
         self.store.oldest_timestamp()
     }
 
-    /// Seq of the oldest log entry currently in the store, or `None` if empty.
-    /// Drives bookmark eviction — see `bookmarks::should_evict`.
+    /// Seq of the oldest log entry currently in the store, or `None` if empty. Reported as
+    /// `buffer_oldest_seq` and in `domains.list`. NOT an eviction boundary — bookmark eviction
+    /// reads [`Self::lost_below`] (`bookmarks::should_evict`).
     pub fn oldest_log_seq(&self) -> Option<u64> {
         self.store.oldest_seq()
     }
