@@ -716,7 +716,8 @@ mod bookmark_tests {
 
 /// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
 /// Used by registration guards to reject bookmark filters and cursor filters in long-lived
-/// registered filters/triggers.
+/// registered filters, triggers and collectors — on add, on edit, and when a persisted one
+/// is restored.
 pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,

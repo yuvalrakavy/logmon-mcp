@@ -91,10 +91,11 @@ across such a stretch. The buffer now keeps itself in seq order: a trigger's flu
 in where its seqs belong.
 
 The ORDER you see changes only where a trigger has fired while a **session filter** was
-keeping records out of the buffer, or where a trigger's pre-window reached past what a small
-buffer still held (the flush re-stored records the buffer had already evicted). Otherwise
-every record is stored as it arrives, a trigger finds its pre-window already held, and the
-buffer was in seq order already. Where it applies:
+keeping records out of the buffer, where a trigger's pre-window reached past what a small
+buffer still held, or where a trigger fired after `logs.clear` (in the last two, the flush
+re-stored records the buffer had evicted or cleared). Otherwise every record is stored as it
+arrives, a trigger finds its pre-window already held, and the buffer was in seq order
+already. Where it applies:
 
 - `logs.recent` (`get_recent_logs`): the newest is the newest seq; a flushed pre-window
   record is no longer shown as the newest. Results are still newest-first.
@@ -119,7 +120,10 @@ What the buffer ADMITS changes with or without filters:
 
 - `logs.clear` (`clear_logs`) refuses, from then on, every record that arrived before it,
   stored or not. A trigger firing after a clear used to flush back the records the clear had
-  emptied, and records a filter had kept out that were still in the pre-trigger buffer.
+  emptied, and records a filter had kept out that were still in the pre-trigger buffer. And
+  `logs.export` (`export_logs`) with no range starts where the clear did, so its verdict no
+  longer grades the filters that were active before it (a `filtered` export can now be
+  `complete`).
 - A record older than one the buffer has already evicted is not stored either: in a full
   buffer it would be the oldest record, evicted first. A trigger's flush can offer one.
 - So `status.get`'s (`get_status`) `store.total_received` — the records OFFERED to the
@@ -208,8 +212,10 @@ only query tools resolve one, and in a registered filter it never matches. `edit
 `edit_trigger`, `add_collector` and `edit_collector` did not check. Editing a session's
 filter to `b>=mark` silently stopped the domain storing what that filter had matched, a
 trigger edited to one never fired, and a collector given one measured nothing. All four now
-refuse it with the same error as the adds. A filter or trigger saved with one by an earlier
-version is not restored at startup; the daemon logs a warning naming it.
+refuse it with the same error as the adds. A filter, trigger or collector saved with one by an
+earlier version is not restored at startup: the daemon logs a warning naming a filter or
+trigger, and reports the collector as rejected. If that filter was a session's only one, the
+domain stores more after the upgrade, not less — it was matching nothing.
 
 ### Fixed — a span trigger's notification said seq 0
 

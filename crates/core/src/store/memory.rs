@@ -414,7 +414,6 @@ impl InMemoryStore {
     {
         let inner = self.inner.read().unwrap();
         let mut counts = ScanCounts {
-            held: inner.entries.len(),
             oldest_seq: inner.entries.front().map(|e| e.seq),
             newest_seq: inner.entries.back().map(|e| e.seq),
             lost_below: self.lost_below.load(Ordering::Relaxed),
@@ -436,19 +435,18 @@ impl InMemoryStore {
 
 /// What a full-buffer walk examined and what it kept.
 ///
-/// Two named fields rather than a `(usize, usize)`: they are the same type and
-/// differ only in meaning, so a tuple is one transposition away from reporting
-/// a filter that matched everything as one that matched nothing.
+/// Named fields rather than a `(usize, usize)`: `scanned` and `matched` are the
+/// same type and differ only in meaning, so a tuple is one transposition away
+/// from reporting a filter that matched everything as one that matched nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanCounts {
     /// Records examined — the whole ring, never a `count`-limited prefix.
     pub scanned: usize,
     /// Records that passed the filter and reached the visitor.
     pub matched: usize,
-    /// The ring as the walk saw it — its size, lowest and highest seq, and the loss floor —
-    /// read under the walk's own lock, so a reply built from these never pairs the walk with
-    /// a count, bound or floor read after an eviction.
-    pub held: usize,
+    /// The ring as the walk saw it — its lowest and highest seq and the loss floor (its size
+    /// is `scanned`) — read under the walk's own lock, so a reply built from these never
+    /// pairs the walk with a bound or floor read after an eviction.
     pub oldest_seq: Option<u64>,
     pub newest_seq: Option<u64>,
     pub lost_below: u64,

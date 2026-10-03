@@ -295,7 +295,7 @@ impl LogPipeline {
         // The ring's size and bounds as the WALK saw them, not read again after it.
         let stats = RecentStats {
             scanned: counts.scanned,
-            buffer_total: counts.held,
+            buffer_total: counts.scanned,
             buffer_oldest_seq: counts.oldest_seq,
             buffer_newest_seq: counts.newest_seq,
         };

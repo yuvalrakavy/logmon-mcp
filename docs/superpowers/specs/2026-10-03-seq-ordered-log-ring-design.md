@@ -116,8 +116,9 @@ comparing with `back().seq` in O(1), and binary-searches only otherwise.
   stored ring, today's code re-appends records that had been evicted, pushing out newer ones —
   even the trigger's own record; that stops too.
 - **Counters:** `total_received` counts every record offered to the store; `total_stored` every
-  record inserted. A record refused below the floor or skipped as already held counts as
-  received only, and an excess dropped during a merge (§3.1 step 4) counts as stored and then
+  record inserted. A record refused below the floor counts as received only (*as built:* a
+  record skipped as already held is not counted at all — it is not a new receipt), and an
+  excess dropped during a merge (§3.1 step 4) counts as stored and then
   evicted, as any eviction does. `total_received ≠ total_stored` becomes possible for the first
   time; both are on the wire (`status.get`, `rpc_handler.rs:1755`), so the CHANGELOG says so.
 

@@ -4319,7 +4319,7 @@ fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> 
 fn refuse_bookmark_in(parsed: &crate::filter::parser::ParsedFilter) -> Result<(), String> {
     if crate::filter::parser::contains_bookmark_qualifier(parsed) {
         return Err(
-            "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
+            "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters, triggers or collectors — use them only in query tools"
                 .to_string(),
         );
     }

@@ -396,7 +396,7 @@ fn the_span_line_reports_the_span_rings_own_retention() {
     below.window.span_lost_below = 40_000;
     let out = render(&below).body;
     assert!(
-        out.contains("the span ring has dropped only spans below seq 40000, outside this window"),
+        out.contains("the span ring has dropped spans below seq 40000, none of which could have been in this window"),
         "{out}"
     );
     assert!(
@@ -523,7 +523,7 @@ fn the_span_eviction_line_names_the_span_floor() {
     );
     assert!(
         r.body
-            .contains("The span ring had already dropped spans from this window"),
+            .contains("The span ring had dropped spans this capture may have wanted"),
         "a next step for it: {}",
         r.body
     );
@@ -550,6 +550,11 @@ fn a_shortfall_is_an_empty_past_only_if_neither_ring_dropped_anything() {
         "{out}"
     );
     assert!(!out.contains("empty past"), "{out}");
+    assert!(
+        out.contains("The span ring had dropped spans this capture may have wanted"),
+        "the span loss below the window gets a next step too: {out}"
+    );
+    assert!(!out.contains("Nothing limits this capture"), "{out}");
 }
 
 #[test]

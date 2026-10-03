@@ -743,7 +743,8 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                 "the span ring has never dropped a span".to_string()
             } else {
                 format!(
-                    "the span ring has dropped only spans below seq {}, outside this window",
+                    "the span ring has dropped spans below seq {}, none of which could have \
+                     been in this window",
                     w.span_lost_below
                 )
             };
@@ -951,12 +952,15 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
     }
     // The span ring's loss is its own fact — the log verdict does not cover it — so it gets
     // its own next step, or the document could say nothing limits a capture whose span
-    // section says spans are gone.
-    if i.window.spans_evicted_before_window.is_some() {
+    // section says spans may be gone: inside the window (an upper bound, so hedged) or below
+    // it (a shortfall with the span ring's floor raised).
+    if i.window.spans_evicted_before_window.is_some()
+        || (i.window.short_before > 0 && i.window.span_lost_below > 0)
+    {
         item(
             s,
-            "**The span ring had already dropped spans from this window.** Raise the domain's \
-             `span_buffer_size`, or capture sooner after the event."
+            "**The span ring had dropped spans this capture may have wanted.** Raise the \
+             domain's `span_buffer_size`, or capture sooner after the event."
                 .into(),
         );
     }

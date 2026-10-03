@@ -685,7 +685,7 @@ get_recent_traces(filter="b>=before-deploy, b<=after-deploy, d>=100")
 
 Naming: bookmarks are stored as `{session}/{name}`. Bare `before` in a query resolves to your own session; `other/before` reaches into another session's bookmarks (pure-read across sessions is fine; cross-session **advance** with `c>=` is rejected).
 
-`b>=`, `b<=`, and `c>=` are query-only — rejected by `add_filter` and `add_trigger`.
+`b>=`, `b<=`, and `c>=` are query-only — rejected by `add_filter`/`edit_filter`, `add_trigger`/`edit_trigger` and `add_collector`/`edit_collector`.
 
 ## Cursors: "what's new since I last checked"
 

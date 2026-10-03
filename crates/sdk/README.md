@@ -718,7 +718,7 @@ loop {
 
 #### Where `c>=` is permitted
 
-Allowed in: `logs_recent`, `logs_export`, `traces_logs`. Rejected in `logs_context`, `traces_recent`, `traces_summary`, `traces_slow`, `traces_get`, `spans_context` (their results are anchored or aggregated, not seq-streamable). Also rejected in `filters_add` and `triggers_add` — cursor positions don't make sense in long-lived registered filters.
+Allowed in: `logs_recent`, `logs_export`, `traces_logs`. Rejected in `logs_context`, `traces_recent`, `traces_summary`, `traces_slow`, `traces_get`, `spans_context` (their results are anchored or aggregated, not seq-streamable). Also rejected in `filters_add`/`filters_edit`, `triggers_add`/`triggers_edit` and `collectors_add`/`collectors_edit` — cursor positions don't make sense in long-lived registered filters.
 
 #### `cursor_advanced_to` field
 

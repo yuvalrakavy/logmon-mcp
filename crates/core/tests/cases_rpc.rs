@@ -1618,7 +1618,7 @@ fn spans_dropped_above_the_window_are_not_counted_as_gone_from_it() {
         "vacuity: {doc}"
     );
     assert!(
-        doc.contains("span ring has dropped only spans below seq 24"),
+        doc.contains("span ring has dropped spans below seq 24, none of which could have been in this window"),
         "{doc}"
     );
     assert!(!doc.contains("**had** evicted"), "{doc}");
@@ -1657,7 +1657,7 @@ fn a_span_floor_below_the_window_is_not_an_empty_past() {
     );
     assert!(!doc.contains("neither ring has dropped anything"), "{doc}");
     assert!(
-        doc.contains("the span ring has dropped only spans below seq 4, outside this window"),
+        doc.contains("the span ring has dropped spans below seq 4, none of which could have been in this window"),
         "{doc}"
     );
 }
