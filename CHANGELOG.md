@@ -126,6 +126,16 @@ finds its pre-window already held, and the buffer was in seq order already. Wher
   trigger with a smaller pre-window had drained newer ones, so a later flush could pull in
   records far older than N arrivals.
 
+### Changed — a trigger notification carries `notify_context` records, not its whole pre-window
+
+A trigger's `context_before` is documented as "at most `notify_context`" records (default 5),
+but the daemon sent the trigger's whole pre-window — up to 500 records with the default
+`l>=ERROR` trigger — and the matched record a second time as its last entry. It now sends
+the `notify_context` records just before the match, in seq order, without the match itself
+(that is `matched_entry`). The rest of the pre-window is still stored: read it with
+`get_log_context` (`logs.context`) around the matched entry's seq. A client that read the
+whole pre-window from the notification gets 5 records now, or `notify_context` if set.
+
 ### Fixed — `traces.logs` (`get_trace_logs`) walked the whole log buffer on every call
 
 Looking up one trace's logs found the trace's seqs in an index, then compared every record

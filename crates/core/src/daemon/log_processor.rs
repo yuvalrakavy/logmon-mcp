@@ -116,7 +116,16 @@ pub fn process_entry_for_domain(
             // Build notification event and send/queue
             let mut any_oneshot_removed = false;
             for m in &matches {
-                let context_before = pipeline.context_by_seq(entry.seq, m.pre_window as usize, 0);
+                // The `notify_context` records just before the match, in seq order — the
+                // documented bound on `context_before`. Not the whole pre-window: that is
+                // STORED (the flush above) and readable with `logs.context` around this
+                // seq. And not the match itself, which `context_by_seq` includes and the
+                // notification already carries as `matched_entry`.
+                let mut context_before =
+                    pipeline.context_by_seq(entry.seq, m.notify_context as usize, 0);
+                if context_before.last().is_some_and(|e| e.seq == entry.seq) {
+                    context_before.pop();
+                }
                 let event = PipelineEvent {
                     session_id: sid.to_string(),
                     trigger_id: m.id,

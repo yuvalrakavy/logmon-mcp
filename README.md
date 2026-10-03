@@ -781,7 +781,7 @@ Triggers watch every incoming log and fire when a match occurs, capturing contex
 
 - `pre_window` — logs captured *before* the matching event (flight recorder).
 - `post_window` — logs captured *after* the matching event.
-- `notify_context` — how many pre-window entries are inlined into the notification payload.
+- `notify_context` — how many of the records just before the match are inlined into the notification payload (default 5). The rest of the pre-window is stored, not sent: read it with `get_log_context` around the matched entry's seq.
 - `oneshot` — when `true`, the trigger auto-removes after its first match.
 
 Each session automatically gets two triggers on startup: `l>=ERROR` and `mfm=panic`. The pre- and post-trigger captures bypass buffer filters, so context around a fire is never truncated by a narrow filter.
