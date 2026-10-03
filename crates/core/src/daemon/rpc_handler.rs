@@ -2223,9 +2223,10 @@ impl RpcHandler {
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
 
-        // logs_by_trace_id already returns logs in stored (seq-ascending) order
-        // — that's the same order cursor pagination wants — so no ordering
-        // switch is needed on this code path.
+        // logs_by_trace_id returns logs in STORED order, which is append order and
+        // usually seq-ascending — but not always: a trigger appends its pre-window's
+        // older records after the triggering one (`daemon/log_processor.rs`), so a
+        // cursor that has already passed a seq does not see a lower one stored later.
         let mut logs = d.pipeline.logs_by_trace_id(trace_id);
         if let Some(f) = resolved.as_ref() {
             logs.retain(|e| crate::filter::matcher::matches_entry(f, e));

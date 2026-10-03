@@ -323,8 +323,8 @@ fn check_header(file: &str, header: &str, want_kind: &str) -> Result<(), LoadErr
 /// Records must be ascending, distinct and inside the declared window.
 ///
 /// The stores assume exactly this: `context_by_seq` locates by `position()` and
-/// slices, and `seq_set` is a `HashSet`, so a duplicate is kept by the deque and
-/// collapsed by the set — after which `len()` and `contains_seq` disagree and
+/// slices, and `seq_pos` is a map keyed by seq, so a duplicate is kept by the deque
+/// and collapsed by the map — after which `len()` and `contains_seq` disagree and
 /// every windowed read is subtly wrong.
 fn validate_seqs<T: HasSeq>(
     key: &'static str,

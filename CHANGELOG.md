@@ -80,6 +80,22 @@ a path outside the case.
 case with no registry entry reads as "no provenance recorded" rather than an
 error. A reader must not reconstruct one from the table.
 
+### Fixed — `traces.logs` (`get_trace_logs`) walked the whole log buffer on every call
+
+Looking up one trace's logs found the trace's seqs in an index, then compared
+every record in the buffer against them — under the store's read lock, which
+ingestion needs as a write lock. On a full default buffer (500,000 records) a
+call for a 2,000-record trace took **15.8 ms**. A client polling per trace (a
+test harness waiting for a marker record, from many parallel lanes) asks for
+more of those per second than one core can serve, and under that load records
+were seen reaching readers seconds after they were sent.
+
+The store now keeps each record's position, and the lookup reads only the
+trace's own records: **0.28 ms** for the same call (release build, measured).
+Results are unchanged, in the same order — the order the records were stored,
+which is not always seq order: a trigger stores its pre-window's older records
+after the triggering one.
+
 ### Fixed — `create_case` captured a window cut from the logs alone
 
 `before`/`after` counted **log** records and the resulting seq range was then

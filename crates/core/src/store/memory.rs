@@ -3,7 +3,7 @@ use crate::filter::parser::ParsedFilter;
 use crate::gelf::message::LogEntry;
 use crate::store::traits::{LogStore, StoreStats};
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -17,7 +17,19 @@ use std::time::Duration;
 /// Mirrors the single-lock pattern in `SpanStore`.
 struct StoreInner {
     entries: VecDeque<LogEntry>,
-    seq_set: HashSet<u64>,
+    /// Every held record's seq → its ABSOLUTE position: the number of records pushed
+    /// before it, ever. The record is `entries[pos - popped]`. This is what lets
+    /// `logs_by_trace_id` read a trace's own records instead of walking the whole ring.
+    ///
+    /// A map rather than a binary search because the ring is in APPEND order, not seq
+    /// order: when a trigger fires, the triggering record is appended first and the older
+    /// records of its pre-window after it (`daemon/log_processor.rs`), so a search by seq
+    /// would silently miss them.
+    seq_pos: HashMap<u64, u64>,
+    /// Records evicted from the front, ever. Invariant: the record at `entries[i]` has
+    /// position `popped + i`. A `clear` empties `entries` and `seq_pos` together, which keeps
+    /// the invariant without touching this.
+    popped: u64,
     trace_index: HashMap<u128, Vec<u64>>,
 }
 
@@ -48,7 +60,8 @@ impl InMemoryStore {
             // memory — matters when many domains are created but stay idle.
             inner: RwLock::new(StoreInner {
                 entries: VecDeque::new(),
-                seq_set: HashSet::new(),
+                seq_pos: HashMap::new(),
+                popped: 0,
                 trace_index: HashMap::new(),
             }),
             max_capacity: capacity,
@@ -78,14 +91,14 @@ impl InMemoryStore {
     /// unmeasured rather than as perfect.
     ///
     /// Records must be ascending and distinct; the caller validates, because
-    /// `entries` and `seq_set` desynchronise on a duplicate — the deque keeps
-    /// both and the set keeps one, so `len()` and `contains_seq` stop agreeing.
+    /// `entries` and `seq_pos` desynchronise on a duplicate — the deque keeps
+    /// both and the map keeps one, so `len()` and `contains_seq` stop agreeing.
     pub fn from_records(capacity: usize, records: Vec<LogEntry>, lost_below: u64) -> Self {
         let mut entries = VecDeque::with_capacity(capacity.max(records.len()));
-        let mut seq_set = HashSet::with_capacity(records.len());
+        let mut seq_pos = HashMap::with_capacity(records.len());
         let mut trace_index: HashMap<u128, Vec<u64>> = HashMap::new();
         for e in records {
-            seq_set.insert(e.seq);
+            seq_pos.insert(e.seq, entries.len() as u64);
             if let Some(tid) = e.trace_id {
                 trace_index.entry(tid).or_default().push(e.seq);
             }
@@ -95,7 +108,8 @@ impl InMemoryStore {
             max_capacity: capacity.max(entries.len()),
             inner: RwLock::new(StoreInner {
                 entries,
-                seq_set,
+                seq_pos,
+                popped: 0,
                 trace_index,
             }),
             total_stored: AtomicU64::new(0),
@@ -230,7 +244,8 @@ impl LogStore for InMemoryStore {
 
         if inner.entries.len() >= self.max_capacity {
             if let Some(evicted) = inner.entries.pop_front() {
-                inner.seq_set.remove(&evicted.seq);
+                inner.seq_pos.remove(&evicted.seq);
+                inner.popped += 1;
                 // The one place a record actually leaves. Recorded under the
                 // same write guard that removes it, so the boundary and the
                 // removal cannot be observed out of step.
@@ -247,8 +262,9 @@ impl LogStore for InMemoryStore {
             }
         }
 
+        let pos = inner.popped + inner.entries.len() as u64;
         inner.entries.push_back(entry);
-        inner.seq_set.insert(seq);
+        inner.seq_pos.insert(seq, pos);
         if let Some(tid) = trace_id {
             inner.trace_index.entry(tid).or_default().push(seq);
         }
@@ -297,19 +313,26 @@ impl LogStore for InMemoryStore {
     }
 
     fn contains_seq(&self, seq: u64) -> bool {
-        self.inner.read().unwrap().seq_set.contains(&seq)
+        self.inner.read().unwrap().seq_pos.contains_key(&seq)
     }
 
+    /// A trace's records in the order they were stored (append order — see `seq_pos`).
+    ///
+    /// Reads only the trace's own records, by position: O(records in the trace), not
+    /// O(ring). It used to walk the whole ring under the read lock, which on a full
+    /// 500,000-record domain made every call cost the whole ring while ingestion waited for
+    /// the write lock — and a client that polls this per trace (a test harness waiting for a
+    /// marker record) issues many such calls a second.
     fn logs_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
         let inner = self.inner.read().unwrap();
         let Some(seqs) = inner.trace_index.get(&trace_id) else {
             return Vec::new();
         };
-        let seq_set: HashSet<u64> = seqs.iter().copied().collect();
-        inner
-            .entries
-            .iter()
-            .filter(|e| seq_set.contains(&e.seq))
+        seqs.iter()
+            .filter_map(|seq| {
+                let pos = *inner.seq_pos.get(seq)?;
+                inner.entries.get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
+            })
             .cloned()
             .collect()
     }
@@ -331,7 +354,7 @@ impl LogStore for InMemoryStore {
                 .store(newest.saturating_add(1), Ordering::Relaxed);
         }
         inner.entries.clear();
-        inner.seq_set.clear();
+        inner.seq_pos.clear();
         inner.trace_index.clear();
     }
 
@@ -659,5 +682,171 @@ mod concurrency_tests {
         tokio::time::timeout(Duration::from_secs(20), work)
             .await
             .expect("deadlock — clear/logs_by_trace_id ABBA regression");
+    }
+}
+
+#[cfg(test)]
+mod trace_lookup_tests {
+    //! `logs_by_trace_id` reads a trace's records by position (`seq_pos`) instead of walking
+    //! the ring. The oracle for every test here is the DEFINITION, computed without the
+    //! index: the ring's records whose `trace_id` is the trace's, in ring order.
+
+    use super::*;
+    use crate::gelf::message::{Level, LogEntry, LogSource};
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn entry(seq: u64, trace_id: Option<u128>) -> LogEntry {
+        LogEntry {
+            seq,
+            timestamp: Utc::now(),
+            level: Level::Info,
+            message: "m".to_string(),
+            full_message: None,
+            host: "h".to_string(),
+            facility: None,
+            file: None,
+            line: None,
+            additional_fields: HashMap::new(),
+            trace_id,
+            span_id: None,
+            matched_filters: Vec::new(),
+            source: LogSource::Filter,
+        }
+    }
+
+    fn seqs(entries: Vec<LogEntry>) -> Vec<u64> {
+        entries.into_iter().map(|e| e.seq).collect()
+    }
+
+    fn by_definition(store: &InMemoryStore, trace: u128) -> Vec<u64> {
+        let inner = store.inner.read().unwrap();
+        inner.entries.iter().filter(|e| e.trace_id == Some(trace)).map(|e| e.seq).collect()
+    }
+
+    /// The structure's own invariant: every held record is indexed at `popped + i`, and the
+    /// index holds nothing else.
+    fn assert_positions(store: &InMemoryStore) {
+        let inner = store.inner.read().unwrap();
+        assert_eq!(inner.seq_pos.len(), inner.entries.len(), "one index entry per held record");
+        for (i, e) in inner.entries.iter().enumerate() {
+            assert_eq!(inner.seq_pos.get(&e.seq), Some(&(inner.popped + i as u64)), "seq {}", e.seq);
+        }
+    }
+
+    /// The trigger path's shape: the triggering record is stored first and its older
+    /// pre-window record after it, so the ring is not in seq order.
+    #[test]
+    fn a_record_stored_out_of_seq_order_is_found_in_stored_order() {
+        let store = InMemoryStore::new(10);
+        store.append(entry(10, Some(7)));
+        store.append(entry(5, Some(7)));
+        store.append(entry(11, Some(8)));
+        assert_eq!(seqs(store.logs_by_trace_id(7)), vec![10, 5]);
+        assert_eq!(seqs(store.logs_by_trace_id(8)), vec![11]);
+        assert!(store.contains_seq(5));
+        assert_positions(&store);
+    }
+
+    #[test]
+    fn eviction_keeps_every_position_right() {
+        let store = InMemoryStore::new(3);
+        for s in 1..=5 {
+            store.append(entry(s, Some(1)));
+        }
+        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![3, 4, 5]);
+        assert!(!store.contains_seq(2) && store.contains_seq(3));
+        assert_positions(&store);
+    }
+
+    #[test]
+    fn a_clear_then_more_appends_keeps_every_position_right() {
+        let store = InMemoryStore::new(10);
+        store.append(entry(1, Some(1)));
+        store.append(entry(2, Some(1)));
+        store.clear();
+        assert!(store.logs_by_trace_id(1).is_empty());
+        store.append(entry(3, Some(1)));
+        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![3]);
+        assert!(!store.contains_seq(1) && store.contains_seq(3));
+        assert_positions(&store);
+    }
+
+    /// A case loads through `from_records`, not `append`: its positions must be right too.
+    #[test]
+    fn a_store_built_from_records_finds_its_traces_and_then_appends() {
+        let store = InMemoryStore::from_records(
+            10,
+            vec![entry(1, Some(1)), entry(2, Some(2)), entry(3, Some(1))],
+            1,
+        );
+        assert_positions(&store);
+        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![1, 3]);
+        store.append(entry(4, Some(1)));
+        assert_eq!(seqs(store.logs_by_trace_id(1)), vec![1, 3, 4]);
+        assert_positions(&store);
+    }
+
+    /// xorshift64: deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// Differential: a seeded mix of in-order appends, LATE appends of a seq assigned earlier
+    /// and held back (the trigger path's shape), untraced records, evictions from a small ring
+    /// and the odd clear — checked against the definition and the position invariant after
+    /// every step.
+    #[test]
+    fn the_lookup_matches_the_definition_under_late_appends_evictions_and_clears() {
+        let store = InMemoryStore::new(16);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut next_seq = 1_000u64;
+        let mut held_back: Vec<u64> = Vec::new();
+        let (mut late, mut clears, mut nonempty) = (0, 0, 0);
+        for _ in 0..5_000 {
+            let r = rng.next();
+            let trace = match r % 4 {
+                0 => None,
+                k => Some(k as u128),
+            };
+            match (r >> 8) % 10 {
+                0 if !held_back.is_empty() => {
+                    let i = (r >> 16) as usize % held_back.len();
+                    store.append(entry(held_back.swap_remove(i), trace));
+                    late += 1;
+                }
+                1 => {
+                    held_back.push(next_seq);
+                    next_seq += 1;
+                }
+                2 if (r >> 16).is_multiple_of(40) => {
+                    store.clear();
+                    clears += 1;
+                }
+                _ => {
+                    store.append(entry(next_seq, trace));
+                    next_seq += 1;
+                }
+            }
+            for t in 1..=3u128 {
+                let got = seqs(store.logs_by_trace_id(t));
+                assert_eq!(got, by_definition(&store, t), "trace {t}");
+                if !got.is_empty() {
+                    nonempty += 1;
+                }
+            }
+            assert_positions(&store);
+        }
+        // Vacuity guards: the run must have exercised what it claims to.
+        assert!(late > 100, "late appends exercised: {late}");
+        assert!(clears > 2, "clears exercised: {clears}");
+        assert!(store.inner.read().unwrap().popped > 1_000, "evictions exercised");
+        assert!(nonempty > 1_000, "lookups that returned records: {nonempty}");
     }
 }
