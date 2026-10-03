@@ -27,10 +27,10 @@ pub struct SpanStore {
 
 struct SpanStoreInner {
     buffer: VecDeque<SpanEntry>,
-    /// Every held span's seq → its ABSOLUTE position: the number of spans pushed before
-    /// it, ever. The span is `buffer[pos - popped]`. This is what lets `get_trace` read a
-    /// trace's own spans instead of walking the whole ring (the log store's `seq_pos`,
-    /// for the same reason).
+    /// Every held span's seq → its ABSOLUTE position, a count that only grows (see `popped`
+    /// for the invariant). The span is `buffer[pos - popped]`. This is what lets `get_trace`
+    /// read a trace's own spans instead of walking the whole ring (the log store's
+    /// `seq_pos`, for the same reason).
     ///
     /// A map rather than a binary search by seq because nothing makes the ring seq-ordered:
     /// `insert` takes its seq from the shared counter BEFORE the write lock, so two
@@ -142,27 +142,10 @@ impl SpanStore {
         seq
     }
 
-    /// The trace's spans, by start time. Reads only the trace's own spans: `trace_index`
-    /// lists them in ring order (every push and eviction updates both together), and
-    /// `seq_pos` places each one, so the cost is the trace's size, not the ring's.
+    /// The trace's spans, by start time. See [`trace_spans`].
     pub fn get_trace(&self, trace_id: u128) -> Vec<SpanEntry> {
         let inner = self.inner.read().unwrap();
-        let seqs = match inner.trace_index.get(&trace_id) {
-            Some(s) => s,
-            None => return vec![],
-        };
-        let mut spans: Vec<SpanEntry> = seqs
-            .iter()
-            .filter_map(|seq| {
-                let pos = *inner.seq_pos.get(seq)?;
-                inner
-                    .buffer
-                    .get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
-            })
-            .cloned()
-            .collect();
-        spans.sort_by_key(|s| s.start_time);
-        spans
+        trace_spans(&inner, trace_id).into_iter().cloned().collect()
     }
 
     pub fn slow_spans(
@@ -272,11 +255,10 @@ impl SpanStore {
         traces
             .iter()
             .map(|&(trace_id, _)| {
-                let spans: Vec<&SpanEntry> = inner
-                    .buffer
-                    .iter()
-                    .filter(|s| s.trace_id == trace_id)
-                    .collect();
+                // Non-empty: the trace is here because at least one of its spans is held.
+                // In start-time order, as `get_trace` returns them, so a trace with no root
+                // starts at its EARLIEST span and agrees with `build_trace_summary`.
+                let spans = trace_spans(&inner, trace_id);
                 let root = spans.iter().find(|s| s.parent_span_id.is_none());
                 TraceSummary {
                     trace_id,
@@ -370,6 +352,28 @@ impl SpanStore {
     pub fn oldest_seq(&self) -> Option<u64> {
         self.inner.read().unwrap().buffer.front().map(|s| s.seq)
     }
+}
+
+/// One trace's held spans, by start time (ties in ring order — the sort is stable). Reads
+/// only the trace's own spans: `trace_index` lists them in ring order (every push and
+/// eviction updates both together), and `seq_pos` places each one, so the cost is the
+/// trace's size, not the ring's. Shared by `get_trace` and `recent_traces`, which used to
+/// walk the whole ring once per trace.
+fn trace_spans(inner: &SpanStoreInner, trace_id: u128) -> Vec<&SpanEntry> {
+    let Some(seqs) = inner.trace_index.get(&trace_id) else {
+        return Vec::new();
+    };
+    let mut spans: Vec<&SpanEntry> = seqs
+        .iter()
+        .filter_map(|seq| {
+            let pos = *inner.seq_pos.get(seq)?;
+            inner
+                .buffer
+                .get(usize::try_from(pos.checked_sub(inner.popped)?).ok()?)
+        })
+        .collect();
+    spans.sort_by_key(|s| s.start_time);
+    spans
 }
 
 #[cfg(test)]
@@ -498,7 +502,9 @@ mod trace_lookup_tests {
 
     /// Spans held out of seq order — the shape two racing inserts leave, and what
     /// `from_records` builds from whatever it is given — are all found, and inserting and
-    /// evicting after a load keeps every position right.
+    /// evicting after a load keeps every position right. 105 and 103 share a start time,
+    /// so the result also pins that a tie keeps RING order, as the old ring walk did: a
+    /// lookup that walked the trace's seqs in seq order would return 103 first.
     #[test]
     fn spans_held_out_of_seq_order_are_found_before_and_after_evictions() {
         let store = SpanStore::from_records(
@@ -506,7 +512,7 @@ mod trace_lookup_tests {
             Arc::new(SeqCounter::new()),
             vec![
                 span(105, 1, 0),
-                span(103, 1, 1),
+                span(103, 1, 0),
                 span(109, 2, 2),
                 span(104, 1, 3),
             ],
@@ -525,6 +531,37 @@ mod trace_lookup_tests {
         assert_eq!(seqs(store.get_trace(1)), by_definition(&store, 1));
         assert_eq!(seqs(store.get_trace(2)), by_definition(&store, 2));
         assert_positions(&store);
+    }
+
+    /// `recent_traces` reads each trace by position too, in start-time order — so a trace
+    /// with no root starts at its EARLIEST span, as `build_trace_summary` (which reads
+    /// `get_trace`) has it, not at whichever span the ring happens to hold first.
+    #[test]
+    fn a_rootless_trace_starts_at_its_earliest_span_in_recent_traces() {
+        let store = SpanStore::new(16, Arc::new(SeqCounter::new()));
+        for offset in [5, 2, 9] {
+            let mut child = span(0, 7, offset);
+            child.parent_span_id = Some(1);
+            store.insert(child);
+        }
+        store.insert(span(0, 8, 1)); // another trace, with a root, inserted last
+
+        let summaries = store.recent_traces(10, None, |_| 0);
+        let rootless = summaries
+            .iter()
+            .find(|t| t.trace_id == 7)
+            .expect("trace 7 is listed");
+        assert_eq!(rootless.span_count, 3);
+        assert_eq!(
+            rootless.start_time,
+            span(0, 7, 2).start_time,
+            "a rootless trace starts at its earliest span"
+        );
+        assert_eq!(
+            summaries.iter().map(|t| t.trace_id).collect::<Vec<_>>(),
+            vec![8, 7],
+            "most recent trace first"
+        );
     }
 
     /// xorshift64: deterministic, no dependency.

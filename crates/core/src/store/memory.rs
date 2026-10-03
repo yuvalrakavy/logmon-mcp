@@ -17,8 +17,8 @@ use std::time::Duration;
 /// Mirrors the single-lock pattern in `SpanStore`.
 struct StoreInner {
     entries: VecDeque<LogEntry>,
-    /// Every held record's seq → its ABSOLUTE position: the number of records pushed
-    /// before it, ever. The record is `entries[pos - popped]`. This is what lets
+    /// Every held record's seq → its ABSOLUTE position, a count that only grows (see
+    /// `popped` for the invariant). The record is `entries[pos - popped]`. This is what lets
     /// `logs_by_trace_id` read a trace's own records instead of walking the whole ring.
     ///
     /// A map rather than a binary search because the ring is in APPEND order, not seq
@@ -93,7 +93,8 @@ impl InMemoryStore {
     /// Records must be ascending and distinct; the caller validates, because
     /// `entries` and `seq_pos` desynchronise on a duplicate — the deque keeps
     /// both and the map keeps one, so `len()` and `contains_seq` stop agreeing,
-    /// and a trace lookup returns the later copy twice and the earlier never.
+    /// and a trace lookup can return the wrong record — the later copy twice, or
+    /// another trace's record when the two copies are in different traces.
     pub fn from_records(capacity: usize, records: Vec<LogEntry>, lost_below: u64) -> Self {
         let mut entries = VecDeque::with_capacity(capacity.max(records.len()));
         let mut seq_pos = HashMap::with_capacity(records.len());

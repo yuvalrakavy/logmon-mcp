@@ -387,6 +387,62 @@ fn a_trace_id_anchor_takes_the_earliest_seq_when_a_trigger_stored_it_out_of_orde
     assert!(doc.contains("# early in the trace"), "{doc}");
     assert!(doc.contains("matched 3 entries"), "{doc}");
     assert!(doc.contains(&format!("earliest by seq ({early})")), "{doc}");
+
+    // And the case reads back: its log file is in seq order, which `cases.load`
+    // requires, although the store held these records newest-first.
+    let p = r["paths"][0].as_str().expect("a document path");
+    let case = logmon_broker_core::cases::load::load(std::path::Path::new(p))
+        .expect("a case captured over a trigger's stored stretch loads");
+    let seqs: Vec<u64> = case
+        .logs
+        .unwrap_or_default()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![early, early + 1, fired],
+        "the log file is in seq order"
+    );
+}
+
+/// The window is cut by SEQ, not by position in the ring. Anchored on the record
+/// that fired a trigger — stored FIRST, before the older pre-window records it
+/// pulls in — `before: 2` must reach the two records just below it in seq, not
+/// the records that happen to sit before it in the ring (none, here).
+#[test]
+fn a_window_is_cut_by_seq_when_a_trigger_stored_it_out_of_order() {
+    let h = harness();
+    let noisy = h.sessions.create_named("noisy").unwrap();
+    h.sessions
+        .add_filter(&noisy, "l>=ERROR", Some("errors only"))
+        .unwrap();
+    h.call(
+        "triggers.add",
+        json!({ "filter": "l>=ERROR", "pre_window": 5, "post_window": 0 }),
+    )
+    .unwrap();
+
+    let first = h.feed(Level::Info, "first before the error");
+    let second = h.feed(Level::Info, "second before the error");
+    let boom = h.feed(Level::Error, "boom");
+
+    let r = h
+        .capture(json!({ "anchor": { "seq": boom }, "before": 2, "after": 0 }))
+        .unwrap();
+    let p = r["paths"][0].as_str().expect("a document path");
+    let case = logmon_broker_core::cases::load::load(std::path::Path::new(p)).expect("loads");
+    let seqs: Vec<u64> = case
+        .logs
+        .unwrap_or_default()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![first, second, boom],
+        "the two records nearest the anchor in seq are in the window, in seq order"
+    );
 }
 
 /// A bookmark marks a BOUNDARY, not a record: `b>=name` selects strictly after
@@ -611,8 +667,8 @@ fn a_second_capture_in_the_same_second_does_not_overwrite_the_first() {
 }
 
 /// The gate found `EvidenceVerdict::Evicted` structurally unreachable here: the
-/// window's lower end comes from `context_by_seq`, which only returns STORED
-/// entries, so it could never sit below the oldest one. A capture that asked for
+/// window's lower end comes from the STORED entries, so it could never sit below
+/// the oldest one. A capture that asked for
 /// 100 records of context and got 29 reported `complete`.
 #[test]
 fn a_window_the_ring_has_eaten_reports_evicted_not_complete() {

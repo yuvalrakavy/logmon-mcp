@@ -98,16 +98,37 @@ after the triggering one.
 
 `traces.get` (`get_trace`) had the same shape on the span buffer, with each span
 compared against the trace's whole span list, so its cost grew with the buffer
-times the trace. It reads by position now too (not measured).
+times the trace; `traces.recent` walked the whole span buffer once per trace it
+returned. Both read by position now (not measured). `traces.recent` also now
+gives a trace with no root span the start time of its EARLIEST span, as the
+trace summary in a span trigger's notification already did; it used to take whichever
+span the buffer held first.
 
 ### Fixed — `create_case` anchored on a trace id could take the wrong record
 
 The anchor is documented as the trace's earliest record by seq, but it was the
 first record the store returned for the trace. When the trace's early records
 reached the store only through a trigger's pre-window, the trigger stored its own
-record first, so the anchor was the trace's LATEST record, and the case document
-said *"the earliest by seq (N) was taken"* with N the wrong record. The
-anchor now takes the lowest seq.
+record first, so the anchor was the record that fired the trigger rather than the
+trace's earliest, and the case document said *"the earliest by seq (N) was
+taken"* with N the wrong record. The anchor now takes the lowest seq.
+
+### Fixed — a case captured across a trigger could not be loaded, and its window was cut wrong
+
+A trigger stores the record that fired it before its pre-window's older records,
+so the log buffer is not always in seq order. `create_case` cut its log window by
+POSITION in the buffer and wrote the records in that order, which had two
+effects whenever the window took in such a stretch:
+
+- `load_case` refused the case outright: a case's records must be in ascending
+  seq order, and these were not.
+- The window could hold the wrong records. Records farther from the anchor in seq
+  took the slots of nearer ones, and when that left the window short below the
+  anchor, the document could report records as **gone** that were still stored,
+  advising a larger `log_buffer_size`.
+
+The window is now cut by seq from both stores, and both evidence files are
+written in seq order.
 
 ### Fixed — `create_case` captured a window cut from the logs alone
 

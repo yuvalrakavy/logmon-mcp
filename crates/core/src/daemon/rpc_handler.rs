@@ -2346,28 +2346,36 @@ impl RpcHandler {
         // 1007–1009, zero spans captured, and those spans were stored 95 seconds
         // BEFORE the capture ran. Counting both stores makes that sentence true
         // as well as filling the file.
-        let log_ctx = d
-            .pipeline
-            .context_by_seq(anchor.seq, before.value, after.value);
-        if log_ctx.is_empty() {
-            // `resolve_case_anchor` already proved the anchor is stored, so an
-            // empty neighbourhood means it was evicted between the two reads.
+        // `resolve_case_anchor` already proved the anchor is stored, so a missing
+        // one means it was evicted between the two reads.
+        if !d.pipeline.contains_seq(anchor.seq) {
             return Err(format!(
                 "the anchor entry at seq {} was evicted while the capture was being taken",
                 anchor.seq
             ));
         }
 
-        // Candidate seqs either side of the anchor, from both stores. The log
-        // side needs no more than its own `before`/`after`: adding spans can
-        // only make the merged window NARROWER in seq terms, never wider, so the
-        // logs already reach at least as far as the answer does.
+        // Candidate seqs either side of the anchor, from both stores, BY SEQ —
+        // the archive's only ordering. Not a positional slice of the log ring:
+        // the ring is in the order records were STORED, and a trigger stores its
+        // own record before its pre-window's older ones, so the records nearest
+        // the anchor in seq can sit far from it in the ring. A positional slice
+        // then let farther records take the window's slots, and wrote the log
+        // file out of seq order, which `cases.load` refuses.
         //
-        // The span scan is unfiltered because the range it would be filtered by
-        // is the thing being computed. It is bounded by the ring, and a capture
-        // is a deliberate one-shot action rather than a query on a hot path.
-        let mut below: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s < anchor.seq).collect();
-        let mut above: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s > anchor.seq).collect();
+        // Both scans are unfiltered because the range they would be filtered by
+        // is the thing being computed. They are bounded by the rings, and a
+        // capture is a deliberate one-shot action rather than a query on a hot
+        // path.
+        let mut below: Vec<u64> = Vec::new();
+        let mut above: Vec<u64> = Vec::new();
+        d.pipeline.for_each_log(None, |e| {
+            if e.seq < anchor.seq {
+                below.push(e.seq);
+            } else if e.seq > anchor.seq {
+                above.push(e.seq);
+            }
+        });
         d.span_store.for_each_matching(None, |s| {
             if s.seq < anchor.seq {
                 below.push(s.seq);
@@ -2386,19 +2394,19 @@ impl RpcHandler {
         let from = below.last().copied().unwrap_or(anchor.seq);
         let to = above.last().copied().unwrap_or(anchor.seq);
 
-        // The logs the window actually contains — a subset of `log_ctx` by
-        // construction, since any log within `[from, to]` is among the
-        // `before`/`after` nearest the anchor.
-        let logs: Vec<_> = log_ctx
-            .into_iter()
-            .filter(|e| e.seq >= from && e.seq <= to)
-            .collect();
+        // The logs the window contains, in seq order — the order a case is read
+        // back in (`cases::load` refuses anything else).
+        let log_filter = lower_seq_range(None, Some(from), Some(to));
+        let mut logs = Vec::new();
+        d.pipeline
+            .for_each_log(log_filter.as_ref(), |e| logs.push(e.clone()));
+        logs.sort_by_key(|e: &LogEntry| e.seq);
 
         // How much of what was ASKED for came back.
         //
-        // `context_by_seq` returns a contiguous run of stored entries, so the
-        // window `[from, to]` is never internally cut — but it can be narrower
-        // at either end than the caller requested, and the two reasons for that
+        // The window holds every stored record in `[from, to]`, so it is never
+        // internally cut — but it can be narrower at either end than the caller
+        // requested, and the two reasons for that
         // are not the same fact. The ring having dropped records is a LOSS; the
         // domain simply not having that much history yet is not. Only
         // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
@@ -2440,6 +2448,9 @@ impl RpcHandler {
         d.span_store.for_each_matching(span_filter.as_ref(), |s| {
             spans.push(s.clone());
         });
+        // Seq order for the same reason as the logs: nothing makes the span ring
+        // seq-ordered (`SpanStore::insert` takes its seq before its write lock).
+        spans.sort_by_key(|s| s.seq);
         let span_evicted = crate::filter::parser::evicted_below(from, d.span_store.lost_below());
 
         let domain_name = d.config.name.to_string();

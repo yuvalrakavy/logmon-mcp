@@ -325,7 +325,7 @@ fn check_header(file: &str, header: &str, want_kind: &str) -> Result<(), LoadErr
 /// The stores assume exactly this: `context_by_seq` locates by `position()` and
 /// slices, and `seq_pos` is a map keyed by seq, so a duplicate is kept by the deque
 /// and collapsed by the map — after which `len()` and `contains_seq` disagree, a
-/// trace lookup returns one copy twice, and every windowed read is subtly wrong.
+/// trace lookup can return the wrong record, and every windowed read is subtly wrong.
 /// The span store keeps the same map and depends on the same rule.
 fn validate_seqs<T: HasSeq>(
     key: &'static str,
