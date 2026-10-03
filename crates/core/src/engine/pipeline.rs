@@ -177,6 +177,12 @@ impl LogPipeline {
         self.store.lost_below()
     }
 
+    /// The lowest seq the log store will still admit after a clear — see
+    /// `InMemoryStore::clear_through`. `0` until the first clear.
+    pub fn admit_from(&self) -> u64 {
+        self.store.admit_from()
+    }
+
     pub fn assign_seq(&self) -> u64 {
         self.seq_counter.next()
     }
@@ -286,11 +292,12 @@ impl LogPipeline {
         F: FnMut(&LogEntry),
     {
         let counts = self.store.for_each_matching(filter, f);
+        // The ring's size and bounds as the WALK saw them, not read again after it.
         let stats = RecentStats {
             scanned: counts.scanned,
-            buffer_total: self.store.len(),
-            buffer_oldest_seq: self.store.oldest_seq(),
-            buffer_newest_seq: self.store.newest_seq(),
+            buffer_total: counts.held,
+            buffer_oldest_seq: counts.oldest_seq,
+            buffer_newest_seq: counts.newest_seq,
         };
         (counts, stats)
     }

@@ -183,6 +183,11 @@ impl InMemoryStore {
         self.lost_below.load(Ordering::Relaxed)
     }
 
+    /// The admission floor — see the field. Not a loss claim.
+    pub fn admit_from(&self) -> u64 {
+        self.admit_from.load(Ordering::Relaxed)
+    }
+
     pub fn increment_malformed(&self) {
         self.malformed_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -276,8 +281,9 @@ impl InMemoryStore {
     /// `insert_sorted`'s body, under the caller's write guard. See there.
     ///
     /// Counters: a seq already held, or repeated in the batch, is not a new receipt and is
-    /// not counted at all; a new one counts as received, and as stored unless the floor
-    /// refuses it. So `total_received - total_stored` is exactly what the floor refused.
+    /// not counted at all; a new one counts as received, and as stored unless a floor (the
+    /// loss floor or the admission floor) refuses it. So `total_received - total_stored` is
+    /// exactly the refused offers — a record offered by two flushes is refused twice.
     fn merge_locked(&self, inner: &mut StoreInner, mut batch: Vec<LogEntry>) -> usize {
         batch.sort_by_key(|e| e.seq);
         batch.dedup_by_key(|e| e.seq);
@@ -407,7 +413,13 @@ impl InMemoryStore {
         F: FnMut(&LogEntry),
     {
         let inner = self.inner.read().unwrap();
-        let mut counts = ScanCounts::default();
+        let mut counts = ScanCounts {
+            held: inner.entries.len(),
+            oldest_seq: inner.entries.front().map(|e| e.seq),
+            newest_seq: inner.entries.back().map(|e| e.seq),
+            lost_below: self.lost_below.load(Ordering::Relaxed),
+            ..ScanCounts::default()
+        };
         for entry in inner.entries.iter() {
             counts.scanned += 1;
             if let Some(p) = filter {
@@ -433,6 +445,13 @@ pub struct ScanCounts {
     pub scanned: usize,
     /// Records that passed the filter and reached the visitor.
     pub matched: usize,
+    /// The ring as the walk saw it — its size, lowest and highest seq, and the loss floor —
+    /// read under the walk's own lock, so a reply built from these never pairs the walk with
+    /// a count, bound or floor read after an eviction.
+    pub held: usize,
+    pub oldest_seq: Option<u64>,
+    pub newest_seq: Option<u64>,
+    pub lost_below: u64,
 }
 
 impl LogStore for InMemoryStore {
@@ -440,8 +459,8 @@ impl LogStore for InMemoryStore {
     /// normal case — the seq just assigned, newer than everything held — is a `push_back`; a
     /// record older than the newest held goes through the same merge `insert_sorted` uses.
     /// A seq already held is skipped and not counted (it is not a new receipt); a seq below
-    /// the floor — older than something already evicted or cleared — is counted as received
-    /// and refused.
+    /// either floor — older than something already evicted or cleared, or arrived before a
+    /// `clear_through` — is counted as received and refused.
     fn append(&self, entry: LogEntry) {
         let mut inner = self.inner.write().unwrap();
         if !inner
@@ -1061,6 +1080,10 @@ mod seq_order_tests {
         let store = InMemoryStore::new(16);
         store.clear_through(40);
         assert_eq!(store.lost_below(), 0);
+        // The admission floor still refuses what arrived before the clear, on the fast path
+        // (an empty ring, a seq above the loss floor).
+        store.append(entry(30, None));
+        assert_eq!(ring(&store), Vec::<u64>::new(), "arrived before the clear");
         store.append(entry(41, None));
         assert_eq!(ring(&store), vec![41]);
     }
@@ -1180,6 +1203,8 @@ mod seq_order_tests {
     struct Model {
         held: BTreeMap<u64, Option<u128>>,
         floor: u64,
+        /// The admission floor a `clear_through` sets; never a loss claim.
+        admit: u64,
         received: u64,
         stored: u64,
     }
@@ -1194,7 +1219,7 @@ mod seq_order_tests {
             }
             self.received += fresh.len() as u64;
             for (s, t) in fresh {
-                if s >= self.floor {
+                if s >= self.floor && s >= self.admit {
                     self.held.insert(s, t);
                     self.stored += 1;
                 }
@@ -1210,6 +1235,11 @@ mod seq_order_tests {
                 self.floor = self.floor.max(newest + 1);
             }
             self.held.clear();
+        }
+
+        fn clear_through(&mut self, newest_assigned: u64) {
+            self.clear();
+            self.admit = self.admit.max(newest_assigned + 1);
         }
     }
 
@@ -1229,6 +1259,7 @@ mod seq_order_tests {
         let mut next_seq = 1_000u64;
         let (mut late, mut batches, mut moved_any, mut refused, mut clears, mut nonempty) =
             (0, 0, 0, 0, 0, 0);
+        let mut clears_through = 0;
         for _ in 0..5_000 {
             let r = rng.next();
             let trace = match r % 4 {
@@ -1247,7 +1278,7 @@ mod seq_order_tests {
                             (next_seq.saturating_sub(back), t)
                         })
                         .collect();
-                    let floor_before = model.floor;
+                    let floor_before = model.floor.max(model.admit);
                     refused += batch.iter().filter(|(s, _)| *s < floor_before).count();
                     model.offer(&batch, CAP);
                     let moved =
@@ -1265,8 +1296,19 @@ mod seq_order_tests {
                     late += 1;
                 }
                 4 if (r >> 16).is_multiple_of(25) => {
-                    model.clear();
-                    store.clear();
+                    if (r >> 24).is_multiple_of(2) {
+                        model.clear();
+                        store.clear();
+                    } else {
+                        // The daemon's clear: through the counter, which sits above the
+                        // newest held whenever records were kept out — and the counter, like
+                        // the real one, moves on past it.
+                        let through = next_seq + (r >> 26) % 5;
+                        model.clear_through(through);
+                        store.clear_through(through);
+                        next_seq = through + 1;
+                        clears_through += 1;
+                    }
                     clears += 1;
                 }
                 _ => {
@@ -1332,6 +1374,10 @@ mod seq_order_tests {
         );
         assert!(refused > 50, "below-floor offers: {refused}");
         assert!(clears > 2, "clears: {clears}");
+        assert!(
+            clears_through > 0,
+            "clears through the counter: {clears_through}"
+        );
         assert!(
             nonempty > 1_000,
             "trace lookups that returned records: {nonempty}"

@@ -1012,7 +1012,25 @@ impl SessionRegistry {
             let _ = state.triggers.remove(t.id);
         }
 
+        // A bookmark or cursor qualifier never matches in a registered filter or trigger, and
+        // the RPC refuses one on add and edit. A state file written before the edits were
+        // guarded can still hold one; it is skipped rather than reinstated, or a filter of
+        // `b>=mark` would go on keeping the domain from storing what it matched.
+        let carries_bookmark = |filter: &str| {
+            parse_filter(filter)
+                .is_ok_and(|p| crate::filter::parser::contains_bookmark_qualifier(&p))
+        };
+
         for pt in &persisted.triggers {
+            if carries_bookmark(&pt.filter) {
+                tracing::warn!(
+                    session = name,
+                    filter = %pt.filter,
+                    "persisted trigger carries a bookmark or cursor qualifier, which never \
+                     matches in a registered trigger; not restored"
+                );
+                continue;
+            }
             let _ = state.triggers.add(
                 &pt.filter,
                 pt.pre_window,
@@ -1027,6 +1045,15 @@ impl SessionRegistry {
         {
             let mut filters = state.filters.write().expect("filters lock poisoned");
             for pf in &persisted.filters {
+                if carries_bookmark(&pf.filter) {
+                    tracing::warn!(
+                        session = name,
+                        filter = %pf.filter,
+                        "persisted filter carries a bookmark or cursor qualifier, which never \
+                         matches in a registered filter; not restored"
+                    );
+                    continue;
+                }
                 if let Ok(condition) = parse_filter(&pf.filter) {
                     let filter_id = state.next_filter_id.fetch_add(1, Ordering::Relaxed);
                     filters.push(BufferFilterEntry {

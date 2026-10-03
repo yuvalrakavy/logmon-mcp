@@ -91,9 +91,10 @@ across such a stretch. The buffer now keeps itself in seq order: a trigger's flu
 in where its seqs belong.
 
 The ORDER you see changes only where a trigger has fired while a **session filter** was
-keeping records out of the buffer. With no filters every record is stored as it arrives, a
-trigger finds its pre-window already held, and the buffer was in seq order already. Where it
-applies:
+keeping records out of the buffer, or where a trigger's pre-window reached past what a small
+buffer still held (the flush re-stored records the buffer had already evicted). Otherwise
+every record is stored as it arrives, a trigger finds its pre-window already held, and the
+buffer was in seq order already. Where it applies:
 
 - `logs.recent` (`get_recent_logs`): the newest is the newest seq; a flushed pre-window
   record is no longer shown as the newest. Results are still newest-first.
@@ -195,19 +196,20 @@ outranks `evicted`, the document still says so. A shortfall below the window is 
 empty past" only when neither buffer has dropped anything.
 
 The capture also reads each buffer's records over the window together with that buffer's
-eviction floor, under one lock, and counts the shortfall it reports from those same reads.
-Read apart, a log evicted between the two reads could be in the log file and reported gone
-at once, and a log stored between them could be missing from the file of a window graded
-`complete`, or be in the file while the document said the window was short of it. The span
-eviction line also no longer counts spans gone ABOVE the window as gone from it.
+eviction floor, under one lock. Read apart, a log evicted between the two reads could be in
+the log file and reported gone at once, and a log stored between them could be missing from
+the file of a window graded `complete`. The span eviction line also no longer counts spans
+gone ABOVE the window, or seqs the window's logs occupy, as spans gone from it.
 
-### Fixed — `edit_filter` and `edit_trigger` accepted a bookmark or cursor
+### Fixed — edits and collectors accepted a bookmark or cursor in a registered filter
 
 `add_filter` and `add_trigger` refuse a bookmark or cursor qualifier (`b>=`, `b<=`, `c>=`):
-only query tools resolve one, and in a registered filter it never matches. The edits did not
-check. Editing a session's filter to `b>=mark` silently stopped the domain storing what that
-filter had matched, and a trigger edited to one never fired. Both edits now refuse it with
-the same error as the adds.
+only query tools resolve one, and in a registered filter it never matches. `edit_filter`,
+`edit_trigger`, `add_collector` and `edit_collector` did not check. Editing a session's
+filter to `b>=mark` silently stopped the domain storing what that filter had matched, a
+trigger edited to one never fired, and a collector given one measured nothing. All four now
+refuse it with the same error as the adds. A filter or trigger saved with one by an earlier
+version is not restored at startup; the daemon logs a warning naming it.
 
 ### Fixed — a span trigger's notification said seq 0
 

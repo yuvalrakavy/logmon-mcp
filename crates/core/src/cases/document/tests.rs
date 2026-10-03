@@ -521,6 +521,17 @@ fn the_span_eviction_line_names_the_span_floor() {
         "{}",
         r.body
     );
+    assert!(
+        r.body
+            .contains("The span ring had already dropped spans from this window"),
+        "a next step for it: {}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("Nothing limits this capture"),
+        "{}",
+        r.body
+    );
 }
 
 /// A shortfall below the window is an empty past only if NEITHER ring has dropped anything:

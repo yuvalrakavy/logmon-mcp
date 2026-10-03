@@ -47,7 +47,8 @@ keep.** Every reader may rely on it.
 
 **`append(entry)`** (the `LogStore` trait method; its contract changes and is documented):
 1. **Floor first:** `entry.seq < lost_below` → refused (see §3.3). Checked before the fast path,
-   because after `clear` the ring is empty while the floor is not.
+   because after `clear` the ring is empty while the floor is not. *As built:* below either
+   floor — `lost_below` or the admission floor `admit_from` (§3.3) — is refused.
 2. **Fast path, the normal case:** ring empty or `entry.seq > back().seq` → evict-if-full, then
    `push_back`, exactly as today.
 3. **Already held:** a seq equal to one held is skipped (callers check today; the store must not
@@ -61,7 +62,7 @@ keep.** Every reader may rely on it.
    entries, then the trace read returns OLDER ones still in the pre-buffer), and a merge fed an
    unsorted batch would corrupt the ring with every binary search then answering wrongly and
    silently.
-2. **Floor:** drops seqs `< lost_below`.
+2. **Floor:** drops seqs `< lost_below` (*as built:* below either floor, §3.3).
 3. **Merge:** `split = partition_point(seq < batch[0].seq)`; drain `entries[split..]` (the tail)
    into a scratch vec; merge tail and batch by seq.
 4. **Capacity, BEFORE pushing back:** if `split + merged.len() > max_capacity`, the lowest
@@ -105,7 +106,13 @@ comparing with `back().seq` in O(1), and binary-searches only otherwise.
   kept out before the clear (deep gate, two finders independently). The second raised
   `lost_below` to the counter, which claimed logs LOST over seqs that were spans, or nothing —
   a clean domain cleared at the start of a run graded its first case `evicted` (re-gate, two
-  finders independently). On a small, densely
+  finders independently). *Known residuals, accepted:* (a) a log whose seq was assigned before
+  a clear but which reaches the store after it is refused by `admit_from` with no loss claim —
+  one floor cannot mark it without again claiming the seqs below it (spans, filtered logs) as
+  lost, and the window is one `process_entry_for_domain` call; (b) a clear is graded as a loss
+  "exactly as an eviction", so a case reaching into a cleared stretch reports those logs gone
+  and suggests raising `log_buffer_size`, which does not apply to a clear (predates this
+  change). On a small, densely
   stored ring, today's code re-appends records that had been evicted, pushing out newer ones —
   even the trigger's own record; that stops too.
 - **Counters:** `total_received` counts every record offered to the store; `total_stored` every

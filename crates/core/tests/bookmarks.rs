@@ -92,6 +92,47 @@ fn call(
     }
 }
 
+/// A collector with a bookmark or cursor qualifier would measure nothing — the qualifier never
+/// matches in a registered filter — so collectors refuse one on add and on edit, as session
+/// filters and triggers do.
+#[test]
+fn a_collector_with_a_bookmark_is_refused() {
+    let (handler, _pipeline, sessions) = build_handler();
+    let sid = sessions.create_named("A").expect("create session A");
+    call(&handler, &sid, "bookmarks.add", json!({ "name": "mark" })).unwrap();
+
+    let err = call(
+        &handler,
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "sn=checkout, b>=mark" }),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("not allowed in registered filters"),
+        "got: {err}"
+    );
+
+    call(
+        &handler,
+        &sid,
+        "collectors.add",
+        json!({ "name": "c", "filter": "ALL" }),
+    )
+    .expect("a plain collector is armed");
+    let err = call(
+        &handler,
+        &sid,
+        "collectors.edit",
+        json!({ "name": "c", "domain": "default", "filter": "c>=cur" }),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("not allowed in registered filters"),
+        "got: {err}"
+    );
+}
+
 /// The registration guard holds on EDIT as on add. A bookmark or cursor qualifier in a
 /// registered filter never matches, so editing a session's filter to `b>=mark` silently
 /// stopped the domain storing what that filter had matched — and a trigger edited to one
@@ -120,6 +161,15 @@ fn editing_a_filter_or_trigger_to_a_bookmark_is_refused() {
         err.contains("not allowed in registered filters"),
         "got: {err}"
     );
+    // An INVALID filter is still reported by the session layer, as it was before the guard.
+    let err = call(
+        &handler,
+        &sid,
+        "filters.edit",
+        json!({ "id": f["id"], "filter": "l>=" }),
+    )
+    .unwrap_err();
+    assert!(err.starts_with("filter error:"), "got: {err}");
     // The filter is unchanged, so it still stores what it matched.
     let mut e = make_entry(Level::Info, "still stored");
     process_entry(&mut e, &pipeline, &sessions);

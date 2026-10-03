@@ -949,6 +949,17 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
                 .into(),
         );
     }
+    // The span ring's loss is its own fact — the log verdict does not cover it — so it gets
+    // its own next step, or the document could say nothing limits a capture whose span
+    // section says spans are gone.
+    if i.window.spans_evicted_before_window.is_some() {
+        item(
+            s,
+            "**The span ring had already dropped spans from this window.** Raise the domain's \
+             `span_buffer_size`, or capture sooner after the event."
+                .into(),
+        );
+    }
     let (_, missing) = core_coverage(&i.registry);
     if !missing.is_empty() {
         item(

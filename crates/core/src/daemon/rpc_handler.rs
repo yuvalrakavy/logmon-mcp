@@ -1291,9 +1291,9 @@ impl RpcHandler {
             fields.retain(|f| f.coverage_pct >= min_coverage_pct);
         }
 
-        // Read ONCE: the reply states the floor and a verdict derived from it, and two reads
-        // could straddle an eviction and disagree with each other.
-        let lost_below = d.pipeline.lost_below();
+        // The floor as the WALK saw it, with the buffer bounds in `stats`: read apart, an
+        // eviction between them could report a floor above `buffer_oldest_seq`.
+        let lost_below = counts.lost_below;
         let evicted_before_window =
             crate::filter::parser::evicted_before_window(&resolved, lost_below);
 
@@ -1408,8 +1408,8 @@ impl RpcHandler {
         let capped = map.cardinality_capped();
         let (groups, groups_total) = map.finish(top_n);
 
-        // Read ONCE, as `logs.fields` does: the floor and the verdict from it must agree.
-        let lost_below = d.pipeline.lost_below();
+        // The floor as the walk saw it, as `logs.fields` does.
+        let lost_below = counts.lost_below;
         let evicted_before_window =
             crate::filter::parser::evicted_before_window(&resolved, lost_below);
 
@@ -1608,11 +1608,16 @@ impl RpcHandler {
         let (lo, hi) = crate::filter::parser::resolved_seq_range(resolved.as_ref());
         let window = stats.buffer_oldest_seq.and_then(|_| {
             let from = lo.unwrap_or_else(|| {
+                // And not below the admission floor: after a `logs.clear` the
+                // seqs before it will never be stored, so they are not part of
+                // what this incarnation answers for (a window over them graded
+                // the filters that were active before the clear).
                 d.pipeline
                     .epochs()
                     .origin_seq()
                     .saturating_add(1)
                     .max(d.pipeline.lost_below())
+                    .max(d.pipeline.admit_from())
             });
             let to = hi.unwrap_or_else(|| d.pipeline.current_seq());
             (from <= to).then_some((from, to))
@@ -1842,9 +1847,7 @@ impl RpcHandler {
         self.require_live(session_id, "edit_filter")?;
         let filter_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
-        if let Some(f) = filter {
-            refuse_bookmark_qualifier(f)?;
-        }
+        refuse_bookmark_in_edit(filter)?;
         let desc = opt_str(params, "description")?;
         let info = self
             .sessions
@@ -1930,9 +1933,7 @@ impl RpcHandler {
         let d = self.resolve_domain(session_id)?;
         let trigger_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
-        if let Some(f) = filter {
-            refuse_bookmark_qualifier(f)?;
-        }
+        refuse_bookmark_in_edit(filter)?;
         let pre = opt_u32(params, "pre_window")?;
         let post = opt_u32(params, "post_window")?;
         let ctx = opt_u32(params, "notify_context")?;
@@ -2403,11 +2404,16 @@ impl RpcHandler {
         // could disagree — with the span floor read in the same lock, as the
         // log floor is.
         let (spans, span_lost_below) = d.span_store.range_with_floor(from, to);
-        // Clamped to the window: the span floor can sit far above `to` (unlike the log
-        // floor, which the held anchor bounds), and spans gone above the window are not
-        // spans gone from it.
-        let span_evicted =
-            crate::filter::parser::evicted_below(from, span_lost_below.min(to.saturating_add(1)));
+        // Bounded by the window, twice over: the span floor can sit far above `to`
+        // (unlike the log floor, which the held anchor bounds), and spans gone above
+        // the window are not spans gone from it; and a seq a held log occupies was
+        // never a span. What is left is still an upper bound (a seq may have been a
+        // log a filter kept out), and when nothing is left there is no span loss.
+        let span_gap_end = span_lost_below.min(to.saturating_add(1));
+        let logs_in_gap = logs.iter().filter(|e| e.seq < span_gap_end).count() as u64;
+        let span_evicted = crate::filter::parser::evicted_below(from, span_gap_end)
+            .map(|gap| gap.saturating_sub(logs_in_gap))
+            .filter(|gap| *gap > 0);
 
         // How much of what was ASKED for came back.
         //
@@ -2418,16 +2424,15 @@ impl RpcHandler {
         // `oldest_log_seq` for it would call the second one eviction on every
         // young domain.
         //
-        // Counted from what the FILES hold, in the same merged space the window
-        // was cut from: a record stored or evicted between the cut and the
-        // second read (a trigger's flush, an eviction) would otherwise leave the
-        // counts describing one instant and the files another.
-        let held_below = logs.iter().filter(|e| e.seq < anchor.seq).count()
-            + spans.iter().filter(|s| s.seq < anchor.seq).count();
-        let held_above = logs.iter().filter(|e| e.seq > anchor.seq).count()
-            + spans.iter().filter(|s| s.seq > anchor.seq).count();
-        let short_before = before.value.saturating_sub(held_below);
-        let short_after = after.value.saturating_sub(held_above);
+        // Counted from the CUT, in the same merged space `from`/`to` came from,
+        // so the counts and the window's ends describe one instant. Not from the
+        // files: a span evicted between the cut and the second read would then
+        // read as "the stores had nothing more at that end" — false, and with a
+        // log floor ever raised it flipped `complete` to `evicted`. The residual
+        // the cut leaves is smaller: a record a trigger flushes in between can be
+        // in the file of a window the document calls short of it.
+        let short_before = before.value.saturating_sub(below.len());
+        let short_after = after.value.saturating_sub(above.len());
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //
@@ -3188,6 +3193,7 @@ impl RpcHandler {
 
         let parsed = crate::filter::parser::parse_filter(filter_string)
             .map_err(|e| format!("invalid filter: {e}"))?;
+        refuse_bookmark_in(&parsed)?;
         let warnings: Vec<String> = crate::filter::admission::admit_span_filter(&parsed)
             .map_err(|e| e.to_string())?
             .warnings
@@ -3382,6 +3388,7 @@ impl RpcHandler {
         if let Some(f) = new_filter {
             let parsed = crate::filter::parser::parse_filter(f)
                 .map_err(|e| format!("invalid filter: {e}"))?;
+            refuse_bookmark_in(&parsed)?;
             warnings = crate::filter::admission::admit_span_filter(&parsed)
                 .map_err(|e| e.to_string())?
                 .warnings
@@ -4302,20 +4309,37 @@ fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> 
     opt_of(params, key, "a string", Value::as_str)
 }
 
-/// Refuse a bookmark or cursor qualifier in a REGISTERED filter or trigger. Only query tools
-/// resolve them; a registered one never matches, so a session filter of `b>=mark` silently
-/// stops the domain storing what it matched, and a trigger of one never fires. Every handler
-/// that sets a registered filter calls this — `add` and `edit` alike: the edits once skipped
-/// it.
-fn refuse_bookmark_qualifier(filter: &str) -> Result<(), String> {
-    let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
-    if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
+/// Refuse a bookmark or cursor qualifier in a REGISTERED filter, trigger or collector. Only
+/// query tools resolve them; a registered one never matches, so a session filter of
+/// `b>=mark` silently stops the domain storing what it matched, a trigger of one never
+/// fires, and a collector of one measures nothing. Every handler that sets a registered
+/// filter calls this — add and edit alike, for filters, triggers and collectors: the edits
+/// and the collectors once skipped it. (Restored sessions are checked in
+/// `SessionRegistry::restore_named`.)
+fn refuse_bookmark_in(parsed: &crate::filter::parser::ParsedFilter) -> Result<(), String> {
+    if crate::filter::parser::contains_bookmark_qualifier(parsed) {
         return Err(
             "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
                 .to_string(),
         );
     }
     Ok(())
+}
+
+/// [`refuse_bookmark_in`] for a filter not yet parsed, returning the parser's own error for
+/// an invalid one (the adds' behaviour).
+fn refuse_bookmark_qualifier(filter: &str) -> Result<(), String> {
+    let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
+    refuse_bookmark_in(&parsed)
+}
+
+/// [`refuse_bookmark_in`] for an edit's new filter. An invalid one is left to the session
+/// layer, which reports it as it always has (`filter error: …` / `trigger error: …`).
+fn refuse_bookmark_in_edit(filter: Option<&str>) -> Result<(), String> {
+    match filter.map(crate::filter::parser::parse_filter) {
+        Some(Ok(parsed)) => refuse_bookmark_in(&parsed),
+        _ => Ok(()),
+    }
 }
 
 fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {

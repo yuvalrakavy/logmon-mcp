@@ -258,3 +258,51 @@ fn ttl_predicate_spares_connected_and_dispose_removes() {
         "disposed sessions are gone: {expired:?}"
     );
 }
+
+/// A state file written before the edit handlers were guarded can hold a bookmark or cursor
+/// qualifier in a registered filter or trigger. It is not reinstated: such a filter never
+/// matches, and as a session's filter it would keep the domain from storing what it matched.
+#[test]
+fn a_persisted_bookmark_filter_or_trigger_is_not_restored() {
+    use logmon_broker_core::daemon::persistence::{
+        PersistedFilter, PersistedSession, PersistedTrigger,
+    };
+    let trigger = |filter: &str| PersistedTrigger {
+        filter: filter.into(),
+        pre_window: 0,
+        post_window: 0,
+        notify_context: 0,
+        description: None,
+        oneshot: false,
+    };
+    let filter = |filter: &str| PersistedFilter {
+        filter: filter.into(),
+        description: None,
+    };
+    let persisted = PersistedSession {
+        triggers: vec![trigger("l>=ERROR"), trigger("c>=cur")],
+        filters: vec![filter("l>=WARN"), filter("b>=mark")],
+        client_info: None,
+        bookmarks: vec![],
+    };
+    let registry = SessionRegistry::new();
+    registry.restore_named(
+        "old",
+        &persisted,
+        &logmon_broker_core::store::bookmarks::BookmarkStore::new(),
+    );
+
+    let id = SessionId::Named("old".into());
+    let filters: Vec<String> = registry
+        .list_filters(&id)
+        .into_iter()
+        .map(|f| f.filter_string)
+        .collect();
+    assert_eq!(filters, vec!["l>=WARN".to_string()]);
+    let triggers: Vec<String> = registry
+        .list_triggers(&id)
+        .into_iter()
+        .map(|t| t.filter_string)
+        .collect();
+    assert_eq!(triggers, vec!["l>=ERROR".to_string()]);
+}

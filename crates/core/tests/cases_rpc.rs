@@ -484,6 +484,37 @@ fn a_case_after_a_clear_does_not_call_spans_lost_logs() {
     assert!(!doc.contains("are **gone**"), "{doc}");
 }
 
+/// After `logs.clear`, an export with no range starts at the admission floor: the seqs before
+/// the clear will never be stored, so the filter that was active over them is not this
+/// window's. Before, the export reached back to the loss floor and graded those seqs.
+#[test]
+fn an_export_after_a_clear_does_not_reach_back_before_it() {
+    let h = harness();
+    // The default triggers' post-window would store the INFO records the filter keeps out.
+    let listed = h.call("triggers.list", json!({})).unwrap();
+    for t in listed["triggers"].as_array().expect("a triggers array") {
+        h.call("triggers.remove", json!({ "id": t["id"] })).unwrap();
+    }
+    let f = h
+        .call("filters.add", json!({ "filter": "l>=ERROR" }))
+        .unwrap();
+    h.feed(Level::Error, "held, then cleared");
+    for i in 0..3 {
+        h.feed(Level::Info, &format!("kept out {i}"));
+    }
+    h.call("filters.remove", json!({ "id": f["id"] })).unwrap();
+    h.call("logs.clear", json!({})).unwrap();
+    let first = h.feed(Level::Info, "after the clear");
+    h.feed(Level::Info, "after the clear 2");
+
+    let r = h.call("logs.export", json!({ "format": "json" })).unwrap();
+    assert_eq!(
+        r["verdict"], "complete",
+        "the window starts at {first}, where the clear did, so the filter before it is not \
+         graded: {r}"
+    );
+}
+
 /// A trigger also flushes its trace's records from the pre-buffer when they are older than
 /// its pre-window — the second half of its batch, which arrives BELOW the first half, so the
 /// store must sort it — and every record a trigger stores is marked `pre_trigger`.
@@ -1559,8 +1590,9 @@ fn the_window_takes_the_nearest_records_of_both_stores_and_nothing_beyond() {
     assert_eq!(r["spandata"]["records"], 4, "{r}");
 }
 
-/// Spans the span ring dropped ABOVE the window are not spans gone from it: the gap the
-/// document reports is bounded by the window, not by how far the span floor has risen.
+/// Spans the span ring dropped ABOVE the window are not spans gone from it, and a seq a held
+/// log occupies was never a span: a window of five held logs has lost no spans, however far
+/// the span floor has risen.
 #[test]
 fn spans_dropped_above_the_window_are_not_counted_as_gone_from_it() {
     let h = harness();
@@ -1575,8 +1607,8 @@ fn spans_dropped_above_the_window_are_not_counted_as_gone_from_it() {
         d.span_store.insert(a_span());
     }
 
-    // Logs 1-5, spans 6-25 into a ring of 2 (floor 24). The window is the logs, 1-5: at
-    // most 5 of its seqs could have been spans, not the 23 below the span floor.
+    // Logs 1-5, spans 6-25 into a ring of 2 (floor 24). The window is the logs, 1-5, every
+    // seq of it a held log: none could have been a span, so none is gone.
     let r = h
         .capture(json!({ "anchor": { "seq": anchor }, "before": 2, "after": 2 }))
         .unwrap();
@@ -1586,9 +1618,10 @@ fn spans_dropped_above_the_window_are_not_counted_as_gone_from_it() {
         "vacuity: {doc}"
     );
     assert!(
-        doc.contains("the span ring **had** evicted below seq 24 — up to 5 spans over this window"),
+        doc.contains("span ring has dropped only spans below seq 24"),
         "{doc}"
     );
+    assert!(!doc.contains("**had** evicted"), "{doc}");
 }
 
 /// A span ring that dropped spans only BELOW the window says so, and the shortfall below
