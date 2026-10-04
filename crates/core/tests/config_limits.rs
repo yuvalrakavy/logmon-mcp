@@ -42,18 +42,22 @@ async fn the_daemon_refuses_to_start_with_an_oversize_global_buffer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_config_domain_with_an_oversize_buffer_is_skipped_and_the_daemon_starts() {
-    let declared = |name: &str, log_buffer_size: Option<usize>| ConfigDomain {
+    let declared = |name: &str, log: Option<usize>, span: Option<usize>| ConfigDomain {
         name: name.into(),
         gelf_port: Some(0),
         otlp_grpc_port: Some(0),
         otlp_http_port: Some(0),
-        log_buffer_size,
-        span_buffer_size: None,
+        log_buffer_size: log,
+        span_buffer_size: span,
     };
     let mut config = default_test_config();
     config.domains = vec![
-        declared("ok", None),
-        declared("big", Some(MAX_BUFFER_SIZE + 1)),
+        declared("ok", None, None),
+        declared("big", Some(MAX_BUFFER_SIZE + 1), None),
+        declared("bigspans", None, Some(MAX_BUFFER_SIZE + 1)),
+        // An oversize entry does not claim its name: the corrected one after it starts.
+        declared("again", Some(MAX_BUFFER_SIZE + 1), None),
+        declared("again", None, None),
     ];
 
     let daemon = TestDaemonHandle::spawn_with_config(config).await;
@@ -68,4 +72,46 @@ async fn a_config_domain_with_an_oversize_buffer_is_skipped_and_the_daemon_start
         !text.contains("\"big\""),
         "the oversize entry is skipped: {text}"
     );
+    assert!(
+        !text.contains("\"bigspans\""),
+        "an oversize SPAN buffer is skipped too: {text}"
+    );
+    assert!(
+        text.contains("\"again\""),
+        "a corrected entry after an oversize one of the same name starts: {text}"
+    );
+}
+
+/// A trigger's `pre_window` sizes the pre-trigger buffer, which holds a clone of every
+/// record up to it — so it has the buffer limit too, on add and on edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_window_above_the_buffer_limit_is_refused() {
+    let daemon = TestDaemonHandle::spawn_with_config(default_test_config()).await;
+    let mut client = daemon.connect_anon().await;
+    let too_big = MAX_BUFFER_SIZE as u64 + 1;
+
+    let err = client
+        .call::<Value>(
+            "triggers.add",
+            json!({ "filter": "l>=ERROR", "pre_window": too_big }),
+        )
+        .await
+        .expect_err("refused on add");
+    assert!(format!("{err:?}").contains("pre_window"), "{err:?}");
+
+    let added: Value = client
+        .call(
+            "triggers.add",
+            json!({ "filter": "l>=ERROR", "pre_window": 10 }),
+        )
+        .await
+        .unwrap();
+    let err = client
+        .call::<Value>(
+            "triggers.edit",
+            json!({ "id": added["id"], "pre_window": too_big }),
+        )
+        .await
+        .expect_err("refused on edit");
+    assert!(format!("{err:?}").contains("pre_window"), "{err:?}");
 }

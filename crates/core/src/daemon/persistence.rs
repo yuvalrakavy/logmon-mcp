@@ -179,7 +179,8 @@ fn default_max_domains() -> usize {
 }
 
 /// The largest buffer, in records, any domain may have — log or span, configured or created
-/// over the RPC. A domain's ring reserves its whole capacity at once, inside the one process
+/// over the RPC — and the largest trigger `pre_window`, which sizes the pre-trigger buffer.
+/// A domain's ring reserves its whole capacity at once, inside the one process
 /// that serves every domain and every client, so an absurd size is refused at the boundary
 /// rather than aborting the process on that domain's first record. 10M entries is ~100x any
 /// realistic per-domain ring and still comfortably allocatable.
@@ -644,8 +645,9 @@ mod tests {
         assert_eq!(got, std::path::PathBuf::from("/home/u/.config/logmon"));
     }
 
-    /// A configured buffer size above the limit is refused, naming the key — the global
-    /// sizes and a declared domain's own — and the limit itself is accepted.
+    /// A global configured buffer size above the limit is refused, naming the key, and the
+    /// limit itself is accepted. (A declared domain's own size is skipped at boot instead —
+    /// `tests/config_limits.rs`.)
     #[test]
     fn a_configured_buffer_size_above_the_limit_is_refused() {
         let at_limit = DaemonConfig {

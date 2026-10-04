@@ -1022,6 +1022,15 @@ impl SessionRegistry {
         };
 
         for pt in &persisted.triggers {
+            if pt.pre_window as usize > crate::daemon::persistence::MAX_BUFFER_SIZE {
+                tracing::warn!(
+                    session = name,
+                    filter = %pt.filter,
+                    pre_window = pt.pre_window,
+                    "persisted trigger's pre_window exceeds the buffer limit; not restored"
+                );
+                continue;
+            }
             if carries_bookmark(&pt.filter) {
                 tracing::warn!(
                     session = name,

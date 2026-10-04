@@ -38,9 +38,9 @@ pub fn sync_pre_buffer_size(pipeline: &LogPipeline, sessions: &SessionRegistry) 
     sync_pre_buffer_size_for_domain(pipeline, sessions, &DomainId::default_domain());
 }
 
-/// Process one entry against `domain`: assign seq, buffer it, evaluate the
-/// triggers/filters of the sessions bound to `domain`, and store per the
-/// trigger/post-window/filter rules. Considers ONLY `domain`'s sessions —
+/// Process one entry against `domain`: assign seq, evaluate the triggers/filters of the
+/// sessions bound to `domain`, store per the trigger/post-window/filter rules, and only then
+/// add it to the pre-trigger buffer (so a trigger's pre-window is the records BEFORE it). Considers ONLY `domain`'s sessions —
 /// a filter or trigger in another domain can neither suppress storage here nor
 /// fire on this record (spec §2 isolation, §9.1).
 pub fn process_entry_for_domain(

@@ -146,12 +146,28 @@ N stores the N records before the match. At the default 500 the difference is on
 ### Fixed — an oversize configured buffer could abort the broker
 
 `create_domain` refuses a buffer above 10,000,000 records, but the configured
-`buffer_size`/`span_buffer_size` (`config.json`, `--buffer-size`, `--span-buffer-size`) and a
-config-declared domain's own sizes were never checked. A value too large to reserve failed on
-the domain's first record — taking down the whole process, not just that domain. A global size
-above the limit now stops the broker at startup with an error naming the key. A config-declared
-domain with an oversize buffer is skipped with a warning, as any other bad domain entry is, and
-the broker starts.
+`buffer_size`/`span_buffer_size` (`config.json`, `--buffer-size`, `--span-buffer-size`), a
+config-declared domain's own sizes, and a trigger's `pre_window` (which sizes the pre-trigger
+buffer) were never checked. A value too large to reserve failed on the domain's first record —
+taking down the whole process, not just that domain. Now:
+
+- A global size above the limit stops the broker at startup, with an error naming the key in
+  `daemon.log`. **A config that set one and happened to work** (the ring is reserved on the
+  first record, which a large machine can satisfy) **now refuses to start** — lower the value.
+- A config-declared domain with an oversize buffer is skipped with a warning, as any other bad
+  domain entry is, and the broker starts.
+- `add_trigger` / `edit_trigger` refuse a `pre_window` above the limit, and a persisted trigger
+  with one is not restored (logged).
+
+### Fixed — a broker that never announced itself to OTLP producers announced it was going away
+
+On shutdown the broker multicast `OTEL:OFFLINE` to the host unconditionally. tracing-init's
+producers read that as "the collector is down" and open their circuit breaker, dropping spans
+until the next reprobe (30 s by default). A broker whose OTLP receiver never started — OTLP
+disabled, a port clash at boot, or an in-process test daemon — had never sent `OTEL:ONLINE`, so
+its shutdown silenced the producers of whichever broker WAS serving them; running logmon's own
+test suite did this on every test daemon's shutdown. It now sends `OFFLINE` only if it sent
+`ONLINE`.
 
 ### Changed — a trigger notification carries `notify_context` records, not its whole pre-window
 
