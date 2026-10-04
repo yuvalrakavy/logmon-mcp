@@ -353,6 +353,16 @@ impl CollectorRegistry {
         };
         let filter = crate::filter::parser::parse_filter(&file.filter)
             .map_err(|e| format!("recorded filter `{}` no longer parses: {e}", file.filter))?;
+        // `collectors.add`/`edit` refuse a bookmark or cursor qualifier — it never matches in a
+        // registered filter, so the collector would measure nothing — but an earlier version
+        // accepted one, and its file is still on disk.
+        if crate::filter::parser::contains_bookmark_qualifier(&filter) {
+            return Err(format!(
+                "recorded filter `{}` carries a bookmark or cursor qualifier, which never \
+                 matches in a collector",
+                file.filter
+            ));
+        }
         let domain = DomainId::new(&file.domain)
             .map_err(|e| format!("recorded domain `{}` is invalid: {e}", file.domain))?;
         let def = CollectorDef {

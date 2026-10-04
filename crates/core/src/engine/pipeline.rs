@@ -177,6 +177,12 @@ impl LogPipeline {
         self.store.lost_below()
     }
 
+    /// The lowest seq the log store will still admit after a clear — see
+    /// `InMemoryStore::clear_through`. `0` until the first clear.
+    pub fn admit_from(&self) -> u64 {
+        self.store.admit_from()
+    }
+
     pub fn assign_seq(&self) -> u64 {
         self.seq_counter.next()
     }
@@ -214,14 +220,29 @@ impl LogPipeline {
         self.store.append(entry);
     }
 
+    /// Store records that may be older than records already held, keeping the ring in seq
+    /// order. Returns how many held records moved. See `InMemoryStore::insert_sorted`.
+    pub fn insert_sorted(&self, batch: Vec<LogEntry>) -> usize {
+        self.store.insert_sorted(batch)
+    }
+
     pub fn contains_seq(&self, seq: u64) -> bool {
         self.store.contains_seq(seq)
     }
 
+    /// Empty the log ring, and refuse from now on every record that ARRIVED before the clear
+    /// — including records a filter kept out, which a trigger firing later would otherwise
+    /// flush in from the pre-trigger buffer. See `InMemoryStore::clear_through`.
     pub fn clear_logs(&self) -> usize {
         let count = self.store.len();
-        self.store.clear();
+        self.store.clear_through(self.seq_counter.current());
         count
+    }
+
+    /// The held logs over `[from, to]` and the log floor, read together. See
+    /// `InMemoryStore::range_with_floor`.
+    pub fn logs_in_range_with_floor(&self, from: u64, to: u64) -> (Vec<LogEntry>, u64) {
+        self.store.range_with_floor(from, to)
     }
 
     pub fn recent_logs(
@@ -271,11 +292,12 @@ impl LogPipeline {
         F: FnMut(&LogEntry),
     {
         let counts = self.store.for_each_matching(filter, f);
+        // The ring's size and bounds as the WALK saw them, not read again after it.
         let stats = RecentStats {
             scanned: counts.scanned,
-            buffer_total: self.store.len(),
-            buffer_oldest_seq: self.store.oldest_seq(),
-            buffer_newest_seq: self.store.newest_seq(),
+            buffer_total: counts.scanned,
+            buffer_oldest_seq: counts.oldest_seq,
+            buffer_newest_seq: counts.newest_seq,
         };
         (counts, stats)
     }
@@ -284,8 +306,9 @@ impl LogPipeline {
         self.store.oldest_timestamp()
     }
 
-    /// Seq of the oldest log entry currently in the store, or `None` if empty.
-    /// Drives bookmark eviction — see `bookmarks::should_evict`.
+    /// Seq of the oldest log entry currently in the store, or `None` if empty. Reported as
+    /// `buffer_oldest_seq` and in `domains.list`. NOT an eviction boundary — bookmark eviction
+    /// reads [`Self::lost_below`] (`bookmarks::should_evict`).
     pub fn oldest_log_seq(&self) -> Option<u64> {
         self.store.oldest_seq()
     }

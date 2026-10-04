@@ -90,25 +90,22 @@ pub fn process_entry_for_domain(
                 pipeline.append_to_store(trigger_entry);
             }
 
-            // Copy pre_window entries from pre-buffer into store
-            let pre_entries = pipeline.pre_buffer_copy(trigger_max_pre as usize);
-            for mut pre_entry in pre_entries {
-                if !pipeline.contains_seq(pre_entry.seq) {
-                    pre_entry.source = LogSource::PreTrigger;
-                    pipeline.append_to_store(pre_entry);
-                }
-            }
-
-            // Additionally, copy logs from the same trace_id
+            // The pre-window, then the trace's other entries still in the pre-buffer — in that
+            // order, since the copy drains what the trace read would otherwise return twice —
+            // stored as ONE batch. Both are OLDER than the record just stored, and the batch is
+            // not sorted (the trace read returns entries older than the drained window), so the
+            // store merges it into the ring in seq order (`InMemoryStore::insert_sorted`), and
+            // skips anything already held — a record a filter stored earlier keeps its own
+            // `source`. One merge per firing session, before that session's `context_before`
+            // below reads the ring.
+            let mut flushed = pipeline.pre_buffer_copy(trigger_max_pre as usize);
             if let Some(tid) = entry.trace_id {
-                let trace_entries = pipeline.pre_buffer_entries_by_trace_id(tid);
-                for mut trace_entry in trace_entries {
-                    if !pipeline.contains_seq(trace_entry.seq) {
-                        trace_entry.source = LogSource::PreTrigger;
-                        pipeline.append_to_store(trace_entry);
-                    }
-                }
+                flushed.extend(pipeline.pre_buffer_entries_by_trace_id(tid));
             }
+            for e in &mut flushed {
+                e.source = LogSource::PreTrigger;
+            }
+            pipeline.insert_sorted(flushed);
 
             // Activate post-window for this session. EXTEND rather than set:
             // a match can now land inside an already-open window, and a small
@@ -119,7 +116,16 @@ pub fn process_entry_for_domain(
             // Build notification event and send/queue
             let mut any_oneshot_removed = false;
             for m in &matches {
-                let context_before = pipeline.context_by_seq(entry.seq, m.pre_window as usize, 0);
+                // The `notify_context` records just before the match, in seq order — the
+                // documented bound on `context_before`. Not the whole pre-window: that is
+                // STORED (the flush above) and readable with `logs.context` around this
+                // seq. And not the match itself, which `context_by_seq` includes and the
+                // notification already carries as `matched_entry`.
+                let mut context_before =
+                    pipeline.context_by_seq(entry.seq, m.notify_context as usize, 0);
+                if context_before.last().is_some_and(|e| e.seq == entry.seq) {
+                    context_before.pop();
+                }
                 let event = PipelineEvent {
                     session_id: sid.to_string(),
                     trigger_id: m.id,

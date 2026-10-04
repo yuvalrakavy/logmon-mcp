@@ -210,8 +210,8 @@ by asking what filters *you* hold.
 ### Triggers (per-session, push notifications)
 
 - **`get_triggers` / `add_trigger(filter, pre_window?, post_window?, notify_context?, oneshot?, description?)` / `edit_trigger(id, …)` / `remove_trigger(id)`**.
-- Defaults on every new session: `l>=ERROR` and `mfm=panic`.
-- `pre_window` captures **unfiltered** context before the match (flight recorder). `post_window` captures after. `notify_context` is how many of the pre-window entries ride along in the notification.
+- Defaults on every new session: `l>=ERROR` and `/panic|unwrap failed|stack backtrace/`.
+- `pre_window` captures **unfiltered** context before the match (flight recorder). `post_window` captures after. `notify_context` is how many of the records just before the match ride along in the notification (default 5); the rest of the pre-window is stored, not sent — read it with `get_log_context` around the matched entry's seq.
 - `oneshot=true` removes the trigger after the first match — useful for "tell me the next time this happens."
 - A trigger is **debounced by its own `post_window`**: inside the window opened by its last match it won't fire again, so a burst yields one capture. The debounce is per trigger and never silences a different one — arming `kind=deadlock` alongside the noisy built-in `l>=ERROR` is safe, the busy trigger cannot starve the rare one. Use `post_window=0` to count every match — but only for a LOW-RATE signal. A firing entry costs ~200 µs against ~0.6 µs for a normal one (store scan + context clones), `post_window=0` also gives up aftermath capture, and notification delivery is a bounded channel that drops silently client-side when it can't keep up. On a bursty signal, keep a window.
 - Because of that debounce, `match_count` is "capture count", not "matching entries seen". Don't read it as an event tally on a bursty signal.
@@ -685,7 +685,7 @@ get_recent_traces(filter="b>=before-deploy, b<=after-deploy, d>=100")
 
 Naming: bookmarks are stored as `{session}/{name}`. Bare `before` in a query resolves to your own session; `other/before` reaches into another session's bookmarks (pure-read across sessions is fine; cross-session **advance** with `c>=` is rejected).
 
-`b>=`, `b<=`, and `c>=` are query-only — rejected by `add_filter` and `add_trigger`.
+`b>=`, `b<=`, and `c>=` are query-only — rejected by `add_filter`/`edit_filter`, `add_trigger`/`edit_trigger` and `add_collector`/`edit_collector`.
 
 ## Cursors: "what's new since I last checked"
 

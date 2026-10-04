@@ -161,8 +161,8 @@ fn out_of_window_and_duplicate_seqs_are_refused() {
     let p = md.parent().unwrap().join(&logdata);
     let text = std::fs::read_to_string(&p).unwrap();
 
-    // A duplicate: the deque keeps both and `seq_set` keeps one, after which
-    // `len()` and `contains_seq` disagree and every windowed read is wrong.
+    // A duplicate: the store's `from_records` asserts ascending, distinct seqs, so
+    // the loader must refuse this with a reason rather than let the daemon panic.
     let dup = text.replace("\"seq\":1002", "\"seq\":1001");
     std::fs::write(&p, &dup).unwrap();
     assert!(
@@ -187,6 +187,34 @@ fn out_of_window_and_duplicate_seqs_are_refused() {
             "the WINDOW rule must be what refuses it, not the ascending rule: {m}"
         ),
         other => panic!("expected BadRecords, got {other:?}"),
+    }
+
+    // Above the declared window: the LAST record, so it is still ascending and only the
+    // window's upper bound can refuse it.
+    let above = text.replace("\"seq\":1012", "\"seq\":1013");
+    std::fs::write(&p, &above).unwrap();
+    match load(&md) {
+        Err(LoadError::BadRecords(m)) => assert!(
+            m.contains("outside the declared window"),
+            "the window's UPPER bound must refuse it: {m}"
+        ),
+        other => panic!("expected BadRecords, got {other:?}"),
+    }
+}
+
+/// The span file is validated as the log file is. The span store's `from_records` asserts
+/// the same order, so a case whose spans repeat a seq must be refused here, with a reason,
+/// rather than reach the store and panic the daemon.
+#[test]
+fn a_repeated_span_seq_is_refused_rather_than_a_panic() {
+    let (_d, md) = scratch(STEM);
+    let [_, _, spandata] = super::super::naming::file_names(STEM);
+    let p = md.parent().unwrap().join(&spandata);
+    let text = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, text.replace("\"seq\":1008", "\"seq\":1007")).unwrap();
+    match load(&md) {
+        Err(LoadError::BadRecords(m)) => assert!(m.contains("spandata"), "{m}"),
+        other => panic!("expected BadRecords for the span file, got {other:?}"),
     }
 }
 

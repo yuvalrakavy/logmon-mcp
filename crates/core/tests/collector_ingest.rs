@@ -41,7 +41,7 @@ impl Harness {
 
     fn feed(&self, domain: &DomainId, span: &SpanEntry) {
         process_span_for_domain(
-            span,
+            &mut span.clone(),
             &self.store,
             &self.sessions,
             &self.pipeline,

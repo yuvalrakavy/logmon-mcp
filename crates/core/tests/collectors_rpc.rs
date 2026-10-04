@@ -158,7 +158,7 @@ impl Harness {
         let id = DomainId::new(domain).expect("valid domain name");
         let d = self.domains.get(&id).expect("domain exists");
         process_span_for_domain(
-            span,
+            &mut span.clone(),
             &d.span_store,
             &self.sessions,
             &self.pipeline,
@@ -436,6 +436,56 @@ fn restart_over_at(dir: &std::path::Path, now: chrono::DateTime<chrono::Utc>) ->
         report.rejected
     );
     h
+}
+
+/// A collector file an earlier version wrote with a bookmark or cursor qualifier — accepted
+/// then, refused now on add and edit — is rejected on restore rather than reinstated: it
+/// never matches, so it would measure nothing while the case documents counted it as armed.
+#[test]
+fn a_persisted_collector_with_a_bookmark_is_rejected_on_restore() {
+    let d = tempfile::TempDir::new().unwrap();
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "sn=checkout" }),
+        )
+        .unwrap();
+    }
+    // Rewrite the definition as the earlier version would have stored it.
+    let mut rewrote = 0;
+    let mut stack = vec![d.path().to_path_buf()];
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            stack.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
+        } else if let Ok(text) = std::fs::read_to_string(&p) {
+            if text.contains("\"sn=checkout\"") {
+                std::fs::write(
+                    &p,
+                    text.replace("\"sn=checkout\"", "\"sn=checkout, b>=mark\""),
+                )
+                .unwrap();
+                rewrote += 1;
+            }
+        }
+    }
+    assert!(rewrote > 0, "vacuity: the definition was found on disk");
+
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let report = h
+        .collectors
+        .restore(chrono::Utc::now(), |_| Arc::new(ReceiverMetrics::new()));
+    assert!(report.restored.is_empty(), "{:?}", report.restored);
+    assert!(
+        report
+            .rejected
+            .iter()
+            .any(|(name, why)| name == "c" && why.contains("bookmark or cursor")),
+        "{:?}",
+        report.rejected
+    );
 }
 
 #[test]

@@ -183,7 +183,9 @@ fn hostile_input() -> CaseInput {
             short_before: 3,
             short_after: 7,
             log_lost_below: 0,
+            logs_evicted_before_window: None,
             spans_evicted_before_window: None,
+            span_lost_below: 0,
         },
         logdata: Some(FilePointer {
             file: "checkout-hang-260731-141530.logdata.jsonl".into(),

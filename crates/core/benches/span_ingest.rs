@@ -51,12 +51,12 @@ fn ingest_with_sessions(c: &mut Criterion, n_sessions: usize) {
     for _ in 0..n_sessions {
         sessions.create_anonymous();
     }
-    let span = make_span();
+    let mut span = make_span();
 
     c.bench_function(&format!("span_ingest/{n_sessions}_sessions"), |b| {
         b.iter(|| {
             process_span(
-                black_box(&span),
+                black_box(&mut span),
                 black_box(&store),
                 black_box(&sessions),
                 black_box(&pipeline),
@@ -122,12 +122,12 @@ fn ingest_with_collectors(c: &mut Criterion, n_collectors: usize) {
             )
             .expect("within budget");
     }
-    let span = make_span();
+    let mut span = make_span();
 
     c.bench_function(&format!("span_ingest/{n_collectors}_collectors"), |b| {
         b.iter(|| {
             process_span_for_domain(
-                black_box(&span),
+                black_box(&mut span),
                 black_box(&store),
                 black_box(&sessions),
                 black_box(&pipeline),

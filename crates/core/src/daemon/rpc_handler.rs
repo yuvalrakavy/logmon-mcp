@@ -1291,8 +1291,11 @@ impl RpcHandler {
             fields.retain(|f| f.coverage_pct >= min_coverage_pct);
         }
 
+        // The floor as the WALK saw it, with the buffer bounds in `stats`: read apart, an
+        // eviction between them could report a floor above `buffer_oldest_seq`.
+        let lost_below = counts.lost_below;
         let evicted_before_window =
-            crate::filter::parser::evicted_before_window(&resolved, d.pipeline.lost_below());
+            crate::filter::parser::evicted_before_window(&resolved, lost_below);
 
         Ok(json!({
             "fields": fields,
@@ -1305,7 +1308,7 @@ impl RpcHandler {
             // structurally false however much rolled off.
             "buffer_oldest_seq": stats.buffer_oldest_seq,
             "buffer_newest_seq": stats.buffer_newest_seq,
-            "lost_below": d.pipeline.lost_below(),
+            "lost_below": lost_below,
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
             "names_capped": names_capped,
@@ -1405,8 +1408,10 @@ impl RpcHandler {
         let capped = map.cardinality_capped();
         let (groups, groups_total) = map.finish(top_n);
 
+        // The floor as the walk saw it, as `logs.fields` does.
+        let lost_below = counts.lost_below;
         let evicted_before_window =
-            crate::filter::parser::evicted_before_window(&resolved, d.pipeline.lost_below());
+            crate::filter::parser::evicted_before_window(&resolved, lost_below);
 
         Ok(json!({
             "groups": groups,
@@ -1426,7 +1431,7 @@ impl RpcHandler {
             "last_time": bounds.last_time,
             "buffer_oldest_seq": stats.buffer_oldest_seq,
             "buffer_newest_seq": stats.buffer_newest_seq,
-            "lost_below": d.pipeline.lost_below(),
+            "lost_below": lost_below,
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
             "suppressed": suppressed,
@@ -1603,11 +1608,16 @@ impl RpcHandler {
         let (lo, hi) = crate::filter::parser::resolved_seq_range(resolved.as_ref());
         let window = stats.buffer_oldest_seq.and_then(|_| {
             let from = lo.unwrap_or_else(|| {
+                // And not below the admission floor: after a `logs.clear` the
+                // seqs before it will never be stored, so they are not part of
+                // what this incarnation answers for (a window over them graded
+                // the filters that were active before the clear).
                 d.pipeline
                     .epochs()
                     .origin_seq()
                     .saturating_add(1)
                     .max(d.pipeline.lost_below())
+                    .max(d.pipeline.admit_from())
             });
             let to = hi.unwrap_or_else(|| d.pipeline.current_seq());
             (from <= to).then_some((from, to))
@@ -1823,14 +1833,7 @@ impl RpcHandler {
         self.require_live(session_id, "add_filter")?;
         let d = self.resolve_domain(session_id)?;
         let filter = req_str(params, "filter")?;
-        // Reject bookmark filters in registered (long-lived) filters.
-        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
-        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
-            return Err(
-                "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
-                    .to_string(),
-            );
-        }
+        refuse_bookmark_qualifier(filter)?;
         let desc = opt_str(params, "description")?;
         let id = self
             .sessions
@@ -1844,6 +1847,7 @@ impl RpcHandler {
         self.require_live(session_id, "edit_filter")?;
         let filter_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
+        refuse_bookmark_in_edit(filter)?;
         let desc = opt_str(params, "description")?;
         let info = self
             .sessions
@@ -1900,14 +1904,7 @@ impl RpcHandler {
         self.require_live(session_id, "add_trigger")?;
         let d = self.resolve_domain(session_id)?;
         let filter = req_str(params, "filter")?;
-        // Reject bookmark filters in registered (long-lived) triggers.
-        let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
-        if crate::filter::parser::contains_bookmark_qualifier(&parsed) {
-            return Err(
-                "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters/triggers — use them only in query tools"
-                    .to_string(),
-            );
-        }
+        refuse_bookmark_qualifier(filter)?;
         // Omitted windows default to 500/200/5 (§6, decision #4) so an ad-hoc
         // trigger captures context by default. An EXPLICIT value — including 0 —
         // is honored (only an absent or null value defaults).
@@ -1936,6 +1933,7 @@ impl RpcHandler {
         let d = self.resolve_domain(session_id)?;
         let trigger_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
+        refuse_bookmark_in_edit(filter)?;
         let pre = opt_u32(params, "pre_window")?;
         let post = opt_u32(params, "post_window")?;
         let ctx = opt_u32(params, "notify_context")?;
@@ -2223,9 +2221,10 @@ impl RpcHandler {
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
 
-        // logs_by_trace_id already returns logs in stored (seq-ascending) order
-        // — that's the same order cursor pagination wants — so no ordering
-        // switch is needed on this code path.
+        // logs_by_trace_id returns logs in seq order (the ring is seq-ordered). A cursor
+        // commits the highest seq it returned, so it still never sees a lower seq that is
+        // STORED LATER — a trigger's pre-window, flushed after the read: late arrival, a
+        // semantic question this order does not change.
         let mut logs = d.pipeline.logs_by_trace_id(trace_id);
         if let Some(f) = resolved.as_ref() {
             logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
@@ -2385,40 +2384,73 @@ impl RpcHandler {
         let from = below.last().copied().unwrap_or(anchor.seq);
         let to = above.last().copied().unwrap_or(anchor.seq);
 
-        // The logs the window actually contains — a subset of `log_ctx` by
-        // construction, since any log within `[from, to]` is among the
-        // `before`/`after` nearest the anchor.
-        let logs: Vec<_> = log_ctx
-            .into_iter()
-            .filter(|e| e.seq >= from && e.seq <= to)
-            .collect();
+        // The logs the window contains, and the log floor, read TOGETHER under
+        // one lock once the window is cut. `log_ctx` only cut it: the stores
+        // were read separately, so a log stored after `log_ctx` (and below a
+        // span the span scan saw) is inside `[from, to]` without being in
+        // `log_ctx`, and a log in `log_ctx` may since have been evicted. Read
+        // apart, the file and the floor could describe different instants —
+        // and the floor would call a record gone that the file holds.
+        let (logs, log_lost_below) = d.pipeline.logs_in_range_with_floor(from, to);
+        if logs.binary_search_by_key(&anchor.seq, |e| e.seq).is_err() {
+            return Err(format!(
+                "the anchor entry at seq {} was evicted while the capture was being taken",
+                anchor.seq
+            ));
+        }
+
+        // Spans over the SAME resolved range, so the two files describe one
+        // interval by construction rather than by two window parameters that
+        // could disagree — with the span floor read in the same lock, as the
+        // log floor is.
+        let (spans, span_lost_below) = d.span_store.range_with_floor(from, to);
+        // Bounded by the window, twice over: the span floor can sit far above `to`
+        // (unlike the log floor, which the held anchor bounds), and spans gone above
+        // the window are not spans gone from it; and a seq a held log occupies was
+        // never a span. What is left is still an upper bound (a seq may have been a
+        // log a filter kept out), and when nothing is left there is no span loss.
+        let span_gap_end = span_lost_below.min(to.saturating_add(1));
+        let logs_in_gap = logs.iter().filter(|e| e.seq < span_gap_end).count() as u64;
+        let span_evicted = crate::filter::parser::evicted_below(from, span_gap_end)
+            .map(|gap| gap.saturating_sub(logs_in_gap))
+            .filter(|gap| *gap > 0);
 
         // How much of what was ASKED for came back.
         //
-        // `context_by_seq` returns a contiguous run of stored entries, so the
-        // window `[from, to]` is never internally cut — but it can be narrower
-        // at either end than the caller requested, and the two reasons for that
-        // are not the same fact. The ring having dropped records is a LOSS; the
-        // domain simply not having that much history yet is not. Only
-        // `lost_below` can tell them apart, and reading `oldest_log_seq` for it
-        // would call the second one eviction on every young domain.
-        // Counted in the same merged space the window was cut from, or the two
-        // numbers would describe different axes.
+        // The window can be narrower at either end than the caller requested,
+        // and the two reasons for that are not the same fact. The ring having
+        // dropped records is a LOSS; the domain simply not having that much
+        // history yet is not. Only `lost_below` can tell them apart, and reading
+        // `oldest_log_seq` for it would call the second one eviction on every
+        // young domain.
+        //
+        // Counted from the CUT, in the same merged space `from`/`to` came from,
+        // so the counts and the window's ends describe one instant. Not from the
+        // files: a span evicted between the cut and the second read would then
+        // read as "the stores had nothing more at that end" — false, and with a
+        // log floor ever raised it flipped `complete` to `evicted`. The residual
+        // the cut leaves is smaller: a record a trigger flushes in between can be
+        // in the file of a window the document calls short of it.
         let short_before = before.value.saturating_sub(below.len());
         let short_after = after.value.saturating_sub(above.len());
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //
-        // **No count travels with this.** `lost_below - from` is zero by
-        // construction — `from` is the first surviving seq and so is
-        // `lost_below`, which is exactly why measuring from the window's own
-        // lower end could never fire — and `short_before` is bounded by
-        // `before`, not by what the ring dropped. Passing the shortfall off as
-        // records-lost made a ring of 30 that had ever received 32 records
-        // report 71 of them gone. The document gets both numbers and multiplies
-        // neither into the other.
-        let log_lost_below = d.pipeline.lost_below();
-        let log_evicted = short_before > 0 && log_lost_below > 0;
+        // **No count travels with the shortfall.** `short_before` is bounded by
+        // `before`, not by what the ring dropped; passing it off as records-lost
+        // made a ring of 30 that had ever received 32 records report 71 of them
+        // gone. The document gets both numbers and multiplies neither into the
+        // other.
+        //
+        // And logs can be gone from INSIDE the window: `from` is the lowest of
+        // the nearest records from BOTH stores, so it can be a span below the log
+        // floor (typically with spans filling `before`, so `short_before` is 0),
+        // or a log evicted since `log_ctx` was read. Either way only the floor
+        // sitting above `from` says the logs there are gone — and it was read
+        // with `logs`.
+        let logs_evicted_before_window = crate::filter::parser::evicted_below(from, log_lost_below);
+        let log_evicted =
+            (short_before > 0 && log_lost_below > 0) || logs_evicted_before_window.is_some();
 
         let coverage = d.pipeline.epochs().coverage(from, to);
         let verdict = crate::engine::epoch::evidence_verdict(
@@ -2430,16 +2462,6 @@ impl RpcHandler {
             // one — see `Window::clamped`.
             false,
         );
-
-        // Spans over the SAME resolved range, so the two files describe one
-        // interval by construction rather than by two window parameters that
-        // could disagree.
-        let span_filter = lower_seq_range(None, Some(from), Some(to));
-        let mut spans = Vec::new();
-        d.span_store.for_each_matching(span_filter.as_ref(), |s| {
-            spans.push(s.clone());
-        });
-        let span_evicted = crate::filter::parser::evicted_below(from, d.span_store.lost_below());
 
         let domain_name = d.config.name.to_string();
         let collectors = self.case_collector_lines(&d.config.name);
@@ -2531,7 +2553,9 @@ impl RpcHandler {
                 short_before,
                 short_after,
                 log_lost_below,
+                logs_evicted_before_window,
                 spans_evicted_before_window: span_evicted,
+                span_lost_below,
             },
             // `None` when omitted, so the front-matter key is ABSENT rather than
             // present-with-zero. That is the only thing telling a reader "nobody
@@ -2788,11 +2812,14 @@ impl RpcHandler {
                 .map_err(|_| format!("`{hex}` is not a hexadecimal trace id"))?;
             let entries = d.pipeline.logs_by_trace_id(tid);
             let n = entries.len();
-            // Earliest by seq — `logs_by_trace_id` returns stored order, which
-            // is seq-ascending — and the document says how many there were.
+            // Earliest BY SEQ, and the document says how many there were.
+            // `logs_by_trace_id` returns seq order, so this is its first entry;
+            // the `min_by_key` states the requirement rather than leaning on
+            // that order (which it once did not have: a trigger stored its
+            // pre-window's older records AFTER the record that fired it).
             let e = entries
                 .into_iter()
-                .next()
+                .min_by_key(|e| e.seq)
                 .ok_or_else(|| format!("no stored log entry carries trace id `{hex}`"))?;
             ("trace_id", hex.to_string(), e, (n > 1).then_some(n))
         };
@@ -3166,6 +3193,7 @@ impl RpcHandler {
 
         let parsed = crate::filter::parser::parse_filter(filter_string)
             .map_err(|e| format!("invalid filter: {e}"))?;
+        refuse_bookmark_in(&parsed)?;
         let warnings: Vec<String> = crate::filter::admission::admit_span_filter(&parsed)
             .map_err(|e| e.to_string())?
             .warnings
@@ -3360,6 +3388,7 @@ impl RpcHandler {
         if let Some(f) = new_filter {
             let parsed = crate::filter::parser::parse_filter(f)
                 .map_err(|e| format!("invalid filter: {e}"))?;
+            refuse_bookmark_in(&parsed)?;
             warnings = crate::filter::admission::admit_span_filter(&parsed)
                 .map_err(|e| e.to_string())?
                 .warnings
@@ -4278,6 +4307,39 @@ fn missing(key: &str) -> String {
 
 fn opt_str<'a>(params: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
     opt_of(params, key, "a string", Value::as_str)
+}
+
+/// Refuse a bookmark or cursor qualifier in a REGISTERED filter, trigger or collector. Only
+/// query tools resolve them; a registered one never matches, so a session filter of
+/// `b>=mark` silently stops the domain storing what it matched, a trigger of one never
+/// fires, and a collector of one measures nothing. Every handler that sets a registered
+/// filter calls this — add and edit alike, for filters, triggers and collectors: the edits
+/// and the collectors once skipped it. (Restored sessions are checked in
+/// `SessionRegistry::restore_named`.)
+fn refuse_bookmark_in(parsed: &crate::filter::parser::ParsedFilter) -> Result<(), String> {
+    if crate::filter::parser::contains_bookmark_qualifier(parsed) {
+        return Err(
+            "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters, triggers or collectors — use them only in query tools"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// [`refuse_bookmark_in`] for a filter not yet parsed, returning the parser's own error for
+/// an invalid one (the adds' behaviour).
+fn refuse_bookmark_qualifier(filter: &str) -> Result<(), String> {
+    let parsed = crate::filter::parser::parse_filter(filter).map_err(|e| e.to_string())?;
+    refuse_bookmark_in(&parsed)
+}
+
+/// [`refuse_bookmark_in`] for an edit's new filter. An invalid one is left to the session
+/// layer, which reports it as it always has (`filter error: …` / `trigger error: …`).
+fn refuse_bookmark_in_edit(filter: Option<&str>) -> Result<(), String> {
+    match filter.map(crate::filter::parser::parse_filter) {
+        Some(Ok(parsed)) => refuse_bookmark_in(&parsed),
+        _ => Ok(()),
+    }
 }
 
 fn req_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {

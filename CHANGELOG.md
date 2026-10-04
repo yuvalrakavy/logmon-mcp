@@ -80,6 +80,150 @@ a path outside the case.
 case with no registry entry reads as "no provenance recorded" rather than an
 error. A reader must not reconstruct one from the table.
 
+### Changed — the log buffer holds records in seq order
+
+A record's **seq** — the number every log and span of a domain is given on arrival, from one
+sequence — is the only ordering the archive has. The log buffer kept records in the order
+they were STORED instead, and a trigger breaks that: it stores the record that fired it, then
+the older records of its pre-window and of its trace that are still in the pre-trigger
+buffer. Every reader that took a position in the buffer for a position in seq was wrong
+across such a stretch. The buffer now keeps itself in seq order: a trigger's flush is merged
+in where its seqs belong.
+
+The ORDER you see changes only where a trigger has fired while a **session filter** was
+keeping records out of the buffer, where a trigger's pre-window reached past what a small
+buffer still held, or where a trigger fired after `logs.clear` (in the last two, the flush
+re-stored records the buffer had evicted or cleared). Otherwise every record is stored as it
+arrives, a trigger finds its pre-window already held, and the buffer was in seq order
+already. Where it applies:
+
+- `logs.recent` (`get_recent_logs`): the newest is the newest seq; a flushed pre-window
+  record is no longer shown as the newest. Results are still newest-first.
+- `logs.context` (`get_log_context`) around a trigger's record includes its pre-window, in
+  seq order.
+- `traces.logs` (`get_trace_logs`), the logs of `traces.get` (`get_trace`), and `logs.recent`
+  with a `trace_id` were in stored order — ascending except across a trigger's stretch — and
+  are ascending throughout now. Their direction did not change.
+- `buffer_oldest_seq`/`buffer_newest_seq` and `domains.list`'s (`list_domains`) oldest and
+  newest seq are the true lowest and highest seq held.
+- A cursor read (`c>=`) with a `count` no longer skips held records. A trigger on seq 100
+  stores 100, then the records of its pre-window, 97-99; over a buffer that held 91 before,
+  stored as `[91, 100, 97, 98, 99]`, `c>=` with `count: 2` returned `[91, 100]`, moved the
+  cursor past 100, and never returned 97-99. It now returns `[91, 97]`, then `[98, 99]`,
+  then `[100]`. Unchanged: a record that is stored only AFTER a cursor has passed its seq
+  — a pre-window flushed by a trigger that fires later — is still not returned to that
+  cursor.
+- `cases.create` (`create_case`) anchored on a bookmark takes the lowest seq after the
+  bookmark's.
+
+What the buffer ADMITS changes with or without filters:
+
+- `logs.clear` (`clear_logs`) refuses, from then on, every record that arrived before it,
+  stored or not. A trigger firing after a clear used to flush back the records the clear had
+  emptied, and records a filter had kept out that were still in the pre-trigger buffer. And
+  `logs.export` (`export_logs`) with no range starts where the clear did, so its verdict no
+  longer grades the filters that were active before it (a `filtered` export can now be
+  `complete`).
+- A record older than one the buffer has already evicted is not stored either: in a full
+  buffer it would be the oldest record, evicted first. A trigger's flush can offer one.
+- So `status.get`'s (`get_status`) `store.total_received` — the records OFFERED to the
+  buffer, which leaves out those a session filter kept out — can now exceed
+  `store.total_stored`. The difference counts refused offers: a record offered by two
+  flushes counts twice.
+- A trigger's pre-window reaches back at most the last N arrivals, N being the largest
+  pre-window among the domain's triggers. A flush used to leave older records behind once a
+  trigger with a smaller pre-window had drained newer ones, so a later flush could pull in
+  records far older than N arrivals.
+
+### Changed — a trigger notification carries `notify_context` records, not its whole pre-window
+
+A trigger's `context_before` is documented as "at most `notify_context`" records (default 5),
+but the daemon sent the trigger's whole pre-window — up to 500 records with the default
+`l>=ERROR` trigger — and the matched record a second time as its last entry. It now sends
+the `notify_context` records just before the match, in seq order, without the match itself
+(that is `matched_entry`). The rest of the pre-window is still stored: read it with
+`get_log_context` (`logs.context`) around the matched entry's seq. A client that read the
+whole pre-window from the notification gets 5 records now, or `notify_context` if set.
+
+### Fixed — `traces.logs` (`get_trace_logs`) walked the whole log buffer on every call
+
+Looking up one trace's logs found the trace's seqs in an index, then compared every record
+in the buffer against them — under the buffer's read lock, which ingestion needs as a write
+lock. A call cost time in proportion to the BUFFER, not the trace: with 500,000 records
+buffered, a call for a 2,000-record trace took **15.8 ms** (release build, measured). The
+default buffer holds 10,000 records, where the walk is fifty times shorter; it mattered for
+a domain configured with a large buffer and polled per trace — a test harness waiting for a
+marker record, from many parallel lanes — under which records were seen reaching readers
+seconds after they were sent.
+
+The lookup now reads only the trace's own records, each found by binary search in the
+seq-ordered buffer, so its cost follows the trace rather than the buffer. `logs.recent` with
+a `trace_id` uses the same lookup. The same call — a 2,000-record trace in 500,000 buffered
+records — takes **0.36 ms** (median of 200, release build, measured with a separate probe
+from the 15.8 ms one). The end-to-end delay the harness saw was not re-measured.
+
+`traces.get` (`get_trace`) had the same shape on the span buffer, with each span compared
+against the trace's whole span list, so its cost grew with the buffer times the trace;
+`traces.recent` (`get_recent_traces`) walked the whole span buffer once per trace it
+returned. Both read the trace's own spans now (not measured). `traces.recent` also gives a
+trace with no root span the start time of its EARLIEST span, and picks a root among several
+by start time, as `traces.summary` (`get_trace_summary`) already did; it used to take
+whichever span the buffer held first.
+
+### Fixed — `create_case` anchored on a trace id could take the wrong record
+
+The anchor is documented as the trace's earliest record by seq, but it was the first
+record the store returned for the trace — which, before the buffer kept seq order, could be
+the record that fired a trigger rather than the trace's earliest, with the case document
+saying *"the earliest by seq (N) was taken"* about the wrong N. The anchor takes the lowest
+seq.
+
+### Fixed — a case captured across a trigger could not be loaded, and its window could hold the wrong records
+
+`cases.create` (`create_case`) cuts its log window by position around the anchor. Before the
+buffer kept seq order, a window taking in a trigger's stored stretch was written out of seq
+order, which `cases.load` (`load_case`) refuses; and records farther from the anchor in seq
+could take nearer ones' slots, so the document could call records **gone** that were still
+stored. With the buffer in seq order, the window is the anchor's seq neighbourhood and both
+files are written in seq order. A case an earlier version wrote across a trigger keeps its
+out-of-order log file, and `load_case` still refuses it; capture it again.
+
+### Fixed — logs gone from inside a case window were not reported
+
+A case window's lower end is the nearest record below the anchor in EITHER store, so it can
+be a span below the oldest log still held. Logs stored between the two had been evicted, but
+the spans filled `before`, so nothing was short: the window was graded `complete` and the
+document said nothing was lost. It is graded `evicted` now, and the document says up to how
+many logs, over which seqs, are gone — an upper bound, since some of those seqs belonged to
+spans or to records a filter never stored. Where the window is also `filtered`, which
+outranks `evicted`, the document still says so. A shortfall below the window is called "an
+empty past" only when neither buffer has dropped anything.
+
+The capture also reads each buffer's records over the window together with that buffer's
+eviction floor, under one lock. Read apart, a log evicted between the two reads could be in
+the log file and reported gone at once, and a log stored between them could be missing from
+the file of a window graded `complete`. The span eviction line also no longer counts spans
+gone ABOVE the window, or seqs the window's logs occupy, as spans gone from it.
+
+### Fixed — edits and collectors accepted a bookmark or cursor in a registered filter
+
+`add_filter` and `add_trigger` refuse a bookmark or cursor qualifier (`b>=`, `b<=`, `c>=`):
+only query tools resolve one, and in a registered filter it never matches. `edit_filter`,
+`edit_trigger`, `add_collector` and `edit_collector` did not check. Editing a session's
+filter to `b>=mark` silently stopped the domain storing what that filter had matched, a
+trigger edited to one never fired, and a collector given one measured nothing. All four now
+refuse it with the same error as the adds. A filter, trigger or collector saved with one by an
+earlier version is not restored at startup: the daemon logs a warning naming a filter or
+trigger, and reports the collector as rejected. If that filter was a session's only one, the
+domain stores more after the upgrade, not less — it was matching nothing.
+
+### Fixed — a span trigger's notification said seq 0
+
+The span processor stored a copy of each span and passed on the receiver's own, which still
+carried the placeholder seq 0, so every span trigger notification reported `seq: 0` for its
+matched span — a seq that points nowhere, where the stored one can be handed to
+`get_span_context`. The notification now carries the seq the span was stored under.
+
 ### Fixed — `create_case` captured a window cut from the logs alone
 
 `before`/`after` counted **log** records and the resulting seq range was then

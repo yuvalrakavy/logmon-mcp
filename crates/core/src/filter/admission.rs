@@ -204,8 +204,10 @@ pub fn admit_span_filter(filter: &ParsedFilter) -> Result<Admission, AdmissionEr
                 warnings.push(AdmissionWarning::BarePatternMatchesNameOnly);
             }
             // Bookmarks are rejected separately by the RPC layer for collectors
-            // (a pre-parsed filter would freeze a stale seq bound); they are
-            // legal for `traces.profile`, so admission does not object.
+            // (`refuse_bookmark_in` in `collectors.add`/`collectors.edit`: a
+            // registered one never matches, so the collector would measure
+            // nothing); they are legal for `traces.profile`, so admission does
+            // not object.
             Qualifier::BookmarkFilter { .. }
             | Qualifier::CursorFilter { .. }
             | Qualifier::SeqFilter { .. } => {}

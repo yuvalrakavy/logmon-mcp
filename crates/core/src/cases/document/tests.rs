@@ -50,7 +50,9 @@ fn base() -> CaseInput {
             short_before: 0,
             short_after: 0,
             log_lost_below: 0,
+            logs_evicted_before_window: None,
             spans_evicted_before_window: None,
+            span_lost_below: 0,
         },
         logdata: Some(FilePointer {
             file: "checkout-hang-260731-141530.logdata.jsonl".into(),
@@ -384,7 +386,17 @@ fn collector_state_names_the_owner_and_says_so_when_there_are_none() {
 fn the_span_line_reports_the_span_rings_own_retention() {
     let out = render(&base()).body;
     assert!(
-        out.contains("Spans: 168 captured, and the span ring had dropped nothing below seq 40672"),
+        out.contains("Spans: 168 captured, and the span ring has never dropped a span."),
+        "{out}"
+    );
+
+    // A span ring that has dropped spans, all of them below the window: that is NOT "dropped
+    // nothing" (the claim the old wording made whenever the floor sat at or below `from`).
+    let mut below = base();
+    below.window.span_lost_below = 40_000;
+    let out = render(&below).body;
+    assert!(
+        out.contains("the span ring has dropped spans below seq 40000, none of which could have been in this window"),
         "{out}"
     );
     assert!(
@@ -410,6 +422,139 @@ fn the_span_line_reports_the_span_rings_own_retention() {
         "{:?}",
         r.notes
     );
+}
+
+/// Logs gone from INSIDE the window (the log floor above `from`, which a span reaches below):
+/// `short_before` is 0, so nothing else would say so. Under `evicted` the verdict paragraph
+/// says it; under `filtered`, which outranks `evicted`, its own line does; and either way the
+/// next steps say records were dropped.
+#[test]
+fn logs_evicted_inside_the_window_are_reported_whatever_the_verdict() {
+    let mut i = base();
+    i.window.log_lost_below = 40_700;
+    i.window.logs_evicted_before_window = Some(28);
+    i.window.verdict = EvidenceVerdict::Evicted;
+    let r = render(&i);
+    assert!(
+        r.body.contains("the log ring has dropped everything below seq 40700: up to 28 log records over seqs 40672–40699 are **gone**"),
+        "{}",
+        r.body
+    );
+    assert!(
+        !r.body
+            .contains("It starts at seq 40672, the ring has dropped everything below that"),
+        "the old sentence claims the floor is the window's start: {}",
+        r.body
+    );
+    assert!(
+        r.body
+            .contains("The ring had already dropped part of this window"),
+        "{}",
+        r.body
+    );
+    assert!(
+        !r.body
+            .contains("Logs inside this window had already been dropped"),
+        "under `evicted` the verdict's own next step says it; not twice: {}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("Records below this window"),
+        "nothing below the window was asked for and missing (`short_before` is 0): {}",
+        r.body
+    );
+
+    i.window.verdict = EvidenceVerdict::Filtered;
+    i.window.narrowed_by = vec![NarrowedRange {
+        from_seq: 40672,
+        to_seq: 41100,
+        filters: vec!["service:checkout".into()],
+    }];
+    let r = render(&i);
+    assert!(
+        r.body.contains("the log ring has dropped everything below seq 40700, so up to 28 log records over seqs 40672–40699 are **gone**"),
+        "{}",
+        r.body
+    );
+    assert!(r.body.contains("Logs inside the window:"), "{}", r.body);
+    assert!(
+        r.body
+            .contains("Logs inside this window had already been dropped"),
+        "{}",
+        r.body
+    );
+}
+
+/// With BOTH rings dropped, a shortfall below the window is the log ring's loss: the
+/// sentence that says the log ring has dropped nothing must not be the one chosen.
+#[test]
+fn a_shortfall_with_both_rings_dropped_names_the_log_floor() {
+    let mut i = base();
+    i.window.short_before = 5;
+    i.window.log_lost_below = 40_600;
+    i.window.span_lost_below = 40_650;
+    let r = render(&i);
+    assert!(
+        r.body
+            .contains("the log ring has dropped everything under seq 40600"),
+        "{}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("the log ring has dropped nothing"),
+        "{}",
+        r.body
+    );
+}
+
+/// The span line names the span ring's own floor as the boundary, not the window's start:
+/// spans from `from` up to the floor are the ones gone.
+#[test]
+fn the_span_eviction_line_names_the_span_floor() {
+    let mut i = base();
+    i.window.span_lost_below = 40_690;
+    i.window.spans_evicted_before_window = Some(18);
+    let r = render(&i);
+    assert!(
+        r.body
+            .contains("the span ring **had** evicted below seq 40690 — up to 18 spans"),
+        "{}",
+        r.body
+    );
+    assert!(
+        r.body
+            .contains("The span ring had dropped spans this capture may have wanted"),
+        "a next step for it: {}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("Nothing limits this capture"),
+        "{}",
+        r.body
+    );
+}
+
+/// A shortfall below the window is an empty past only if NEITHER ring has dropped anything:
+/// evicted spans would have filled `before` too.
+#[test]
+fn a_shortfall_is_an_empty_past_only_if_neither_ring_dropped_anything() {
+    let mut i = base();
+    i.window.short_before = 5;
+    let out = render(&i).body;
+    assert!(out.contains("neither ring has dropped anything"), "{out}");
+
+    i.window.span_lost_below = 40_000;
+    let out = render(&i).body;
+    assert!(
+        out.contains("the span ring has dropped everything under seq 40000, so some share of those 5 missing record(s) may be spans that are **gone**"),
+        "{out}"
+    );
+    assert!(!out.contains("empty past"), "{out}");
+    assert!(
+        out.contains("The span ring had dropped spans this capture may have wanted"),
+        "the span loss below the window gets a next step too: {out}"
+    );
+    assert!(!out.contains("Nothing limits this capture"), "{out}");
 }
 
 #[test]

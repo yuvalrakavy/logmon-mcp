@@ -716,7 +716,8 @@ mod bookmark_tests {
 
 /// Returns true if any qualifier in the filter is a `BookmarkFilter` or `CursorFilter`.
 /// Used by registration guards to reject bookmark filters and cursor filters in long-lived
-/// registered filters/triggers.
+/// registered filters, triggers and collectors — on add, on edit, and when a persisted one
+/// is restored.
 pub fn contains_bookmark_qualifier(filter: &ParsedFilter) -> bool {
     match filter {
         ParsedFilter::All | ParsedFilter::None => false,
@@ -860,9 +861,10 @@ pub fn evicted_below(from: u64, lost_below: u64) -> Option<u64> {
 /// `should_evict` cannot drift — they decide the same question about the same
 /// window and disagreed by one until they were made to share the arithmetic.
 ///
-/// Not used by `cases.create`: there the window's lower end IS the store's
-/// floor, so this can only ever return `None`. That path reports the floor and
-/// the caller's shortfall as the two separate facts they are.
+/// Not used by `cases.create`, which has no filter to resolve a bound from: it
+/// calls [`evicted_below`] with the window's own lower end, which can sit below
+/// the log floor (a span there, or a log evicted during the capture), and
+/// reports the floor and the caller's shortfall as the separate facts they are.
 pub fn evicted_before_window(filter: &ParsedFilter, lost_below: u64) -> Option<u64> {
     let lb = resolved_lower_bound(filter)?;
     evicted_below(lb.saturating_add(1), lost_below)

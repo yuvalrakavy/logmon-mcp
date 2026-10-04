@@ -43,8 +43,8 @@ fn test_span_stored() {
     let sessions = Arc::new(SessionRegistry::new());
     let pipeline = Arc::new(LogPipeline::new(100));
 
-    let span = make_span("query", 100.0);
-    process_span(&span, &store, &sessions, &pipeline);
+    let mut span = make_span("query", 100.0);
+    process_span(&mut span, &store, &sessions, &pipeline);
     assert_eq!(store.len(), 1);
 }
 
@@ -61,8 +61,8 @@ fn test_span_trigger_fires() {
         .add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow span"), false)
         .unwrap();
 
-    let span = make_span("slow_query", 600.0);
-    process_span(&span, &store, &sessions, &pipeline);
+    let mut span = make_span("slow_query", 600.0);
+    process_span(&mut span, &store, &sessions, &pipeline);
 
     // Span stored
     assert_eq!(store.len(), 1);
@@ -71,6 +71,42 @@ fn test_span_trigger_fires() {
     // assertion held even when no trigger matched. match_count is the first
     // signal on this path that distinguishes fired from didn't.
     assert_eq!(match_count_of(&sessions, &sid, t), 1);
+}
+
+/// A span trigger's notification carries the seq the store gave the span. The receivers hand
+/// a span over with a placeholder 0, and the processor used to pass THAT copy on after storing
+/// another one — so every span notification said seq 0.
+#[test]
+fn a_span_triggers_notification_carries_the_stored_seq() {
+    let store = Arc::new(SpanStore::new(
+        100,
+        Arc::new(SeqCounter::new_with_initial(41)),
+    ));
+    let sessions = Arc::new(SessionRegistry::new());
+    let pipeline = Arc::new(LogPipeline::new(100));
+    let sid = sessions.create_named("watcher").unwrap();
+    sessions
+        .add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow span"), false)
+        .unwrap();
+    sessions.disconnect(&sid);
+
+    process_span(
+        &mut make_span("slow_query", 600.0),
+        &store,
+        &sessions,
+        &pipeline,
+    );
+
+    let events = sessions.drain_notifications(&sid);
+    assert_eq!(events.len(), 1, "the trigger fired once");
+    assert_eq!(
+        events[0].matched_entry.seq, 42,
+        "the seq the store assigned, not the receiver's 0"
+    );
+    assert!(
+        store.get_trace(0xabc).iter().any(|s| s.seq == 42),
+        "and it is the stored span"
+    );
 }
 
 #[test]
@@ -95,8 +131,8 @@ fn span_triggers_are_not_debounced() {
         .unwrap();
 
     for _ in 0..3 {
-        let span = make_span("slow_query", 600.0);
-        process_span(&span, &store, &sessions, &pipeline);
+        let mut span = make_span("slow_query", 600.0);
+        process_span(&mut span, &store, &sessions, &pipeline);
     }
 
     assert_eq!(
@@ -126,8 +162,8 @@ fn non_span_filter_trigger_never_fires_on_a_span() {
         .add_trigger(&sid, "ALL", 0, 0, 0, Some("everything"), false)
         .unwrap();
 
-    let span = make_span("anything", 1.0);
-    process_span(&span, &store, &sessions, &pipeline);
+    let mut span = make_span("anything", 1.0);
+    process_span(&mut span, &store, &sessions, &pipeline);
 
     assert_eq!(store.len(), 1, "the span was ingested");
     assert_eq!(
@@ -164,10 +200,10 @@ fn oneshot_span_trigger_is_removed_after_it_fires() {
     // Control arm: a NON-matching span must leave it armed. Without this the
     // test below would pass against an implementation that removed oneshot
     // triggers unconditionally.
-    process_span(&make_span("fast", 10.0), &store, &sessions, &pipeline);
+    process_span(&mut make_span("fast", 10.0), &store, &sessions, &pipeline);
     assert!(present(t), "a non-matching span must not consume a oneshot");
 
-    process_span(&make_span("slow", 600.0), &store, &sessions, &pipeline);
+    process_span(&mut make_span("slow", 600.0), &store, &sessions, &pipeline);
     assert!(
         !present(t),
         "a oneshot span trigger is removed once a span matches it"
@@ -189,8 +225,8 @@ fn test_span_trigger_no_match() {
         .add_trigger(&sid, "d>=500", 0, 0, 0, Some("slow"), false)
         .unwrap();
 
-    let span = make_span("fast_query", 10.0);
-    process_span(&span, &store, &sessions, &pipeline);
+    let mut span = make_span("fast_query", 10.0);
+    process_span(&mut span, &store, &sessions, &pipeline);
 
     // Span stored but no trigger fired
     assert_eq!(store.len(), 1);

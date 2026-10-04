@@ -100,21 +100,29 @@ pub struct Window {
     /// nothing has ever left it. A STORE fact.
     ///
     /// **A seq, not a count, and the two must never be multiplied into each
-    /// other.** `from` is by construction the first SURVIVING record, so
-    /// `log_lost_below - from` is zero here and `short_before` is the only
-    /// number in reach — but it is bounded by `before`, not by what the ring
-    /// dropped. Rendering it as records-lost made a domain that had ever held
-    /// 32 records report 71 of them gone.
+    /// other.** `short_before` is bounded by `before`, not by what the ring
+    /// dropped; rendering one as the other made a domain that had ever held 32
+    /// records report 71 of them gone.
     ///
-    /// The span side below CAN carry a count, and the asymmetry is real rather
-    /// than an oversight: the window's ends come from the LOG store, so a span
-    /// floor above `from` measures a genuine stretch of the window the span
-    /// ring no longer covers.
+    /// The window's lower end `from` is the lowest of the nearest records from
+    /// BOTH stores, so it can be a span below this floor — see
+    /// `logs_evicted_before_window`.
     pub log_lost_below: u64,
+    /// Logs gone from INSIDE `[from, to]`, as an upper bound: `Some` when the log
+    /// floor is above `from` — because spans reach further back than the logs
+    /// still do (typically with spans filling `before`, so `short_before` is 0), or because
+    /// the lowest log was evicted while the capture was taken. Nothing else in
+    /// the window says logs are missing from it.
+    pub logs_evicted_before_window: Option<u64>,
     /// The SPAN ring's own eviction, as an upper bound on spans gone from
     /// inside `[from, to]`. Separate because the two stores share a seq axis
     /// but evict independently, and one verdict cannot honestly speak for both.
     pub spans_evicted_before_window: Option<u64>,
+    /// The span ring's floor, as `log_lost_below` is the log ring's. Needed
+    /// because a shortfall below the window is an empty past only if NEITHER
+    /// ring has dropped anything — a span ring that evicted below `from` would
+    /// have filled `before` otherwise.
+    pub span_lost_below: u64,
 }
 
 /// A logdata file, as the document points at it.
@@ -129,8 +137,8 @@ pub struct FilePointer {
 /// The split between records stored because they matched a **filter** and those
 /// the flight recorder flushed as an **unfiltered window** around a trigger.
 ///
-/// **Reported because the verdict cannot see it.** The pre-trigger flush calls
-/// `append_to_store` directly (`daemon/log_processor.rs:90`) and never reaches
+/// **Reported because the verdict cannot see it.** The pre-trigger flush stores
+/// directly (`append_to_store` and `insert_sorted`, `daemon/log_processor.rs`) and never reaches
 /// the `epochs().observe` on the storage-decision branch, so those seqs keep the
 /// surrounding epoch's policy — a window holding a complete unfiltered burst
 /// still grades `filtered`. That under-claims in the safe direction, but it
@@ -543,25 +551,48 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                 });
             }
         }
-        EvidenceVerdict::Evicted => {
-            let _ = writeln!(
-                s,
-                "**`evicted`** — this window reaches the bottom of what the log ring still \
-                 holds. It starts at seq {}, the ring has dropped everything below that, and \
-                 records the capture asked for are **gone**. How many is not knowable from \
-                 here: a ring keeps no tally of what it evicted, and the shortfall stated \
-                 below is bounded by what was REQUESTED, not by what was lost.\n",
-                w.from
-            );
-            notes.push(Note {
-                kind: NOTE_CAPTURE_GAP,
-                detail: format!(
-                    "the log ring has dropped everything below seq {}; {} requested record(s) \
-                     before the anchor did not come back",
-                    w.log_lost_below, w.short_before
-                ),
-            });
-        }
+        EvidenceVerdict::Evicted => match w.logs_evicted_before_window {
+            Some(gap) => {
+                let _ = writeln!(
+                    s,
+                    "**`evicted`** — this window reaches below what the log ring still \
+                     holds. It starts at seq {}, but the log ring has dropped everything \
+                     below seq {}: up to {gap} log records over seqs {}–{} are **gone**.\n",
+                    w.from,
+                    w.log_lost_below,
+                    w.from,
+                    w.log_lost_below.saturating_sub(1)
+                );
+                notes.push(Note {
+                    kind: NOTE_CAPTURE_GAP,
+                    detail: format!(
+                        "the log ring has dropped everything below seq {}, inside this window \
+                         (it starts at seq {}): up to {gap} log records there are gone",
+                        w.log_lost_below, w.from
+                    ),
+                });
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "**`evicted`** — this window reaches the bottom of what the log ring \
+                     still holds. It starts at seq {}, the ring has dropped everything below \
+                     that, and records the capture asked for are **gone**. How many is not \
+                     knowable from here: a ring keeps no tally of what it evicted, and the \
+                     shortfall stated below is bounded by what was REQUESTED, not by what \
+                     was lost.\n",
+                    w.from
+                );
+                notes.push(Note {
+                    kind: NOTE_CAPTURE_GAP,
+                    detail: format!(
+                        "the log ring has dropped everything below seq {}; {} requested \
+                         record(s) before the anchor did not come back",
+                        w.log_lost_below, w.short_before
+                    ),
+                });
+            }
+        },
         EvidenceVerdict::CannotVerify => {
             let _ = writeln!(
                 s,
@@ -605,15 +636,39 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                  dropped.\n",
                 w.log_lost_below, w.short_before
             )
+        } else if w.span_lost_below > 0 {
+            writeln!(
+                s,
+                "Below the window: the log ring has dropped nothing, but the span ring has \
+                 dropped everything under seq {}, so some share of those {} missing record(s) \
+                 may be spans that are **gone** rather than never recorded.\n",
+                w.span_lost_below, w.short_before
+            )
         } else {
             writeln!(
                 s,
-                "Below the window: seq {} is the oldest record this store has ever held and it \
-                 has dropped nothing, so the shortfall before the anchor is an empty past \
-                 rather than a loss.\n",
+                "Below the window: seq {} is the oldest record this store has ever held and \
+                 neither ring has dropped anything, so the shortfall before the anchor is an \
+                 empty past rather than a loss.\n",
                 w.from
             )
         };
+    }
+    // Logs gone from INSIDE the window, whatever the verdict says — a `filtered`
+    // verdict outranks `evicted`, and this is the only place the loss would show.
+    if let (Some(gap), false) = (
+        w.logs_evicted_before_window,
+        w.verdict == EvidenceVerdict::Evicted,
+    ) {
+        let _ = writeln!(
+            s,
+            "Logs inside the window: it reaches below the oldest log still held — the log \
+             ring has dropped everything below seq {}, so up to {gap} log records over seqs \
+             {}–{} are **gone**.\n",
+            w.log_lost_below,
+            w.from,
+            w.log_lost_below.saturating_sub(1)
+        );
     }
     if w.short_after > 0 {
         let _ = writeln!(
@@ -684,13 +739,20 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
     let span_records = i.spandata.as_ref().map_or(0, |p| p.records);
     match w.spans_evicted_before_window {
         None if i.spandata.is_some() => {
+            let dropped = if w.span_lost_below == 0 {
+                "the span ring has never dropped a span".to_string()
+            } else {
+                format!(
+                    "the span ring has dropped spans below seq {}, none of which could have \
+                     been in this window",
+                    w.span_lost_below
+                )
+            };
             let _ = writeln!(
                 s,
-                "Spans: {span_records} captured, and the span ring had dropped nothing below \
-                 seq {}. **Session filters never narrow spans** — they are stored \
-                 unconditionally — so whatever the verdict above says about the logs, the spans \
-                 over this range are all of them.\n",
-                w.from
+                "Spans: {span_records} captured, and {dropped}. **Session filters never narrow \
+                 spans** — they are stored unconditionally — so whatever the verdict above says \
+                 about the logs, the spans over this range are all of them.\n"
             );
         }
         None => {}
@@ -700,13 +762,13 @@ fn evidence(s: &mut String, i: &CaseInput, notes: &mut Vec<Note>) {
                 "Spans: {span_records} captured; the span ring **had** evicted below seq {} — up \
                  to {gap} spans over this window are gone. The log verdict above does not cover \
                  this: the two stores share a seq axis but evict independently.\n",
-                w.from
+                w.span_lost_below
             );
             notes.push(Note {
                 kind: NOTE_CAPTURE_GAP,
                 detail: format!(
                     "the span ring evicted below seq {}; up to {gap} spans are gone",
-                    w.from
+                    w.span_lost_below
                 ),
             });
         }
@@ -857,7 +919,22 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
         ),
         EvidenceVerdict::Complete => {}
     }
-    if i.window.short_before > 0 && i.window.log_lost_below > 0 {
+    // Under an `evicted` verdict its own item above already says the ring dropped part of
+    // the window; the in-window item is for the verdicts that outrank it (`filtered`), where
+    // nothing else would.
+    let dropped_inside = i.window.logs_evicted_before_window.is_some()
+        && i.window.verdict != EvidenceVerdict::Evicted;
+    let dropped_below = i.window.short_before > 0 && i.window.log_lost_below > 0;
+    if dropped_inside {
+        item(
+            s,
+            "**Logs inside this window had already been dropped** — it reaches below the \
+             oldest log still held. Raise the domain's `log_buffer_size`, or capture sooner \
+             after the event — nothing can recover them now."
+                .into(),
+        );
+    }
+    if dropped_below {
         item(
             s,
             "**Records below this window had already been dropped.** Raise the domain's \
@@ -865,11 +942,25 @@ fn what_to_do(s: &mut String, i: &CaseInput) {
              now."
                 .into(),
         );
-    } else if i.window.clamped {
+    } else if i.window.clamped && i.window.logs_evicted_before_window.is_none() {
         item(
             s,
             "**`before`/`after` hit the maximum.** A larger value will not widen this window; \
              capture a second case anchored further out if you need more."
+                .into(),
+        );
+    }
+    // The span ring's loss is its own fact — the log verdict does not cover it — so it gets
+    // its own next step, or the document could say nothing limits a capture whose span
+    // section says spans may be gone: inside the window (an upper bound, so hedged) or below
+    // it (a shortfall with the span ring's floor raised).
+    if i.window.spans_evicted_before_window.is_some()
+        || (i.window.short_before > 0 && i.window.span_lost_below > 0)
+    {
+        item(
+            s,
+            "**The span ring had dropped spans this capture may have wanted.** Raise the \
+             domain's `span_buffer_size`, or capture sooner after the event."
                 .into(),
         );
     }

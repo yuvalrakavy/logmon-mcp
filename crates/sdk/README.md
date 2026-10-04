@@ -519,7 +519,7 @@ pub struct TriggerInfo {
     pub filter: String,                      // The DSL string as registered.
     pub pre_window: u32,                     // Pre-trigger context capacity.
     pub post_window: u32,                    // Post-trigger capture window.
-    pub notify_context: u32,                 // How many pre-window entries to include in the notification.
+    pub notify_context: u32,                 // How many records just before the match to include in the notification.
     pub description: Option<String>,
     pub match_count: u64,                    // Lifetime fire count.
     pub oneshot: bool,                       // Auto-removes after the first match if true.
@@ -718,7 +718,7 @@ loop {
 
 #### Where `c>=` is permitted
 
-Allowed in: `logs_recent`, `logs_export`, `traces_logs`. Rejected in `logs_context`, `traces_recent`, `traces_summary`, `traces_slow`, `traces_get`, `spans_context` (their results are anchored or aggregated, not seq-streamable). Also rejected in `filters_add` and `triggers_add` — cursor positions don't make sense in long-lived registered filters.
+Allowed in: `logs_recent`, `logs_export`, `traces_logs`. Rejected in `logs_context`, `traces_recent`, `traces_summary`, `traces_slow`, `traces_get`, `spans_context` (their results are anchored or aggregated, not seq-streamable). Also rejected in `filters_add`/`filters_edit`, `triggers_add`/`triggers_edit` and `collectors_add`/`collectors_edit` — cursor positions don't make sense in long-lived registered filters.
 
 #### `cursor_advanced_to` field
 
