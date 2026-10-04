@@ -114,7 +114,7 @@
           "minimum": 0
         },
         "cursor_late_lost": {
-          "description": "Cursor reads: late-stored records that left the buffer before any read of this cursor\ncould consider them. Absent when none.",
+          "description": "Cursor reads: an upper bound on late-stored records that left the buffer before any read\nof this cursor could consider them (it counts what left, not what would have matched).\nAbsent when none.",
           "type": [
             "integer",
             "null"
@@ -1488,7 +1488,7 @@
           "minimum": 0
         },
         "cursor_late_lost": {
-          "description": "Cursor reads: late-stored records that left the buffer before any read of this cursor\ncould consider them. Absent when none.",
+          "description": "Cursor reads: an upper bound on late-stored records that left the buffer before any read\nof this cursor could consider them (it counts what left, not what would have matched).\nAbsent when none.",
           "type": [
             "integer",
             "null"

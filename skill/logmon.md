@@ -700,11 +700,11 @@ get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 ```
 
-Results are returned **oldest-first** when `c>=` is present, and a cursor returns every stored record exactly once. One exception to "seqs only go up": a trigger stores its pre-window LATE — records a filter had kept out, older than records already stored. A cursor that already read past them gets them on its next read, oldest-first like everything else, with `cursor_late=N` saying how many; `cursor_late_lost=N` counts late records that left the buffer before any read could see them.
+Results are returned **oldest-first** when `c>=` is present, and a cursor returns every stored record exactly once. One exception to "seqs only go up": a trigger stores its pre-window LATE — records a filter had kept out, older than records already stored. A cursor that already read past them gets them on its next read, oldest-first like everything else, with `cursor_late=N` saying how many; `cursor_late_lost=N` is an upper bound on late records that left the buffer before any read could see them.
 
 `c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Rejected in `get_log_context`, `get_recent_traces`, `get_trace_summary`, `get_slow_spans`, `get_trace`, and `get_span_context` — their results are anchor-driven or aggregated, not seq-streamable. Only one `c>=` per filter.
 
-To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter, and records a trigger stored late before the call are not replayed.
+To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter. A bookmark read as a cursor never returns a record from before its position, even one a trigger stores late afterwards.
 
 ## Triggers vs bookmarks: which one?
 

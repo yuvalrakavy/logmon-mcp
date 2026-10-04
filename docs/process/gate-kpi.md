@@ -36,6 +36,7 @@ process skipped.
 | 2026-08-02/03 | `logs.fields` | T2 | *skipped — see note* | ≈70 | — | 0 | 1 | — |
 | 2026-08-03 | `logs.profile` | T2 | ≈90 | ≈84 | ≈6 | 0 | 2 | ~1.6M |
 | 2026-10-03/04 | seq-ordered log ring (+ `traces.logs` perf) | T2 | *not recorded* | ≈105 | ≈13 | *pending* | 2 | ~3.1M |
+| 2026-10-04 | open-issue batch: cursor late records (#23) + #21 #24 #25 #27 #28 #29 | T2 (#23) / T1 | ≈38 | ≈62 | ≈1 | *pending* | 2 | ~2.5M |
 
 **Seeded 2026-08-03 from `retro-log.md` entries.** Rows before `logs.profile`
 are reconstructed from those entries and are marked where a number cannot be
@@ -44,6 +45,18 @@ defended — the case-documents design gate ran before this ledger existed, and
 
 ### Notes on the rows
 
+- **open-issue batch (#23 + six T1 fixes)**: DG ≈38 is the one fresh-eyes pass on the cursor
+  spec — two S3 (its main verification test passed against the bug it was for, because the
+  cursor had not read past the record before it was stored late; and the store decided the
+  commit before the handler truncated, losing a record), plus four S2. IG ≈62 is three lenses
+  on the frozen diff. Its one S3 was a DESIGN miss the design gate also missed — a "from now"
+  cursor took records that arrived BEFORE it, because the spec's sufficiency argument covered
+  records the cursor had read past and never records it had never had; the fix is a creation
+  floor. Two lenses converged independently on six findings; all six were real. The mutation
+  lens added ~28 of test-plan gaps (14 proved by probes). SG ≈1: the dropped-commit guard.
+  Unexplained and recorded: one control run hung 9 minutes on a test-client call that the
+  daemon never answered; 50 reruns did not reproduce it. The harness now fails such a call
+  with its reason instead of waiting, so a recurrence reports itself.
 - **seq-ordered log ring**: IG counts the deep gate plus the re-gates of its fixes,
   because two of the re-gates' worst findings were defects the FIXES introduced — an
   S3 (a clear raised the loss floor to the counter, so spans' seqs read as lost logs)

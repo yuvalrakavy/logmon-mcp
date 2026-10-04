@@ -1096,8 +1096,10 @@ impl SessionRegistry {
                 created_at: pb.created_at,
                 description: pb.description.clone(),
                 // Not persisted: the restarted store is empty and its late counter starts
-                // again at 0 (see `Bookmark::late_mark`).
+                // again at 0, and every new seq is above this position (see
+                // `Bookmark::late_mark` / `Bookmark::floor`).
                 late_mark: 0,
+                floor: 0,
             });
         }
 

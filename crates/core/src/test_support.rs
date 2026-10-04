@@ -449,12 +449,22 @@ impl Drop for TestDaemonHandle {
     }
 }
 
+/// How long [`TestClient::call`] waits for a reply. Generous — the slowest harness calls are
+/// whole-buffer exports — and only there so a lost reply FAILS, naming the method, rather than
+/// parking a test forever with nothing to say.
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Low-level RPC client used by harness tests. Owns one Unix-socket connection
 /// to the daemon, dispatches responses by id, and surfaces notifications
 /// through an unbounded mpsc.
 pub struct TestClient {
     writer: tokio::io::WriteHalf<UnixStream>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
+    /// Why the reader task stopped, once it has — set under `pending`'s lock, beside clearing
+    /// it, so a call either registers before the reader stops (and its sender is dropped, so
+    /// it errors) or sees this and errors at once. Before, a reader that stopped (EOF, or a
+    /// line it could not parse) left every pending call waiting forever, silently.
+    closed: Arc<std::sync::Mutex<Option<String>>>,
     notification_rx: mpsc::UnboundedReceiver<RpcNotification>,
     next_id: AtomicU64,
     /// The handshake response. Populated once during connect and never
@@ -561,15 +571,17 @@ impl TestClient {
 
         // Spawn the reader task to dispatch responses + forward notifications.
         let pending_for_reader = pending.clone();
+        let closed: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let closed_for_reader = closed.clone();
         tokio::spawn(async move {
-            loop {
+            let reason = loop {
                 let mut line = String::new();
                 let n = match reader.read_line(&mut line).await {
                     Ok(n) => n,
-                    Err(_) => break,
+                    Err(e) => break format!("read error: {e}"),
                 };
                 if n == 0 {
-                    break;
+                    break "the daemon closed the connection".to_string();
                 }
                 match parse_daemon_message_from_str(&line) {
                     Ok(DaemonMessage::Response(resp)) => {
@@ -579,17 +591,22 @@ impl TestClient {
                     }
                     Ok(DaemonMessage::Notification(notif)) => {
                         if notif_tx.send(notif).is_err() {
-                            break;
+                            break "the notification receiver was dropped".to_string();
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => break format!("unparseable daemon line ({e}): {}", line.trim_end()),
                 }
-            }
+            };
+            // Fail every pending call (dropping its sender) and every later one.
+            let mut pending = pending_for_reader.lock().await;
+            *closed_for_reader.lock().expect("closed lock poisoned") = Some(reason);
+            pending.clear();
         });
 
         Ok(Self {
             writer,
             pending,
+            closed,
             notification_rx: notif_rx,
             next_id: AtomicU64::new(1),
             session_start_result,
@@ -628,15 +645,35 @@ impl TestClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let req = RpcRequest::new(id, method, params);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        {
+            let mut pending = self.pending.lock().await;
+            if let Some(reason) = self.closed.lock().expect("closed lock poisoned").clone() {
+                anyhow::bail!("{method}: connection already closed: {reason}");
+            }
+            pending.insert(id, tx);
+        }
 
+        let closed = self.closed.clone();
         let result: anyhow::Result<RpcResponse> = async {
             let json = serde_json::to_string(&req)?;
             self.writer.write_all(json.as_bytes()).await?;
             self.writer.write_all(b"\n").await?;
             self.writer.flush().await?;
-            rx.await
-                .map_err(|e| anyhow::anyhow!("response channel closed: {e}"))
+            // Bounded: a reply that never comes fails the test naming the call, instead of
+            // parking it until someone kills the run.
+            match tokio::time::timeout(CALL_TIMEOUT, rx).await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(_)) => {
+                    let reason = closed.lock().expect("closed lock poisoned").clone();
+                    Err(anyhow::anyhow!(
+                        "{method}: no reply — {}",
+                        reason.unwrap_or_else(|| "response channel closed".into())
+                    ))
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "{method}: no reply within {CALL_TIMEOUT:?} (the connection is still open)"
+                )),
+            }
         }
         .await;
 

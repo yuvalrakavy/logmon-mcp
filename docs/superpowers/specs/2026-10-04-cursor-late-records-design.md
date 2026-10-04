@@ -186,6 +186,25 @@ before (seen now) or after (numbered `> S`).
 - The dropped-commit guard (§3.4) is caught only by the `logs.export` probe test (a late-only
   reply), and the "mark jumps past a dropped late record" mutation only by the model test — each
   mechanism has at least one test that fails without it (controls C23a–C23j).
+- **The pre-merge gate found what this spec missed: a CREATION FLOOR.** A cursor created by
+  `bookmarks.add` sits at the seq counter; a record a filter kept out BEFORE the add is still in
+  the pre-trigger buffer, and a trigger firing after the add flushes it late with a fresh number —
+  so the late part (number above the mark, seq at or below the position) returned it to a "from
+  now" cursor. §3.1's sufficiency argument was about records the cursor had read past; this one it
+  never had. Every cursor now carries `floor` (`Bookmark::floor`, `CursorPos::floor`): the
+  `bookmarks.add` start seq, 0 for an auto-created or restored one; the late part takes only
+  `seq ∈ (floor, position]`. The same floor gives an explicit `start_seq` its plain meaning.
+- An auto-created cursor's mark is the store's late counter, not 0 (`resolve_bookmarks_at`): at
+  position 0 every held record reaches it through the normal part anyway, and a mark of 0 made its
+  first read report every late record that ever left the domain as `cursor_late_lost`.
+- `cursor_late_lost` is an upper bound, not an exact count of the cursor's own losses: a departed
+  record's seq and fields are gone, so neither the floor nor the read's filter can be applied to
+  it. Documented as such, beside `evicted_before_window`, which is an upper bound for the same
+  reason.
+- `CursorCommit::commit` compares-and-sets: it moves the cursor only from the position the read
+  started at, and re-inserts a swept cursor only when the SEQ moved. Unconditional, a mark-only
+  commit (new with this change) also overwrote a concurrent `bookmarks.add replace`.
+- The normal walk checks `seq > position` itself, not only through the filter's `CursorSeq`.
 - Docs: README §"`c>=` — read and advance", the skill's cursor lines (`skill/logmon.md:703`, `:707`,
   `:792`), the SDK README cursor section (`crates/sdk/README.md:723-737`: `cursor_advanced_to: None`
   no longer means "cursor unchanged"), the `traces.logs` comment (`rpc_handler.rs:2230-2233`),

@@ -123,6 +123,23 @@ async fn a_disconnected_anonymous_session_no_longer_sizes_the_buffer() {
     assert_eq!(run_scenario(&daemon, &mut k).await, vec!["boom"]);
 }
 
+/// A session renamed onto a stale holder's name displaces it, triggers and all, and the buffer
+/// shrinks with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_displaced_by_a_rename_no_longer_sizes_the_buffer() {
+    let daemon = spawn_test_daemon().await;
+    let mut k = keeper(&daemon).await;
+    let mut big = daemon.connect_named("big", None).await;
+    add_big_window(&mut big).await;
+    big.close().await.unwrap();
+    wait_for_disconnected(&mut k, "big").await;
+    let _: Value = k
+        .call("sessions.rename", json!({ "name": "big" }))
+        .await
+        .unwrap();
+    assert_eq!(run_scenario(&daemon, &mut k).await, vec!["boom"]);
+}
+
 /// Wait until the named session `name` is listed as disconnected (`sessions.drop` refuses a
 /// connected one).
 async fn wait_for_disconnected(client: &mut TestClient, name: &str) {

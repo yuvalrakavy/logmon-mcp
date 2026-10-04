@@ -733,11 +733,15 @@ a filter kept out, older than records already stored — so a cursor that alread
 them on its next read, with seqs below records it returned earlier. Two more fields say so:
 
 - `cursor_late: Option<u64>` — how many of `logs` were stored late (absent when none).
-- `cursor_late_lost: Option<u64>` — late-stored records that left the buffer before any read of
-  this cursor could consider them (absent when none; not on `traces_logs`).
+- `cursor_late_lost: Option<u64>` — an UPPER BOUND on late-stored records that left the buffer
+  before any read of this cursor could consider them (absent when none; not on `traces_logs`).
+  Like `evicted_before_window`, it counts what left, not what would have matched: a departed
+  record's fields are gone, so the read's filter cannot be applied to it.
 
 A late record is judged by the filter of the first cursor read after it is stored, and is passed
-by for good if it does not match — as any record behind a cursor always has been.
+by for good if it does not match — as any record behind a cursor always has been. A cursor never
+returns a record from before its CREATION position: a bookmark added at seq N, read as a cursor,
+never returns a record at or below N, even one a trigger stores late afterwards.
 
 To inspect a cursor's current seq without advancing it, call `bookmarks_list()` and find the entry by name.
 
@@ -745,7 +749,7 @@ To inspect a cursor's current seq without advancing it, call `bookmarks_list()` 
 
 | Creation path | Default `seq` | First read returns |
 |---|---|---|
-| `bookmarks_add(name)` (no `start_seq`) | current seq counter | only records arriving after this call (late-stored ones included, earlier late ones not) |
+| `bookmarks_add(name)` (no `start_seq`) | current seq counter | only records arriving after this call — never one from before it, even if a trigger stores it late |
 | Implicit `c>=name` on missing entry | 0 | all records currently in the buffer + everything after |
 
 To get "stream from now" via the implicit path, call `bookmarks_add(name)` first; the subsequent `c>=name` finds the bookmark already at current-seq and behaves accordingly.

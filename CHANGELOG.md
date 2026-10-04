@@ -149,15 +149,24 @@ next read — oldest-first with everything else, so with a seq below records it 
 and the reply counts them:
 
 - **`cursor_late`** — how many of the returned records were stored late. Absent when none.
-- **`cursor_late_lost`** — late records that left the buffer before any read could see them.
-  Absent when none; not on `get_trace_logs`.
+- **`cursor_late_lost`** — an upper bound on late records that left the buffer before any read
+  could see them (like `evicted_before_window`, it counts what left, not what would have
+  matched). Absent when none; not on `get_trace_logs`.
 - **`cursor_advanced_to`** is still the cursor's new seq position, so it is now also absent when
   the only records returned were late ones.
 
 A late record is judged by the filter of the first cursor read after it is stored, as any record
-behind a cursor always was. A bookmark added with `add_bookmark` and read as a cursor still means
-"from now": late records stored before the call are not replayed. `export_logs`'s `verdict`
-window starts above the cursor, so it does not vouch for late records.
+behind a cursor always was. A cursor never returns a record from before its creation position: a
+bookmark added with `add_bookmark` and read as a cursor still means "from now", even for a record
+that was waiting in the pre-trigger buffer when the bookmark was added and is stored late after
+it. `export_logs`'s `verdict` window starts above the cursor, so it does not vouch for late
+records.
+
+Two cursor fixes ride along. A commit no longer overwrites a cursor that changed during the read
+(an `add_bookmark replace`, or another read of the same cursor that committed first) — it used to
+move a replaced bookmark, or the cursor itself, backwards. And `get_recent_traces`,
+`get_trace`, `get_slow_spans` and `export_spans` refuse a `c>=` qualifier before resolving it,
+so a refused call no longer leaves a freshly created cursor behind.
 
 ### Fixed — a broker that could not start restart-looped with no trace of why
 
@@ -185,9 +194,19 @@ the last step that can fail.
 
 The pre-trigger buffer is sized to the largest `pre_window` among a domain's sessions. Adding,
 editing or removing a trigger re-derived it; removing a whole session did not — `sessions.drop`,
-the TTL sweep, or an anonymous session's disconnect (the common one). The gone session's largest
-window kept the buffer that size, holding the memory and widening how far back a traced trigger
-firing reached, until something else re-derived it. All three now do.
+the TTL sweep, an anonymous session's disconnect (the common one), or a stale holder displaced by
+`sessions.rename`. The gone session's largest window kept the buffer that size, holding the
+memory and widening how far back a traced trigger firing reached, until something else
+re-derived it. All four now do, and a re-derivation is computed and applied as one step, so two
+racing ones (a disconnect's and another session's trigger change) cannot leave the stale value.
+
+### Fixed — a session whose client vanished mid-reply stayed connected until a restart
+
+A connection disconnected its session at the end of its loop, but the writes before it returned
+early when the client had gone (the reply to `session.start` or to any request, or a trigger
+notification). The session then stayed `connected`: a named one's name was refused
+("already connected") until the broker restarted, and an anonymous one was never removed, so its
+triggers kept sizing the pre-trigger buffer. The disconnect now runs on every exit.
 
 ### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
 

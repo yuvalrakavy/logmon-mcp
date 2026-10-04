@@ -46,6 +46,17 @@ pub fn resolve_bookmarks(
     store: &BookmarkStore,
     current_session: &str,
 ) -> Result<ResolvedFilter, BookmarkResolutionError> {
+    resolve_bookmarks_at(filter, store, current_session, 0)
+}
+
+/// [`resolve_bookmarks`], with the log store's late counter for a cursor this resolution
+/// auto-creates (`BookmarkStore::cursor_read_and_advance_at`).
+pub fn resolve_bookmarks_at(
+    filter: ParsedFilter,
+    store: &BookmarkStore,
+    current_session: &str,
+    late_counter: u64,
+) -> Result<ResolvedFilter, BookmarkResolutionError> {
     let qs = match filter {
         ParsedFilter::All | ParsedFilter::None => {
             return Ok(ResolvedFilter {
@@ -82,7 +93,8 @@ pub fn resolve_bookmarks(
                         qualified,
                     ));
                 }
-                let (lower, commit) = store.cursor_read_and_advance(target_session, target_name);
+                let (lower, commit) =
+                    store.cursor_read_and_advance_at(target_session, target_name, late_counter);
                 // Its own variant, not `SeqFilter { Gt }`: a cursor read must tell its bound
                 // apart from an explicit `from_seq` (see `Qualifier::CursorSeq`).
                 out.push(Qualifier::CursorSeq { after: lower });

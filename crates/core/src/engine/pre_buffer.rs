@@ -117,6 +117,12 @@ impl PreTriggerBuffer {
         self.inner.lock().unwrap().entries.len()
     }
 
+    /// The capacity, in arrivals — the largest `pre_window` among the domain's sessions, as
+    /// last resynced.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().unwrap().capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

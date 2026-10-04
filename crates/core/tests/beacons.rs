@@ -19,6 +19,7 @@ fn free_port() -> u16 {
 /// as the receiver started and then exit through `?` without `OFFLINE`, leaving every producer
 /// on the host pointed at a collector that was never there (gh #27).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tracing_test::traced_test]
 async fn a_daemon_that_fails_after_its_receivers_start_announces_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let beacons = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -44,6 +45,13 @@ async fn a_daemon_that_fails_after_its_receivers_start_announces_nothing() {
     )
     .await;
     assert!(result.is_err(), "the socket bind must fail: {result:?}");
+    // Not vacuous: the OTLP receiver must actually have started. A port lost to the
+    // bind-then-drop race in `free_port` degrades OTLP to disabled (a WARN, and startup goes
+    // on), and a broker with no OTLP receiver announces nothing whether or not it should.
+    assert!(
+        logs_contain("OTLP receiver started"),
+        "the OTLP receiver never started, so this run proves nothing"
+    );
     let mut buf = [0u8; 64];
     let mut seen = Vec::new();
     while let Ok((n, _)) = beacons.recv_from(&mut buf) {

@@ -670,14 +670,7 @@ async fn run_initialized(
             loop {
                 interval.tick().await;
                 for id in sessions.expired_disconnected(ttl) {
-                    let cleared = handler.clear_session_bookmarks(&id);
-                    // The TTL is what bounds the collector reservation: a named
-                    // session keeps its collectors across a disconnect (that is
-                    // the arm-run-read workflow), so this sweep is the only
-                    // thing that ever hands the budget back.
-                    let collectors = handler.clear_session_collectors(&id);
-                    sessions.dispose(&id);
-                    handler.resync_pre_buffers();
+                    let (cleared, collectors) = handler.dispose_expired_session(&id);
                     info!(session = %id, bookmarks_cleared = cleared,
                         collectors_released = collectors,
                         "session TTL sweep: disposed (disconnected past TTL)");
@@ -1035,6 +1028,17 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         sessions.set_domain(&session_id, id);
     }
 
+    // From here on the connection owes its session a disconnect, on EVERY exit. The writes
+    // below return through `?` when the client has gone; with the cleanup at the end of the
+    // function they skipped it, leaving a named session `connected` — its name refused until a
+    // broker restart — and an anonymous one never removed, its triggers sizing the pre-trigger
+    // buffer for good. A guard runs it on `?`, `return` and panic alike.
+    let mut cleanup = SessionCleanup {
+        handler: handler.clone(),
+        sessions: sessions.clone(),
+        session_id: session_id.clone(),
+    };
+
     info!(?session_id, is_new, "session started");
 
     // 4. Send session start response
@@ -1088,6 +1092,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 .and_then(|v| v.as_str())
                             {
                                 session_id = SessionId::Named(new_name.to_string());
+                                cleanup.session_id = session_id.clone();
                             }
                         }
                         // §9.4: if the request rebound this session (domains.use),
@@ -1161,29 +1166,44 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
-    // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via snapshot).
-    // Collectors follow the same rule and for the same reason: an anonymous
-    // session cannot be reconnected to, so anything it armed is unreachable
-    // and its share of the sample reservation is pure leak.
-    if matches!(session_id, SessionId::Anonymous(_)) {
-        let removed = handler.clear_session_bookmarks(&session_id);
-        let collectors = handler.clear_session_collectors(&session_id);
-        if removed > 0 || collectors > 0 {
-            info!(
-                ?session_id,
-                removed,
-                collectors,
-                "cleared anonymous-session bookmarks and collectors on disconnect"
-            );
-        }
-    }
-
-    // Disconnect session
-    sessions.disconnect(&session_id);
-    // An anonymous session is REMOVED on disconnect, with its triggers (a named one is kept).
-    if matches!(session_id, SessionId::Anonymous(_)) {
-        handler.resync_pre_buffers();
-    }
-    info!(?session_id, "session disconnected");
+    // `cleanup` disconnects the session as it drops.
     Ok(())
+}
+
+/// What a connection owes its session when it ends, run on every exit — see where
+/// `handle_connection` creates it.
+struct SessionCleanup {
+    handler: Arc<RpcHandler>,
+    sessions: Arc<SessionRegistry>,
+    /// The session's CURRENT id: a `sessions.rename` re-keys it.
+    session_id: SessionId,
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        let session_id = &self.session_id;
+        let anonymous = matches!(session_id, SessionId::Anonymous(_));
+        // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via
+        // snapshot). Collectors follow the same rule and for the same reason: an anonymous
+        // session cannot be reconnected to, so anything it armed is unreachable and its share
+        // of the sample reservation is pure leak.
+        if anonymous {
+            let removed = self.handler.clear_session_bookmarks(session_id);
+            let collectors = self.handler.clear_session_collectors(session_id);
+            if removed > 0 || collectors > 0 {
+                info!(
+                    ?session_id,
+                    removed,
+                    collectors,
+                    "cleared anonymous-session bookmarks and collectors on disconnect"
+                );
+            }
+        }
+        self.sessions.disconnect(session_id);
+        // An anonymous session is REMOVED on disconnect, with its triggers (a named one is kept).
+        if anonymous {
+            self.handler.resync_pre_buffers();
+        }
+        info!(?session_id, "session disconnected");
+    }
 }

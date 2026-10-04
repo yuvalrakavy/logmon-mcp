@@ -518,8 +518,9 @@ impl InMemoryStore {
         } else {
             for (&number, &seq) in inner.late.range(pos.late_mark.saturating_add(1)..) {
                 held += 1;
-                if seq > pos.seq {
-                    // Above the position: the normal part's to judge.
+                if seq > pos.seq || seq <= pos.floor {
+                    // Above the position: the normal part's to judge. At or below the floor:
+                    // it was there before the cursor was, so it is never the cursor's.
                     continue;
                 }
                 view.scanned += 1;
@@ -548,7 +549,10 @@ impl InMemoryStore {
         if late_exhausted && entries.len() < count {
             for e in inner.entries.iter() {
                 view.scanned += 1;
-                if filter.is_some_and(|f| !matches_entry(f, e)) {
+                // The position bound, on its own and not only through the filter's `CursorSeq`:
+                // a caller passing a filter without one would otherwise take a late record in
+                // both parts.
+                if e.seq <= pos.seq || filter.is_some_and(|f| !matches_entry(f, e)) {
                     continue;
                 }
                 entries.push((e.clone(), None));
@@ -592,7 +596,9 @@ impl InMemoryStore {
             let Some(e) = inner.position(seq).and_then(|i| inner.entries.get(i)) else {
                 continue;
             };
-            if seq <= pos.seq {
+            if seq <= pos.floor {
+                continue;
+            } else if seq <= pos.seq {
                 let Some(&number) = inner.late_by_seq.get(&seq) else {
                     continue;
                 };
@@ -680,6 +686,9 @@ impl InMemoryStore {
 pub struct CursorPos {
     pub seq: u64,
     pub late_mark: u64,
+    /// The position the cursor was created at: no record at or below it is ever the cursor's,
+    /// late or not (see `store::bookmarks::Bookmark::floor`).
+    pub floor: u64,
 }
 
 /// A record a cursor read took from its LATE part: its late number, and how many late records
@@ -732,14 +741,23 @@ impl CursorRead {
     }
 
     /// The first `kept` records, ascending by seq — what a reply lists. Late records sit at or
-    /// below the cursor's position, so they come first.
-    pub fn kept_entries(&self, kept: usize) -> Vec<LogEntry> {
-        let mut out: Vec<LogEntry> = self.entries[..kept.min(self.entries.len())]
-            .iter()
-            .map(|(e, _)| e.clone())
+    /// below the cursor's position, so they come first. Consumes the read: the records were
+    /// cloned once, under the lock, and a second copy doubled an export's peak memory.
+    pub fn into_kept_entries(self, kept: usize) -> Vec<LogEntry> {
+        let mut out: Vec<LogEntry> = self
+            .entries
+            .into_iter()
+            .take(kept)
+            .map(|(e, _)| e)
             .collect();
         out.sort_by_key(|e| e.seq);
         out
+    }
+
+    /// [`Self::into_kept_entries`] without consuming the read — for tests.
+    #[cfg(test)]
+    pub fn kept_entries(&self, kept: usize) -> Vec<LogEntry> {
+        self.clone().into_kept_entries(kept)
     }
 
     /// The cursor's next position when the caller keeps the first `kept` records (gh #23):
@@ -1806,6 +1824,7 @@ mod cursor_late_tests {
         *cur = CursorPos {
             seq: adv.seq,
             late_mark: adv.late_mark,
+            ..*cur
         };
         (r.kept_entries(k).iter().map(|e| e.seq).collect(), adv)
     }
@@ -1833,6 +1852,90 @@ mod cursor_late_tests {
         let (again, adv) = read(&store, &mut cur, 10, vec![], None);
         assert_eq!(again, Vec::<u64>::new());
         assert_eq!(adv.late, 0);
+    }
+
+    /// The normal part honours the cursor's position by itself: a caller that passes no filter
+    /// (so no `CursorSeq`) gets the late records once, not the late records plus everything it
+    /// already read again.
+    #[test]
+    fn a_cursor_read_without_a_filter_still_starts_at_its_position() {
+        let (store, cur) = read_past_then_flush();
+        let r = store.cursor_read(10, None, cur);
+        let seqs: Vec<u64> = r.kept_entries(r.len()).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![50, 51, 52, 53, 54]);
+    }
+
+    /// A reply lists its records ascending by seq even when a later flush stored LOWER seqs than
+    /// an earlier one (the late part walks by late number, not by seq).
+    #[test]
+    fn a_reply_is_in_seq_order_across_flushes() {
+        let store = InMemoryStore::new(100);
+        on_arrival(&store, [100]);
+        let mut cur = CursorPos::default();
+        read(&store, &mut cur, 10, vec![], None);
+        late(&store, &[60]);
+        late(&store, &[50]);
+        assert_eq!(read(&store, &mut cur, 10, vec![], None).0, vec![50, 60]);
+    }
+
+    /// `count: 0` takes nothing and moves nothing.
+    #[test]
+    fn a_zero_count_cursor_read_takes_and_moves_nothing() {
+        let (store, cur) = read_past_then_flush();
+        let r = store.cursor_read(0, None, cur);
+        assert!(r.is_empty());
+        let adv = r.advance_for(0);
+        assert_eq!((adv.seq, adv.late_mark), (cur.seq, cur.late_mark));
+    }
+
+    /// `scanned` counts the late candidates the read looked at as well as the ring it walked.
+    #[test]
+    fn scanned_counts_the_late_part_and_the_walk() {
+        let (store, cur) = read_past_then_flush();
+        let f = ParsedFilter::Qualifiers(vec![Qualifier::CursorSeq { after: cur.seq }]);
+        let r = store.cursor_read(100, Some(&f), cur);
+        // 5 late candidates, then the whole 7-record ring.
+        assert_eq!(r.view.scanned, 12);
+    }
+
+    /// A late record AT the cursor's position is the cursor's (`seq <= position`), on both
+    /// reads — the boundary of the short-cut and of the trace walk.
+    #[test]
+    fn a_late_record_at_the_position_itself_is_taken() {
+        let store = InMemoryStore::new(100);
+        on_arrival(&store, [200]);
+        late(&store, &[150]);
+        let pos = CursorPos {
+            seq: 150,
+            late_mark: 0,
+            floor: 0,
+        };
+        let f = ParsedFilter::Qualifiers(vec![Qualifier::CursorSeq { after: 150 }]);
+        let r = store.cursor_read(10, Some(&f), pos);
+        let seqs: Vec<u64> = r.kept_entries(r.len()).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![150, 200]);
+
+        let store = InMemoryStore::new(100);
+        let traced = |s: u64| {
+            let mut e = entry(s);
+            e.trace_id = Some(4);
+            e
+        };
+        store.append(traced(200));
+        store.insert_sorted(vec![traced(150)]);
+        let r = store.cursor_read_trace(4, Some(&f), pos);
+        let seqs: Vec<u64> = r.kept_entries(r.len()).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![150, 200]);
+    }
+
+    /// Only a record stored BELOW the newest held is late: a merged batch's records above it
+    /// are stored as any newer record is.
+    #[test]
+    fn only_records_below_the_newest_held_are_numbered_late() {
+        let store = InMemoryStore::new(100);
+        on_arrival(&store, [100]);
+        late(&store, &[50, 150]);
+        assert_eq!(store.late_counter(), 1, "50 is late, 150 is not");
     }
 
     /// V3: a count-limited cursor drains late then normal records, each exactly once.
@@ -1936,13 +2039,60 @@ mod cursor_late_tests {
         let mut fresh = CursorPos {
             seq: 200,
             late_mark: store.late_counter(),
+            floor: 200,
         };
         assert_eq!(
             read(&store, &mut fresh, 10, vec![], None).0,
             Vec::<u64>::new()
         );
-        late(&store, &[60]);
-        assert_eq!(read(&store, &mut fresh, 10, vec![], None).0, vec![60]);
+        // Records arriving after it are its — including one a later flush stores late, above
+        // its floor — and one from before it (60) is not, however late it is stored.
+        on_arrival(&store, [300]);
+        assert_eq!(read(&store, &mut fresh, 10, vec![], None).0, vec![300]);
+        late(&store, &[60, 250]);
+        assert_eq!(read(&store, &mut fresh, 10, vec![], None).0, vec![250]);
+    }
+
+    /// A cursor created at 150 (`bookmarks.add` "from now") never takes a record at or below
+    /// 150, even one a trigger stores late after the cursor read past it — that record was in
+    /// the pre-trigger buffer before the cursor existed. One above the floor still arrives.
+    #[test]
+    fn a_late_record_below_the_cursors_creation_floor_is_never_its() {
+        let store = InMemoryStore::new(100);
+        on_arrival(&store, [100]);
+        let mut cur = CursorPos {
+            seq: 150,
+            late_mark: store.late_counter(),
+            floor: 150,
+        };
+        on_arrival(&store, [200]);
+        assert_eq!(read(&store, &mut cur, 10, vec![], None).0, vec![200]);
+        late(&store, &[120, 170]);
+        let (got, adv) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![170]);
+        assert_eq!(adv.late, 1);
+        // The trace-scoped read honours the same floor.
+        let store = InMemoryStore::new(100);
+        let traced = |s: u64| {
+            let mut e = entry(s);
+            e.trace_id = Some(9);
+            e
+        };
+        store.append(traced(200));
+        store.insert_sorted(vec![traced(120), traced(170)]);
+        let r = store.cursor_read_trace(
+            9,
+            Some(&ParsedFilter::Qualifiers(vec![Qualifier::CursorSeq {
+                after: 200,
+            }])),
+            CursorPos {
+                seq: 200,
+                late_mark: 0,
+                floor: 150,
+            },
+        );
+        let seqs: Vec<u64> = r.kept_entries(r.len()).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![170]);
     }
 
     /// A6: random interleavings of on-arrival stores, late flushes, evictions, clears and
@@ -2030,6 +2180,7 @@ mod cursor_late_tests {
                         cur = CursorPos {
                             seq: adv.seq,
                             late_mark: adv.late_mark,
+                            ..cur
                         };
                         if kept == r.len() && r.len() < count {
                             full_reads += 1;
@@ -2075,6 +2226,7 @@ mod cursor_late_tests {
                 cur = CursorPos {
                     seq: adv.seq,
                     late_mark: adv.late_mark,
+                    ..cur
                 };
                 if r.is_empty() {
                     break;

@@ -24,7 +24,12 @@ use std::sync::{Arc, RwLock};
 ///
 /// The same as the per-name cap (`DEFAULT_NAME_CAP`), deliberately: a name and a group tuple
 /// each carry one `ExactStats` with its own duration sketch (bounded at 2,048 bins, typically a
-/// few KB), so there was no memory argument for keeping groups at a quarter of names. At 64, a
+/// few KB), and both are copied into each of the collector's history snapshots — so whatever
+/// bounds the per-name tier bounds this one at the same multiple, and keeping groups at a
+/// quarter of names bought nothing that names did not already spend. Neither tier is charged
+/// to the sample budget; the worst case (every tuple's sketch at full width, every history
+/// slot filled) is real but needs durations spread over many orders of magnitude PER TUPLE,
+/// which one call site does not produce. At 64, a
 /// per-call-site census (`--group-keys code.file.path --group-keys code.line.number`) folded
 /// any call site first seen after 64 others into `__overflow__` — the hottest one included, if
 /// it showed up late (gh #21). Past 256 that is still what happens, and `cardinality_capped`

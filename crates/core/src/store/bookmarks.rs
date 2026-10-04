@@ -24,6 +24,14 @@ pub struct Bookmark {
     /// daemon's store is empty and its late counter restarts at 0, which is what a restored
     /// bookmark's 0 means.
     pub late_mark: u64,
+    /// Used only when this bookmark is read as a cursor: the position it was CREATED at.
+    /// Records at or below it are never this cursor's, even if a trigger stores them late
+    /// after the creation — a filtered-out record already in the pre-trigger buffer when
+    /// `bookmarks.add` ran is flushed later with a fresh late number, and without this floor a
+    /// "from now" cursor returned it (gh #23). `bookmarks.add` sets it to the start seq; an
+    /// auto-created cursor starts at 0. In memory only: a restored bookmark gets 0, and a
+    /// restarted daemon hands out seqs above every restored position anyway.
+    pub floor: u64,
 }
 
 #[derive(Debug, Error)]
@@ -49,6 +57,7 @@ pub struct CursorCommit {
     name: String,
     lower_bound: u64,
     late_mark: u64,
+    floor: u64,
 }
 
 impl CursorCommit {
@@ -62,12 +71,22 @@ impl CursorCommit {
         self.late_mark
     }
 
+    /// The cursor's creation floor — see [`Bookmark::floor`].
+    pub fn floor(&self) -> u64 {
+        self.floor
+    }
+
     /// Move the cursor to `(seq, late_mark)`, computed from what the read KEPT
-    /// (`CursorRead::advance_for`). A no-op only when neither moved: a read of late records
-    /// alone leaves the seq where it was and moves the mark, and a read that returned nothing
-    /// may still move the mark past late records its filter passed by. If the entry was evicted
-    /// by `sweep` between read-and-advance and commit, re-inserts at the new position —
-    /// preserves advance intent across racing eviction.
+    /// (`CursorRead::advance_for`). A no-op when neither moved; otherwise it lands even when
+    /// only the mark moved (a read of late records alone, or one that returned nothing past
+    /// late records its filter passed by).
+    ///
+    /// Only over the position this read STARTED from: if the bookmark changed meanwhile — a
+    /// `bookmarks.add replace`, or another read of the same cursor that committed first — that
+    /// change stands. Overwriting it moved a replaced bookmark back, and a cursor backwards.
+    /// If the entry was evicted by `sweep` meanwhile, it is re-inserted only when the SEQ
+    /// moved — the advance intent a racing eviction must not lose. A read that moved only the
+    /// mark leaves the name to the auto-create path, which warns that the cursor was evicted.
     pub fn commit(self, seq: u64, late_mark: u64) {
         if seq == self.lower_bound && late_mark == self.late_mark {
             return;
@@ -75,10 +94,12 @@ impl CursorCommit {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         match map.get_mut(&self.qualified_name) {
             Some(b) => {
-                b.seq = seq;
-                b.late_mark = late_mark;
+                if b.seq == self.lower_bound && b.late_mark == self.late_mark {
+                    b.seq = seq;
+                    b.late_mark = late_mark;
+                }
             }
-            None => {
+            None if seq != self.lower_bound => {
                 // Evicted during the lock-free query phase — re-insert at the new position.
                 map.insert(
                     self.qualified_name.clone(),
@@ -90,9 +111,11 @@ impl CursorCommit {
                         created_at: Utc::now(),
                         description: None,
                         late_mark,
+                        floor: self.floor,
                     },
                 );
             }
+            None => {}
         }
     }
 }
@@ -221,6 +244,8 @@ impl BookmarkStore {
             created_at: Utc::now(),
             description: description.map(|s| s.to_string()),
             late_mark,
+            // Read as a cursor, this bookmark starts at `seq`: nothing at or below it is its.
+            floor: seq,
         };
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         let existed = map.contains_key(&qualified_name);
@@ -325,10 +350,23 @@ impl BookmarkStore {
     /// On auto-create of a name recently evicted by [`Self::sweep`], logs at
     /// WARN — the next read returns the full buffer instead of a delta.
     pub fn cursor_read_and_advance(&self, session: &str, name: &str) -> (u64, CursorCommit) {
+        self.cursor_read_and_advance_at(session, name, 0)
+    }
+
+    /// [`Self::cursor_read_and_advance`], auto-creating a missing cursor with `late_counter` —
+    /// the log store's late counter now — as its mark. At seq 0 every held record is the
+    /// cursor's through its normal read anyway; the mark only says which late records were
+    /// numbered before the cursor existed, so their loss is not reported as its own.
+    pub fn cursor_read_and_advance_at(
+        &self,
+        session: &str,
+        name: &str,
+        late_counter: u64,
+    ) -> (u64, CursorCommit) {
         let qualified_name = format!("{session}/{name}");
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        let (lower_bound, late_mark) = match map.get(&qualified_name) {
-            Some(b) => (b.seq, b.late_mark),
+        let (lower_bound, late_mark, floor) = match map.get(&qualified_name) {
+            Some(b) => (b.seq, b.late_mark, b.floor),
             None => {
                 // Check whether this is a post-eviction auto-recreate.
                 // recently_evicted lock acquired AFTER bookmarks lock — uniform
@@ -360,10 +398,11 @@ impl BookmarkStore {
                         seq: 0,
                         created_at: Utc::now(),
                         description: None,
-                        late_mark: 0,
+                        late_mark: late_counter,
+                        floor: 0,
                     },
                 );
-                (0, 0)
+                (0, late_counter, 0)
             }
         };
         drop(map);
@@ -376,6 +415,7 @@ impl BookmarkStore {
                 name: name.to_string(),
                 lower_bound,
                 late_mark,
+                floor,
             },
         )
     }
@@ -673,6 +713,30 @@ mod tests {
             .find(|b| b.qualified_name == "s/c")
             .unwrap();
         assert_eq!(entry.seq, 50);
+    }
+
+    /// A commit moves the cursor only from where its read STARTED: a bookmark replaced during
+    /// the read keeps the replacement (it used to be moved back to the read's position).
+    #[test]
+    fn a_commit_does_not_overwrite_a_bookmark_replaced_during_the_read() {
+        let store = BookmarkStore::new();
+        let _ = store.add_at("s", "c", 50, 3, None, false).unwrap();
+        let (_, commit) = store.cursor_read_and_advance("s", "c");
+        let _ = store.add_at("s", "c", 500, 9, None, true).unwrap();
+        commit.commit(80, 4);
+        let (_, after) = store.cursor_read_and_advance("s", "c");
+        assert_eq!((after.lower_bound(), after.late_mark()), (500, 9));
+    }
+
+    /// A swept cursor is re-inserted only when its SEQ moved (the advance a racing eviction must
+    /// not lose); a read that moved only the late mark leaves the name to auto-create.
+    #[test]
+    fn a_mark_only_commit_does_not_re_insert_a_swept_cursor() {
+        let store = BookmarkStore::new();
+        let (_, commit) = store.cursor_read_and_advance("s", "c");
+        store.sweep(u64::MAX, u64::MAX);
+        commit.commit(0, 7);
+        assert!(store.list().iter().all(|b| b.qualified_name != "s/c"));
     }
 
     /// A read that returned only late records leaves the seq where it was and moves the mark;

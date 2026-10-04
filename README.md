@@ -108,7 +108,7 @@ logmon-broker install-service --scope user
 
 This registers a launchd agent on macOS or a systemd user unit on Linux. The broker starts at login and restarts on crash. To remove it: `logmon-broker uninstall-service --scope user`.
 
-If the broker keeps restarting, the reason is in the config directory: `daemon.log.<date>` (a line starting `logmon daemon failed:`), or, for a failure before that log exists, `daemon.stderr.log` (launchd; on Linux, `journalctl --user -u logmon-broker`).
+If the broker keeps restarting, the reason is in the config directory: `daemon.log.<date>` (a line starting `logmon daemon failed:`), or, for a failure before that log exists, its stderr — `~/.config/logmon/daemon.stderr.log` for a launchd user agent, `/var/log/logmon-broker.stderr.log` for a system install, and the journal on Linux (`journalctl --user -u logmon-broker`).
 
 If you skip this, the MCP shim auto-starts the broker the first time a client connects.
 

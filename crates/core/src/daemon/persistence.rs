@@ -393,6 +393,15 @@ pub fn config_dir() -> std::path::PathBuf {
     )
 }
 
+/// The config dir of a broker started as a SERVICE (launchd, systemd) for the user whose
+/// home is `home`: always the default, never `LOGMON_CONFIG_DIR` — a service inherits nothing
+/// from the shell that installed it. For anything an installer writes for the service to use
+/// (its stderr file): resolving it with `config_dir()` baked the installer's override in, and
+/// the file landed somewhere the service's own `daemon.log` was not.
+pub fn service_config_dir(home: &std::path::Path) -> std::path::PathBuf {
+    config_dir_from(None, Some(home.as_os_str().to_owned()))
+}
+
 /// The override, if it is usable at all.
 ///
 /// Blank is ignored — `LOGMON_CONFIG_DIR= cmd` is the shell idiom for "unset

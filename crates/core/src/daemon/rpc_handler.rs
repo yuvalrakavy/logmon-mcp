@@ -847,6 +847,9 @@ impl RpcHandler {
                 // readable and removable by whoever took the name, which is a
                 // different conversation's measurements.
                 let inherited = self.collectors.drop_session(&new_id);
+                // The displaced holder went with its triggers, so its `pre_window`s no longer
+                // size any buffer — the fourth way a session is removed (gh #25).
+                self.resync_pre_buffers();
                 tracing::info!(name = %key, bookmarks_cleared = cleared,
                     collectors_cleared = inherited,
                     "displaced a disconnected session holding the target name");
@@ -1207,7 +1210,7 @@ impl RpcHandler {
         &self,
         filter_str: Option<&str>,
         session_id: &SessionId,
-        bookmarks: &crate::store::bookmarks::BookmarkStore,
+        d: &Domain,
     ) -> Result<
         (
             Option<crate::filter::parser::ParsedFilter>,
@@ -1222,13 +1225,38 @@ impl RpcHandler {
             return Ok((None, None));
         }
         let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
-        let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
+        // A cursor this read auto-creates starts at the store's late counter: late records
+        // numbered before it existed are not this cursor's to count as lost (gh #23).
+        let resolved = crate::filter::bookmark_resolver::resolve_bookmarks_at(
             parsed,
-            bookmarks,
+            &d.bookmarks,
             &session_id.to_string(),
+            d.pipeline.late_counter(),
         )
         .map_err(|e| e.to_string())?;
         Ok((Some(resolved.filter), resolved.cursor_commit))
+    }
+
+    /// [`Self::parse_and_resolve_filter`] for a method that does not take a cursor: refused
+    /// BEFORE resolution. Resolving first auto-creates the cursor as a side effect, so a
+    /// refusal after it was honest about not advancing the cursor and silently wrong about
+    /// leaving nothing behind — the defect `logs.fields` fixed for itself.
+    fn parse_and_resolve_filter_without_cursor(
+        &self,
+        filter_str: Option<&str>,
+        session_id: &SessionId,
+        d: &Domain,
+        method: &str,
+    ) -> Result<Option<crate::filter::parser::ParsedFilter>, String> {
+        if let Some(s) = filter_str.filter(|s| !s.trim().is_empty()) {
+            let parsed = crate::filter::parser::parse_filter(s).map_err(|e| e.to_string())?;
+            if crate::filter::parser::contains_cursor_qualifier(&parsed) {
+                return Err(format!("cursor qualifier not permitted in {method}"));
+            }
+        }
+        let (resolved, cursor) = self.parse_and_resolve_filter(filter_str, session_id, d)?;
+        debug_assert!(cursor.is_none(), "a cursor was refused above");
+        Ok(resolved)
     }
 
     /// `logs.fields` — the map an agent needs before it can name an axis.
@@ -1479,7 +1507,7 @@ impl RpcHandler {
         }
 
         let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
+            self.parse_and_resolve_filter(filter_str, session_id, &d)?;
         let (entries, stats, cursor) = match cursor_commit {
             Some(commit) => {
                 // Oldest first, late records included (gh #23); everything taken is kept.
@@ -1488,7 +1516,8 @@ impl RpcHandler {
                     .cursor_read(count, resolved.as_ref(), cursor_pos(&commit));
                 let kept = read.len();
                 let outcome = commit_cursor(commit, &read, kept);
-                (read.kept_entries(kept), read.view.into(), Some(outcome))
+                let view = read.view;
+                (read.into_kept_entries(kept), view.into(), Some(outcome))
             }
             None => {
                 let (entries, stats) =
@@ -1534,7 +1563,7 @@ impl RpcHandler {
         let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
         let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
+            self.parse_and_resolve_filter(filter_str, session_id, &d)?;
         let resolved = lower_seq_range(
             resolved,
             opt_u64(params, "from_seq")?,
@@ -1556,9 +1585,10 @@ impl RpcHandler {
                 let capped = read.len() > count;
                 let kept = read.len().min(count);
                 let outcome = commit_cursor(commit, &read, kept);
+                let view = read.view;
                 (
-                    read.kept_entries(kept),
-                    read.view.into(),
+                    read.into_kept_entries(kept),
+                    view.into(),
                     capped,
                     Some(outcome),
                 )
@@ -1996,11 +2026,12 @@ impl RpcHandler {
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(20);
         let filter_str = opt_str(params, "filter")?;
-        let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
-        if cursor_commit.is_some() {
-            return Err("cursor qualifier not permitted in traces.recent".to_string());
-        }
+        let resolved = self.parse_and_resolve_filter_without_cursor(
+            filter_str,
+            session_id,
+            &d,
+            "traces.recent",
+        )?;
 
         let pipeline = &d.pipeline;
         let summaries = d
@@ -2033,11 +2064,8 @@ impl RpcHandler {
 
         // Resolve filter (used to filter spans within the trace below)
         let filter_str = opt_str(params, "filter")?;
-        let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
-        if cursor_commit.is_some() {
-            return Err("cursor qualifier not permitted in traces.get".to_string());
-        }
+        let resolved =
+            self.parse_and_resolve_filter_without_cursor(filter_str, session_id, &d, "traces.get")?;
 
         let mut spans = d.span_store.get_trace(trace_id);
         if let Some(f) = resolved.as_ref() {
@@ -2141,11 +2169,12 @@ impl RpcHandler {
         let min_duration = opt_f64(params, "min_duration_ms")?.unwrap_or(100.0);
         let count = opt_usize(params, "count")?.unwrap_or(20);
         let filter_str = opt_str(params, "filter")?;
-        let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
-        if cursor_commit.is_some() {
-            return Err("cursor qualifier not permitted in traces.slow".to_string());
-        }
+        let resolved = self.parse_and_resolve_filter_without_cursor(
+            filter_str,
+            session_id,
+            &d,
+            "traces.slow",
+        )?;
         // An unrecognised string used to select the ungrouped arm silently.
         // That was the documented contract, and it is gone: a typo returning a
         // different answer than the one asked for is the failure the strict
@@ -2228,7 +2257,7 @@ impl RpcHandler {
 
         let filter_str = opt_str(params, "filter")?;
         let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
+            self.parse_and_resolve_filter(filter_str, session_id, &d)?;
 
         // The trace's logs in seq order (the ring is seq-ordered). A cursor also gets the
         // trace's records a trigger stored LATE, below a seq it already read past, on the read
@@ -2240,7 +2269,7 @@ impl RpcHandler {
                         .cursor_read_trace(trace_id, resolved.as_ref(), cursor_pos(&commit));
                 let kept = read.len();
                 let outcome = commit_cursor(commit, &read, kept);
-                (read.kept_entries(kept), Some(outcome))
+                (read.into_kept_entries(kept), Some(outcome))
             }
             None => {
                 let mut logs = d.pipeline.logs_by_trace_id(trace_id);
@@ -2938,14 +2967,15 @@ impl RpcHandler {
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
         let filter_str = opt_str(params, "filter")?;
-        let (resolved, cursor_commit) =
-            self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
-        if cursor_commit.is_some() {
-            // A cursor is read-and-advance, so exporting through one would move
-            // the caller's read position as a side effect of gathering
-            // evidence. Refused for the reason `traces.slow` refuses it.
-            return Err("cursor qualifier not permitted in spans.export".to_string());
-        }
+        // A cursor is read-and-advance, so exporting through one would move the caller's read
+        // position as a side effect of gathering evidence. Refused for the reason `traces.slow`
+        // refuses it — and before resolution, which would create it.
+        let resolved = self.parse_and_resolve_filter_without_cursor(
+            filter_str,
+            session_id,
+            &d,
+            "spans.export",
+        )?;
         let resolved = lower_seq_range(
             resolved,
             opt_u64(params, "from_seq")?,
@@ -3173,10 +3203,28 @@ impl RpcHandler {
         self.collectors.drop_session(session_id)
     }
 
+    /// Dispose of a session the TTL sweep found disconnected past its TTL: its bookmarks in
+    /// every domain it touched, its collectors (and their reservation), the session itself, and
+    /// then the pre-trigger buffer sizes its triggers no longer set. Returns the bookmarks and
+    /// collectors cleared, for the sweep's log line. The sweep's whole per-session body, here
+    /// rather than inline in `server.rs` so a test reaches it without waiting a sweep period
+    /// (60 s at the least).
+    pub fn dispose_expired_session(&self, session_id: &SessionId) -> (usize, usize) {
+        let cleared = self.clear_session_bookmarks(session_id);
+        // The TTL is what bounds the collector reservation: a named session keeps its
+        // collectors across a disconnect (that is the arm-run-read workflow), so this sweep is
+        // the only thing that ever hands the budget back.
+        let collectors = self.clear_session_collectors(session_id);
+        self.sessions.dispose(session_id);
+        self.resync_pre_buffers();
+        (cleared, collectors)
+    }
+
     /// Re-derive every domain's pre-trigger buffer size from the sessions bound to it NOW.
     ///
     /// For after a session is REMOVED — `sessions.drop`, the TTL sweep, an anonymous session's
-    /// disconnect. Every trigger add/edit/remove and every rebind already resyncs its domain;
+    /// disconnect, a stale holder displaced by `sessions.rename`. Every trigger add/edit/remove
+    /// and every rebind already resyncs its domain;
     /// a removal did not, so a gone session's largest `pre_window` kept sizing the buffer —
     /// its memory, and how far back a traced firing reaches — until something else resynced
     /// (gh #25). Every domain, because the session is gone by the time this runs and so is the
@@ -4523,6 +4571,7 @@ fn cursor_pos(commit: &crate::store::bookmarks::CursorCommit) -> crate::store::m
     crate::store::memory::CursorPos {
         seq: commit.lower_bound(),
         late_mark: commit.late_mark(),
+        floor: commit.floor(),
     }
 }
 

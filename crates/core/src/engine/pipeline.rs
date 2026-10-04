@@ -60,6 +60,8 @@ pub struct FilterInfo {
 pub struct LogPipeline {
     store: InMemoryStore,
     pre_buffer: PreTriggerBuffer,
+    /// Serializes [`Self::resync_pre_buffer`]'s compute-then-apply.
+    pre_buffer_resync: std::sync::Mutex<()>,
     seq_counter: Arc<SeqCounter>,
     event_sender: broadcast::Sender<PipelineEvent>,
     /// What storage policy governed each stretch of this pipeline's seq axis.
@@ -155,6 +157,7 @@ impl LogPipeline {
         Self {
             store: InMemoryStore::from_records(store_capacity, records, lost_below),
             pre_buffer: PreTriggerBuffer::new(0),
+            pre_buffer_resync: std::sync::Mutex::new(()),
             seq_counter,
             event_sender,
             epochs: log,
@@ -171,6 +174,7 @@ impl LogPipeline {
         Self {
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(0),
+            pre_buffer_resync: std::sync::Mutex::new(()),
             seq_counter,
             event_sender,
             epochs,
@@ -400,6 +404,23 @@ impl LogPipeline {
 
     pub fn resize_pre_buffer(&self, size: usize) {
         self.pre_buffer.resize(size);
+    }
+
+    /// The pre-trigger buffer's capacity, in arrivals — what the last resync set it to.
+    pub fn pre_buffer_capacity(&self) -> usize {
+        self.pre_buffer.capacity()
+    }
+
+    /// Size the pre-trigger buffer to what `compute` returns, computed and applied under one
+    /// lock. Two resyncs racing — say an anonymous disconnect's and another session's
+    /// `triggers.add` — used to interleave as compute, compute, apply, apply, so the one that
+    /// read the max BEFORE the trigger change could be applied last, leaving a buffer smaller
+    /// than a live trigger's pre-window until the next resync (and `resize` drops entries for
+    /// good). Serialized, the last resync to run computed after every change that came before
+    /// it. `compute` must not resync this pipeline itself.
+    pub fn resync_pre_buffer(&self, compute: impl FnOnce() -> usize) {
+        let _serial = self.pre_buffer_resync.lock().expect("resync lock poisoned");
+        self.pre_buffer.resize(compute());
     }
 
     /// Return copies of pre-buffer entries matching the given trace_id.
