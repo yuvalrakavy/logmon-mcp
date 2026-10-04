@@ -3049,19 +3049,24 @@ impl RpcHandler {
 
     fn handle_sessions_drop(&self, params: &Value) -> Result<Value, String> {
         let name = req_str(params, "name")?;
-        // Collectors first, and unconditionally. They are owned by the session
-        // and hold a slice of a daemon-wide reservation that only four
-        // default-sized collectors fit inside, so a dropped session that kept
-        // them would take that budget to the grave.
-        //
-        // Ordered BEFORE the session drop on purpose: releasing after it meant
-        // the `?` aborted on a session that no longer existed, which is exactly
-        // the state a restored-after-crash collector is in — the one case where
-        // this call is the only way to reclaim the budget at all.
+        // The registry decides first: it refuses a CONNECTED session and removes a disconnected
+        // one under a single lock. A connected session must lose nothing, and the collectors
+        // used to be released before that refusal — destroying a live session's collectors and
+        // replying `dropped` while the session stayed. A separate connectedness check ahead of
+        // the release left a window in which the session could reconnect in between.
+        let session_result = self.sessions.drop_session(name);
+        if let Err(e) = &session_result {
+            if matches!(e, crate::daemon::session::SessionError::AlreadyConnected(_)) {
+                return Err(e.to_string());
+            }
+        }
+        // Collectors are released whether or not the session still existed. They hold a slice
+        // of a daemon-wide reservation that only four default-sized collectors fit inside, and
+        // a collector restored after a crash outlives its session — this call is then the only
+        // way to reclaim that budget, so a missing session must not stop it.
         let collectors = self
             .collectors
             .drop_session(&SessionId::Named(name.to_string()));
-        let session_result = self.sessions.drop_session(name);
         if session_result.is_ok() {
             self.resync_pre_buffers();
         }
@@ -3210,12 +3215,22 @@ impl RpcHandler {
     /// rather than inline in `server.rs` so a test reaches it without waiting a sweep period
     /// (60 s at the least).
     pub fn dispose_expired_session(&self, session_id: &SessionId) -> (usize, usize) {
-        let cleared = self.clear_session_bookmarks(session_id);
+        // Decided under the registry's lock, FIRST: the sweep listed this session a moment
+        // ago, and if it has reconnected since, it is live — its bookmarks and collectors are
+        // not to be cleared, nor the session disposed.
+        let Some(touched) = self.sessions.dispose_if_disconnected(session_id) else {
+            return (0, 0);
+        };
+        let key = session_id.to_string();
+        let cleared = touched
+            .iter()
+            .filter_map(|id| self.domains.get(id))
+            .map(|d| d.bookmarks.clear_session(&key))
+            .sum();
         // The TTL is what bounds the collector reservation: a named session keeps its
         // collectors across a disconnect (that is the arm-run-read workflow), so this sweep is
         // the only thing that ever hands the budget back.
         let collectors = self.clear_session_collectors(session_id);
-        self.sessions.dispose(session_id);
         self.resync_pre_buffers();
         (cleared, collectors)
     }

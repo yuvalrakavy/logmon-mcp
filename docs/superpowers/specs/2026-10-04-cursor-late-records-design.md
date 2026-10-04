@@ -202,8 +202,14 @@ before (seen now) or after (numbered `> S`).
   it. Documented as such, beside `evicted_before_window`, which is an upper bound for the same
   reason.
 - `CursorCommit::commit` compares-and-sets: it moves the cursor only from the position the read
-  started at, and re-inserts a swept cursor only when the SEQ moved. Unconditional, a mark-only
-  commit (new with this change) also overwrote a concurrent `bookmarks.add replace`.
+  started at, and re-inserts a swept cursor only when the SEQ moved. Defensive, not a reachable
+  fix: in the daemon a cursor is read only by its own session, a named session has one
+  connection, and a connection handles one request at a time, so no other read or
+  `bookmarks.add replace` of the same cursor can land between a read and its commit (the
+  re-gate traced every writer). It keeps a future caller that breaks that from moving a cursor
+  backwards.
+- A restored cursor's floor is its restored position, not 0: a `bookmarks.add` with a
+  `start_seq` above the counter must keep excluding what lies below it after a restart.
 - The normal walk checks `seq > position` itself, not only through the filter's `CursorSeq`.
 - Docs: README §"`c>=` — read and advance", the skill's cursor lines (`skill/logmon.md:703`, `:707`,
   `:792`), the SDK README cursor section (`crates/sdk/README.md:723-737`: `cursor_advanced_to: None`

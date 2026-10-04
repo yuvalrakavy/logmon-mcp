@@ -266,6 +266,34 @@ async fn a_cursor_export_is_capped_only_when_more_remain() {
     assert_eq!(r["capped"], json!(true), "{r}");
 }
 
+/// A bookmark whose explicit `start_seq` is ABOVE the counter keeps excluding what lies below
+/// it after a restart: a WARN flushed late below that position is not returned. (A restored
+/// floor of 0 returned it, though the same cursor before the restart did not.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_future_cursor_still_excludes_records_below_it() {
+    let mut daemon = spawn_test_daemon().await;
+    let mut c = marker_only_session(&daemon).await;
+    let _: Value = c
+        .call(
+            "bookmarks.add",
+            json!({ "name": "future", "start_seq": 1_000_000 }),
+        )
+        .await
+        .unwrap();
+    c.close().await.unwrap();
+    daemon.restart().await;
+
+    let mut c = daemon.connect_named("reader", None).await;
+    daemon.inject_log(Level::Warn, "early-warn").await;
+    daemon.inject_log(Level::Error, "boom").await;
+    wait_stored(&mut c, "boom").await;
+    let r: Value = c
+        .call("logs.recent", json!({ "filter": "c>=future", "count": 50 }))
+        .await
+        .unwrap();
+    assert_eq!(messages(&r), Vec::<String>::new(), "{r}");
+}
+
 /// A cursor restored after a daemon restart still gets the records a trigger stores behind it
 /// — the restored late mark belongs to the new incarnation's numbering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -704,7 +704,7 @@ Results are returned **oldest-first** when `c>=` is present, and a cursor return
 
 `c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Rejected in `get_log_context`, `get_recent_traces`, `get_trace_summary`, `get_slow_spans`, `get_trace`, and `get_span_context` — their results are anchor-driven or aggregated, not seq-streamable. Only one `c>=` per filter.
 
-To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter. A bookmark read as a cursor never returns a record from before its position, even one a trigger stores late afterwards.
+To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter. A bookmark read as a cursor never returns a record from before its *creation* position, even one a trigger stores late afterwards.
 
 ## Triggers vs bookmarks: which one?
 

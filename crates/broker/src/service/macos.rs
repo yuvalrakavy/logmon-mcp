@@ -39,8 +39,9 @@ impl Scope {
     /// restarts a broker that cannot start every 10 s with no trace of why: a failure before
     /// the broker's own log exists (the config dir, `load_config`), a panic, `main`'s error
     /// (gh #28). A user agent writes next to its `daemon.log` — in the config dir the SERVICE
-    /// will use, which ignores a `LOGMON_CONFIG_DIR` set in the installing shell (launchd passes
-    /// the agent no environment); a system daemon runs as root, so its config dir is root's,
+    /// will use, which ignores a `LOGMON_CONFIG_DIR` set in the installing shell (launchd sets
+    /// `HOME` but passes on nothing from that shell); a system daemon runs as root, so its config
+    /// dir is root's,
     /// and it writes under `/var/log` instead.
     fn stderr_path(&self) -> Result<PathBuf> {
         match self {
@@ -231,7 +232,7 @@ mod tests {
     }
 
     /// A user agent's stderr file is in the config dir the SERVICE uses — `~/.config/logmon`,
-    /// whatever `LOGMON_CONFIG_DIR` the installing shell had (launchd passes it nothing).
+    /// whatever `LOGMON_CONFIG_DIR` the installing shell had (launchd does not pass it on).
     #[test]
     fn a_user_agent_writes_stderr_beside_the_services_daemon_log() {
         assert_eq!(

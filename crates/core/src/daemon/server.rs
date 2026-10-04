@@ -1039,6 +1039,12 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         session_id: session_id.clone(),
     };
 
+    // The session's own triggers now size its domain's pre-trigger buffer. Nothing re-derived
+    // it here before: a session whose default `pre_window` exceeded the domain's current size
+    // — after the last session left and the buffer shrank to 0, say — got a short pre-window
+    // until some unrelated trigger or filter change resynced it.
+    handler.resync_pre_buffers();
+
     info!(?session_id, is_new, "session started");
 
     // 4. Send session start response
@@ -1079,11 +1085,15 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 match request_result {
                     Ok(Some(request)) => {
                         let response = handler.handle_async(&session_id, &request).await;
-                        write_message(&mut writer, &response).await?;
                         // A successful `sessions.rename` re-keyed the registry
                         // entry; this connection must address the session by
                         // its NEW id from here on (event filtering, domain
-                        // lookups, disconnect handling all key off it).
+                        // lookups, disconnect handling all key off it). BEFORE
+                        // the reply is written: the rename has already
+                        // happened, and a write that fails returns through
+                        // `?` — the cleanup would then disconnect the old id,
+                        // which no longer exists, and leave the renamed
+                        // session connected for good.
                         if request.method == "sessions.rename" {
                             if let Some(new_name) = response
                                 .result
@@ -1095,6 +1105,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 cleanup.session_id = session_id.clone();
                             }
                         }
+                        write_message(&mut writer, &response).await?;
                         // §9.4: if the request rebound this session (domains.use),
                         // re-point the event subscription at the newly-bound
                         // domain's channel so live trigger notifications follow
@@ -1181,29 +1192,48 @@ struct SessionCleanup {
 
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
-        let session_id = &self.session_id;
-        let anonymous = matches!(session_id, SessionId::Anonymous(_));
-        // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via
-        // snapshot). Collectors follow the same rule and for the same reason: an anonymous
-        // session cannot be reconnected to, so anything it armed is unreachable and its share
-        // of the sample reservation is pure leak.
-        if anonymous {
-            let removed = self.handler.clear_session_bookmarks(session_id);
-            let collectors = self.handler.clear_session_collectors(session_id);
-            if removed > 0 || collectors > 0 {
-                info!(
-                    ?session_id,
-                    removed,
-                    collectors,
-                    "cleared anonymous-session bookmarks and collectors on disconnect"
-                );
-            }
+        // Unwinding from a handler panic: a lock that panic poisoned would make the cleanup
+        // panic too, and a panic during unwinding aborts the whole process. Tokio contains a
+        // connection's panic to that connection; run the cleanup on a thread of its own so a
+        // poisoned lock fails that thread, not the daemon.
+        // (A plain function on that thread, not another guard: a guard's own `Drop` would run
+        // the cleanup twice, and re-spawn without end if it panicked there.)
+        if std::thread::panicking() {
+            let (handler, sessions, session_id) = (
+                self.handler.clone(),
+                self.sessions.clone(),
+                self.session_id.clone(),
+            );
+            std::thread::spawn(move || disconnect_session(&handler, &sessions, &session_id));
+            return;
         }
-        self.sessions.disconnect(session_id);
-        // An anonymous session is REMOVED on disconnect, with its triggers (a named one is kept).
-        if anonymous {
-            self.handler.resync_pre_buffers();
-        }
-        info!(?session_id, "session disconnected");
+        disconnect_session(&self.handler, &self.sessions, &self.session_id);
     }
+}
+
+/// [`SessionCleanup`]'s body.
+fn disconnect_session(handler: &RpcHandler, sessions: &SessionRegistry, session_id: &SessionId) {
+    let anonymous = matches!(session_id, SessionId::Anonymous(_));
+    // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via
+    // snapshot). Collectors follow the same rule and for the same reason: an anonymous
+    // session cannot be reconnected to, so anything it armed is unreachable and its share
+    // of the sample reservation is pure leak.
+    if anonymous {
+        let removed = handler.clear_session_bookmarks(session_id);
+        let collectors = handler.clear_session_collectors(session_id);
+        if removed > 0 || collectors > 0 {
+            info!(
+                ?session_id,
+                removed,
+                collectors,
+                "cleared anonymous-session bookmarks and collectors on disconnect"
+            );
+        }
+    }
+    sessions.disconnect(session_id);
+    // An anonymous session is REMOVED on disconnect, with its triggers (a named one is kept).
+    if anonymous {
+        handler.resync_pre_buffers();
+    }
+    info!(?session_id, "session disconnected");
 }

@@ -29,8 +29,8 @@ pub struct Bookmark {
     /// after the creation — a filtered-out record already in the pre-trigger buffer when
     /// `bookmarks.add` ran is flushed later with a fresh late number, and without this floor a
     /// "from now" cursor returned it (gh #23). `bookmarks.add` sets it to the start seq; an
-    /// auto-created cursor starts at 0. In memory only: a restored bookmark gets 0, and a
-    /// restarted daemon hands out seqs above every restored position anyway.
+    /// auto-created cursor starts at 0. In memory only: a restored bookmark gets its restored
+    /// position, so a `start_seq` set above the counter keeps excluding what lies below it.
     pub floor: u64,
 }
 

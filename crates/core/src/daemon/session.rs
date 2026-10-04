@@ -390,6 +390,28 @@ impl SessionRegistry {
             .remove(id);
     }
 
+    /// Dispose of `id` only if it is (still) disconnected, deciding under the write lock.
+    /// Returns the domains it touched — for clearing its bookmarks, which `touched_domains`
+    /// can no longer answer once it is gone — or `None` if it reconnected (or was already
+    /// gone). The TTL sweep lists candidates and disposes them later; a session that
+    /// reconnected in between used to be disposed while live.
+    pub fn dispose_if_disconnected(&self, id: &SessionId) -> Option<Vec<DomainId>> {
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        let state = sessions.get(id)?;
+        if state.connected.load(Ordering::Relaxed) {
+            return None;
+        }
+        let touched = state
+            .touched_domains
+            .read()
+            .expect("touched_domains lock poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        sessions.remove(id);
+        Some(touched)
+    }
+
     /// Sessions that have been DISCONNECTED for longer than `ttl` — the TTL
     /// sweep's candidates. Connected sessions never expire, whatever their
     /// age: TTL measures abandonment, not lifetime.
@@ -1096,10 +1118,12 @@ impl SessionRegistry {
                 created_at: pb.created_at,
                 description: pb.description.clone(),
                 // Not persisted: the restarted store is empty and its late counter starts
-                // again at 0, and every new seq is above this position (see
-                // `Bookmark::late_mark` / `Bookmark::floor`).
+                // again at 0. The floor is the restored position itself: nothing at or below
+                // it is in the new store, and a bookmark whose explicit `start_seq` was ABOVE
+                // the counter must keep excluding what lies below it, as it did before the
+                // restart (see `Bookmark::late_mark` / `Bookmark::floor`).
                 late_mark: 0,
-                floor: 0,
+                floor: pb.seq,
             });
         }
 

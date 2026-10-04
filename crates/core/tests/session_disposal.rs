@@ -46,6 +46,76 @@ fn add_big_trigger(handler: &RpcHandler, id: &SessionId) {
     assert!(resp.error.is_none(), "{:?}", resp.error);
 }
 
+fn single_domain_handler() -> (
+    RpcHandler,
+    Arc<SessionRegistry>,
+    Arc<logmon_broker_core::collector::registry::CollectorRegistry>,
+) {
+    let seq = Arc::new(SeqCounter::new());
+    let domains = Arc::new(DomainRegistry::new());
+    domains.insert(domain(DomainId::default_domain(), seq).0);
+    let sessions = Arc::new(SessionRegistry::new());
+    let collectors = Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new());
+    let handler = RpcHandler::new(
+        domains,
+        sessions.clone(),
+        collectors.clone(),
+        vec!["test".into()],
+        DomainPolicy {
+            max_domains: 32,
+            default_log_buffer_size: 10_000,
+            default_span_buffer_size: 1000,
+            stale_after_secs: 60,
+        },
+    );
+    (handler, sessions, collectors)
+}
+
+/// The sweep lists expired sessions and disposes of them a moment later. One that reconnected
+/// in between is live: it keeps its bookmarks and stays registered.
+#[test]
+fn a_session_that_reconnected_after_the_sweep_listed_it_is_not_disposed() {
+    let (handler, sessions, _) = single_domain_handler();
+    let id = sessions.create_named("comeback").unwrap();
+    let req = RpcRequest::new(1, "bookmarks.add", json!({ "name": "mark" }));
+    assert!(handler.handle(&id, &req).error.is_none());
+    sessions.disconnect(&id);
+    // (The sweep would list it now.) It reconnects before the disposal.
+    sessions.reconnect(&id).unwrap();
+    assert_eq!(handler.dispose_expired_session(&id), (0, 0));
+    assert!(sessions.is_connected(&id), "still registered and connected");
+    let listed = handler.handle(&id, &RpcRequest::new(2, "bookmarks.list", json!({})));
+    let bookmarks = listed.result.unwrap()["bookmarks"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(bookmarks, 1, "its bookmark survived");
+}
+
+/// `sessions.drop` on a CONNECTED session is refused before anything of it is released — it
+/// used to destroy the session's collectors and reply `dropped` while the session stayed.
+#[test]
+fn dropping_a_connected_session_leaves_its_collectors_alone() {
+    let (handler, sessions, collectors) = single_domain_handler();
+    let live = sessions.create_named("live").unwrap();
+    let req = RpcRequest::new(1, "collectors.add", json!({ "name": "c", "filter": "ALL" }));
+    assert!(handler.handle(&live, &req).error.is_none());
+    let reserved = collectors.reserved_bytes();
+    assert!(reserved > 0);
+
+    let other = sessions.create_named("other").unwrap();
+    let resp = handler.handle(
+        &other,
+        &RpcRequest::new(2, "sessions.drop", json!({ "name": "live" })),
+    );
+    assert!(resp.error.is_some(), "a connected session is refused");
+    assert_eq!(
+        collectors.reserved_bytes(),
+        reserved,
+        "its collector is intact"
+    );
+}
+
 #[test]
 fn an_expired_session_stops_sizing_the_buffer_in_every_domain() {
     let seq = Arc::new(SeqCounter::new());

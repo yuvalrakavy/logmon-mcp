@@ -123,6 +123,61 @@ async fn a_disconnected_anonymous_session_no_longer_sizes_the_buffer() {
     assert_eq!(run_scenario(&daemon, &mut k).await, vec!["boom"]);
 }
 
+/// A session that CONNECTS sizes the buffer with its own triggers. Here the only other session
+/// keeps a 10-record trigger, so the buffer is 10; a new session's default `l>=ERROR` trigger
+/// (500) must reach a record 100 arrivals back — it used to get 10 until some trigger or filter
+/// change resynced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connecting_session_sizes_the_buffer_with_its_own_triggers() {
+    let daemon = spawn_test_daemon().await;
+    let mut f = daemon.connect_named("filterer", None).await;
+    let _: Value = f
+        .call("filters.add", json!({ "filter": "m=__nothing_matches__" }))
+        .await
+        .unwrap();
+    let listed: Value = f.call("triggers.list", json!({})).await.unwrap();
+    for t in listed["triggers"].as_array().unwrap() {
+        let _: Value = f
+            .call("triggers.remove", json!({ "id": t["id"] }))
+            .await
+            .unwrap();
+    }
+    let _: Value = f
+        .call(
+            "triggers.add",
+            json!({ "filter": "m=__never_fires__", "pre_window": 10 }),
+        )
+        .await
+        .unwrap();
+
+    // A new session, defaults only — it changes no trigger and no filter.
+    let mut b = daemon.connect_anon().await;
+    daemon.inject_log(Level::Warn, "early-warn").await;
+    for i in 0..100 {
+        daemon.inject_log(Level::Info, &format!("filler {i}")).await;
+    }
+    daemon.inject_log(Level::Error, "boom").await;
+    for _ in 0..500 {
+        let r: Value = b
+            .call("logs.recent", json!({ "filter": "m=boom" }))
+            .await
+            .unwrap();
+        if r["count"].as_u64().unwrap() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let r: Value = b
+        .call("logs.recent", json!({ "filter": "m=early-warn" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        r["count"],
+        json!(1),
+        "the new session's pre-window reached it: {r}"
+    );
+}
+
 /// A session renamed onto a stale holder's name displaces it, triggers and all, and the buffer
 /// shrinks with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

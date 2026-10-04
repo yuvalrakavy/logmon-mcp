@@ -656,9 +656,20 @@ impl TestClient {
         let closed = self.closed.clone();
         let result: anyhow::Result<RpcResponse> = async {
             let json = serde_json::to_string(&req)?;
-            self.writer.write_all(json.as_bytes()).await?;
-            self.writer.write_all(b"\n").await?;
-            self.writer.flush().await?;
+            let written: std::io::Result<()> = async {
+                self.writer.write_all(json.as_bytes()).await?;
+                self.writer.write_all(b"\n").await?;
+                self.writer.flush().await
+            }
+            .await;
+            if let Err(e) = written {
+                // Named too: the reader may not have seen the connection go yet.
+                let reason = closed.lock().expect("closed lock poisoned").clone();
+                anyhow::bail!(
+                    "{method}: request write failed ({e}){}",
+                    reason.map(|r| format!(" — {r}")).unwrap_or_default()
+                );
+            }
             // Bounded: a reply that never comes fails the test naming the call, instead of
             // parking it until someone kills the run.
             match tokio::time::timeout(CALL_TIMEOUT, rx).await {

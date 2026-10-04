@@ -162,11 +162,9 @@ that was waiting in the pre-trigger buffer when the bookmark was added and is st
 it. `export_logs`'s `verdict` window starts above the cursor, so it does not vouch for late
 records.
 
-Two cursor fixes ride along. A commit no longer overwrites a cursor that changed during the read
-(an `add_bookmark replace`, or another read of the same cursor that committed first) — it used to
-move a replaced bookmark, or the cursor itself, backwards. And `get_recent_traces`,
-`get_trace`, `get_slow_spans` and `export_spans` refuse a `c>=` qualifier before resolving it,
-so a refused call no longer leaves a freshly created cursor behind.
+Also: `get_recent_traces`, `get_trace`, `get_slow_spans` and `export_spans` refuse a `c>=`
+qualifier before resolving it, so a refused call no longer leaves a freshly created cursor
+behind.
 
 ### Fixed — a broker that could not start restart-looped with no trace of why
 
@@ -206,7 +204,25 @@ A connection disconnected its session at the end of its loop, but the writes bef
 early when the client had gone (the reply to `session.start` or to any request, or a trigger
 notification). The session then stayed `connected`: a named one's name was refused
 ("already connected") until the broker restarted, and an anonymous one was never removed, so its
-triggers kept sizing the pre-trigger buffer. The disconnect now runs on every exit.
+triggers kept sizing the pre-trigger buffer. The disconnect now runs on every exit — including
+the reply to a `sessions.rename`, after which it disconnects the session by its NEW name.
+
+### Fixed — a new session's triggers did not size the pre-trigger buffer
+
+Connecting a session (or reconnecting a named one) did not re-derive the domain's pre-trigger
+buffer size, so its default triggers' pre-windows were cut to whatever the buffer was already —
+zero after the last session left — until some trigger or filter change resynced it. It is
+re-derived when a session starts.
+
+### Fixed — two session-lifecycle races
+
+- The TTL sweep listed expired sessions and disposed of them a moment later, so a session that
+  reconnected in between was disposed of while live, its bookmarks and collectors with it. It is
+  now disposed of only if still disconnected, decided under the registry's lock.
+- `sessions.drop` on a CONNECTED session released its collectors (destroying their windows and
+  history) and replied `dropped`, while the session itself was refused and stayed. The registry
+  now decides first — refusing a connected session and removing a disconnected one under its
+  lock — and the collectors are released only when it did not refuse.
 
 ### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
 

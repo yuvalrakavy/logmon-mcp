@@ -9,9 +9,17 @@ use logmon_broker_core::daemon::persistence::DaemonConfig;
 use logmon_broker_core::daemon::server::{run_with_overrides, DaemonOverrides};
 use logmon_broker_core::test_support::*;
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-    l.local_addr().expect("bound").port()
+/// Two DISTINCT free ports (gRPC, HTTP): both listeners are held until both ports are chosen,
+/// so the kernel cannot hand back the same one twice. (Another process taking one before the
+/// daemon binds it is still possible; the vacuity guard below turns that into a red run rather
+/// than a silent pass.)
+fn free_ports() -> (u16, u16) {
+    let a = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let b = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    (
+        a.local_addr().expect("bound").port(),
+        b.local_addr().expect("bound").port(),
+    )
 }
 
 /// A daemon whose OTLP receiver started but whose startup then failed — here the socket bind,
@@ -25,10 +33,11 @@ async fn a_daemon_that_fails_after_its_receivers_start_announces_nothing() {
     let beacons = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     beacons.set_nonblocking(true).unwrap();
     let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (grpc, http) = free_ports();
     let config = DaemonConfig {
         gelf_port: 0,
-        otlp_grpc_port: free_port(),
-        otlp_http_port: free_port(),
+        otlp_grpc_port: grpc,
+        otlp_http_port: http,
         ..DaemonConfig::default()
     };
     let result = run_with_overrides(
@@ -46,7 +55,7 @@ async fn a_daemon_that_fails_after_its_receivers_start_announces_nothing() {
     .await;
     assert!(result.is_err(), "the socket bind must fail: {result:?}");
     // Not vacuous: the OTLP receiver must actually have started. A port lost to the
-    // bind-then-drop race in `free_port` degrades OTLP to disabled (a WARN, and startup goes
+    // bind-then-drop race in `free_ports` degrades OTLP to disabled (a WARN, and startup goes
     // on), and a broker with no OTLP receiver announces nothing whether or not it should.
     assert!(
         logs_contain("OTLP receiver started"),
@@ -73,10 +82,11 @@ async fn a_daemon_that_never_announced_itself_announces_nothing_on_shutdown() {
 /// to the test's own socket.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_with_otlp_announces_online_then_offline() {
+    let (grpc, http) = free_ports();
     let config = DaemonConfig {
         gelf_port: 0,
-        otlp_grpc_port: free_port(),
-        otlp_http_port: free_port(),
+        otlp_grpc_port: grpc,
+        otlp_http_port: http,
         ..DaemonConfig::default()
     };
     let d = TestDaemonHandle::spawn_with_real_receivers_config(config).await;
