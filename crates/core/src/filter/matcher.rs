@@ -18,11 +18,25 @@ fn matches_qualifier(qualifier: &Qualifier, entry: &LogEntry) -> bool {
         Qualifier::LevelFilter { op, level } => matches_level(*op, *level, entry.level),
         Qualifier::DurationFilter(..) => false, // duration only applies to spans
         Qualifier::BookmarkFilter { .. } => false,
-        Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to SeqFilter
+        Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to CursorSeq
         Qualifier::SeqFilter { op, value } => match op {
             SeqOp::Gt => entry.seq > *value,
             SeqOp::Lt => entry.seq < *value,
         },
+        Qualifier::CursorSeq { after } => entry.seq > *after,
+    }
+}
+
+/// [`matches_entry`] with the cursor's own bound (`CursorSeq`) treated as passed — every other
+/// qualifier, an explicit seq range included, still applies. For a cursor read's LATE part,
+/// whose records sit at or below the cursor's position by definition (gh #23).
+pub fn matches_entry_past_cursor(filter: &ParsedFilter, entry: &LogEntry) -> bool {
+    match filter {
+        ParsedFilter::All => true,
+        ParsedFilter::None => false,
+        ParsedFilter::Qualifiers(qs) => qs
+            .iter()
+            .all(|q| matches!(q, Qualifier::CursorSeq { .. }) || matches_qualifier(q, entry)),
     }
 }
 
@@ -186,11 +200,12 @@ fn matches_span_qualifier(qualifier: &Qualifier, span: &SpanEntry) -> bool {
         },
         Qualifier::LevelFilter { .. } => false, // log-only
         Qualifier::BookmarkFilter { .. } => false,
-        Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to SeqFilter
+        Qualifier::CursorFilter { .. } => false, // cursors are intermediate; should be resolved to CursorSeq
         Qualifier::SeqFilter { op, value } => match op {
             SeqOp::Gt => span.seq > *value,
             SeqOp::Lt => span.seq < *value,
         },
+        Qualifier::CursorSeq { after } => span.seq > *after,
     }
 }
 

@@ -332,7 +332,7 @@ Points worth knowing before you rely on it:
 - **`groups_total` is the count before `top_n` truncation** (default 20). `groups_total: 2` with two rows means you are seeing everything; `groups_total: 900` with 20 rows means you are seeing the top slice.
 - **Group rows come off the exact tier**, so they carry `exact` and `estimated` but no `sampled` block — no self time, no call paths, per row.
 - **A warm-up cut withholds them.** `skip_warmup_ms` windows the sample tier only, and these rows are unwindowed, so they are suppressed rather than served alongside windowed headline figures. Group by `trace` or `path` under a cut, or reset the collector after warm-up instead.
-- **Cardinality is capped.** Unbounded attributes (a user id, a request id) fold into `__overflow__` and set `cardinality_capped`. Group by something with a handful of values.
+- **Cardinality is capped.** A collector keeps 256 distinct group tuples (and 256 span names); later ones fold into `__overflow__`, in arrival order, and set `cardinality_capped`. Unbounded attributes (a user id, a request id) hit that at once — group by something with a bounded set of values. A per-call-site census (`group_keys` `code.file.path` + `code.line.number`) fits up to 256 call sites; if `cardinality_capped` is set, a late-arriving hot call site may be inside `__overflow__`, so narrow the filter (a service, a file prefix) until it clears.
 
 **Repeat before you conclude.** Two runs differing by 5% tell you nothing until you know the run-to-run spread. Take three snapshots of the *same* configuration first, read the `floor` from `get_collector_history(merge=true)`, and treat differences below it as noise. A single run reports the spread as unknown, which is the honest answer, not zero.
 
@@ -366,7 +366,7 @@ Points worth knowing before you rely on it:
 
 ### Status
 
-- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`gelf_tcp_oversize_dropped`**, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
   It also reports **`broker_version`** and **`broker_tools`** — see below.
 
@@ -393,7 +393,7 @@ Read `broker_version` the first time you call `get_status`, and reach for `broke
 
 **Do not add `trace_ingest.dropped` to the `receiver_drops` trace fields — it IS those fields.** `dropped` is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, the same counters read a second time so the three trace figures read as one block. Summing them double-counts. `shed_batches` and `malformed_dropped` are the genuinely new numbers.
 
-Also: `shed_batches` counts **request bodies**, not spans — the bodies were refused with 429/UNAVAILABLE before being parsed, so how many spans were in them is unknowable. And the standing "bump `buffer_size`" remedy applies only to channel-full drops: a `malformed_dropped` span was refused for cause (an unusable trace id), and no buffer size changes that.
+Also: `shed_batches` counts **request bodies**, not spans — the bodies were refused with 429/UNAVAILABLE before being parsed, so how many spans were in them is unknowable. And the standing "bump `buffer_size`" remedy applies only to channel-full drops: a `malformed_dropped` span was refused for cause (an unusable trace id), and no buffer size changes that. Nor does it change **`gelf_tcp_oversize_dropped`** — GELF TCP messages over the 64 KB limit, dropped because the sender's message was too big, not because the broker was behind: the fix is on the sender's side (smaller messages, or send the big payload some other way).
 
 ### Domains
 
@@ -700,11 +700,11 @@ get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 ```
 
-Results are returned **oldest-first** when `c>=` is present, so a paginated drain stays monotonic.
+Results are returned **oldest-first** when `c>=` is present, and a cursor returns every stored record exactly once. One exception to "seqs only go up": a trigger stores its pre-window LATE — records a filter had kept out, older than records already stored. A cursor that already read past them gets them on its next read, oldest-first like everything else, with `cursor_late=N` saying how many; `cursor_late_lost=N` is an upper bound on late records that left the buffer before any read could see them.
 
 `c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Rejected in `get_log_context`, `get_recent_traces`, `get_trace_summary`, `get_slow_spans`, `get_trace`, and `get_span_context` — their results are anchor-driven or aggregated, not seq-streamable. Only one `c>=` per filter.
 
-To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter.
+To pre-position a cursor at "now" (so the first read returns only future records), call `add_bookmark("name")` first — the default `start_seq` is the current seq counter. A bookmark read as a cursor never returns a record from before its *creation* position, even one a trigger stores late afterwards.
 
 ## Triggers vs bookmarks: which one?
 
@@ -789,7 +789,8 @@ loop:
     r = get_recent_logs(filter="c>=drain, l>=warn", count=500)
     if r.logs is empty: break
     process(r.logs)
-# Cursor auto-advances each call; oldest-first ordering keeps it monotonic.
+# Cursor auto-advances each call; every record arrives once (late-stored ones on the
+# next call — see `cursor_late`).
 ```
 
 ### Pattern: zoom in on the context around an error
@@ -850,7 +851,7 @@ In order:
 2. Does the application emit telemetry yet? Many projects send GELF only after a feature flag flips. Ask the user to trigger an action that should produce a log.
 3. Is a filter narrowing the buffer? `get_filters` — if filters exist, the buffer only stores matches. Remove them or widen.
 4. Did someone (you, another session) call `clear_logs`? The buffer is shared.
-5. Check `receiver_drops` on `get_status`. Non-zero means the receivers couldn't keep up — the user's app is over-producing; suggest bumping `buffer_size` in `~/.config/logmon/config.json`.
+5. Check `receiver_drops` on `get_status`. Non-zero means the receivers couldn't keep up — the user's app is over-producing; suggest bumping `buffer_size` in `~/.config/logmon/config.json`. A non-zero `gelf_tcp_oversize_dropped` is a different problem: the app sent GELF TCP messages over 64 KB, which no buffer size fixes.
 
 ### "My cursor returned a huge unexpected flood"
 

@@ -265,6 +265,16 @@ pub struct LogsRecentResult {
     pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had
+    /// already read past — so they arrive now, with seqs below records it returned earlier.
+    /// Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late: Option<u64>,
+    /// Cursor reads: an upper bound on late-stored records that left the buffer before any read
+    /// of this cursor could consider them (it counts what left, not what would have matched).
+    /// Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late_lost: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +683,16 @@ pub struct LogsExportResult {
     pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had
+    /// already read past. The `verdict` window starts above the cursor, so it does not vouch
+    /// for these. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late: Option<u64>,
+    /// Cursor reads: an upper bound on late-stored records that left the buffer before any read
+    /// of this cursor could consider them (it counts what left, not what would have matched).
+    /// Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late_lost: Option<u64>,
     /// `count` stopped this short of everything that matched the range.
     ///
     /// Stated rather than left to be inferred, because it **cannot** be
@@ -1096,6 +1116,10 @@ pub struct TracesLogsResult {
     pub count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had
+    /// already read past — so they arrive now. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -2396,6 +2420,15 @@ pub struct StatusGetResult {
     pub store: StoreStats,
     #[serde(default)]
     pub receiver_drops: ReceiverDropCounts,
+    /// GELF TCP messages dropped for exceeding the 64 KB size limit — a
+    /// sibling of `receiver_drops`, not a member, for the reason given on
+    /// [`TraceIngestCounts`]: `receiver_drops` means the broker could not keep
+    /// up, and its remedy (a larger buffer) does nothing for a message that is
+    /// too big. Non-zero means a sender is sending messages over the limit; the
+    /// connection carries on with its next message. Additive: an older daemon
+    /// that omits it deserializes as `0`.
+    #[serde(default)]
+    pub gelf_tcp_oversize_dropped: u64,
     /// Spans lost on the OTLP trace transports before any collector saw
     /// them — a sibling of `receiver_drops`, not a member (§ doc on
     /// [`TraceIngestCounts`]). Non-zero means every span-derived number

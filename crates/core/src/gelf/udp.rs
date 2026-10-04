@@ -1,9 +1,15 @@
 use crate::gelf::message::{parse_gelf_message, LogEntry};
 use crate::receiver::{ReceiverMetrics, ReceiverSource};
+use crate::throttle::{note, Throttle};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+
+// Throttled, as for TCP: any host can send malformed datagrams, and each was a line in an
+// unrotated log.
+static MALFORMED: Throttle = Throttle::new();
+static RECV_ERRORS: Throttle = Throttle::new();
 
 pub struct UdpListenerHandle {
     port: u16,
@@ -47,21 +53,42 @@ pub async fn start_udp_listener(
 
     tokio::spawn(async move {
         let mut buf = [0u8; 65535];
+        let mut failures_in_a_row = 0u32;
         loop {
             tokio::select! {
                 result = socket.recv_from(&mut buf) => {
-                    if let Ok((len, _addr)) = result {
-                        // Strip trailing null bytes (some GELF libraries append TCP-style null delimiters to UDP)
-                        let mut end = len;
-                        while end > 0 && buf[end - 1] == 0 {
-                            end -= 1;
+                    let len = match result {
+                        Ok((len, _addr)) => {
+                            failures_in_a_row = 0;
+                            len
                         }
-                        // Parse with seq=0 — daemon assigns real seq later
-                        match parse_gelf_message(&buf[..end], 0) {
-                            Ok(entry) => {
-                                let _ = metrics.try_send_log(&sender, entry, ReceiverSource::GelfUdp);
+                        Err(e) => {
+                            // Was ignored outright: one that repeated came straight back on
+                            // every retry, a silent spin at full CPU.
+                            crate::throttle::pace_after_error(
+                                &RECV_ERRORS,
+                                &mut failures_in_a_row,
+                                &e,
+                                |n| note(format_args!("GELF UDP receive failed ({n} so far): {e}")),
+                            )
+                            .await;
+                            continue;
+                        }
+                    };
+                    // Strip trailing null bytes (some GELF libraries append TCP-style null delimiters to UDP)
+                    let mut end = len;
+                    while end > 0 && buf[end - 1] == 0 {
+                        end -= 1;
+                    }
+                    // Parse with seq=0 — daemon assigns real seq later
+                    match parse_gelf_message(&buf[..end], 0) {
+                        Ok(entry) => {
+                            let _ = metrics.try_send_log(&sender, entry, ReceiverSource::GelfUdp);
+                        }
+                        Err(e) => {
+                            if let Some(n) = MALFORMED.hit() {
+                                note(format_args!("malformed GELF UDP ({n} so far): {e}"));
                             }
-                            Err(e) => { eprintln!("malformed GELF UDP: {e}"); }
                         }
                     }
                 }

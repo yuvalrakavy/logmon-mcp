@@ -28,8 +28,10 @@ pub fn sync_pre_buffer_size_for_domain(
     sessions: &SessionRegistry,
     domain: &DomainId,
 ) {
-    let max_pre = sessions.max_pre_window_for_domain(domain) as usize;
-    pipeline.resize_pre_buffer(max_pre);
+    // Computed and applied as one step (`LogPipeline::resync_pre_buffer`): separately, a resync
+    // that read the max before another session's trigger change could apply its stale value
+    // AFTER that session's own resync.
+    pipeline.resync_pre_buffer(|| sessions.max_pre_window_for_domain(domain) as usize);
 }
 
 /// Convenience: sync the pre-buffer for the `default` domain. Used by the boot

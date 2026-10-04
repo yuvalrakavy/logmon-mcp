@@ -6,9 +6,15 @@
 //! these never park: on `TrySendError::Full` they bump the per-source drop
 //! counter and return `false`. The first drop in any 60-second window also
 //! emits a `tracing::warn!` so daemon.log surfaces backpressure visibly.
+//!
+//! A GELF TCP message over the size limit is counted apart from those, in
+//! [`ReceiverMetrics::oversize_dropped`], with a warning throttle of its own: there
+//! the sender's message is too big, the broker is not behind, and the two call
+//! for different remedies.
 
 use crate::gelf::message::LogEntry;
 use crate::span::types::SpanEntry;
+use crate::throttle::Throttle;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
@@ -36,8 +42,6 @@ impl ReceiverSource {
         }
     }
 }
-
-const WARN_INTERVAL_NANOS: i64 = 60_000_000_000; // 60 seconds
 
 /// The two transports a span can arrive on.
 ///
@@ -121,9 +125,15 @@ pub struct ReceiverMetrics {
     /// Spans discarded at parse time, per transport.
     otlp_http_traces_malformed: AtomicU64,
     otlp_grpc_traces_malformed: AtomicU64,
-    /// Unix-epoch nanos of the last warn emission. Initialised to a value
-    /// that ensures the first drop always warns.
-    last_warn_nanos: AtomicI64,
+    /// GELF TCP messages dropped for exceeding the size limit. Not a
+    /// `receiver_drops` figure: those mean the broker could not keep up, and
+    /// their remedy (a larger buffer) does nothing for this.
+    gelf_tcp_oversize: AtomicU64,
+    /// When to warn about a full channel: the first drop, then at most once a minute.
+    drop_warn: Throttle,
+    /// The same, for oversize messages. A throttle of its own, so a cheap
+    /// oversize message cannot silence the backpressure warning, nor the reverse.
+    oversize_warn: Throttle,
     /// Unix-epoch nanos of the last SUCCESSFUL forward per source (`i64::MIN` =
     /// never received). Powers per-domain / per-listener liveness (#2).
     gelf_udp_last: AtomicI64,
@@ -158,7 +168,9 @@ impl ReceiverMetrics {
             otlp_grpc_traces_shed: AtomicU64::new(0),
             otlp_http_traces_malformed: AtomicU64::new(0),
             otlp_grpc_traces_malformed: AtomicU64::new(0),
-            last_warn_nanos: AtomicI64::new(i64::MIN),
+            gelf_tcp_oversize: AtomicU64::new(0),
+            drop_warn: Throttle::new(),
+            oversize_warn: Throttle::new(),
             gelf_udp_last: AtomicI64::new(i64::MIN),
             gelf_tcp_last: AtomicI64::new(i64::MIN),
             otlp_http_logs_last: AtomicI64::new(i64::MIN),
@@ -200,7 +212,8 @@ impl ReceiverMetrics {
     }
 
     /// Increment the counter for `source` and emit a `tracing::warn!` if the
-    /// last warning was more than 60 seconds ago (or never).
+    /// last warning was a minute ago or more (or never). Timed on the monotonic
+    /// clock, so a wall-clock step backwards cannot silence it.
     pub(crate) fn record_drop(&self, source: ReceiverSource) {
         let counter = match source {
             ReceiverSource::GelfUdp => &self.gelf_udp,
@@ -211,21 +224,33 @@ impl ReceiverMetrics {
             ReceiverSource::OtlpGrpcTraces => &self.otlp_grpc_traces,
         };
         counter.fetch_add(1, Ordering::Relaxed);
-
-        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-        // Relaxed: last_warn_nanos guards nothing else; sole side effect is the warn emission below.
-        let last = self.last_warn_nanos.load(Ordering::Relaxed);
-        if now_nanos.saturating_sub(last) >= WARN_INTERVAL_NANOS
-            && self
-                .last_warn_nanos
-                .compare_exchange(last, now_nanos, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
+        if self.drop_warn.hit().is_some() {
             tracing::warn!(
                 source = source.as_str(),
                 "receiver dropped entry due to channel backpressure"
             );
         }
+    }
+
+    /// Count a GELF TCP message dropped for exceeding the size limit, and warn at most once a
+    /// minute. Apart from [`Self::record_drop`] — counter and warning throttle both — because a
+    /// full channel means the broker is behind and an oversize message means the sender's
+    /// message is too big: one counter would send a reader to the wrong remedy, and one
+    /// throttle would let either cause silence the other's warning.
+    pub(crate) fn record_oversize_drop(&self) {
+        self.gelf_tcp_oversize.fetch_add(1, Ordering::Relaxed);
+        if let Some(n) = self.oversize_warn.hit() {
+            tracing::warn!(
+                source = ReceiverSource::GelfTcp.as_str(),
+                "receiver dropped a message over the size limit ({n} so far)"
+            );
+        }
+    }
+
+    /// GELF TCP messages dropped for exceeding the size limit, since these counters were
+    /// created. See [`Self::record_oversize_drop`].
+    pub fn oversize_dropped(&self) -> u64 {
+        self.gelf_tcp_oversize.load(Ordering::Relaxed)
     }
 
     /// Record one trace request body refused wholesale under backpressure.
@@ -345,6 +370,25 @@ mod tests {
         assert_eq!(snap.otlp_http_logs, 2);
         assert_eq!(snap.gelf_udp, 1);
         assert_eq!(snap.otlp_http_traces, 0);
+    }
+
+    /// An oversize message and a full channel each keep their own warning: one cannot use up
+    /// the other's once-a-minute line.
+    #[test]
+    fn an_oversize_drop_and_a_channel_full_drop_do_not_silence_each_other() {
+        let m = ReceiverMetrics::new();
+        m.record_oversize_drop();
+        assert!(
+            m.drop_warn.hit().is_some(),
+            "the next channel-full drop still warns"
+        );
+
+        let m = ReceiverMetrics::new();
+        m.record_drop(ReceiverSource::GelfTcp);
+        assert!(
+            m.oversize_warn.hit().is_some(),
+            "the next oversize drop still warns"
+        );
     }
 
     #[test]

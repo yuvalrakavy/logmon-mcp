@@ -1758,6 +1758,7 @@ fn canonical_qualifier(q: &Qualifier) -> String {
         Qualifier::BookmarkFilter { op, name } => format!("bm:{op:?}:{name}"),
         Qualifier::CursorFilter { name } => format!("cur:{name}"),
         Qualifier::SeqFilter { op, value } => format!("seq:{op:?}:{value}"),
+        Qualifier::CursorSeq { after } => format!("curseq:{after}"),
     }
 }
 

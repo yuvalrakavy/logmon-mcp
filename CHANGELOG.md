@@ -135,6 +135,254 @@ What the buffer ADMITS changes with or without filters:
   trigger with a smaller pre-window had drained newer ones, so a later flush could pull in
   records far older than N arrivals.
 
+### Fixed — a cursor never returned a record a trigger stored behind it (wire addition)
+
+A trigger stores its pre-window LATE: records a session filter had kept out, older than records
+already in the buffer. A cursor (`c>=` on `get_recent_logs`, `export_logs`, `get_trace_logs`)
+was a single seq that advanced to the highest seq returned, so once it had read past those seqs
+it never returned them — in any domain with a filter, the context around an error could be
+missing from a cursor-driven drain for good. A test harness draining by cursor and asserting "no
+warnings" saw a green run over warnings it never received.
+
+A cursor now returns every stored record exactly once. A record stored behind it arrives on the
+next read — oldest-first with everything else, so with a seq below records it returned earlier —
+and the reply counts them:
+
+- **`cursor_late`** — how many of the returned records were stored late. Absent when none.
+- **`cursor_late_lost`** — an upper bound on late records that left the buffer before any read
+  could see them (like `evicted_before_window`, it counts what left, not what would have
+  matched). Absent when none; not on `get_trace_logs`.
+- **`cursor_advanced_to`** is still the cursor's new seq position, so it is now also absent when
+  the only records returned were late ones.
+
+A late record is judged by the filter of the first cursor read after it is stored, as any record
+behind a cursor always was. A cursor never returns a record from before its creation position: a
+bookmark added with `add_bookmark` and read as a cursor still means "from now", even for a record
+that was waiting in the pre-trigger buffer when the bookmark was added and is stored late after
+it. `export_logs`'s `verdict` window starts above the cursor, so it does not vouch for late
+records.
+
+Also: `get_recent_traces`, `get_trace`, `get_slow_spans` and `export_spans` refuse a `c>=`
+qualifier before resolving it, so a refused call no longer leaves a freshly created cursor
+behind.
+
+### Fixed — a broker that could not start restart-looped with no trace of why
+
+Under the launchd service (`install-service`), a broker that exits is restarted every 10 s,
+and its stderr was discarded. Of the ways startup can fail, only an oversize buffer was logged;
+the rest — the GELF port taken, another broker already running, an unreadable state file — went
+to stderr alone, so the broker restart-looped silently. Two changes:
+
+- Every error after the broker's log exists is now logged to `daemon.log.<date>` as
+  `logmon daemon failed: …` before the broker exits.
+- The launchd service writes stderr to `daemon.stderr.log` in the config directory
+  (`/var/log/logmon-broker.stderr.log` for a system install), which catches what happens before
+  that log exists — an unreadable `config.json`, a panic. **Re-run `logmon-broker
+  install-service` to pick this up**; an existing plist keeps discarding stderr. (systemd already
+  sends a service's stderr to the journal.)
+
+### Fixed — a broker that failed partway through startup never said `OTEL:OFFLINE`
+
+`OTEL:ONLINE` went out as soon as the OTLP receiver started. If startup then failed — writing
+the pid file, binding the socket — the broker exited without `OTEL:OFFLINE`, leaving producers
+pointed at a collector that was never serving. `ONLINE` now goes out once the listener is bound,
+the last step that can fail.
+
+### Fixed — a removed session's `pre_window` kept sizing the pre-trigger buffer
+
+The pre-trigger buffer is sized to the largest `pre_window` among a domain's sessions. Adding,
+editing or removing a trigger re-derived it; removing a whole session did not — `sessions.drop`,
+the TTL sweep, an anonymous session's disconnect (the common one), or a stale holder displaced by
+`sessions.rename`. The gone session's largest window kept the buffer that size, holding the
+memory and widening how far back a traced trigger firing reached, until something else
+re-derived it. All four now do, and a re-derivation is computed and applied as one step, so two
+racing ones (a disconnect's and another session's trigger change) cannot leave the stale value.
+
+### Fixed — a session whose client vanished mid-reply stayed connected until a restart
+
+A connection disconnected its session at the end of its loop, but the writes before it returned
+early when the client had gone (the reply to `session.start` or to any request, or a trigger
+notification). The session then stayed `connected`: a named one's name was refused
+("already connected") until the broker restarted, and an anonymous one was never removed, so its
+triggers kept sizing the pre-trigger buffer. The disconnect now runs on every exit — including
+the reply to a `sessions.rename`, after which it disconnects the session by its NEW name.
+
+### Fixed — a new session's triggers did not size the pre-trigger buffer
+
+Connecting a new session (or a reconnecting named one whose connect-time domain moved its
+binding) did not re-derive the domain's pre-trigger buffer size, so its triggers' pre-windows
+were cut to whatever the buffer was already — zero after the last session left — until some
+trigger or filter change resynced it. It is re-derived when a session starts. (A named session
+that merely reconnects already counted while disconnected, so nothing changed for it.)
+
+### Fixed — session lifecycle: disposal, drop, rename and reconnect
+
+- The TTL sweep lists the sessions past their TTL and disposes of them one by one, and it
+  disposed of any that was still disconnected — including one that had reconnected and left
+  again since the listing (a CLI invocation does exactly that), along with the collector or
+  bookmark it had just made. A session is now disposed of only if it is still abandoned —
+  disconnected AND last seen past the TTL — decided under the registry's lock, and the sweep
+  logs a spared session as kept rather than disposed.
+- The sweep and `sessions.drop` cleared the session's bookmarks and collectors AFTER removing it
+  from the registry, and `sessions.rename` moved them after renaming it. All of it is keyed by
+  the session's NAME, so another request in between — a rename onto the freed name, a drop of
+  the old one — could lose its state or take the renamer's (a drop of the old name released the
+  renaming session's collectors and replied `dropped`). Each of them now changes that state
+  inside the registry's lock, before any other request can see the name; the collector files
+  are written and removed after it, sparing any a new holder of the name has written since.
+- `sessions.drop` on a CONNECTED session released its collectors (destroying their windows and
+  history) and replied `dropped`, while the session itself was refused and stayed. It is now
+  refused with nothing touched.
+- `sessions.drop` left the session's bookmarks behind, and a later session of the same name
+  inherited them: its cursors resumed from the old positions and `bookmarks.add` refused names it
+  had never used. They are cleared with the session. (A drop of a name no session holds still
+  reclaims only collectors — the name may be a live anonymous session's id.)
+- A named session could take a live ANONYMOUS session's id as its name (`session.start` or
+  `sessions.rename` to the UUID `get_sessions` shows). Both are keyed by that string, so they
+  shared bookmarks, and the anonymous session's disconnect, which clears its own, wiped the named
+  one's. Such a name is refused as "already connected".
+- `session.start` for a named session created it or, failing that, reconnected — two steps, so
+  a disposal of the name in between (the TTL sweep, `sessions.drop`) failed the handshake with
+  "session not found" where a fresh session was the answer. It is one step now.
+- `sessions.rename` moved the session's collectors but not its bookmarks. Left under the old
+  name, its cursors auto-created at 0 under the new one and replayed everything they had already
+  returned (and an anonymous session's bookmarks stayed in memory until a restart). Bookmarks now
+  move with the session, positions intact.
+- A rename to the session's OWN name deleted every one of its collector files (each was written
+  and then deleted at the same path), so the next restart found no collectors. It moves nothing
+  now. And a rename removes a collector's old file only once the new one is written: a failed
+  write (a full disk) used to delete the only copy. Where the renamed session displaced a stale
+  holder with a collector of the same name, and the write fails, the stale holder's file at that
+  name is removed rather than kept: kept, a restart would have restored a dead session's
+  collector under the renamed session's name.
+- A collector file's removal is decided by what is on disk, not by who holds the name: a file is
+  removed only if no write that began after the removal was decided has succeeded on it. Deciding by
+  who held the name got both cases wrong under a race — it could delete the file a new holder of
+  the name had just written, and it kept a dropped session's file when a new holder's own write
+  had failed (the restart then restored the dead collector under the live name). A write that was
+  already under way when a removal came in is the removal's to delete. Writes and removals of one
+  file take one lock of their own; different collectors' files never wait on each other. A write
+  prepared before its collector was removed is not written after the removal (it put the file
+  back, and the removed collector returned at the next boot), and a removal that cannot delete a
+  collector's file says so in the log instead of silently leaving it to come back. (It deletes
+  the file at the collector's own name; a copy left at another name — one the boot migration could
+  not move into place, or a moved collector's old file after its new one failed to write — is
+  not found by it.) A snapshot whose collector is removed while the run is being written now
+  says the run was not filed; it reported it as filed.
+- A collector is identified by more than its name when its file is written. A write prepared for
+  a collector that was then removed and re-armed under the same name used to land on the new
+  collector's file, putting the removed one's definition back at the next boot; an edit could
+  likewise apply to the re-armed collector after writing the removed one's file. And a session
+  renamed while a snapshot was being taken no longer loses the run: it read as removed, and the
+  run went into no history although the collector still had one.
+- The record of evicted cursors — what makes a recreated cursor warn that it lost its place —
+  stayed under the old name on a rename (the warning was lost) and outlived a dropped or
+  disposed session (a later holder of the name was warned about a cursor it never had). It
+  moves and goes with the session's bookmarks.
+- Two `session.start`s for the same disconnected name could both succeed: the claim was a check
+  and then a set, so both passed the check and both connections owned one session. When the
+  first left, the other's live session read as disconnected, open to the TTL sweep and to
+  `sessions.drop`. The claim is now one atomic step; the loser gets "already connected".
+
+### Fixed — a request split around a trigger notification closed the connection
+
+The connection loop races reading the next request against forwarding trigger notifications,
+and each read went into a buffer of its own. When a notification won while a request was only
+partly received — the SDK and the shim write a request and its newline as two writes — the bytes
+already read were dropped, the rest failed to parse, and the broker closed the connection. A
+request now survives the race: what arrived stays buffered until the line completes.
+
+Every request line is also capped now, at 64 MiB, the first one (`session.start`) included: a
+client that streamed bytes with no newline grew the buffer until the broker ran out of memory. A
+longer line closes the connection with a warning. A connection must send `session.start` within
+30 seconds: one that never did held a task and a socket for as long as it stayed open. And each
+message the broker writes to a client must complete within 30 seconds: a client that stopped
+reading filled its socket, and the write then waited for as long as the client stayed connected —
+with its session marked connected, so its name was refused to anyone else.
+
+### Fixed — a GELF TCP sender could buffer without limit
+
+The GELF TCP input read each message up to its NUL terminator with no limit, on a port that
+listens on every interface without authentication — so any host that could reach it could send
+bytes with no NUL and grow the broker's memory until it died. A message is now at most 64 KB on
+the wire — the same ceiling as a GELF UDP datagram — and a longer one is dropped, counted in the
+new `status.get` field `gelf_tcp_oversize_dropped`, and skipped to the NUL that ends it in
+bounded memory, so the connection carries on with the next message. That count is deliberately
+not part of `receiver_drops`, which means the broker could not keep up: a larger buffer, the
+remedy for those, does nothing for a message that is too big. The rendered `get_status` shows
+it on a line of its own, and no longer ends with `postmortem=null` on a live domain.
+
+The broker also holds connections it can no longer use for less long:
+
+- A GELF TCP or OTLP connection whose sender vanished without closing it (power or network
+  lost) was held, with its file descriptor, for the life of the broker. Connections accepted on
+  every TCP ingest input now use TCP keepalive, so the system notices a dead peer within a few
+  minutes and the connection ends.
+- Deleting a domain closed its GELF TCP listener but not the connections it had accepted. They
+  went on reading into the deleted domain, so a sender on a persistent connection fed a
+  re-created domain on the same port nothing until it reconnected. They now close with the
+  listener.
+- A failed `accept` that repeats (out of file descriptors) is retried after a pause — on the
+  GELF TCP and OTLP gRPC inputs and on the broker's own client sockets alike. It was retried at
+  once, spinning a core for as long as it lasted, and on the client sockets writing an ERROR
+  line per turn. A GELF UDP receive error, ignored outright before, is logged and paced the
+  same way. (The OTLP HTTP input already paused.) An error that belongs to one connection — a
+  peer that reset while queued — is not counted as a repeat and never pauses, so a remote host
+  cannot use it to slow accepts down.
+- The GELF receivers no longer log every malformed message (any sender could fill the disk
+  through the log, and a write to a full disk panicked the task that logged — a connection, or
+  the TCP accept loop). Each such line is now logged at most once a minute, with a running count,
+  and cannot panic. The receivers' backpressure warning keeps the same once-a-minute rate on the
+  monotonic clock, so a wall-clock step backwards no longer silences it.
+
+Known limit: a host that can reach an ingest port can still hold connections open — the GELF and
+OTLP inputs take no authentication — and enough of them exhaust the broker's file descriptors.
+Keep the ingest ports off networks you do not trust.
+
+Known limit, unchanged: the log store (and the ingest channel in front of it) is bounded by
+record COUNT, not by bytes, for every input — and a parsed record can take many times its wire
+size. See the README's "Memory" note.
+
+### Fixed — two collectors could share one file
+
+A collector's file was named `{session}__{name}.json`, and both parts may contain `_`, so
+session `a__b`'s collector `c` and session `a`'s collector `b__c` were one file — each
+overwriting the other's definition and recorded history. Names differing only in case (`Perf`,
+`perf`) were one file too on a case-insensitive filesystem, the macOS default. Files are now
+named `{session}.{name}.json`, each part keeping `[a-z0-9_-]`, writing an uppercase letter as
+`^` and the letter, and percent-encoding anything else — a name no two collectors can share on
+any filesystem. Names too long to fit a filename this way (names have no length limit) are
+shortened to readable prefixes plus a hash of the full names; they used to fail to be written
+at all. Existing files are moved to the new names at the first start. Where two files hold the
+same collector (an earlier naming's beside the current one), the most recently written is the
+collector and the other is set aside as `*.json.superseded` — never deleted, and never over an
+earlier set-aside copy. The move into place never overwrites another collector's file, even two
+files swapped by hand. (A pair that had already collided cannot be recovered: only the last
+write survived.)
+
+### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
+
+Both read the eviction floor, and the buffer's size and seq bounds, separately from the query
+that produced the records. Under ingest at the bottom of a full buffer an eviction could land in
+between, and the reply then reported `evicted_before_window` (and `export_logs` a verdict of
+`evicted`) about a record it was handing back. The floor and bounds now come from the query's
+own lock, as `create_case`, `list_log_fields` and `profile_logs` already did.
+
+### Fixed — a traced trigger firing scanned the whole pre-trigger buffer
+
+When a trigger fires on a record with a trace id, it also stores that trace's other entries
+still in the pre-trigger buffer. It found them by scanning every buffered entry under the
+buffer's lock — which every ingested record also takes — and the buffer may now be as large as
+the log ring. A per-trace index finds them in the trace's own size, with the same result.
+
+### Changed — a span collector keeps 256 distinct group tuples, up from 64
+
+Past the cap, group tuples fold into `__overflow__` in arrival order. At 64, a per-call-site
+breakdown (`group_keys` `code.file.path` + `code.line.number`) folded every call site first seen
+after 64 others — the hottest one included, if it showed up late. The cap now matches the
+per-name cap (each carries the same stats and duration sketch). Past 256 it still folds and sets
+`cardinality_capped`: narrow the filter until it clears.
+
 ### Fixed — `pre_window = N` stored N−1 records before the match
 
 A record joined the pre-trigger buffer before its own triggers were evaluated, so when it

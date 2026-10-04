@@ -62,6 +62,10 @@ pub async fn start_http_server(
         tracing::info!("OTLP HTTP server listening on {}", addr);
     }
 
+    // Keepalive on each accepted connection, as for gRPC: an exporter that vanished without
+    // closing its connection held it for the life of the broker.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| crate::receiver::keepalive::keep_alive(tcp));
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;

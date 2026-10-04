@@ -122,6 +122,20 @@ pub fn render(result: &Value) -> Option<String> {
             lines.push(line);
         }
     }
+    // A line of its own, not a receiver drop: the sender's message was too big, the broker
+    // was not behind, so the drops' remedy (a larger buffer) does nothing for it.
+    // Anything but a zero or a `null` is shown — a value that is not a count too, rather than
+    // vanishing behind its place in `KNOWN`. A `null` says nothing, as below.
+    if let Some(v) = obj
+        .get("gelf_tcp_oversize_dropped")
+        .filter(|v| !v.is_null() && v.as_u64() != Some(0))
+    {
+        lines.push(format!(
+            "oversize dropped: gelf_tcp={} (messages over the {} KB limit)",
+            super::blocks::compact(v),
+            crate::gelf::tcp::MAX_GELF_TCP_MESSAGE_BYTES / 1024
+        ));
+    }
 
     // When each receiver last saw traffic — the answer to "is my app actually
     // sending?", which is the first question behind an empty buffer. Rendered
@@ -157,9 +171,9 @@ pub fn render(result: &Value) -> Option<String> {
     }
 
     // Anything this renderer does not know about. `status.get` has no record
-    // array, so the structural drop rule admits NO omission: a key added to the
-    // result later must show up here rather than vanish from a rendering that
-    // reads as complete.
+    // array, so the structural drop rule admits no omission of a VALUE: a key
+    // added to the result later must show up here rather than vanish from a
+    // rendering that reads as complete. (A `null` is no value, and is left out.)
     const KNOWN: &[&str] = &[
         "broker_version",
         "daemon_uptime_secs",
@@ -169,13 +183,16 @@ pub fn render(result: &Value) -> Option<String> {
         "session",
         "active_filters",
         "receiver_drops",
+        "gelf_tcp_oversize_dropped",
         "trace_ingest",
         "receiver_liveness",
         "broker_tools",
     ];
+    // A `null` says nothing — the daemon sends `postmortem: null` for every live domain, and
+    // listing it ended every status with noise. Anything else is shown.
     let mut unknown: Vec<String> = obj
         .keys()
-        .filter(|k| !KNOWN.contains(&k.as_str()) && !k.starts_with('_'))
+        .filter(|k| !KNOWN.contains(&k.as_str()) && !k.starts_with('_') && !obj[*k].is_null())
         .map(|k| format!("{k}={}", super::blocks::compact(&obj[k])))
         .collect();
     unknown.sort();
@@ -201,9 +218,39 @@ mod tests {
                         "trigger_count": 2, "filter_count": 0, "queue_size": 0},
             "active_filters": [],
             "receiver_drops": {"gelf_udp": 0, "gelf_tcp": 0},
+            "gelf_tcp_oversize_dropped": 0,
             "trace_ingest": {"dropped": 0, "shed_batches": 0},
             "broker_tools": ["a", "b", "c"],
         })
+    }
+
+    /// Oversize messages get a line of their own — the sender's message was too big, the
+    /// broker was not behind — and, like every loss counter, only when non-zero.
+    #[test]
+    fn oversize_drops_appear_on_their_own_line_only_when_non_zero() {
+        let quiet = render(&reply()).expect("renders");
+        assert!(!quiet.contains("oversize"), "{quiet}");
+
+        let mut lossy = reply();
+        lossy["gelf_tcp_oversize_dropped"] = json!(3);
+        let out = render(&lossy).expect("renders");
+        assert!(
+            out.contains("oversize dropped: gelf_tcp=3 (messages over the 64 KB limit)"),
+            "{out}"
+        );
+        assert!(!out.contains("receiver drops"), "{out}");
+
+        // A value that is not a count is shown as it is, not swallowed — but a `null` says
+        // nothing, as for every other key.
+        lossy["gelf_tcp_oversize_dropped"] = json!("unexpected");
+        let out = render(&lossy).expect("renders");
+        assert!(
+            out.contains("oversize dropped: gelf_tcp=unexpected"),
+            "{out}"
+        );
+        lossy["gelf_tcp_oversize_dropped"] = Value::Null;
+        let out = render(&lossy).expect("renders");
+        assert!(!out.contains("oversize"), "{out}");
     }
 
     /// The rule this method exists to demonstrate: the tool list is noise to the
@@ -349,5 +396,19 @@ mod tests {
         r["alpha_metric"] = json!(2);
         let out = render(&r).expect("renders");
         assert!(out.contains("alpha_metric=2  zebra_metric=1"), "{out}");
+    }
+
+    /// An unknown key whose value is `null` says nothing and is left out — a live domain's
+    /// `postmortem: null` ended every status with it — while a value is still shown.
+    #[test]
+    fn an_unknown_key_with_no_value_is_left_out() {
+        let mut r = reply();
+        r["postmortem"] = Value::Null;
+        let out = render(&r).expect("renders");
+        assert!(!out.contains("postmortem"), "{out}");
+
+        r["postmortem"] = json!({"case": "c1"});
+        let out = render(&r).expect("renders");
+        assert!(out.contains("postmortem="), "{out}");
     }
 }

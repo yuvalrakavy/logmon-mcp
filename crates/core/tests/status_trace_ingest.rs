@@ -287,3 +287,43 @@ fn trace_ingest_follows_the_session_domain_binding_not_daemon_wide_totals() {
     assert_eq!(other_status.trace_ingest.malformed_dropped, 0);
     assert_eq!(other_status.receiver_drops.otlp_http_traces, 0);
 }
+
+// ---------------------------------------------------------------------------
+// (d) An oversize GELF TCP message is reported, apart from receiver_drops.
+// ---------------------------------------------------------------------------
+
+/// A GELF TCP message over the size limit reaches `status.get` as
+/// `gelf_tcp_oversize_dropped` — and NOT as a receiver drop, whose remedy (a
+/// larger buffer) does nothing for it. Through a real listener feeding the
+/// domain's own counters, so the field is checked from the wire to the reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversize_gelf_tcp_message_is_reported_apart_from_receiver_drops() {
+    use logmon_broker_core::gelf::tcp::{start_tcp_listener, MAX_GELF_TCP_MESSAGE_BYTES};
+    use tokio::io::AsyncWriteExt;
+
+    let h = harness();
+    let sid = h.sessions.create_named("A").expect("session");
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let listener = start_tcp_listener("127.0.0.1:0", tx, h.metrics("default"))
+        .await
+        .expect("listener");
+    let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", listener.port()))
+        .await
+        .expect("connect");
+    stream
+        .write_all(&vec![b'x'; MAX_GELF_TCP_MESSAGE_BYTES + 100])
+        .await
+        .expect("write");
+    stream.write_all(&[0u8]).await.expect("write");
+
+    let mut status = h.status(&sid);
+    for _ in 0..500 {
+        if status.gelf_tcp_oversize_dropped > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        status = h.status(&sid);
+    }
+    assert_eq!(status.gelf_tcp_oversize_dropped, 1);
+    assert_eq!(status.receiver_drops.gelf_tcp, 0, "not a receiver drop");
+}

@@ -210,7 +210,8 @@ pub fn admit_span_filter(filter: &ParsedFilter) -> Result<Admission, AdmissionEr
             // not object.
             Qualifier::BookmarkFilter { .. }
             | Qualifier::CursorFilter { .. }
-            | Qualifier::SeqFilter { .. } => {}
+            | Qualifier::SeqFilter { .. }
+            | Qualifier::CursorSeq { .. } => {}
         }
     }
 

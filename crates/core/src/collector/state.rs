@@ -20,8 +20,21 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Distinct group tuples carrying their own stats and sketch (§3.5).
-/// Past this, tuples fold into an all-overflow tuple.
-pub const MAX_GROUP_TUPLES: usize = 64;
+/// Past this, tuples fold — by ARRIVAL order — into an all-overflow tuple.
+///
+/// The same as the per-name cap (`DEFAULT_NAME_CAP`), deliberately: a name and a group tuple
+/// each carry one `ExactStats` with its own duration sketch (bounded at 2,048 bins, typically a
+/// few KB), and both are copied into each of the collector's history snapshots — so whatever
+/// bounds the per-name tier bounds this one at the same multiple, and keeping groups at a
+/// quarter of names bought nothing that names did not already spend. Neither tier is charged
+/// to the sample budget; the worst case (every tuple's sketch at full width, every history
+/// slot filled) is real but needs durations spread over many orders of magnitude PER TUPLE,
+/// which one call site does not produce. At 64, a
+/// per-call-site census (`--group-keys code.file.path --group-keys code.line.number`) folded
+/// any call site first seen after 64 others into `__overflow__` — the hottest one included, if
+/// it showed up late (gh #21). Past 256 that is still what happens, and `cardinality_capped`
+/// says so: narrow the filter (a service, a file prefix) until it clears.
+pub const MAX_GROUP_TUPLES: usize = 256;
 
 /// Default per-collector sample budget (§3.4).
 pub const DEFAULT_MAX_SAMPLE_BYTES: usize = 64 * 1024 * 1024;
@@ -573,6 +586,43 @@ mod tests {
             "the projection sees a fixed point in time"
         );
         assert_eq!(c.snapshot().total.count, 2);
+    }
+
+    /// A call-site census keeps 256 distinct tuples as rows of their own; the 257th tuple and
+    /// every later one fold into one all-overflow row, and the snapshot says a cap fired. At the
+    /// old cap of 64 a census of 200 call sites lost 136 of them (gh #21).
+    #[test]
+    fn group_tuples_are_kept_up_to_256_and_the_fold_is_reported() {
+        let c = Collector::new(def(Level::Scalar, &["code.line.number"]), now());
+        let site = |line: usize| {
+            let mut s = span("op", S, S + 10);
+            s.attributes
+                .insert("code.line.number".into(), serde_json::json!(line));
+            s
+        };
+        for line in 0..200 {
+            c.ingest(&site(line));
+        }
+        let s = c.snapshot();
+        assert_eq!(s.per_group.len(), 200, "200 call sites, 200 rows");
+        assert!(!s.cardinality_capped(), "nothing folded under the cap");
+
+        for line in 200..300 {
+            c.ingest(&site(line));
+        }
+        let s = c.snapshot();
+        assert_eq!(
+            s.per_group.len(),
+            257,
+            "256 tuples of their own, then one shared overflow row"
+        );
+        assert!(s.cardinality_capped(), "the fold is announced");
+        let overflow: Vec<u32> = vec![OVERFLOW_ID];
+        assert_eq!(
+            s.per_group.get(&overflow).map(|e| e.count),
+            Some(44),
+            "lines 256-299 arrived after the 256th tuple"
+        );
     }
 
     #[test]

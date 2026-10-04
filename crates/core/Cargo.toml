@@ -41,8 +41,12 @@ sd-notify = { workspace = true }
 [dev-dependencies]
 tokio-test.workspace = true
 tempfile.workspace = true
-tracing-test = "0.2"
+# `no-env-filter`: an integration test (its own crate) must see this crate's logs too — by
+# default `traced_test` keeps only the test crate's own.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# `all`: the keepalive getters a test reads the broker's settings back with.
+socket2 = { workspace = true, features = ["all"] }
 
 [[bench]]
 name = "span_ingest"

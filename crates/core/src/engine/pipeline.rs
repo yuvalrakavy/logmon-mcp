@@ -60,6 +60,8 @@ pub struct FilterInfo {
 pub struct LogPipeline {
     store: InMemoryStore,
     pre_buffer: PreTriggerBuffer,
+    /// Serializes [`Self::resync_pre_buffer`]'s compute-then-apply.
+    pre_buffer_resync: std::sync::Mutex<()>,
     seq_counter: Arc<SeqCounter>,
     event_sender: broadcast::Sender<PipelineEvent>,
     /// What storage policy governed each stretch of this pipeline's seq axis.
@@ -77,6 +79,21 @@ pub struct RecentStats {
     pub buffer_total: usize,
     pub buffer_oldest_seq: Option<u64>,
     pub buffer_newest_seq: Option<u64>,
+    /// The loss floor at the instant of the query — what `evicted_before_window`
+    /// is graded from.
+    pub lost_below: u64,
+}
+
+impl From<crate::store::memory::RingView> for RecentStats {
+    fn from(v: crate::store::memory::RingView) -> Self {
+        Self {
+            scanned: v.scanned,
+            buffer_total: v.len,
+            buffer_oldest_seq: v.oldest_seq,
+            buffer_newest_seq: v.newest_seq,
+            lost_below: v.lost_below,
+        }
+    }
 }
 
 impl LogPipeline {
@@ -140,6 +157,7 @@ impl LogPipeline {
         Self {
             store: InMemoryStore::from_records(store_capacity, records, lost_below),
             pre_buffer: PreTriggerBuffer::new(0),
+            pre_buffer_resync: std::sync::Mutex::new(()),
             seq_counter,
             event_sender,
             epochs: log,
@@ -156,6 +174,7 @@ impl LogPipeline {
         Self {
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(0),
+            pre_buffer_resync: std::sync::Mutex::new(()),
             seq_counter,
             event_sender,
             epochs,
@@ -256,22 +275,53 @@ impl LogPipeline {
     }
 
     /// Like `recent_logs`, but also returns buffer/scan stats for B2's
-    /// `scanned` / `buffer_*` response fields (one query; snapshot-consistent
-    /// enough for a diagnostic count).
+    /// `scanned` / `buffer_*` response fields and the loss floor — all read
+    /// under the query's own lock, so a reply never calls a record it returns
+    /// evicted (gh #24).
     pub fn recent_logs_with_stats(
         &self,
         count: usize,
         filter: Option<&ParsedFilter>,
         oldest_first: bool,
     ) -> (Vec<LogEntry>, RecentStats) {
-        let (entries, scanned) = self.store.recent_with_scanned(count, filter, oldest_first);
+        let (entries, view) = self.store.recent_with_view(count, filter, oldest_first);
         let stats = RecentStats {
-            scanned,
-            buffer_total: self.store.len(),
-            buffer_oldest_seq: self.store.oldest_seq(),
-            buffer_newest_seq: self.store.newest_seq(),
+            scanned: view.scanned,
+            buffer_total: view.len,
+            buffer_oldest_seq: view.oldest_seq,
+            buffer_newest_seq: view.newest_seq,
+            lost_below: view.lost_below,
         };
         (entries, stats)
+    }
+
+    /// A cursor read — see [`InMemoryStore::cursor_read`].
+    ///
+    /// [`InMemoryStore::cursor_read`]: crate::store::memory::InMemoryStore::cursor_read
+    pub fn cursor_read(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        pos: crate::store::memory::CursorPos,
+    ) -> crate::store::memory::CursorRead {
+        self.store.cursor_read(count, filter, pos)
+    }
+
+    /// A cursor read of one trace — see [`InMemoryStore::cursor_read_trace`].
+    ///
+    /// [`InMemoryStore::cursor_read_trace`]: crate::store::memory::InMemoryStore::cursor_read_trace
+    pub fn cursor_read_trace(
+        &self,
+        trace_id: u128,
+        filter: Option<&ParsedFilter>,
+        pos: crate::store::memory::CursorPos,
+    ) -> crate::store::memory::CursorRead {
+        self.store.cursor_read_trace(trace_id, filter, pos)
+    }
+
+    /// The log store's late counter — the mark a cursor created now starts from.
+    pub fn late_counter(&self) -> u64 {
+        self.store.late_counter()
     }
 
     /// Fold the **whole** matching population without materialising it.
@@ -299,6 +349,7 @@ impl LogPipeline {
             buffer_total: counts.scanned,
             buffer_oldest_seq: counts.oldest_seq,
             buffer_newest_seq: counts.newest_seq,
+            lost_below: counts.lost_below,
         };
         (counts, stats)
     }
@@ -353,6 +404,23 @@ impl LogPipeline {
 
     pub fn resize_pre_buffer(&self, size: usize) {
         self.pre_buffer.resize(size);
+    }
+
+    /// The pre-trigger buffer's capacity, in arrivals — what the last resync set it to.
+    pub fn pre_buffer_capacity(&self) -> usize {
+        self.pre_buffer.capacity()
+    }
+
+    /// Size the pre-trigger buffer to what `compute` returns, computed and applied under one
+    /// lock. Two resyncs racing — say an anonymous disconnect's and another session's
+    /// `triggers.add` — used to interleave as compute, compute, apply, apply, so the one that
+    /// read the max BEFORE the trigger change could be applied last, leaving a buffer smaller
+    /// than a live trigger's pre-window until the next resync (and `resize` drops entries for
+    /// good). Serialized, the last resync to run computed after every change that came before
+    /// it. `compute` must not resync this pipeline itself.
+    pub fn resync_pre_buffer(&self, compute: impl FnOnce() -> usize) {
+        let _serial = self.pre_buffer_resync.lock().expect("resync lock poisoned");
+        self.pre_buffer.resize(compute());
     }
 
     /// Return copies of pre-buffer entries matching the given trace_id.

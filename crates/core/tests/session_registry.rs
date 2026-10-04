@@ -87,8 +87,199 @@ fn test_drop_named_session() {
     let registry = SessionRegistry::new();
     let id = registry.create_named("test").unwrap();
     registry.disconnect(&id);
-    registry.drop_session("test").unwrap();
+    let mut cleaned = false;
+    registry
+        .drop_session("test", |existed| cleaned = existed)
+        .unwrap();
     assert!(registry.get(&id).is_none());
+    assert!(cleaned, "the cleanup ran");
+}
+
+/// A connected session is refused, and its cleanup never runs.
+#[test]
+fn dropping_a_connected_session_runs_no_cleanup() {
+    let registry = SessionRegistry::new();
+    let id = registry.create_named("live").unwrap();
+    let mut cleaned = false;
+    assert!(registry.drop_session("live", |_| cleaned = true).is_err());
+    assert!(registry.get(&id).is_some());
+    assert!(!cleaned);
+}
+
+/// The work a drop, a disposal or a rename runs for its name-keyed state happens while the
+/// registry's lock is held: a new holder of the name cannot appear in between. Each closure
+/// starts a thread that claims the name, and that claim must not complete until the closure
+/// has returned — run after the lock, it completed at once, inside the closure.
+#[test]
+fn name_keyed_cleanup_runs_before_a_new_holder_can_claim_the_name() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    /// Start a claim of `name` from another thread and report whether it completed within a
+    /// window — returning, not asserting: the closure this runs in is contained, and an assert
+    /// failing inside it would be swallowed. The receiver is returned so the caller can see
+    /// the claim complete once the lock is released (the thread was alive, not just slow).
+    fn start_claim(
+        registry: &Arc<SessionRegistry>,
+        name: &'static str,
+    ) -> (bool, mpsc::Receiver<()>) {
+        let (tx, rx) = mpsc::channel();
+        let registry = registry.clone();
+        std::thread::spawn(move || {
+            let _ = registry.claim_named(name);
+            let _ = tx.send(());
+        });
+        let completed_during = rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        (completed_during, rx)
+    }
+
+    fn assert_waited(probe: Option<(bool, mpsc::Receiver<()>)>, what: &str) {
+        let (completed_during, rx) = probe.unwrap_or_else(|| panic!("{what}: cleanup never ran"));
+        assert!(
+            !completed_during,
+            "{what}: a new holder claimed the name while the cleanup ran"
+        );
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what}: the claim never completed after the lock"));
+    }
+
+    let registry = Arc::new(SessionRegistry::new());
+
+    let id = registry.create_named("dropped").unwrap();
+    registry.disconnect(&id);
+    let mut probe = None;
+    registry
+        .drop_session("dropped", |_| {
+            probe = Some(start_claim(&registry, "dropped"))
+        })
+        .unwrap();
+    assert_waited(probe, "drop");
+
+    let id = registry.create_named("expired").unwrap();
+    registry.disconnect(&id);
+    let mut probe = None;
+    let outcome = registry.dispose_if_expired(&id, Duration::ZERO, || {
+        probe = Some(start_claim(&registry, "expired"))
+    });
+    assert_eq!(outcome, DisposeOutcome::Disposed);
+    assert_waited(probe, "disposal");
+
+    let id = registry.create_named("renamer").unwrap();
+    let mut probe = None;
+    registry
+        .rename(&id, "renamed", |_, _| {
+            probe = Some(start_claim(&registry, "renamer"))
+        })
+        .unwrap();
+    assert_waited(probe, "rename");
+}
+
+/// A panic in that work is contained on every path that runs it: the registry's lock is not
+/// poisoned, and the daemon — every connection and every domain's ingest reads it — keeps
+/// working.
+#[test]
+fn a_panic_in_name_keyed_cleanup_leaves_the_registry_usable() {
+    let registry = SessionRegistry::new();
+    let works = |label: &str| {
+        let id = registry
+            .create_named(&format!("after-{label}"))
+            .unwrap_or_else(|e| panic!("{label}: the registry no longer works: {e}"));
+        assert!(registry.get(&id).is_some());
+    };
+
+    let id = registry.create_named("dropped").unwrap();
+    registry.disconnect(&id);
+    let _ = registry.drop_session("dropped", |_| panic!("a leaf lock was poisoned"));
+    works("drop");
+
+    let _ = registry.drop_session("never-was", |_| panic!("a leaf lock was poisoned"));
+    works("not-found-drop");
+
+    let id = registry.create_named("expired").unwrap();
+    registry.disconnect(&id);
+    let _ = registry.dispose_if_expired(&id, std::time::Duration::ZERO, || {
+        panic!("a leaf lock was poisoned")
+    });
+    works("disposal");
+
+    let id = registry.create_named("renamer").unwrap();
+    let _ = registry.rename(&id, "renamed", |_, _| panic!("a leaf lock was poisoned"));
+    works("rename");
+}
+
+/// A named session may not take a name a live anonymous session holds as its id: both
+/// stringify the same, and bookmarks are keyed by that string — so they would share bookmarks,
+/// and the anonymous session's disconnect would wipe the named one's.
+#[test]
+fn a_named_session_cannot_take_a_live_anonymous_id() {
+    let registry = SessionRegistry::new();
+    let anon = registry.create_anonymous();
+    let uuid = anon.to_string();
+    assert!(matches!(
+        registry.claim_named(&uuid),
+        Err(SessionError::AlreadyConnected(_))
+    ));
+    assert!(matches!(
+        registry.create_named(&uuid),
+        Err(SessionError::AlreadyConnected(_))
+    ));
+    let named = registry.create_named("someone").unwrap();
+    assert!(matches!(
+        registry.rename(&named, &uuid, |_, _| {}),
+        Err(SessionError::AlreadyConnected(_))
+    ));
+    // The anonymous session itself may take its own id as a name.
+    let (renamed, _) = registry.rename(&anon, &uuid, |_, _| {}).unwrap();
+    assert_eq!(renamed, SessionId::Named(uuid));
+}
+
+/// `claim_named` creates, takes over a disconnected session, or refuses a connected one — in
+/// one step, so no disposal can land between "exists" and "take over".
+#[test]
+fn claiming_a_name_creates_resumes_or_refuses() {
+    let registry = SessionRegistry::new();
+    let (id, is_new) = registry.claim_named("lane").unwrap();
+    assert!(is_new);
+    assert!(matches!(
+        registry.claim_named("lane"),
+        Err(SessionError::AlreadyConnected(_))
+    ));
+    registry.disconnect(&id);
+    let (again, is_new) = registry.claim_named("lane").unwrap();
+    assert_eq!(again, id);
+    assert!(!is_new);
+    assert!(registry.is_connected(&id));
+}
+
+/// Two `session.start`s for one disconnected name: exactly one gets the session. The claim
+/// was a load and then a store under a READ lock, so both could pass the load and both own
+/// it. Raced from barrier-released threads, many rounds.
+#[test]
+fn concurrent_reconnects_to_one_name_admit_exactly_one() {
+    use std::sync::{Arc, Barrier};
+    const THREADS: usize = 8;
+    let registry = Arc::new(SessionRegistry::new());
+    let id = registry.create_named("contested").unwrap();
+    for round in 0..500 {
+        registry.disconnect(&id);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let winners: usize = (0..THREADS)
+            .map(|_| {
+                let (registry, barrier, id) = (registry.clone(), barrier.clone(), id.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.reconnect(&id).is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum();
+        assert_eq!(
+            winners, 1,
+            "round {round}: {winners} connections own one session"
+        );
+    }
 }
 
 #[test]
@@ -251,7 +442,10 @@ fn ttl_predicate_spares_connected_and_dispose_removes() {
         "a connected session must NEVER expire: {expired:?}"
     );
 
-    registry.dispose(&dead);
+    assert_eq!(
+        registry.dispose_if_expired(&dead, std::time::Duration::ZERO, || {}),
+        DisposeOutcome::Disposed
+    );
     let expired = registry.expired_disconnected(std::time::Duration::ZERO);
     assert!(
         expired.is_empty(),

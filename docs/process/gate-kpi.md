@@ -36,6 +36,7 @@ process skipped.
 | 2026-08-02/03 | `logs.fields` | T2 | *skipped — see note* | ≈70 | — | 0 | 1 | — |
 | 2026-08-03 | `logs.profile` | T2 | ≈90 | ≈84 | ≈6 | 0 | 2 | ~1.6M |
 | 2026-10-03/04 | seq-ordered log ring (+ `traces.logs` perf) | T2 | *not recorded* | ≈105 | ≈13 | *pending* | 2 | ~3.1M |
+| 2026-10-04 | open-issue batch: cursor late records (#23) + #21 #24 #25 #27 #28 #29 | T2 (#23) / T1 | ≈38 | ≈62 + 9 re-gates (see note) | ≈1 | *pending* | 2 | ~2.5M + ~6.5M re-gates |
 
 **Seeded 2026-08-03 from `retro-log.md` entries.** Rows before `logs.profile`
 are reconstructed from those entries and are marked where a number cannot be
@@ -44,6 +45,33 @@ defended — the case-documents design gate ran before this ledger existed, and
 
 ### Notes on the rows
 
+- **open-issue batch (#23 + six T1 fixes)**: DG ≈38 is the one fresh-eyes pass on the cursor
+  spec — two S3 (its main verification test passed against the bug it was for, because the
+  cursor had not read past the record before it was stored late; and the store decided the
+  commit before the handler truncated, losing a record), plus four S2. IG ≈62 is three lenses
+  on the frozen diff. Its one S3 was a DESIGN miss the design gate also missed — a "from now"
+  cursor took records that arrived BEFORE it, because the spec's sufficiency argument covered
+  records the cursor had read past and never records it had never had; the fix is a creation
+  floor. Two lenses converged independently on six findings; all six were real. The mutation
+  lens added ~28 of test-plan gaps (14 proved by probes). SG ≈1: the dropped-commit guard.
+  Unexplained and recorded: one control run hung 9 minutes on a test-client call that the
+  daemon never answered; 50 reruns did not reproduce it. The harness now fails such a call
+  with its reason instead of waiting, so a recurrence reports itself.
+- **open-issue batch, the re-gates**: IG ≈62 is the first gate only. Nine re-gates of the fix
+  sets followed (two lenses each, the last a single lens on the final delta), and rounds 1-7
+  each found real defects, the worst of a round usually one the PREVIOUS round's fix had
+  introduced — an anonymous session's bookmarks wiped by a drop keyed on its id; a panic in
+  name-keyed cleanup poisoning the session lock; file I/O under the session lock; a
+  check-then-unlink race on collector files; a write stamped when it finished, not when it
+  found its collector; a 128-connection GELF TCP cap that 128 idle sockets locked out; oversize
+  drops merged into a counter whose protocol doc forbids it; a snapshot reported filed after
+  its collector was removed. Rounds 8 and 9 found no high defect and no medium one in
+  production code — test strength, claims in my own commit messages, and adjacent pre-existing
+  defects (fixed). The per-round severities were not tallied as the rounds ran, so the
+  re-gates are not weighted here: recorded as nine non-empty rounds rather than a number that
+  would claim a measurement not taken. Cost: rounds 7-9 measured at ≈0.70M / 0.73M / 0.72M
+  subagent tokens; rounds 1-6 estimated at the same rate. The re-gates cost more than twice
+  the first gate — see retro-log.md for what that says about building mechanisms under review.
 - **seq-ordered log ring**: IG counts the deep gate plus the re-gates of its fixes,
   because two of the re-gates' worst findings were defects the FIXES introduced — an
   S3 (a clear raised the loss floor to the counter, so spans' seqs read as lost logs)

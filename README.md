@@ -108,6 +108,8 @@ logmon-broker install-service --scope user
 
 This registers a launchd agent on macOS or a systemd user unit on Linux. The broker starts at login and restarts on crash. To remove it: `logmon-broker uninstall-service --scope user`.
 
+If the broker keeps restarting, the reason is in the config directory: `daemon.log.<date>` (a line starting `logmon daemon failed:`), or, for a failure before that log exists, its stderr — `~/.config/logmon/daemon.stderr.log` for a launchd user agent, `/var/log/logmon-broker.stderr.log` for a system install, and the journal on Linux (`journalctl --user -u logmon-broker` for a user install, `journalctl -u logmon-broker` for a system one).
+
 If you skip this, the MCP shim auto-starts the broker the first time a client connects.
 
 ### Wire up your AI assistant
@@ -436,7 +438,7 @@ Full guide: [Provenance and case documents](#provenance-and-case-documents).
 |---|---|
 | `get_sessions` / `drop_session` | Multi-session inspection. |
 | `rename_session` | Rename this session in place — all state (domain binding, triggers, filters, bookmarks, collectors) survives. A name held by a *connected* session errors (deliberate: two live clients must not share an identity); a *disconnected* holder is displaced (reported via `displaced_stale_holder`). |
-| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. Also **`broker_version`** and **`broker_tools`** — the tools this broker serves, which is what your client registered from. See [Reinstalling](#reinstalling-after-a-change). |
+| `get_status` | Daemon uptime, receivers, store stats, per-source drop counts, **`gelf_tcp_oversize_dropped`** (GELF TCP messages over the 64 KB limit — a different problem from a drop, see [Backpressure](#backpressure)), **`trace_ingest`** (trace-transport loss before any collector saw it — see [Backpressure](#backpressure); its `dropped` is a repeat of two `receiver_drops` fields, so don't sum them), current domain + active filters, and per-listener `receiver_liveness`. Also **`broker_version`** and **`broker_tools`** — the tools this broker serves, which is what your client registered from. See [Reinstalling](#reinstalling-after-a-change). |
 | `list_domains` / `create_domain` / `delete_domain` | Manage isolated domains (each with its own receivers, buffers, triggers). `list_domains` also reports per-domain liveness (last received / idle / stale) and `bound_sessions` — which sessions are bound to each domain (derived from the session registry; disconnected holders are suffixed). |
 | `use_domain` | Bind this session to a domain for subsequent queries + notifications. |
 | `clear_domain` | Dispose the bound domain's logs + spans (keeps the domain alive). |
@@ -517,7 +519,7 @@ get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 ```
 
-When a `c>=` qualifier is present, results come back oldest-first within the cursor's window so paginated polls drain monotonically.
+When a `c>=` qualifier is present, results come back oldest-first, and a cursor returns every stored record exactly once. A trigger stores its pre-window *late* — records a filter had kept out, older than records already stored — so a cursor that already read past them gets them on its next read, counted in `cursor_late`; late records that left the buffer before any read could see them are counted in `cursor_late_lost`.
 
 `c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Other query methods reject it because their results aren't seq-streamable.
 
@@ -995,7 +997,8 @@ Config and state live in `~/.config/logmon/` on both macOS and Linux:
 | `domain_data/` | The per-domain provenance registry, one file per domain, off the ingest path. |
 | `logmon.sock` | The JSON-RPC Unix domain socket. |
 | `daemon.pid` | PID file. |
-| `daemon.log` | Broker log output. |
+| `daemon.log.<date>` | Broker log output, one file per day. A startup failure is logged here as `logmon daemon failed: …`. |
+| `daemon.stderr.log` | The broker's stderr under the launchd service: what happens before `daemon.log` exists (an unreadable `config.json`), and panics. |
 
 Case documents are **not** here — `create_case` writes them to the absolute `dir` you
 name, because they belong beside the project they are evidence about.
@@ -1070,13 +1073,29 @@ A noisy producer should slow itself down, not take the broker down. Concretely:
 - GELF UDP sets `SO_RCVBUF` to **8 MB** so a slow consumer has a sizeable OS-side cushion before datagrams start falling on the floor.
 - OTLP gRPC and OTLP HTTP both check channel fill before consuming a payload. At **≥ 80% full**, gRPC returns `UNAVAILABLE` and HTTP returns `429`. The producer is expected to retry with backoff. The protocol-level rejection *is* the backpressure signal — per-source drop counters aren't bumped, because nothing was silently dropped.
 - Per-source drop counts surface in `status.get` under `receiver_drops` (`gelf_udp`, `gelf_tcp`, `otlp_http_logs`, `otlp_http_traces`, `otlp_grpc_logs`, `otlp_grpc_traces`). Healthy operation keeps all six at zero.
+- A GELF TCP message over 64 KB is dropped at the receiver and counted separately, under `gelf_tcp_oversize_dropped` — not a drop in the sense above: the sender's message was too big, the broker was not behind. The connection carries on with the next message.
 - Trace-transport loss surfaces separately under `trace_ingest` (`dropped`, `shed_batches`, `malformed_dropped`) — spans lost before any collector saw them, so non-zero means every span-derived figure is a lower bound. `shed_batches` counts request **bodies** refused with 429/UNAVAILABLE, not spans: the bodies were never parsed, so how many spans they held is unknowable. **`dropped` is not a separate quantity** — it is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, reported again so the three trace figures read as one block, so **adding it to those two double-counts**.
 
 If you're seeing nonzero **drops**, the broker is the bottleneck — bump `buffer_size` /
 `span_buffer_size`, or check whether a runaway producer is genuinely outpacing the consumer.
 That remedy is for channel-full drops only: a `shed_batches` count means the producer was
-told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
-unusable trace id) — no buffer size changes either.
+told to back off and should retry, a `malformed_dropped` span was refused for cause (an
+unusable trace id), and a `gelf_tcp_oversize_dropped` message was too big for the input (the
+sender has to send smaller messages) — no buffer size changes any of them.
+
+**Memory.** The log and span stores are bounded by record COUNT (`buffer_size`,
+`span_buffer_size`), not by bytes, and so are the two ingest channels in front of each domain's
+stores (logs and spans, 65,536 entries each, whatever the buffer sizes): what they hold is that
+count times the size of the records that arrive. A GELF message is at most 64 KB on the wire on
+either transport (a UDP datagram's limit; the TCP input drops a longer message, counts it in
+`gelf_tcp_oversize_dropped`, and carries on with the next one). In memory a parsed record can be
+much larger than its wire size — a message made of many small fields can take ten times as much
+or more — and OTLP records are bounded only by the request-size limits of the HTTP and gRPC
+libraries the OTLP receivers are built on (their defaults: about 2 MB per HTTP request and 4 MB
+per gRPC message; logmon does not set them), which are larger. So size buffers for the records
+you actually send, and keep the ingest ports off networks you do not trust: they take no
+authentication, any sender can make every record as large as those limits allow, and a sender
+that holds enough connections open can exhaust the broker's file descriptors.
 
 ## Reinstalling after a change
 

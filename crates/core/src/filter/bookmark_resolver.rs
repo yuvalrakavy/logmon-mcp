@@ -16,8 +16,8 @@ pub enum BookmarkResolutionError {
 /// has been replaced with the corresponding internal `SeqFilter`). When the
 /// input contained at least one `CursorFilter`, `cursor_commit` carries the
 /// commit handle returned by `BookmarkStore::cursor_read_and_advance` — the
-/// caller is expected to invoke `commit_handle.commit(max_seq)` after the
-/// lock-free query phase to advance the cursor. A filter never contains more
+/// caller is expected to commit the advance for what its read kept, after the
+/// lock-free query phase. A filter never contains more
 /// than one `CursorFilter` (parser-enforced — see `parser.rs:495`), so a
 /// single `Option<CursorCommit>` is sufficient.
 #[derive(Debug)]
@@ -39,12 +39,23 @@ pub struct ResolvedFilter {
 ///   silently corrupt that session's read state. For same-session cursors the
 ///   resolver calls `BookmarkStore::cursor_read_and_advance` to obtain the
 ///   current lower bound (auto-creating at seq=0 if absent) and a commit
-///   handle, emits a `Qualifier::SeqFilter { op: Gt, value: lower }`, and
+///   handle, emits a `Qualifier::CursorSeq { after: lower }`, and
 ///   captures the commit handle on the returned `ResolvedFilter`.
 pub fn resolve_bookmarks(
     filter: ParsedFilter,
     store: &BookmarkStore,
     current_session: &str,
+) -> Result<ResolvedFilter, BookmarkResolutionError> {
+    resolve_bookmarks_at(filter, store, current_session, 0)
+}
+
+/// [`resolve_bookmarks`], with the log store's late counter for a cursor this resolution
+/// auto-creates (`BookmarkStore::cursor_read_and_advance_at`).
+pub fn resolve_bookmarks_at(
+    filter: ParsedFilter,
+    store: &BookmarkStore,
+    current_session: &str,
+    late_counter: u64,
 ) -> Result<ResolvedFilter, BookmarkResolutionError> {
     let qs = match filter {
         ParsedFilter::All | ParsedFilter::None => {
@@ -82,11 +93,11 @@ pub fn resolve_bookmarks(
                         qualified,
                     ));
                 }
-                let (lower, commit) = store.cursor_read_and_advance(target_session, target_name);
-                out.push(Qualifier::SeqFilter {
-                    op: SeqOp::Gt,
-                    value: lower,
-                });
+                let (lower, commit) =
+                    store.cursor_read_and_advance_at(target_session, target_name, late_counter);
+                // Its own variant, not `SeqFilter { Gt }`: a cursor read must tell its bound
+                // apart from an explicit `from_seq` (see `Qualifier::CursorSeq`).
+                out.push(Qualifier::CursorSeq { after: lower });
                 cursor_commit = Some(commit);
             }
             other => out.push(other),
@@ -206,18 +217,12 @@ mod tests {
     }
 
     #[test]
-    fn resolves_cursor_qualifier_to_seq_filter_with_auto_create() {
+    fn resolves_cursor_qualifier_to_cursor_seq_with_auto_create() {
         let store = BookmarkStore::new();
         let filter = parse_filter("c>=mycur").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved.filter {
-            assert!(matches!(
-                qs[0],
-                Qualifier::SeqFilter {
-                    op: SeqOp::Gt,
-                    value: 0
-                }
-            ));
+            assert!(matches!(qs[0], Qualifier::CursorSeq { after: 0 }));
         } else {
             panic!("expected qualifiers");
         }
@@ -242,13 +247,7 @@ mod tests {
         let filter = parse_filter("c>=existing").unwrap();
         let resolved = resolve_bookmarks(filter, &store, "A").unwrap();
         if let ParsedFilter::Qualifiers(qs) = resolved.filter {
-            assert!(matches!(
-                qs[0],
-                Qualifier::SeqFilter {
-                    op: SeqOp::Gt,
-                    value: 100
-                }
-            ));
+            assert!(matches!(qs[0], Qualifier::CursorSeq { after: 100 }));
         } else {
             panic!("expected qualifiers");
         }

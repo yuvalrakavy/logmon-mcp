@@ -24,8 +24,10 @@ use crate::receiver::TraceIngestLoss;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::{PathRow, ProfileSampled};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Bumped only when a change cannot be expressed additively. A file whose
 /// version this build does not know is quarantined rather than guessed at.
@@ -373,29 +375,118 @@ impl PersistedSnapshot {
     }
 }
 
-/// Where a collector's file lives. The name is validated at `collectors.add`
-/// to `[A-Za-z0-9_-]`, which is what makes this safe to build by
-/// concatenation.
+/// Where a collector's file lives: `{owner}.{name}.json`, each part [`encode`]d.
+///
+/// Owner and name both reach the filename, so two sessions may each hold a collector called
+/// `perf` without colliding on disk — and no two collectors share a file, even on a
+/// case-insensitive filesystem (the macOS default). It was `{owner}__{name}.json`, and both
+/// parts may contain `_`: owner `a__b` with collector `c` and owner `a` with collector `b__c`
+/// wrote one file, each overwriting the other's definition and history. `.` never appears
+/// inside an encoded part, so it cannot be confused with the separator.
+///
+/// Names have no length limit, and a filesystem name does (255 bytes, with `atomic_write`'s
+/// temp suffix on top). A name whose encoding would come near it is shortened to readable
+/// prefixes plus a hash of the exact names — `{owner prefix}.{name prefix}.{hash}.json`, which
+/// has one more part than any full name and so cannot equal one.
 pub fn collector_path(dir: &Path, owner: &str, name: &str) -> PathBuf {
-    // Owner and name both reach the filename, so two sessions may each hold a
-    // collector called `perf` without colliding on disk.
-    dir.join(COLLECTORS_DIR)
-        .join(format!("{}__{}.json", sanitize(owner), name))
+    let (owner_enc, name_enc) = (encode(owner), encode(name));
+    let full_len = owner_enc.len() + ".".len() + name_enc.len() + ".json".len();
+    let file = if full_len <= MAX_FULL_NAME {
+        format!("{owner_enc}.{name_enc}.json")
+    } else {
+        let hash = fnv1a64(owner.bytes().chain([0xFF]).chain(name.bytes()));
+        format!(
+            "{}.{}.{hash:016x}.json",
+            &owner_enc[..owner_enc.len().min(PREFIX)],
+            &name_enc[..name_enc.len().min(PREFIX)]
+        )
+    };
+    dir.join(COLLECTORS_DIR).join(file)
 }
 
-/// Session names are `[A-Za-z0-9_-]` by the same rule as collector names, but
-/// they arrive from a wider surface (anonymous ids are UUIDs), so anything
-/// unexpected is folded to `_` rather than trusted into a path.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// The longest `{owner}.{name}.json` used as is — leaving room under the 255-byte filename limit
+/// for `atomic_write`'s temp suffix and the migration's staging suffix.
+const MAX_FULL_NAME: usize = 200;
+/// How much of each encoded part a shortened name keeps.
+const PREFIX: usize = 80;
+
+/// FNV-1a, 64-bit: fixed by definition, so a name shortened by one build is found by the next
+/// (std's `DefaultHasher` makes no such promise). `0xFF` separates owner from name — it never
+/// occurs in UTF-8.
+fn fnv1a64(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Keep `[a-z0-9_-]`; write an uppercase letter as `^` and the letter in lowercase; write every
+/// other byte as `%XX` (uppercase hex) — `%` and `^` included. One-to-one, and still one-to-one
+/// once a case-insensitive filesystem folds case: names are case-sensitive, so `Perf` and
+/// `perf` are two collectors, and with the letters kept they were one file on macOS. (No letter
+/// in the output is uppercase except a hex digit after `%`, and `%` only ever starts one.)
+/// Lowercase names stay readable; nothing unexpected (an anonymous id from a wider surface, a
+/// `..`) is ever trusted into a path.
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' {
+            out.push(b as char);
+        } else if b.is_ascii_uppercase() {
+            out.push('^');
+            out.push(b.to_ascii_lowercase() as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `path` with `suffix` appended to its file name, on the OS string — a hand-placed file whose
+/// name is not UTF-8 keeps it.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Move `path` aside as `<path>.<suffix>` — or `<path>.<suffix>.N` for the first `N` not taken,
+/// so an earlier set-aside copy is never overwritten. Returns where it went, or `None` if the
+/// move failed (the file is then left where it was).
+fn set_aside(path: &Path, suffix: &str) -> Option<PathBuf> {
+    let first = with_suffix(path, &format!(".{suffix}"));
+    let mut candidate = first.clone();
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = with_suffix(&first, &format!(".{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &candidate).ok().map(|_| candidate)
+}
+
+/// Where a file is staged on its way to its canonical name — still a `.json`, so a crash
+/// between the two moves leaves a file the next boot reads like any other copy. It cannot equal
+/// a canonical name: a full one is `{owner}.{name}.json`, a shortened one has a 16-hex-digit
+/// third part, and a staging name's next-to-last part is `moving` (never hex, and never inside
+/// an encoded part, which has no `.`).
+fn staging_path(canonical: &Path) -> PathBuf {
+    canonical.with_extension("moving.json")
+}
+
+/// `rename`, refusing to replace anything at `to`. POSIX `rename` silently replaces its target,
+/// and every target in a migration is a name some other file may hold (one placed by hand, or
+/// left by an earlier failed move); replacing it would destroy that file. Checked then renamed:
+/// the migration runs at boot, before anything else writes this directory.
+fn rename_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is taken", to.display()),
+        ));
+    }
+    std::fs::rename(from, to)
 }
 
 pub fn save(dir: &Path, file: &PersistedCollector) -> anyhow::Result<()> {
@@ -415,36 +506,129 @@ pub struct LoadOutcome {
     /// build cannot parse may be readable by the next one, and is in any case
     /// the only record of the runs it held.
     pub quarantined: Vec<(PathBuf, String)>,
+    /// Readable files set aside because a newer copy of the same collector won — never
+    /// deleted either.
+    pub superseded: Vec<(PathBuf, String)>,
 }
 
 pub fn load_all(dir: &Path) -> LoadOutcome {
-    let mut collectors = Vec::new();
-    let mut quarantined = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir.join(COLLECTORS_DIR)) else {
-        return LoadOutcome {
-            collectors,
-            quarantined,
-        };
+    let mut out = LoadOutcome {
+        collectors: Vec::new(),
+        quarantined: Vec::new(),
+        superseded: Vec::new(),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    let Ok(entries) = std::fs::read_dir(dir.join(COLLECTORS_DIR)) else {
+        return out;
+    };
+    // Listed up front: files are renamed below, and a directory read while it changes may or
+    // may not show the new names — which could load one collector twice.
+    let paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    let mut by_collector: HashMap<(String, String), Vec<FileCopy>> = HashMap::new();
+    for path in paths {
         match read_one(&path) {
-            Ok(c) => collectors.push(c),
-            Err(reason) => {
-                let moved = path.with_extension("json.corrupt");
-                let _ = std::fs::rename(&path, &moved);
-                quarantined.push((moved, reason));
+            Ok(c) => {
+                let modified = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                by_collector
+                    .entry((c.owner.clone(), c.name.clone()))
+                    .or_default()
+                    .push((path, modified, c));
+            }
+            Err(reason) => match set_aside(&path, "corrupt") {
+                Some(moved) => out.quarantined.push((moved, reason)),
+                None => out
+                    .quarantined
+                    .push((path, format!("{reason} (and it could not be moved aside)"))),
+            },
+        }
+    }
+    // Each collector's file belongs at its canonical path. A file elsewhere was written under
+    // an earlier naming (or moved by hand). Of several copies of one collector — an earlier
+    // naming's file beside the current one, after a downgrade and an upgrade — the most
+    // recently written is the collector, and the others are set aside, never deleted.
+    let mut keys: Vec<_> = by_collector.keys().cloned().collect();
+    keys.sort();
+    let mut winners: Vec<(PathBuf, PathBuf, PersistedCollector)> = Vec::new();
+    let mut losers: Vec<(usize, PathBuf)> = Vec::new();
+    for key in keys {
+        let mut copies = by_collector.remove(&key).expect("listed from the map");
+        let canonical = collector_path(dir, &key.0, &key.1);
+        // Newest first; on a tie, the one already in place, then by path (deterministic).
+        copies.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then((a.0 != canonical).cmp(&(b.0 != canonical)))
+                .then(a.0.cmp(&b.0))
+        });
+        let mut copies = copies.into_iter();
+        let (path, _, c) = copies.next().expect("a group has at least one copy");
+        for (stale, _, _) in copies {
+            match set_aside(&stale, "superseded") {
+                Some(moved) => losers.push((winners.len(), moved)),
+                None => tracing::warn!(path = ?stale,
+                    "could not set aside an older copy of a collector file; left where it is"),
             }
         }
+        winners.push((path, canonical, c));
     }
-    LoadOutcome {
-        collectors,
-        quarantined,
+    // Into place, in two moves: every winner not at its canonical name is first staged, so the
+    // canonical names it needs are free of each other's files (two hand-swapped files block
+    // each other otherwise), then moved in. A canonical name still occupied after that holds
+    // something that is no copy of any readable collector; it is not overwritten, and the
+    // winner goes back where it was.
+    let mut staged: Vec<(usize, PathBuf)> = Vec::new();
+    for (i, (path, canonical, _)) in winners.iter().enumerate() {
+        if path == canonical {
+            continue;
+        }
+        let staging = staging_path(canonical);
+        if *path == staging {
+            // Already staged: a crash between the two moves of an earlier boot.
+            staged.push((i, staging));
+            continue;
+        }
+        match rename_no_clobber(path, &staging) {
+            Ok(()) => staged.push((i, staging)),
+            // Loaded anyway, from where it is; the next boot tries again.
+            Err(e) => tracing::warn!(?path, ?canonical, error = %e,
+                "could not move a collector file to its canonical name"),
+        }
     }
+    let mut final_paths: Vec<PathBuf> = winners.iter().map(|w| w.0.clone()).collect();
+    for (i, staging) in staged {
+        let (original, canonical, _) = &winners[i];
+        if rename_no_clobber(&staging, canonical).is_ok() {
+            final_paths[i] = canonical.clone();
+            continue;
+        }
+        tracing::warn!(path = ?original, ?canonical,
+            "a collector file's canonical name is occupied by something else; left where it was");
+        if rename_no_clobber(&staging, original).is_err() {
+            // Still a `.json`: read like any other copy at the next boot.
+            final_paths[i] = staging;
+        } else {
+            final_paths[i] = original.clone();
+        }
+    }
+    for (i, moved) in losers {
+        out.superseded.push((
+            moved,
+            format!(
+                "a newer copy of the same collector was loaded: {}",
+                final_paths[i].display()
+            ),
+        ));
+    }
+    out.collectors = winners.into_iter().map(|w| w.2).collect();
+    out
 }
+
+/// One readable copy of a collector file: where it is, when it was last written, what it holds.
+type FileCopy = (PathBuf, SystemTime, PersistedCollector);
 
 fn read_one(path: &Path) -> Result<PersistedCollector, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;

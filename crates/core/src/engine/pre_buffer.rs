@@ -1,5 +1,5 @@
 use crate::gelf::message::LogEntry;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 /// The last `capacity` ARRIVALS, minus whatever a trigger has already flushed.
@@ -26,6 +26,12 @@ struct Inner {
     /// later append runs `expire` at capacity 0, so it would outlive any number of arrivals
     /// and come back with the next trigger.
     capacity: usize,
+    /// Each trace's buffered entries, by arrival index, ascending — so a trace's lookup costs
+    /// its own size. It used to scan every entry under this lock on each traced firing, and a
+    /// `pre_window` may now be as large as the log ring itself (gh #29). Kept in step with
+    /// `entries` by every removal: `expire` takes the oldest arrivals (each its trace's
+    /// oldest), `flush` the newest (each its trace's newest).
+    by_trace: HashMap<u128, VecDeque<u64>>,
 }
 
 impl Inner {
@@ -33,7 +39,24 @@ impl Inner {
     fn expire(&mut self, cap: usize) {
         let oldest_kept = self.arrivals.saturating_sub(cap as u64);
         while self.entries.front().is_some_and(|(a, _)| *a < oldest_kept) {
-            self.entries.pop_front();
+            if let Some((_, e)) = self.entries.pop_front() {
+                self.forget(e.trace_id, true);
+            }
+        }
+    }
+
+    /// Drop one entry of `trace_id` from the index: its oldest (`front`) or its newest.
+    fn forget(&mut self, trace_id: Option<u128>, front: bool) {
+        let Some(tid) = trace_id else { return };
+        if let Some(arrivals) = self.by_trace.get_mut(&tid) {
+            if front {
+                arrivals.pop_front();
+            } else {
+                arrivals.pop_back();
+            }
+            if arrivals.is_empty() {
+                self.by_trace.remove(&tid);
+            }
         }
     }
 }
@@ -45,6 +68,7 @@ impl PreTriggerBuffer {
                 entries: VecDeque::new(),
                 arrivals: 0,
                 capacity,
+                by_trace: HashMap::new(),
             }),
         }
     }
@@ -57,6 +81,9 @@ impl PreTriggerBuffer {
         }
         let arrival = inner.arrivals;
         inner.arrivals += 1;
+        if let Some(tid) = entry.trace_id {
+            inner.by_trace.entry(tid).or_default().push_back(arrival);
+        }
         inner.entries.push_back((arrival, entry));
         inner.expire(cap);
     }
@@ -73,6 +100,10 @@ impl PreTriggerBuffer {
         let n = pre_window.min(len);
         // split_off at (len - n) gives us the last n entries
         let tail = inner.entries.split_off(len - n);
+        // The newest arrivals overall, so each is the newest of its own trace.
+        for (_, e) in &tail {
+            inner.forget(e.trace_id, false);
+        }
         tail.into_iter().map(|(_, e)| e).collect()
     }
 
@@ -86,19 +117,44 @@ impl PreTriggerBuffer {
         self.inner.lock().unwrap().entries.len()
     }
 
+    /// The capacity, in arrivals — the largest `pre_window` among the domain's sessions, as
+    /// last resynced.
+    pub fn capacity(&self) -> usize {
+        self.inner.lock().unwrap().capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Return copies of entries matching the given trace_id.
+    /// Return copies of entries matching the given trace_id, oldest arrival first.
+    ///
+    /// Through the trace's own index, each entry found by binary search on its arrival index
+    /// (`entries` is ascending by arrival): O(k log n) for a trace of k entries, not a scan of
+    /// the whole buffer under the lock that every ingested record also takes.
     pub fn entries_by_trace_id(&self, trace_id: u128) -> Vec<LogEntry> {
         let inner = self.inner.lock().unwrap();
-        inner
-            .entries
+        let Some(arrivals) = inner.by_trace.get(&trace_id) else {
+            return Vec::new();
+        };
+        arrivals
             .iter()
-            .filter(|(_, e)| e.trace_id == Some(trace_id))
-            .map(|(_, e)| e.clone())
+            .filter_map(|a| {
+                let i = inner.entries.binary_search_by_key(a, |(x, _)| *x).ok()?;
+                inner.entries.get(i).map(|(_, e)| e.clone())
+            })
             .collect()
+    }
+
+    /// Traces in the index and the arrivals it holds — for the tests that pin the index
+    /// against `entries` (a stale index would hold arrivals `entries` no longer has).
+    #[cfg(test)]
+    fn index_sizes(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        (
+            inner.by_trace.len(),
+            inner.by_trace.values().map(VecDeque::len).sum(),
+        )
     }
 }
 
@@ -152,5 +208,88 @@ mod arrival_window_tests {
             vec![4, 5],
             "the last 3 arrivals are 4-6, 6 drained"
         );
+    }
+}
+
+/// The trace index answers exactly what a scan of the buffer would (gh #29), and holds nothing
+/// the buffer does not — a stale arrival would not change an answer (each one is checked against
+/// `entries`), only leak, so the index's size is pinned separately.
+#[cfg(test)]
+mod trace_index_tests {
+    use super::*;
+    use crate::gelf::message::{Level, LogEntry};
+
+    fn entry(seq: u64, trace: Option<u128>) -> LogEntry {
+        let mut e = LogEntry::synthetic(Level::Info, "m");
+        e.seq = seq;
+        e.trace_id = trace;
+        e
+    }
+
+    /// The pre-index answer: every buffered entry of the trace, by a full scan.
+    fn scan(buf: &PreTriggerBuffer, trace: u128) -> Vec<u64> {
+        let inner = buf.inner.lock().unwrap();
+        inner
+            .entries
+            .iter()
+            .filter(|(_, e)| e.trace_id == Some(trace))
+            .map(|(_, e)| e.seq)
+            .collect()
+    }
+
+    /// `(traces, traced entries)` as the buffer itself holds them.
+    fn held(buf: &PreTriggerBuffer) -> (usize, usize) {
+        let inner = buf.inner.lock().unwrap();
+        let traced: Vec<u128> = inner
+            .entries
+            .iter()
+            .filter_map(|(_, e)| e.trace_id)
+            .collect();
+        let distinct: std::collections::HashSet<u128> = traced.iter().copied().collect();
+        (distinct.len(), traced.len())
+    }
+
+    #[test]
+    fn the_index_matches_a_scan_through_appends_flushes_and_resizes() {
+        let buf = PreTriggerBuffer::new(8);
+        // xorshift: deterministic, so a failure reproduces.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut seq = 0u64;
+        for step in 0..5_000 {
+            match next() % 10 {
+                // Mostly appends, a third of them untraced, over four traces.
+                0..=6 => {
+                    seq += 1;
+                    let t = next() % 6;
+                    buf.append(entry(seq, (t < 4).then_some(t as u128)));
+                }
+                7 | 8 => {
+                    buf.flush((next() % 5) as usize);
+                }
+                _ => buf.resize((next() % 12) as usize),
+            }
+            for t in 0..4u128 {
+                let got: Vec<u64> = buf.entries_by_trace_id(t).iter().map(|e| e.seq).collect();
+                assert_eq!(got, scan(&buf, t), "trace {t} at step {step}");
+            }
+            assert_eq!(buf.index_sizes(), held(&buf), "index size at step {step}");
+        }
+    }
+
+    /// A trace whose entries all left the buffer leaves no key behind.
+    #[test]
+    fn a_trace_whose_entries_left_has_no_index_entry() {
+        let buf = PreTriggerBuffer::new(2);
+        buf.append(entry(1, Some(7)));
+        buf.append(entry(2, None));
+        buf.append(entry(3, None));
+        assert!(buf.entries_by_trace_id(7).is_empty());
+        assert_eq!(buf.index_sizes(), (0, 0));
     }
 }

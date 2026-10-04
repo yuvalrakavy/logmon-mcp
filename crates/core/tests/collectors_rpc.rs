@@ -429,11 +429,14 @@ fn restart_over_at(dir: &std::path::Path, now: chrono::DateTime<chrono::Utc>) ->
     let report = h
         .collectors
         .restore(now, |_| Arc::new(ReceiverMetrics::new()));
+    // Superseded files too: a restart that found two copies of one collector set one aside,
+    // which no restart in these tests should ever produce.
     assert!(
-        report.quarantined.is_empty() && report.rejected.is_empty(),
-        "restore had problems: {:?} {:?}",
+        report.quarantined.is_empty() && report.rejected.is_empty() && report.superseded.is_empty(),
+        "restore had problems: {:?} {:?} {:?}",
         report.quarantined,
-        report.rejected
+        report.rejected,
+        report.superseded
     );
     h
 }
@@ -1203,6 +1206,31 @@ fn a_rename_carries_its_collectors_and_does_not_inherit_a_displaced_session_s() 
         DEFAULT_MAX_SAMPLE_BYTES,
         "exactly one collector's worth reserved"
     );
+}
+
+/// A rename to the session's own name keeps its collectors on disk. Taken through the owner
+/// move, each collector's file was written and then deleted — the same path both times — so
+/// the next restart found none of them.
+#[test]
+fn a_rename_to_the_session_s_own_name_keeps_its_collector_files() {
+    let d = tempfile::TempDir::new().unwrap();
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL" }),
+        )
+        .unwrap();
+        h.call(&sid, "sessions.rename", json!({ "name": "perf" }))
+            .expect("a same-name rename");
+    }
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let report = h
+        .collectors
+        .restore(chrono::Utc::now(), |_| Arc::new(ReceiverMetrics::new()));
+    assert_eq!(report.restored.len(), 1, "{:?}", report.restored);
 }
 
 #[test]

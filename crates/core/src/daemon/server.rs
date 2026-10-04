@@ -7,7 +7,7 @@ use crate::daemon::persistence::{
 use crate::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::daemon::span_processor::spawn_span_processor;
-use crate::daemon::transport::{read_request, write_message};
+use crate::daemon::transport::{write_message, RequestReader};
 use crate::engine::pipeline::{LogPipeline, PipelineEvent};
 use crate::engine::seq_counter::SeqCounter;
 use crate::gelf::message::LogEntry;
@@ -23,9 +23,42 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+/// Failed accepts on the broker's client sockets. Throttled and paced, because one that repeats
+/// — out of file descriptors — came straight back on every retry: a spin at full CPU writing
+/// an ERROR line per turn, while every client waited in the backlog.
+static ACCEPT_ERRORS: crate::throttle::Throttle = crate::throttle::Throttle::new();
+
 /// Notification method name for fired triggers. Underscore form matches
 /// `notifications/<name>` rationalization (vs the legacy dot form).
 const TRIGGER_FIRED_METHOD: &str = "trigger_fired";
+
+/// How long a new connection has to send `session.start`. Every client sends it at once; the
+/// bound is for one that never does, which otherwise held a task and a socket for as long as
+/// it stayed connected.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long one message may take to write to a connection's client. A client that stopped
+/// reading filled its socket, and the write then waited for as long as the client stayed
+/// connected — its session marked connected, so its name was refused to anyone else. Past this
+/// the connection is closed (and its session disconnected) instead. The bound is on the whole
+/// message, so a client still reading, but too slowly to take one message in 30 s, is closed
+/// too; every client here reads on a task of its own, over a local socket.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`write_message`] bounded by [`WRITE_TIMEOUT`] — every write a connection makes goes
+/// through here.
+async fn write_bounded<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, write_message(writer, msg))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "a message to the client did not finish writing within {WRITE_TIMEOUT:?}"
+            )
+        })?
+}
 
 /// Convert an internal [`PipelineEvent`] (engine-side observability struct)
 /// into a wire-shape JSON value matching
@@ -61,6 +94,19 @@ fn send_otel_beacon(message: &str, target: Option<std::net::SocketAddr>) {
             Some(addr) => socket.send_to(message.as_bytes(), addr),
             None => socket.send_to(message.as_bytes(), "239.255.77.1:4399"),
         };
+    }
+}
+
+/// Announce `OTEL:ONLINE` — once the broker can serve, i.e. after its listener is bound, the
+/// last fallible step of startup. Only a broker whose OTLP receiver started announces anything,
+/// and only that one owes `OTEL:OFFLINE` at shutdown (the same `_otlp_receiver.is_some()` gates
+/// both). Default-domain ONLY, by design (consumer #4/§18): the beacon carries no domain/port,
+/// so non-default domains never emit it (see `domain_lifecycle`, which sends none); a producer
+/// targeting a non-default domain uses `create_domain` returning (its OTLP port pre-binds
+/// synchronously) as the readiness signal.
+fn announce_online(otlp_started: bool, target: Option<std::net::SocketAddr>) {
+    if otlp_started {
+        send_otel_beacon("OTEL:ONLINE\n", target);
     }
 }
 
@@ -178,14 +224,43 @@ pub async fn run_with_overrides(
 
     info!("logmon daemon starting");
 
-    // 2a. Refuse a buffer size no domain could allocate — it would otherwise abort the process
-    //     on that domain's first record. After tracing (which binds nothing) so the refusal
-    //     lands in `daemon.log`: under the launchd service stderr goes nowhere, and the agent
-    //     would restart-loop with no trace of why. Still before anything binds or allocates.
-    if let Err(e) = config.validate_buffer_sizes() {
-        error!("refusing to start: {e:#}");
-        return Err(e);
+    // Every error from here on is logged before it propagates, so it lands in `daemon.log`
+    // (gh #28). A service manager restarts a broker that exits, and under launchd stderr went
+    // nowhere, so a broker that could not start — the GELF port taken, another broker already
+    // running, an unreadable state file — restart-looped with no trace of why. A failure BEFORE
+    // this point (the config dir, tracing itself, `load_config` in `main`) still has only
+    // stderr, which the service definitions now capture (`daemon.stderr.log`).
+    let result = run_initialized(
+        config,
+        dir,
+        socket_override,
+        injected_log_rx,
+        shutdown_rx,
+        accept_paused,
+        beacon_target,
+    )
+    .await;
+    if let Err(e) = &result {
+        error!("logmon daemon failed: {e:#}");
     }
+    result
+}
+
+/// [`run_with_overrides`] from the config dir and tracing onward: everything that can fail
+/// once there is a log to say so in.
+async fn run_initialized(
+    config: DaemonConfig,
+    dir: PathBuf,
+    socket_override: Option<PathBuf>,
+    injected_log_rx: Option<mpsc::Receiver<LogEntry>>,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+    accept_paused: Option<Arc<AtomicBool>>,
+    beacon_target: Option<std::net::SocketAddr>,
+) -> anyhow::Result<()> {
+    // 2a. Refuse a buffer size no domain could allocate — it would otherwise abort the process
+    //     on that domain's first record. After tracing (which binds nothing), so the refusal
+    //     is logged by the caller; still before anything binds or allocates.
+    config.validate_buffer_sizes()?;
 
     // 2b. Stale-pid sweep. If a `daemon.pid` exists from a previous run:
     //     - and that pid is alive, refuse to start (someone else owns the
@@ -358,12 +433,10 @@ pub async fn run_with_overrides(
                         let otlp_info = otlp_receiver.listening_on();
                         info!(?otlp_info, "OTLP receiver started");
                         all_receivers_info.extend(otlp_info);
-                        // Default-domain ONLY, by design (consumer #4/§18): the beacon
-                        // carries no domain/port, so non-default domains never emit it
-                        // (see `domain_lifecycle`, which sends none). A producer
-                        // targeting a non-default domain uses `create_domain` returning
-                        // (its OTLP port pre-binds synchronously) as the readiness signal.
-                        send_otel_beacon("OTEL:ONLINE\n", beacon_target);
+                        // `OTEL:ONLINE` is NOT sent here: startup can still fail after this
+                        // point (the pid file, the socket bind), and a broker that announced
+                        // itself and then exited never says `OFFLINE` (gh #27). It goes out
+                        // once the listener is bound — see `announce_online`.
                         Some(otlp_receiver)
                     }
                     Err(e) => {
@@ -604,6 +677,10 @@ pub async fn run_with_overrides(
         for (path, reason) in &report.quarantined {
             warn!(?path, %reason, "collector file moved aside; it could not be read");
         }
+        for (path, reason) in &report.superseded {
+            warn!(?path, %reason,
+                "collector file set aside: another copy of the same collector was newer");
+        }
         for (name, reason) in &report.rejected {
             warn!(%name, %reason, "collector file describes something this build cannot arm");
         }
@@ -611,9 +688,12 @@ pub async fn run_with_overrides(
 
     // 13b. Session TTL sweep (meaningful-session-names spec, 2026-07-17):
     //      a session DISCONNECTED longer than `session_ttl_secs` is disposed —
-    //      its cross-domain bookmarks cleared first, then the registry entry.
-    //      Connected sessions never expire (TTL measures abandonment, not
-    //      lifetime). Keeps unique-per-conversation names from accumulating.
+    //      the registry entry, and under the same lock its bookmarks in every
+    //      domain and its collectors. Re-decided per session at disposal: one
+    //      that reconnected after the listing, or reconnected and left again,
+    //      is no longer abandoned and is left alone. Connected sessions never
+    //      expire (TTL measures abandonment, not lifetime). Keeps
+    //      unique-per-conversation names from accumulating.
     //      Wake: the interval tick. Sleep: `interval.tick().await`.
     {
         let sessions = sessions.clone();
@@ -630,16 +710,23 @@ pub async fn run_with_overrides(
             loop {
                 interval.tick().await;
                 for id in sessions.expired_disconnected(ttl) {
-                    let cleared = handler.clear_session_bookmarks(&id);
-                    // The TTL is what bounds the collector reservation: a named
-                    // session keeps its collectors across a disconnect (that is
-                    // the arm-run-read workflow), so this sweep is the only
-                    // thing that ever hands the budget back.
-                    let collectors = handler.clear_session_collectors(&id);
-                    sessions.dispose(&id);
-                    info!(session = %id, bookmarks_cleared = cleared,
-                        collectors_released = collectors,
-                        "session TTL sweep: disposed (disconnected past TTL)");
+                    use crate::daemon::rpc_handler::ExpiredDisposal;
+                    match handler.dispose_expired_session(&id, ttl) {
+                        ExpiredDisposal::Disposed {
+                            bookmarks,
+                            collectors,
+                        } => {
+                            info!(session = %id, bookmarks_cleared = bookmarks,
+                                collectors_released = collectors,
+                                "session TTL sweep: disposed (disconnected past TTL)");
+                        }
+                        ExpiredDisposal::NotAbandoned => {
+                            info!(session = %id,
+                                "session TTL sweep: kept (active again since it was listed)");
+                        }
+                        // Dropped or displaced since the listing: nothing happened, nothing to say.
+                        ExpiredDisposal::Gone => {}
+                    }
                 }
             }
         });
@@ -678,6 +765,7 @@ pub async fn run_with_overrides(
         let _ = std::fs::remove_file(&socket_path);
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
         info!(?socket_path, "listening on Unix socket");
+        announce_online(_otlp_receiver.is_some(), beacon_target);
 
         // Track spawned connection-handler tasks so we can abort them on
         // shutdown. Without this, the accept loop exits but per-connection
@@ -685,6 +773,7 @@ pub async fn run_with_overrides(
         // after `shutdown_future` resolves, which makes restart-based
         // reconnect testing impossible.
         let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut accept_failures_in_a_row = 0u32;
 
         // Accept loop with override-aware shutdown for graceful termination.
         loop {
@@ -709,6 +798,7 @@ pub async fn run_with_overrides(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            accept_failures_in_a_row = 0;
                             let handler = handler.clone();
                             let domains = domains.clone();
                             let sessions = sessions.clone();
@@ -719,7 +809,13 @@ pub async fn run_with_overrides(
                             });
                         }
                         Err(e) => {
-                            error!("accept error: {e}");
+                            crate::throttle::pace_after_error(
+                                &ACCEPT_ERRORS,
+                                &mut accept_failures_in_a_row,
+                                &e,
+                                |n| error!("accept error ({n} so far): {e}"),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -779,8 +875,10 @@ pub async fn run_with_overrides(
         let _ = socket_override;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:12200").await?;
         info!("listening on TCP 127.0.0.1:12200");
+        announce_online(_otlp_receiver.is_some(), beacon_target);
 
         let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut accept_failures_in_a_row = 0u32;
 
         loop {
             if let Some(p) = accept_paused.as_ref() {
@@ -801,6 +899,7 @@ pub async fn run_with_overrides(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
+                            accept_failures_in_a_row = 0;
                             info!(?addr, "new TCP connection");
                             let handler = handler.clone();
                             let domains = domains.clone();
@@ -812,7 +911,13 @@ pub async fn run_with_overrides(
                             });
                         }
                         Err(e) => {
-                            error!("accept error: {e}");
+                            crate::throttle::pace_after_error(
+                                &ACCEPT_ERRORS,
+                                &mut accept_failures_in_a_row,
+                                &e,
+                                |n| error!("accept error ({n} so far): {e}"),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -871,12 +976,28 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    // One reader for the whole connection, the handshake included: it caps a request line
+    // (`MAX_REQUEST_BYTES`), and the first line used to be read without one — any local client
+    // could stream bytes with no newline until the daemon ran out of memory, before a session
+    // even existed.
+    let mut requests = RequestReader::default();
 
-    // 1. Read first request -- must be session.start
-    let first_request = match read_request(&mut reader).await? {
-        Some(req) => req,
-        None => return Ok(()), // EOF immediately
-    };
+    // 1. Read first request -- must be session.start. Bounded: a client that connects and never
+    //    sends it held this task and its socket for as long as it stayed connected.
+    let first_request =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, requests.next(&mut reader)).await {
+            Ok(read) => match read? {
+                Some(req) => req,
+                None => return Ok(()), // EOF immediately
+            },
+            Err(_) => {
+                warn!(
+                    timeout = ?HANDSHAKE_TIMEOUT,
+                    "a connection sent no session.start in time; closing it"
+                );
+                return Ok(());
+            }
+        };
 
     if first_request.method != "session.start" {
         let resp = RpcResponse::error(
@@ -884,7 +1005,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             -32600,
             "first request must be session.start",
         );
-        write_message(&mut writer, &resp).await?;
+        write_bounded(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -906,7 +1027,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 params.protocol_version, PROTOCOL_VERSION
             ),
         );
-        write_message(&mut writer, &resp).await?;
+        write_bounded(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -917,7 +1038,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         if serialized.len() > 4096 {
             let resp =
                 RpcResponse::error(first_request.id, -32602, "client_info exceeds 4 KB limit");
-            write_message(&mut writer, &resp).await?;
+            write_bounded(&mut writer, &resp).await?;
             return Ok(());
         }
     }
@@ -934,7 +1055,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     -32602,
                     &format!("domain \"{id}\" does not exist — create it first"),
                 );
-                write_message(&mut writer, &resp).await?;
+                write_bounded(&mut writer, &resp).await?;
                 return Ok(());
             }
             Err(e) => {
@@ -943,7 +1064,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     -32602,
                     &format!("invalid domain name: {e}"),
                 );
-                write_message(&mut writer, &resp).await?;
+                write_bounded(&mut writer, &resp).await?;
                 return Ok(());
             }
         },
@@ -952,27 +1073,16 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     // 3. Create/reconnect session
     let (mut session_id, is_new) = match &params.name {
-        Some(name) => {
-            // Try create_named first; if it fails (already exists), try reconnect
-            match sessions.create_named(name) {
-                Ok(id) => (id, true),
-                Err(_) => {
-                    let id = SessionId::Named(name.clone());
-                    match sessions.reconnect(&id) {
-                        Ok(()) => (id, false),
-                        Err(e) => {
-                            let resp = RpcResponse::error(
-                                first_request.id,
-                                -32600,
-                                &format!("session error: {e}"),
-                            );
-                            write_message(&mut writer, &resp).await?;
-                            return Ok(());
-                        }
-                    }
-                }
+        // Create or take over, in one step (`claim_named` says why).
+        Some(name) => match sessions.claim_named(name) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                let resp =
+                    RpcResponse::error(first_request.id, -32600, &format!("session error: {e}"));
+                write_bounded(&mut writer, &resp).await?;
+                return Ok(());
             }
-        }
+        },
         None => {
             let id = sessions.create_anonymous();
             (id, true)
@@ -992,20 +1102,37 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         sessions.set_domain(&session_id, id);
     }
 
+    // From here on the connection owes its session a disconnect, on EVERY exit. The writes
+    // below return through `?` when the client has gone; with the cleanup at the end of the
+    // function they skipped it, leaving a named session `connected` — its name refused until a
+    // broker restart — and an anonymous one never removed, its triggers sizing the pre-trigger
+    // buffer for good. A guard runs it on `?`, `return` and panic alike.
+    let mut cleanup = SessionCleanup {
+        handler: handler.clone(),
+        sessions: sessions.clone(),
+        session_id: session_id.clone(),
+    };
+
+    // The session's own triggers now size its domain's pre-trigger buffer. Nothing re-derived
+    // it here before: a session whose default `pre_window` exceeded the domain's current size
+    // — after the last session left and the buffer shrank to 0, say — got a short pre-window
+    // until some unrelated trigger or filter change resynced it.
+    handler.resync_pre_buffers();
+
     info!(?session_id, is_new, "session started");
 
     // 4. Send session start response
     let mut start_result = handler.build_session_start_result(&session_id);
     start_result.is_new = is_new;
     let resp = RpcResponse::success(first_request.id, serde_json::to_value(&start_result)?);
-    write_message(&mut writer, &resp).await?;
+    write_bounded(&mut writer, &resp).await?;
 
     // 5. Drain queued notifications and send each as RPC notification
     let queued = sessions.drain_notifications(&session_id);
     for event in queued {
         let payload = pipeline_event_to_trigger_fired(&event)?;
         let notification = RpcNotification::new(TRIGGER_FIRED_METHOD, payload);
-        write_message(&mut writer, &notification).await?;
+        write_bounded(&mut writer, &notification).await?;
     }
 
     // 6. Subscribe to the CONNECT-TIME domain's pipeline events for live
@@ -1025,18 +1152,24 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // Tracked so the loop can re-subscribe when the binding changes (§9.4).
     let mut current_domain = connect_domain;
 
-    // 7. Main loop
+    // 7. Main loop. Requests are read through the connection's `RequestReader`: the read races
+    //    the notification branch, and a request half-received when a notification wins must
+    //    survive into the next iteration.
     loop {
         tokio::select! {
-            request_result = read_request(&mut reader) => {
+            request_result = requests.next(&mut reader) => {
                 match request_result {
                     Ok(Some(request)) => {
                         let response = handler.handle_async(&session_id, &request).await;
-                        write_message(&mut writer, &response).await?;
                         // A successful `sessions.rename` re-keyed the registry
                         // entry; this connection must address the session by
                         // its NEW id from here on (event filtering, domain
-                        // lookups, disconnect handling all key off it).
+                        // lookups, disconnect handling all key off it). BEFORE
+                        // the reply is written: the rename has already
+                        // happened, and a write that fails returns through
+                        // `?` — the cleanup would then disconnect the old id,
+                        // which no longer exists, and leave the renamed
+                        // session connected for good.
                         if request.method == "sessions.rename" {
                             if let Some(new_name) = response
                                 .result
@@ -1045,8 +1178,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 .and_then(|v| v.as_str())
                             {
                                 session_id = SessionId::Named(new_name.to_string());
+                                cleanup.session_id = session_id.clone();
                             }
                         }
+                        write_bounded(&mut writer, &response).await?;
                         // §9.4: if the request rebound this session (domains.use),
                         // re-point the event subscription at the newly-bound
                         // domain's channel so live trigger notifications follow
@@ -1083,7 +1218,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             TRIGGER_FIRED_METHOD,
                             payload,
                         );
-                        if let Err(e) = write_message(&mut writer, &notification).await {
+                        if let Err(e) = write_bounded(&mut writer, &notification).await {
                             warn!(?session_id, "write error sending notification: {e}");
                             break;
                         }
@@ -1118,13 +1253,60 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
-    // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via snapshot).
-    // Collectors follow the same rule and for the same reason: an anonymous
-    // session cannot be reconnected to, so anything it armed is unreachable
-    // and its share of the sample reservation is pure leak.
-    if matches!(session_id, SessionId::Anonymous(_)) {
-        let removed = handler.clear_session_bookmarks(&session_id);
-        let collectors = handler.clear_session_collectors(&session_id);
+    // `cleanup` disconnects the session as it drops.
+    Ok(())
+}
+
+/// What a connection owes its session when it ends, run on every exit — see where
+/// `handle_connection` creates it.
+struct SessionCleanup {
+    handler: Arc<RpcHandler>,
+    sessions: Arc<SessionRegistry>,
+    /// The session's CURRENT id: a `sessions.rename` re-keys it.
+    session_id: SessionId,
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        // Unwinding from a handler panic: a lock that panic poisoned would make the cleanup
+        // panic too, and a panic during unwinding aborts the whole process. Tokio contains a
+        // connection's panic to that connection; run the cleanup on a thread of its own so a
+        // poisoned lock fails that thread, not the daemon.
+        // (A plain function on that thread, not another guard: a guard's own `Drop` would run
+        // the cleanup twice, and re-spawn without end if it panicked there.) Spawned through
+        // `Builder`, which reports a refused thread as an error: `thread::spawn` panics on one,
+        // and that panic, here, would be the abort this branch exists to avoid. A poisoned lock
+        // still fails the cleanup on that thread — this keeps the daemon up, it does not make
+        // the cleanup succeed.
+        if std::thread::panicking() {
+            let (handler, sessions, session_id) = (
+                self.handler.clone(),
+                self.sessions.clone(),
+                self.session_id.clone(),
+            );
+            let spawned = std::thread::Builder::new()
+                .name("session-cleanup".into())
+                .spawn(move || disconnect_session(&handler, &sessions, &session_id));
+            if let Err(e) = spawned {
+                error!(session = %self.session_id,
+                    "could not start the cleanup of a panicked connection: {e}");
+            }
+            return;
+        }
+        disconnect_session(&self.handler, &self.sessions, &self.session_id);
+    }
+}
+
+/// [`SessionCleanup`]'s body.
+fn disconnect_session(handler: &RpcHandler, sessions: &SessionRegistry, session_id: &SessionId) {
+    let anonymous = matches!(session_id, SessionId::Anonymous(_));
+    // Drop bookmarks for anonymous sessions; named sessions keep theirs (persisted via
+    // snapshot). Collectors follow the same rule and for the same reason: an anonymous
+    // session cannot be reconnected to, so anything it armed is unreachable and its share
+    // of the sample reservation is pure leak.
+    if anonymous {
+        let removed = handler.clear_session_bookmarks(session_id);
+        let collectors = handler.clear_session_collectors(session_id);
         if removed > 0 || collectors > 0 {
             info!(
                 ?session_id,
@@ -1134,9 +1316,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             );
         }
     }
-
-    // Disconnect session
-    sessions.disconnect(&session_id);
+    sessions.disconnect(session_id);
+    // An anonymous session is REMOVED on disconnect, with its triggers (a named one is kept).
+    if anonymous {
+        handler.resync_pre_buffers();
+    }
     info!(?session_id, "session disconnected");
-    Ok(())
 }
