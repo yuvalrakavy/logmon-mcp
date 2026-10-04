@@ -124,10 +124,16 @@ fn refuse_an_anonymous_id(
 /// every connection for good; the work's own failure — a leaf lock poisoned by some earlier
 /// panic — leaves only what it was clearing behind, and is logged.
 fn run_contained(what: &str, work: impl FnOnce()) {
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        let cause = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a non-string panic".to_string());
         tracing::error!(
-            what,
-            "work under the session registry's lock panicked; contained, so the registry stays usable"
+            what, %cause,
+            "work under the session registry's lock panicked; contained, so the registry stays \
+             usable — what it was moving or clearing may be left partly done"
         );
     }
 }
@@ -405,10 +411,10 @@ impl SessionRegistry {
     ///   invariant firing ("another conversation is working this lane");
     /// - target held by a DISCONNECTED session → the stale holder is DISPLACED
     ///   (disposed) and the rename proceeds — a dead conversation must not
-    ///   lock a lane name forever. The stale holder's `touched_domains` are
-    ///   returned so the caller can clear its bookmarks: bookmark stores key
-    ///   by the session NAME, which the renamed session now inherits — without
-    ///   the sweep it would silently adopt a dead conversation's bookmarks.
+    ///   lock a lane name forever. `transfer` is told so, and clears what the
+    ///   stale holder left under the NAME the renamed session now owns —
+    ///   without that it would silently adopt a dead conversation's bookmarks
+    ///   and collectors.
     /// - renaming to one's own current name is a no-op;
     /// - a name a live ANONYMOUS session holds as its id → `AlreadyConnected` (see
     ///   [`refuse_an_anonymous_id`]).

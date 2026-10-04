@@ -251,7 +251,13 @@ that merely reconnects already counted while disconnected, so nothing changed fo
 - A rename to the session's OWN name deleted every one of its collector files (each was written
   and then deleted at the same path), so the next restart found no collectors. It moves nothing
   now. And a rename removes a collector's old file only once the new one is written: a failed
-  write (a full disk) used to delete the only copy.
+  write (a full disk) used to delete the only copy. Where the renamed session displaced a stale
+  holder with a collector of the same name, and the write fails, the stale holder's file at that
+  name is removed rather than kept: kept, a restart would have restored a dead session's
+  collector under the renamed session's name.
+- Collector files are written and removed under one lock of their own, and a removal first
+  checks that no collector holds the path: a removal that raced a new holder of the name could
+  otherwise delete the file that new holder had just written.
 - The record of evicted cursors — what makes a recreated cursor warn that it lost its place —
   stayed under the old name on a rename (the warning was lost) and outlived a dropped or
   disposed session (a later holder of the name was warned about a cursor it never had). It
@@ -269,19 +275,32 @@ partly received — the SDK and the shim write a request and its newline as two 
 already read were dropped, the rest failed to parse, and the broker closed the connection. A
 request now survives the race: what arrived stays buffered until the line completes.
 
-A request line is also capped now, at 64 MiB: a client that streamed bytes with no newline grew
-the buffer until the broker ran out of memory. A longer line closes the connection with a
-warning.
+Every request line is also capped now, at 64 MiB, the first one (`session.start`) included: a
+client that streamed bytes with no newline grew the buffer until the broker ran out of memory. A
+longer line closes the connection with a warning. And a connection must send `session.start`
+within 30 seconds: one that never did held a task and a socket for as long as it stayed open.
+
+### Fixed — a GELF TCP sender could exhaust the broker's memory
+
+The GELF TCP input read each message up to its NUL terminator with no limit, on a port that
+listens on every interface without authentication — so any host that could reach it could send
+bytes with no NUL and grow the broker's memory until it died. A message is now at most 8 MiB
+(real GELF messages are far smaller: chunked GELF over UDP tops out near 1 MB, and Graylog's own
+TCP input defaults to 2 MB); a longer one closes its connection.
 
 ### Fixed — two collectors could share one file
 
 A collector's file was named `{session}__{name}.json`, and both parts may contain `_`, so
 session `a__b`'s collector `c` and session `a`'s collector `b__c` were one file — each
-overwriting the other's definition and recorded history. Files are now named
-`{session}.{name}.json`, with anything outside `[A-Za-z0-9_-]` percent-encoded, which no two
-collectors can share. Existing files are moved to the new names at the first start; a file that
-duplicates one already at its new name is set aside as `*.json.superseded`, never deleted. (A
-pair that had already collided cannot be recovered: only the last write survived.)
+overwriting the other's definition and recorded history. Names differing only in case (`Perf`,
+`perf`) were one file too on a case-insensitive filesystem, the macOS default. Files are now
+named `{session}.{name}.json`, each part with anything outside `[a-z0-9_-]` percent-encoded —
+uppercase letters included — which no two collectors can share on any filesystem. Existing
+files are moved to the new names at the first start. Where two files hold the same collector
+(an earlier naming's beside the current one), the most recently written is the collector and
+the other is set aside as `*.json.superseded` — never deleted, and never over an earlier
+set-aside copy. A file is never moved onto a name another collector's file holds. (A pair that
+had already collided cannot be recovered: only the last write survived.)
 
 ### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
 

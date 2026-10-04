@@ -115,72 +115,96 @@ fn name_keyed_cleanup_runs_before_a_new_holder_can_claim_the_name() {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
-    fn claim_must_wait(registry: &Arc<SessionRegistry>, name: &'static str) -> mpsc::Receiver<()> {
+    /// Start a claim of `name` from another thread and report whether it completed within a
+    /// window — returning, not asserting: the closure this runs in is contained, and an assert
+    /// failing inside it would be swallowed. The receiver is returned so the caller can see
+    /// the claim complete once the lock is released (the thread was alive, not just slow).
+    fn start_claim(
+        registry: &Arc<SessionRegistry>,
+        name: &'static str,
+    ) -> (bool, mpsc::Receiver<()>) {
         let (tx, rx) = mpsc::channel();
         let registry = registry.clone();
         std::thread::spawn(move || {
             let _ = registry.claim_named(name);
             let _ = tx.send(());
         });
+        let completed_during = rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        (completed_during, rx)
+    }
+
+    fn assert_waited(probe: Option<(bool, mpsc::Receiver<()>)>, what: &str) {
+        let (completed_during, rx) = probe.unwrap_or_else(|| panic!("{what}: cleanup never ran"));
         assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "{name}: a new holder claimed the name while the cleanup ran"
+            !completed_during,
+            "{what}: a new holder claimed the name while the cleanup ran"
         );
-        rx
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{what}: the claim never completed after the lock"));
     }
 
     let registry = Arc::new(SessionRegistry::new());
 
     let id = registry.create_named("dropped").unwrap();
     registry.disconnect(&id);
-    let mut claimed = None;
+    let mut probe = None;
     registry
         .drop_session("dropped", |_| {
-            claimed = Some(claim_must_wait(&registry, "dropped"))
+            probe = Some(start_claim(&registry, "dropped"))
         })
         .unwrap();
-    claimed
-        .unwrap()
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the claim completes once the lock is released");
+    assert_waited(probe, "drop");
 
     let id = registry.create_named("expired").unwrap();
     registry.disconnect(&id);
-    let mut claimed = None;
+    let mut probe = None;
     let outcome = registry.dispose_if_expired(&id, Duration::ZERO, || {
-        claimed = Some(claim_must_wait(&registry, "expired"))
+        probe = Some(start_claim(&registry, "expired"))
     });
     assert_eq!(outcome, DisposeOutcome::Disposed);
-    claimed
-        .unwrap()
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap();
+    assert_waited(probe, "disposal");
 
     let id = registry.create_named("renamer").unwrap();
-    let mut claimed = None;
+    let mut probe = None;
     registry
         .rename(&id, "renamed", |_, _| {
-            claimed = Some(claim_must_wait(&registry, "renamer"))
+            probe = Some(start_claim(&registry, "renamer"))
         })
         .unwrap();
-    claimed
-        .unwrap()
-        .recv_timeout(Duration::from_secs(10))
-        .unwrap();
+    assert_waited(probe, "rename");
 }
 
-/// A panic in that work is contained: the registry's lock is not poisoned, and the daemon —
-/// every connection and every domain's ingest reads it — keeps working.
+/// A panic in that work is contained on every path that runs it: the registry's lock is not
+/// poisoned, and the daemon — every connection and every domain's ingest reads it — keeps
+/// working.
 #[test]
 fn a_panic_in_name_keyed_cleanup_leaves_the_registry_usable() {
     let registry = SessionRegistry::new();
-    let id = registry.create_named("doomed").unwrap();
+    let works = |label: &str| {
+        let id = registry
+            .create_named(&format!("after-{label}"))
+            .unwrap_or_else(|e| panic!("{label}: the registry no longer works: {e}"));
+        assert!(registry.get(&id).is_some());
+    };
+
+    let id = registry.create_named("dropped").unwrap();
     registry.disconnect(&id);
-    let _ = registry.drop_session("doomed", |_| panic!("a leaf lock was poisoned"));
-    let other = registry
-        .create_named("after")
-        .expect("the registry still works");
-    assert!(registry.get(&other).is_some());
+    let _ = registry.drop_session("dropped", |_| panic!("a leaf lock was poisoned"));
+    works("drop");
+
+    let _ = registry.drop_session("never-was", |_| panic!("a leaf lock was poisoned"));
+    works("not-found-drop");
+
+    let id = registry.create_named("expired").unwrap();
+    registry.disconnect(&id);
+    let _ = registry.dispose_if_expired(&id, std::time::Duration::ZERO, || {
+        panic!("a leaf lock was poisoned")
+    });
+    works("disposal");
+
+    let id = registry.create_named("renamer").unwrap();
+    let _ = registry.rename(&id, "renamed", |_, _| panic!("a leaf lock was poisoned"));
+    works("rename");
 }
 
 /// A named session may not take a name a live anonymous session holds as its id: both

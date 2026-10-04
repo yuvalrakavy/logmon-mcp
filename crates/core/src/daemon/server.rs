@@ -7,7 +7,7 @@ use crate::daemon::persistence::{
 use crate::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::daemon::span_processor::spawn_span_processor;
-use crate::daemon::transport::{read_request, write_message, RequestReader};
+use crate::daemon::transport::{write_message, RequestReader};
 use crate::engine::pipeline::{LogPipeline, PipelineEvent};
 use crate::engine::seq_counter::SeqCounter;
 use crate::gelf::message::LogEntry;
@@ -26,6 +26,11 @@ use tracing::{error, info, warn};
 /// Notification method name for fired triggers. Underscore form matches
 /// `notifications/<name>` rationalization (vs the legacy dot form).
 const TRIGGER_FIRED_METHOD: &str = "trigger_fired";
+
+/// How long a new connection has to send `session.start`. Every client sends it at once; the
+/// bound is for one that never does, which otherwise held a task and a socket for as long as
+/// it stayed connected.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Convert an internal [`PipelineEvent`] (engine-side observability struct)
 /// into a wire-shape JSON value matching
@@ -644,6 +649,10 @@ async fn run_initialized(
         for (path, reason) in &report.quarantined {
             warn!(?path, %reason, "collector file moved aside; it could not be read");
         }
+        for (path, reason) in &report.superseded {
+            warn!(?path, %reason,
+                "collector file set aside: another copy of the same collector was newer");
+        }
         for (name, reason) in &report.rejected {
             warn!(%name, %reason, "collector file describes something this build cannot arm");
         }
@@ -923,12 +932,28 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    // One reader for the whole connection, the handshake included: it caps a request line
+    // (`MAX_REQUEST_BYTES`), and the first line used to be read without one — any local client
+    // could stream bytes with no newline until the daemon ran out of memory, before a session
+    // even existed.
+    let mut requests = RequestReader::default();
 
-    // 1. Read first request -- must be session.start
-    let first_request = match read_request(&mut reader).await? {
-        Some(req) => req,
-        None => return Ok(()), // EOF immediately
-    };
+    // 1. Read first request -- must be session.start. Bounded: a client that connects and never
+    //    sends it held this task and its socket for as long as it stayed connected.
+    let first_request =
+        match tokio::time::timeout(HANDSHAKE_TIMEOUT, requests.next(&mut reader)).await {
+            Ok(read) => match read? {
+                Some(req) => req,
+                None => return Ok(()), // EOF immediately
+            },
+            Err(_) => {
+                warn!(
+                    timeout = ?HANDSHAKE_TIMEOUT,
+                    "a connection sent no session.start in time; closing it"
+                );
+                return Ok(());
+            }
+        };
 
     if first_request.method != "session.start" {
         let resp = RpcResponse::error(
@@ -1083,10 +1108,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // Tracked so the loop can re-subscribe when the binding changes (§9.4).
     let mut current_domain = connect_domain;
 
-    // 7. Main loop. Requests are read through a `RequestReader`: the read races the
-    //    notification branch, and a request half-received when a notification wins must
+    // 7. Main loop. Requests are read through the connection's `RequestReader`: the read races
+    //    the notification branch, and a request half-received when a notification wins must
     //    survive into the next iteration.
-    let mut requests = RequestReader::default();
     loop {
         tokio::select! {
             request_result = requests.next(&mut reader) => {

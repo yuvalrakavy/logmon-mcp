@@ -349,29 +349,150 @@ fn a_file_under_the_earlier_naming_is_moved_to_its_canonical_path() {
     );
 }
 
-/// A stray copy beside the canonical file is moved aside, never loaded as a second collector
-/// and never deleted. The canonical file wins whichever the directory lists first.
+/// Set a file's modification time `secs` after an arbitrary fixed point.
+fn touch(path: &Path, secs: u64) {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + secs);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+}
+
+/// Write `description`'s copy of collector `sess/perf` under the earlier naming.
+fn legacy_copy(d: &Path, description: &str) -> PathBuf {
+    let mut f = file_with(vec![]);
+    f.description = Some(description.into());
+    let legacy = d.join(COLLECTORS_DIR).join("sess__perf.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, serde_json::to_vec(&f).unwrap()).unwrap();
+    legacy
+}
+
+/// Of two copies of one collector, the more recently written is the collector — whichever is
+/// at the canonical name — and the other is set aside, never loaded as a second collector and
+/// never deleted. An older copy at the canonical name loses: after a downgrade, the older
+/// build kept writing the earlier name, and that copy holds the newer runs.
 #[test]
-fn a_stray_copy_beside_the_canonical_file_is_moved_aside() {
+fn of_two_copies_of_one_collector_the_newer_wins() {
     let d = tmp();
     save(d.path(), &file_with(vec![])).expect("saved");
-    let mut stray = file_with(vec![]);
-    stray.description = Some("the stray".into());
-    let legacy = d.path().join(COLLECTORS_DIR).join("sess__perf.json");
-    std::fs::write(&legacy, serde_json::to_vec(&stray).unwrap()).unwrap();
+    let canonical = collector_path(d.path(), "sess", "perf");
+    let legacy = legacy_copy(d.path(), "written by an older build since");
+    touch(&canonical, 0);
+    touch(&legacy, 60);
 
     let out = load_all(d.path());
     assert_eq!(out.collectors.len(), 1);
     assert_eq!(
         out.collectors[0].description.as_deref(),
-        Some("the read-through cache"),
-        "the canonical file is the collector"
+        Some("written by an older build since"),
+        "the newer copy is the collector"
     );
-    assert_eq!(out.quarantined.len(), 1, "{:?}", out.quarantined);
-    assert!(out.quarantined[0].1.contains("superseded"));
+    assert_eq!(out.superseded.len(), 1, "{:?}", out.superseded);
+    assert!(out.quarantined.is_empty(), "{:?}", out.quarantined);
+    assert!(!legacy.exists());
     assert!(
-        legacy.with_extension("json.superseded").exists(),
-        "kept, aside"
+        canonical.exists(),
+        "the winner now holds the canonical name"
+    );
+    assert!(out.superseded[0].0.exists(), "the loser is kept, aside");
+}
+
+/// The other way round: an older stray beside a newer canonical file is the one set aside.
+#[test]
+fn an_older_stray_copy_is_set_aside() {
+    let d = tmp();
+    save(d.path(), &file_with(vec![])).expect("saved");
+    let canonical = collector_path(d.path(), "sess", "perf");
+    let legacy = legacy_copy(d.path(), "the stray");
+    touch(&canonical, 60);
+    touch(&legacy, 0);
+
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 1);
+    assert_eq!(
+        out.collectors[0].description.as_deref(),
+        Some("the read-through cache")
+    );
+    assert_eq!(out.superseded.len(), 1, "{:?}", out.superseded);
+    assert!(out.superseded[0].0.exists(), "kept, aside");
+}
+
+/// A copy set aside never overwrites one set aside before it.
+#[test]
+fn setting_a_copy_aside_never_overwrites_an_earlier_one() {
+    let d = tmp();
+    let mut kept = Vec::new();
+    for round in 0..2u64 {
+        save(d.path(), &file_with(vec![])).expect("saved");
+        let canonical = collector_path(d.path(), "sess", "perf");
+        let legacy = legacy_copy(d.path(), &format!("stray {round}"));
+        touch(&canonical, 60);
+        touch(&legacy, 0);
+        let out = load_all(d.path());
+        assert_eq!(out.superseded.len(), 1, "{:?}", out.superseded);
+        kept.push(out.superseded[0].0.clone());
+    }
+    assert_ne!(kept[0], kept[1]);
+    for path in &kept {
+        assert!(path.exists(), "{path:?} survived");
+    }
+}
+
+/// A file under the earlier naming is not moved onto its canonical name when that name holds
+/// a file of ANOTHER collector (put there by hand): this load does not overwrite it.
+#[test]
+fn moving_a_file_into_place_never_overwrites_another_collector() {
+    let d = tmp();
+    let canonical = collector_path(d.path(), "sess", "perf");
+    std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+    let mut other = file_with(vec![]);
+    other.owner = "someone".into();
+    other.name = "else".into();
+    std::fs::write(&canonical, serde_json::to_vec(&other).unwrap()).unwrap();
+    legacy_copy(d.path(), "the sess/perf collector");
+
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 2, "both are loaded");
+    // Whichever moved first, neither file was written over: both collectors are on disk.
+    let mut on_disk: Vec<(String, String)> = std::fs::read_dir(d.path().join(COLLECTORS_DIR))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .map(|e| {
+            let c: PersistedCollector =
+                serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+            (c.owner, c.name)
+        })
+        .collect();
+    on_disk.sort();
+    assert_eq!(
+        on_disk,
+        vec![
+            ("sess".to_string(), "perf".to_string()),
+            ("someone".to_string(), "else".to_string())
+        ]
+    );
+}
+
+/// Names that differ only in case are two collectors and get two files even where the
+/// filesystem folds case (the macOS default) — the letters alone would be one file there.
+#[test]
+fn names_differing_only_in_case_get_two_files_on_any_filesystem() {
+    let d = tmp();
+    let a = collector_path(d.path(), "sess", "Perf");
+    let b = collector_path(d.path(), "sess", "perf");
+    assert_ne!(
+        a.to_string_lossy().to_lowercase(),
+        b.to_string_lossy().to_lowercase()
+    );
+    let c = collector_path(d.path(), "Store-t1", "perf");
+    let e = collector_path(d.path(), "store-t1", "perf");
+    assert_ne!(
+        c.to_string_lossy().to_lowercase(),
+        e.to_string_lossy().to_lowercase()
     );
 }
 

@@ -843,33 +843,35 @@ impl RpcHandler {
         let (new_id, displaced) = self
             .sessions
             .rename(session_id, &req.name, |new_id, displaced| {
-                if displaced {
-                    // The stale holder's bookmarks and collectors are keyed by the NAME the
-                    // renamed session now owns. Left behind, the live session would inherit a
-                    // dead conversation's bookmarks, and its collectors — live window AND
-                    // recorded history — would be readable and removable by whoever took the
-                    // name. Detached BEFORE the renamer's state moves in, which is what keeps
-                    // the renamer's own.
-                    let (bookmarks, collectors, pending) =
-                        self.detach_name_keyed_state(new_id, true);
-                    displaced_cleared = (bookmarks, collectors);
-                    files.absorb(pending);
-                }
+                // The stale holder's bookmarks and collectors are keyed by the NAME the renamed
+                // session now owns. Left behind, the live session would inherit a dead
+                // conversation's bookmarks, and its collectors — live window AND recorded
+                // history — would be readable and removable by whoever took the name. Each is
+                // cleared BEFORE the renamer's own moves in, which is what keeps the renamer's.
+                //
                 // The renaming session keeps its OWN collectors and bookmarks: they move with
                 // it. Left under the old name, the collectors are orphaned — invisible to an
                 // owner-scoped list, unreachable by sessions.drop, never swept, still holding
                 // their share of the reservation — and its cursors auto-create at 0 under the
                 // new name and replay everything they had already returned.
+                //
+                // Collectors before bookmarks: their reservation is the scarce resource, so a
+                // panic in a bookmark step (a lock poisoned earlier) must not strand them.
+                if displaced {
+                    let (_, collectors, pending) = self.detach_name_keyed_state(new_id, false);
+                    displaced_cleared.1 = collectors;
+                    files.absorb(pending);
+                }
                 let (collectors, pending) = self.collectors.move_owner(session_id, new_id);
                 files.absorb(pending);
+                moved.1 = collectors;
                 let (old_key, new_key) = (session_id.to_string(), new_id.to_string());
-                let bookmarks: usize = self
-                    .domains
-                    .list()
-                    .iter()
-                    .map(|d| d.bookmarks.rename_session(&old_key, &new_key))
-                    .sum();
-                moved = (bookmarks, collectors);
+                for d in self.domains.list() {
+                    if displaced {
+                        displaced_cleared.0 += d.bookmarks.clear_session(&new_key);
+                    }
+                    moved.0 += d.bookmarks.rename_session(&old_key, &new_key);
+                }
             })
             .map_err(|e| e.to_string())?;
         self.collectors.finish(files);
@@ -3297,6 +3299,9 @@ impl RpcHandler {
         session_id: &SessionId,
         bookmarks: bool,
     ) -> (usize, usize, crate::collector::registry::PendingFiles) {
+        // Collectors first: their reservation is the scarce resource, so a panic in the
+        // bookmark step (a lock poisoned earlier) must not leave them stranded.
+        let (collectors, files) = self.collectors.detach_session(session_id);
         let cleared = if bookmarks {
             let key = session_id.to_string();
             self.domains
@@ -3307,7 +3312,6 @@ impl RpcHandler {
         } else {
             0
         };
-        let (collectors, files) = self.collectors.detach_session(session_id);
         (cleared, collectors, files)
     }
 

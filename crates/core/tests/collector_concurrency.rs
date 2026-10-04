@@ -58,11 +58,13 @@ fn span(i: usize) -> SpanEntry {
     }
 }
 
-/// Block a writer until `ready()` — the other thread has acted at least twice — so the overlap
-/// a test needs is arranged, not hoped for. Left to the scheduler, a loaded machine ran the four
-/// writers to completion before the other thread got a turn: measured, 12 of 80 runs under 60
-/// CPU burners, every one failing only the overlap guard. Bounded: a thread that never acts
-/// fails the test by name instead of parking it.
+/// Block a writer halfway through its spans until the other thread has acted twice SINCE that
+/// point (`ready` compares against the count read there), so its actions land between this
+/// writer's ingests — the overlap a test needs, arranged rather than hoped for. Left to the
+/// scheduler, a loaded machine ran the four writers to completion before the other thread got a
+/// turn: measured, 12 of 80 runs under 60 CPU burners, every one failing only the overlap guard.
+/// (Waiting on a lifetime count was not enough: the actions could all predate the writers.)
+/// Bounded: a thread that never acts fails the test by name instead of parking it.
 fn wait_for(ready: impl Fn() -> bool, what: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !ready() {
@@ -101,7 +103,11 @@ fn a14_a_reader_never_sees_the_two_tiers_disagree() {
             std::thread::spawn(move || {
                 for i in 0..PER_WRITER {
                     if i == PER_WRITER / 2 {
-                        wait_for(|| reads_done.load(Ordering::Relaxed) >= 2, "the reader");
+                        let seen = reads_done.load(Ordering::Relaxed);
+                        wait_for(
+                            || reads_done.load(Ordering::Relaxed) >= seen + 2,
+                            "the reader",
+                        );
                     }
                     registry.ingest_span(&domain, &span(w * PER_WRITER + i));
                 }
@@ -170,7 +176,11 @@ fn a4_a_reset_during_ingest_takes_everything_or_nothing() {
             std::thread::spawn(move || {
                 for i in 0..PER_WRITER {
                     if i == PER_WRITER / 2 {
-                        wait_for(|| resets_done.load(Ordering::Relaxed) >= 2, "the resetter");
+                        let seen = resets_done.load(Ordering::Relaxed);
+                        wait_for(
+                            || resets_done.load(Ordering::Relaxed) >= seen + 2,
+                            "the resetter",
+                        );
                     }
                     registry.ingest_span(&domain, &span(w * PER_WRITER + i));
                 }
@@ -205,6 +215,10 @@ fn a4_a_reset_during_ingest_takes_everything_or_nothing() {
     stop.store(true, Ordering::Relaxed);
     let (taken_count, taken_ns, resets) = resetter.join().expect("resetter finished");
     assert!(resets > 1, "the resets must have overlapped the writers");
+    assert!(
+        taken_count > 0,
+        "the resets took spans the writers had ingested — they ran between ingests"
+    );
 
     let remaining = registry.get(&owner, "c").unwrap().collector.snapshot();
     let total = WRITERS * PER_WRITER;

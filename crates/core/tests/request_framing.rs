@@ -16,6 +16,37 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(10);
 
+/// The first line — the handshake — is capped like every other: a client streaming bytes with
+/// no newline before `session.start` is disconnected, rather than growing a buffer until the
+/// daemon runs out of memory. (The cap was first applied to the main loop only.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_line_past_the_cap_closes_the_connection() {
+    use logmon_broker_core::daemon::transport::MAX_REQUEST_BYTES;
+    use tokio::io::AsyncReadExt;
+    let daemon = spawn_test_daemon().await;
+    let stream = tokio::net::UnixStream::connect(&daemon.socket_path)
+        .await
+        .expect("connect");
+    let (mut r, mut w) = stream.into_split();
+    let chunk = vec![b'x'; 1 << 20];
+    // Until the daemon hangs up; a little past the cap is all it ever has to read.
+    for _ in 0..(MAX_REQUEST_BYTES >> 20) + 8 {
+        if w.write_all(&chunk).await.is_err() {
+            break;
+        }
+    }
+    // The write half stays open while the read decides: closing it would hand the daemon an
+    // end-of-file, which closes the connection by itself — this test would then pass with no
+    // cap at all.
+    let mut byte = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(20), r.read(&mut byte))
+        .await
+        .expect("the daemon closes the connection")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "closed, not answered");
+    drop(w);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_split_around_a_notification_is_still_answered() {
     let daemon = spawn_test_daemon().await;

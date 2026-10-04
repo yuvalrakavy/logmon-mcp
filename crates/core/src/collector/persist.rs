@@ -24,9 +24,10 @@ use crate::receiver::TraceIngestLoss;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::{PathRow, ProfileSampled};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Bumped only when a change cannot be expressed additively. A file whose
 /// version this build does not know is quarantined rather than guessed at.
@@ -377,30 +378,45 @@ impl PersistedSnapshot {
 /// Where a collector's file lives: `{owner}.{name}.json`, each part [`encode`]d.
 ///
 /// Owner and name both reach the filename, so two sessions may each hold a collector called
-/// `perf` without colliding on disk — and the mapping is one-to-one, so no two collectors share
-/// a file. It was `{owner}__{name}.json`, and both parts may contain `_`: owner `a__b` with
-/// collector `c` and owner `a` with collector `b__c` wrote one file, each overwriting the
-/// other's definition and history. `.` never appears inside an encoded part, so it cannot be
-/// confused with the separator.
+/// `perf` without colliding on disk — and no two collectors share a file, even on a
+/// case-insensitive filesystem (the macOS default). It was `{owner}__{name}.json`, and both
+/// parts may contain `_`: owner `a__b` with collector `c` and owner `a` with collector `b__c`
+/// wrote one file, each overwriting the other's definition and history. `.` never appears
+/// inside an encoded part, so it cannot be confused with the separator.
 pub fn collector_path(dir: &Path, owner: &str, name: &str) -> PathBuf {
     dir.join(COLLECTORS_DIR)
         .join(format!("{}.{}.json", encode(owner), encode(name)))
 }
 
-/// Keep `[A-Za-z0-9_-]`; percent-encode every other byte (`%` included, so the encoding is
-/// one-to-one). Session and collector names are already `[A-Za-z0-9_-]` by validation, so this
-/// is the identity on every real name — it exists so nothing unexpected (an anonymous id from a
-/// wider surface, a `..`) is ever trusted into a path, without folding two names into one.
+/// Keep `[a-z0-9_-]`; percent-encode every other byte as `%XX` (uppercase hex) — `%` itself,
+/// and uppercase letters. One-to-one, and still one-to-one once a case-insensitive filesystem
+/// folds case: names are case-sensitive, so `Perf` and `perf` are two collectors, and with the
+/// letters kept they were one file on macOS. Lowercase names stay readable; nothing unexpected
+/// (an anonymous id from a wider surface, a `..`) is ever trusted into a path.
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
         }
     }
     out
+}
+
+/// Move `path` aside as `<path>.<suffix>` — or `<path>.<suffix>.N` for the first `N` not taken,
+/// so an earlier set-aside copy is never overwritten. Returns where it went, or `None` if the
+/// move failed (the file is then left where it was).
+fn set_aside(path: &Path, suffix: &str) -> Option<PathBuf> {
+    let first = PathBuf::from(format!("{}.{suffix}", path.display()));
+    let mut candidate = first.clone();
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{}.{n}", first.display()));
+        n += 1;
+    }
+    std::fs::rename(path, &candidate).ok().map(|_| candidate)
 }
 
 pub fn save(dir: &Path, file: &PersistedCollector) -> anyhow::Result<()> {
@@ -420,16 +436,19 @@ pub struct LoadOutcome {
     /// build cannot parse may be readable by the next one, and is in any case
     /// the only record of the runs it held.
     pub quarantined: Vec<(PathBuf, String)>,
+    /// Readable files set aside because a newer copy of the same collector won — never
+    /// deleted either.
+    pub superseded: Vec<(PathBuf, String)>,
 }
 
 pub fn load_all(dir: &Path) -> LoadOutcome {
-    let mut collectors: Vec<PersistedCollector> = Vec::new();
-    let mut quarantined = Vec::new();
+    let mut out = LoadOutcome {
+        collectors: Vec::new(),
+        quarantined: Vec::new(),
+        superseded: Vec::new(),
+    };
     let Ok(entries) = std::fs::read_dir(dir.join(COLLECTORS_DIR)) else {
-        return LoadOutcome {
-            collectors,
-            quarantined,
-        };
+        return out;
     };
     // Listed up front: files are renamed below, and a directory read while it changes may or
     // may not show the new names — which could load one collector twice.
@@ -438,45 +457,69 @@ pub fn load_all(dir: &Path) -> LoadOutcome {
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
         .collect();
-    let mut read: Vec<(PathBuf, PersistedCollector)> = Vec::new();
+    let mut by_collector: HashMap<
+        (String, String),
+        Vec<(PathBuf, SystemTime, PersistedCollector)>,
+    > = HashMap::new();
     for path in paths {
         match read_one(&path) {
-            Ok(c) => read.push((path, c)),
+            Ok(c) => {
+                let modified = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                by_collector
+                    .entry((c.owner.clone(), c.name.clone()))
+                    .or_default()
+                    .push((path, modified, c));
+            }
             Err(reason) => {
-                let moved = path.with_extension("json.corrupt");
-                let _ = std::fs::rename(&path, &moved);
-                quarantined.push((moved, reason));
+                let moved = set_aside(&path, "corrupt").unwrap_or(path);
+                out.quarantined.push((moved, reason));
             }
         }
     }
-    // A file not at its collector's canonical path was written under an earlier naming (or
-    // moved by hand). It is renamed into place; if the canonical file exists too, that one is
-    // the collector and this one is moved aside — never deleted, like an unreadable file.
-    // Files at canonical paths first, so a canonical file always wins over a stray copy.
-    read.sort_by_key(|(path, c)| *path != collector_path(dir, &c.owner, &c.name));
-    let mut loaded: HashSet<(String, String)> = HashSet::new();
-    for (path, c) in read {
-        let canonical = collector_path(dir, &c.owner, &c.name);
-        if !loaded.insert((c.owner.clone(), c.name.clone())) {
-            let moved = path.with_extension("json.superseded");
-            let _ = std::fs::rename(&path, &moved);
-            quarantined.push((moved, format!("superseded by {}", canonical.display())));
-            continue;
+    // Each collector's file belongs at its canonical path. A file elsewhere was written under
+    // an earlier naming (or moved by hand). Of several copies of one collector — an earlier
+    // naming's file beside the current one, after a downgrade and an upgrade — the most
+    // recently written is the collector, and the others are set aside, never deleted. The
+    // winner is then moved into place, unless something else is already there: a file whose
+    // content names ANOTHER collector, put there by hand, is not this load's to overwrite.
+    let mut keys: Vec<_> = by_collector.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        let mut copies = by_collector.remove(&key).expect("listed from the map");
+        let canonical = collector_path(dir, &key.0, &key.1);
+        // Newest first; on a tie, the one already in place.
+        copies.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then((a.0 != canonical).cmp(&(b.0 != canonical)))
+        });
+        let mut copies = copies.into_iter();
+        let (path, _, c) = copies.next().expect("a group has at least one copy");
+        for (stale, _, _) in copies {
+            let moved = set_aside(&stale, "superseded").unwrap_or(stale);
+            out.superseded.push((
+                moved,
+                format!("a newer copy of the collector is {}", path.display()),
+            ));
         }
         if path != canonical {
-            if let Err(e) = std::fs::rename(&path, &canonical) {
+            if canonical.exists() {
+                tracing::warn!(
+                    ?path,
+                    ?canonical,
+                    "a collector file's canonical name holds another collector; left where it is"
+                );
+            } else if let Err(e) = std::fs::rename(&path, &canonical) {
                 // Loaded anyway; the next write goes to the canonical path, and the next boot
-                // finds this one superseded.
+                // finds this copy older and sets it aside.
                 tracing::warn!(?path, ?canonical, error = %e,
                     "could not move a collector file to its canonical name");
             }
         }
-        collectors.push(c);
+        out.collectors.push(c);
     }
-    LoadOutcome {
-        collectors,
-        quarantined,
-    }
+    out
 }
 
 fn read_one(path: &Path) -> Result<PersistedCollector, String> {

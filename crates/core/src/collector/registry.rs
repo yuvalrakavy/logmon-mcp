@@ -19,7 +19,7 @@ use crate::receiver::{ReceiverMetrics, TraceIngestLoss};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Daemon-wide sample reservation (§3.4). Enforced at arm time, so four
 /// default-sized collectors is the practical ceiling across every session and
@@ -267,6 +267,8 @@ pub struct RestoreReport {
     pub restored: Vec<String>,
     /// Files that could not be parsed at all, moved aside.
     pub quarantined: Vec<(PathBuf, String)>,
+    /// Readable files set aside because another copy of the same collector won.
+    pub superseded: Vec<(PathBuf, String)>,
     /// Files that parsed but described something this build cannot arm.
     pub rejected: Vec<(String, String)>,
 }
@@ -282,6 +284,12 @@ pub struct CollectorRegistry {
     /// whatever directory it was handed, and the live daemon's is one wrong
     /// argument away.
     dir: Option<PathBuf>,
+    /// Serializes every write and delete of a collector file, and is held across a delete's
+    /// liveness check. Without it a delete could check "nobody holds this path", lose the CPU,
+    /// and then remove the file a new holder of the name wrote meanwhile. Never taken while
+    /// `entries` is held — `write` runs outside that lock by design — and never by ingest, so
+    /// the file I/O under it stalls only other collector bookkeeping.
+    files: Mutex<()>,
 }
 
 /// File work a lifecycle change left for after the caller's locks — see
@@ -317,6 +325,7 @@ impl CollectorRegistry {
             entries: RwLock::new(Vec::new()),
             max_total_sample_bytes,
             dir: None,
+            files: Mutex::new(()),
         }
     }
 
@@ -348,6 +357,7 @@ impl CollectorRegistry {
         let outcome = crate::collector::persist::load_all(dir);
         let mut report = RestoreReport {
             quarantined: outcome.quarantined,
+            superseded: outcome.superseded,
             ..Default::default()
         };
         let mut g = self.entries.write().expect("registry lock poisoned");
@@ -454,13 +464,32 @@ impl CollectorRegistry {
     /// must not be able to cost telemetry.
     fn write(&self, file: &crate::collector::persist::PersistedCollector) -> Result<(), String> {
         let Some(dir) = &self.dir else { return Ok(()) };
+        let _files = self.files.lock().expect("collector files lock poisoned");
         crate::collector::persist::save(dir, file).map_err(|e| {
             tracing::error!(
-                collector = %file.name, error = %e,
-                "could not persist collector; it will not survive a restart"
+                collector = %file.name, owner = %file.owner, error = %e,
+                "could not persist collector; a restart restores its last saved state, if any"
             );
             e.to_string()
         })
+    }
+
+    /// Delete `owner`'s file for `name` unless a live collector holds that path now — checked
+    /// and deleted under [`Self::files`], so a new holder's write cannot land in between.
+    fn delete_unless_held(&self, owner: &SessionId, name: &str) {
+        let Some(dir) = &self.dir else { return };
+        let _files = self.files.lock().expect("collector files lock poisoned");
+        if !self.is_live(owner, name) {
+            crate::collector::persist::delete(dir, &owner.to_string(), name);
+        }
+    }
+
+    /// Delete `owner`'s file for `name` whoever holds the path: for bytes known to belong to a
+    /// collector that is gone. Under [`Self::files`] like every file operation.
+    fn delete_regardless(&self, owner: &SessionId, name: &str) {
+        let Some(dir) = &self.dir else { return };
+        let _files = self.files.lock().expect("collector files lock poisoned");
+        crate::collector::persist::delete(dir, &owner.to_string(), name);
     }
 
     pub fn add(
@@ -876,11 +905,14 @@ impl CollectorRegistry {
         if g.len() == before {
             return Err(RegistryError::NotFound(name.to_string()));
         }
+        // The file is deleted after the lock — file I/O never runs under it — and only if no
+        // collector has taken the path since (`delete_unless_held`).
+        drop(g);
         // Removal takes the history with it. §10 could not have it both ways:
         // if disposal took history AND snapshots outlived the session, a
         // daemon whose sessions are swept every 24 hours would leak files
         // forever.
-        self.delete_file(owner, name);
+        self.delete_unless_held(owner, name);
         Ok(())
     }
 
@@ -918,12 +950,6 @@ impl CollectorRegistry {
         (pending.moved.len(), pending)
     }
 
-    fn delete_file(&self, owner: &SessionId, name: &str) {
-        if let Some(dir) = &self.dir {
-            crate::collector::persist::delete(dir, &owner.to_string(), name);
-        }
-    }
-
     /// Drop every collector owned by a session — the lifecycle counterpart of
     /// session disposal.
     pub fn drop_session(&self, owner: &SessionId) -> usize {
@@ -955,13 +981,21 @@ impl CollectorRegistry {
     /// held: file I/O on the path that gates every domain's ingest — here or under the caller's
     /// lock — lets one slow disk stall telemetry daemon-wide.
     ///
-    /// A path is unlinked only if no live collector holds it now: the name may have a new
-    /// holder by the time this runs, and its collector's file is not this work's to remove. (A
-    /// holder arriving between that check and the unlink — microseconds — is the window every
-    /// write outside the lock already has.) A moved collector is written to its new path from
-    /// its CURRENT state, and its old file is unlinked only once that write succeeded: the old
-    /// file is otherwise its only copy on disk.
+    /// A path is unlinked only if no live collector holds it now, checked and unlinked under
+    /// [`Self::files`]: the name may have a new holder by the time this runs, and its
+    /// collector's file is not this work's to remove. A moved collector is written to its new
+    /// path from its CURRENT state, and its old file is unlinked only once that write
+    /// succeeded: the old file is otherwise its only copy on disk.
+    ///
+    /// One path is decided by bytes, not by who holds it: a detached collector's path that a
+    /// moved collector took over (a rename displacing a stale holder of the same collector
+    /// name). The mover holds it, so it reads as live — but until the mover's write lands the
+    /// bytes there are the DETACHED collector's, and kept, a restart would restore a dead
+    /// conversation's definition and history under the renamer's name. It goes unless that
+    /// write succeeded.
     pub fn finish(&self, pending: PendingFiles) {
+        let mut written: std::collections::HashSet<(SessionId, String)> =
+            std::collections::HashSet::new();
         for (old, new, name) in &pending.moved {
             let file = self
                 .entries
@@ -970,18 +1004,30 @@ impl CollectorRegistry {
                 .iter()
                 .find(|e| &e.owner == new && &e.collector.def().name == name)
                 .map(|e| e.to_persisted());
-            let written = match file {
-                Some(file) => self.write(&file).is_ok(),
+            let landed = match file {
+                Some(file) => {
+                    let ok = self.write(&file).is_ok();
+                    if ok {
+                        written.insert((new.clone(), name.clone()));
+                    }
+                    ok
+                }
                 // Removed since it moved: its old file has nothing left to protect.
                 None => true,
             };
-            if written && !self.is_live(old, name) {
-                self.delete_file(old, name);
+            if landed {
+                self.delete_unless_held(old, name);
             }
         }
         for (owner, name) in &pending.unlink {
-            if !self.is_live(owner, name) {
-                self.delete_file(owner, name);
+            let moved_into = pending
+                .moved
+                .iter()
+                .any(|(_, new, n)| new == owner && n == name);
+            if !moved_into {
+                self.delete_unless_held(owner, name);
+            } else if !written.contains(&(owner.clone(), name.clone())) {
+                self.delete_regardless(owner, name);
             }
         }
         // `detached` is dropped here, freeing the detached collectors' samples off every lock.
@@ -1174,6 +1220,77 @@ mod tests {
         r.finish(pending);
         assert!(crate::collector::persist::collector_path(d.path(), "new", "c").exists());
         assert!(!crate::collector::persist::collector_path(d.path(), "old", "c").exists());
+    }
+
+    /// Make the next write of `owner`'s `name` file fail: a directory where its temp file goes.
+    fn block_write(dir: &std::path::Path, owner: &str, name: &str) {
+        let path = crate::collector::persist::collector_path(dir, owner, name);
+        let tmp = format!(
+            "{}{}",
+            path.display(),
+            crate::daemon::persistence::TEMP_SUFFIX
+        );
+        std::fs::create_dir_all(tmp).unwrap();
+    }
+
+    /// A moved collector's old file stays when its new one cannot be written (a full disk): it
+    /// is the collector's only copy on disk.
+    #[test]
+    fn a_move_whose_write_fails_keeps_the_old_file() {
+        let d = tempfile::TempDir::new().unwrap();
+        let r = CollectorRegistry::new().with_persistence(d.path().to_path_buf());
+        r.add(
+            &sid("old"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed");
+        block_write(d.path(), "new", "c");
+        let (_, pending) = r.move_owner(&sid("old"), &sid("new"));
+        r.finish(pending);
+        assert!(
+            crate::collector::persist::collector_path(d.path(), "old", "c").exists(),
+            "the only copy survives"
+        );
+    }
+
+    /// A collector that moves into a path a detached collector of the same name left (a rename
+    /// displacing a stale holder): if the mover's write fails, the bytes still at that path are
+    /// the DETACHED collector's, and they go — kept, a restart would restore a dead session's
+    /// definition and history under the mover's name. The path reads as held (by the mover),
+    /// which is why liveness cannot decide it.
+    #[test]
+    fn a_failed_move_onto_a_detached_collector_s_path_removes_its_bytes() {
+        let d = tempfile::TempDir::new().unwrap();
+        let r = CollectorRegistry::new().with_persistence(d.path().to_path_buf());
+        for owner in ["stale", "mover"] {
+            r.add(
+                &sid(owner),
+                &dom("a"),
+                metrics(),
+                def("c", "sv=svc", 1 << 20),
+                now(),
+            )
+            .expect("armed");
+        }
+        let stale_path = crate::collector::persist::collector_path(d.path(), "stale", "c");
+        assert!(stale_path.exists());
+        // The rename's transfer, as `handle_sessions_rename` does it.
+        let (_, mut pending) = r.detach_session(&sid("stale"));
+        let (_, moved) = r.move_owner(&sid("mover"), &sid("stale"));
+        pending.absorb(moved);
+        block_write(d.path(), "stale", "c");
+        r.finish(pending);
+        assert!(
+            !stale_path.exists(),
+            "the detached collector's bytes are gone"
+        );
+        assert!(
+            crate::collector::persist::collector_path(d.path(), "mover", "c").exists(),
+            "the mover's own copy is kept"
+        );
     }
 
     #[test]

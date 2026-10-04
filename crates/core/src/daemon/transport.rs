@@ -20,28 +20,16 @@ pub async fn write_message<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// Read one newline-delimited JSON line. Returns `None` on EOF.
-pub async fn read_line<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-) -> anyhow::Result<Option<String>> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        return Ok(None);
-    }
-    Ok(Some(line))
-}
-
-/// Reads newline-delimited requests and can be raced in `select!`: a request only partly
-/// received when another branch wins stays in the reader's buffer, and the next call carries
-/// on from where that one stopped.
+/// Reads newline-delimited requests — the only way the daemon reads one — and can be raced in
+/// `select!`: a request only partly received when another branch wins stays in the reader's
+/// buffer, and the next call carries on from where that one stopped.
 ///
-/// [`read_request`] cannot be raced. It reads into a buffer of its own, which the losing
-/// branch drops with whatever had arrived; the rest of the line then failed to parse and the
-/// connection closed. The connection loop races its reads against trigger notifications, and
-/// clients write a request and its newline separately — a trigger firing between them was
-/// enough. This relies on `read_until`'s documented guarantee that what a cancelled call read
-/// is already in the buffer it was given.
+/// A read into a fresh buffer per call cannot be raced: the losing branch drops it with
+/// whatever had arrived, the rest of the line then fails to parse, and the connection closed.
+/// The connection loop races its reads against trigger notifications, and clients write a
+/// request and its newline separately — a trigger firing between them was enough. This relies
+/// on `read_until`'s documented guarantee that what a cancelled call read is already in the
+/// buffer it was given.
 ///
 /// A request is at most [`MAX_REQUEST_BYTES`]. A line that reaches it without a newline is an
 /// error, which closes the connection: unbounded, a client streaming bytes with no newline
@@ -85,17 +73,6 @@ impl RequestReader {
         }
         let line = std::mem::take(&mut self.pending);
         Ok(Some(serde_json::from_slice(&line)?))
-    }
-}
-
-/// Read and parse one `RpcRequest`. Returns `None` on EOF. Not for a `select!` branch — see
-/// [`RequestReader`].
-pub async fn read_request<R: AsyncBufReadExt + Unpin>(
-    reader: &mut R,
-) -> anyhow::Result<Option<RpcRequest>> {
-    match read_line(reader).await? {
-        Some(line) => Ok(Some(serde_json::from_str(&line)?)),
-        None => Ok(None),
     }
 }
 
