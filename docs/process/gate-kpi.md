@@ -54,9 +54,15 @@ defended — the case-documents design gate ran before this ledger existed, and
   records the cursor had read past and never records it had never had; the fix is a creation
   floor. Two lenses converged independently on six findings; all six were real. The mutation
   lens added ~28 of test-plan gaps (14 proved by probes). SG ≈1: the dropped-commit guard.
-  Unexplained and recorded: one control run hung 9 minutes on a test-client call that the
-  daemon never answered; 50 reruns did not reproduce it. The harness now fails such a call
-  with its reason instead of waiting, so a recurrence reports itself.
+  One control run hung on a test-client call that the daemon never answered; 50 reruns did
+  not reproduce it. Explained later by a debugger attach on the stuck process: it was running
+  the G12 MUTATION, which removed a cursor refusal and so tripped a `debug_assert!` in the
+  trace-query path; the panic killed the connection task, and the client waited on the closed
+  connection forever. The reruns ran unmutated code, which is why they never reproduced it.
+  The client-side flaw was real, and was also in the SDK the MCP shim uses — fixed there in
+  #33. Lesson kept: a control run executes deliberately broken code, so a hang inside one is
+  evidence about the harness around it, not about production — find out which mutation was
+  applied before diagnosing.
 - **open-issue batch, the re-gates**: IG ≈62 is the first gate only. Nine re-gates of the fix
   sets followed (two lenses each, the last a single lens on the final delta), and rounds 1-7
   each found real defects, the worst of a round usually one the PREVIOUS round's fix had
