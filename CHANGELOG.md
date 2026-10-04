@@ -5,6 +5,15 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Fixed — an SDK call hung forever when the broker closed the connection mid-call
+
+The SDK (and so the MCP shim and the CLI) waited for a reply that could no longer come when the
+broker closed the connection without answering — it restarted, it crashed, or the request's
+handler panicked. The connection's reader stopped, but the waiting call's slot stayed in place,
+held alive by the call itself, so it waited forever even after a reconnect. Such a call now
+fails with a disconnect error, and a call made on that dead connection afterwards fails at
+once.
+
 ### Fixed — reinstalling the service over a running broker left it stopped (macOS)
 
 `logmon-broker install-service` unloads the old service and loads the new one. launchd's
