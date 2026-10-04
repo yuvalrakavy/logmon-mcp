@@ -23,12 +23,26 @@ pub enum BridgeError {
     Protocol(String),
 }
 
+/// The calls awaiting a reply on one connection, and whether that connection is gone.
+///
+/// One lock for both, so a call cannot register after the reader has given up: when the reader
+/// stops (the daemon closed the connection — it restarted, or the request's handler panicked),
+/// it marks the connection closed and drops every waiting sender, failing those calls with
+/// [`BridgeError::Closed`]. Leaving them in the map hung each one forever — the call holds the
+/// bridge, the bridge holds the map, the map holds the sender — even after a reconnect had
+/// installed a new bridge.
+#[derive(Default)]
+struct Pending {
+    calls: HashMap<u64, oneshot::Sender<RpcResponse>>,
+    closed: bool,
+}
+
 /// Owns the writer half of the daemon socket and the pending-response map.
 /// The reader half runs in a background task spawned by [`DaemonBridge::spawn`]
 /// or [`DaemonBridge::start_reader`].
 pub struct DaemonBridge {
     writer: Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
+    pending: Arc<Mutex<Pending>>,
     next_id: AtomicU64,
     notification_tx: broadcast::Sender<Notification>,
     /// Notified when the reader task exits (EOF or transport error). The
@@ -45,7 +59,7 @@ pub struct DaemonBridge {
 /// once the ordering-critical work is done.
 pub struct PendingReader {
     reader: Box<dyn AsyncBufRead + Unpin + Send>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
+    pending: Arc<Mutex<Pending>>,
     notification_tx: broadcast::Sender<Notification>,
     disconnect: Arc<Notify>,
 }
@@ -96,8 +110,7 @@ impl DaemonBridge {
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (reader, writer) = tokio::io::split(stream);
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(Pending::default()));
         let buf_reader = tokio::io::BufReader::new(reader);
         let disconnect = Arc::new(Notify::new());
 
@@ -173,7 +186,13 @@ impl DaemonBridge {
         let request = RpcRequest::new(id, method, params);
         let request = if display { request.rendered() } else { request };
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.closed {
+                return Err(BridgeError::Closed);
+            }
+            pending.calls.insert(id, tx);
+        }
         {
             let mut writer = self.writer.lock().await;
             transport::write_message(&mut *writer, &request)
@@ -220,7 +239,7 @@ impl DaemonBridge {
 /// the `disconnect` signal so the reconnect machinery can take over.
 fn spawn_reader_loop(
     mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>>,
+    pending: Arc<Mutex<Pending>>,
     notification_tx: broadcast::Sender<Notification>,
     disconnect: Arc<Notify>,
 ) {
@@ -228,7 +247,7 @@ fn spawn_reader_loop(
         loop {
             match transport::read_daemon_message(&mut reader).await {
                 Ok(Some(DaemonMessage::Response(resp))) => {
-                    if let Some(tx) = pending.lock().await.remove(&resp.id) {
+                    if let Some(tx) = pending.lock().await.calls.remove(&resp.id) {
                         let _ = tx.send(resp);
                     }
                 }
@@ -239,16 +258,22 @@ fn spawn_reader_loop(
                 }
                 Ok(None) => {
                     tracing::debug!("bridge reader: EOF, signaling disconnect");
-                    disconnect.notify_waiters();
                     break;
                 }
                 Err(e) => {
                     tracing::warn!("RPC read error: {e}");
-                    disconnect.notify_waiters();
                     break;
                 }
             }
         }
+        // No reply can arrive any more: fail every call still waiting, and refuse new ones —
+        // see `Pending`.
+        {
+            let mut pending = pending.lock().await;
+            pending.closed = true;
+            pending.calls.clear();
+        }
+        disconnect.notify_waiters();
     });
 }
 
@@ -273,5 +298,87 @@ fn notification_from_wire(notif: &RpcNotification) -> Option<Notification> {
             tracing::debug!(method = %other, "ignoring unknown notification");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
+
+    /// A daemon that closes the connection without answering — it restarted, or the request's
+    /// handler panicked — fails the call in flight, and every later call on that connection,
+    /// instead of leaving them waiting forever.
+    #[tokio::test]
+    async fn a_connection_closed_mid_call_fails_the_call_instead_of_hanging() {
+        let (client, daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (tx, _rx) = broadcast::channel(4);
+        let bridge = DaemonBridge::spawn(client, tx).await.unwrap();
+
+        // The daemon reads the request and closes the connection without a reply.
+        let daemon = tokio::spawn(async move {
+            let mut daemon = tokio::io::BufReader::new(daemon);
+            let mut line = String::new();
+            daemon.read_line(&mut line).await.unwrap();
+            assert!(line.contains("status.get"), "{line}");
+        });
+
+        let call = tokio::time::timeout(
+            Duration::from_secs(10),
+            bridge.call("status.get", serde_json::json!({})),
+        )
+        .await
+        .expect("the call ends when its connection closes");
+        assert!(matches!(call, Err(BridgeError::Closed)), "{call:?}");
+        daemon.await.unwrap();
+
+        let later = tokio::time::timeout(
+            Duration::from_secs(10),
+            bridge.call("status.get", serde_json::json!({})),
+        )
+        .await
+        .expect("a call on a closed connection ends at once");
+        assert!(later.is_err(), "{later:?}");
+    }
+
+    /// A reader that stops on a frame it cannot parse leaves the socket WRITABLE, so a later
+    /// call's request goes out without error — and with no reader, no reply could ever reach
+    /// it. It is refused instead.
+    #[tokio::test]
+    async fn a_call_after_the_reader_stopped_is_refused_though_the_socket_is_open() {
+        let (client, daemon) = tokio::net::UnixStream::pair().unwrap();
+        let (tx, _rx) = broadcast::channel(4);
+        let bridge = DaemonBridge::spawn(client, tx).await.unwrap();
+
+        // The daemon answers garbage and keeps the connection open, reading on.
+        let (daemon_reader, mut daemon_writer) = tokio::io::split(daemon);
+        tokio::io::AsyncWriteExt::write_all(&mut daemon_writer, b"not json\n")
+            .await
+            .unwrap();
+        let drain = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(daemon_reader).lines();
+            while let Ok(Some(_)) = lines.next_line().await {}
+            drop(daemon_writer);
+        });
+
+        // Wait until the reader has given up on the garbage.
+        for _ in 0..500 {
+            if bridge.pending.lock().await.closed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(bridge.pending.lock().await.closed, "the reader stopped");
+
+        let call = tokio::time::timeout(
+            Duration::from_secs(10),
+            bridge.call("status.get", serde_json::json!({})),
+        )
+        .await
+        .expect("refused at once, not left waiting");
+        assert!(matches!(call, Err(BridgeError::Closed)), "{call:?}");
+        drop(bridge);
+        drain.await.unwrap();
     }
 }
