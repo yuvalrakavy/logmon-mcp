@@ -24,7 +24,8 @@
 
 mod cli_common;
 
-use cli_common::spawn_with_cli;
+use cli_common::{display_injecting_proxy, spawn_with_cli};
+use logmon_broker_core::gelf::message::Level;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -404,6 +405,96 @@ async fn a_document_with_no_path_returns_markdown_not_an_envelope() {
         );
     })
     .await;
+}
+
+/// With no path, `export_logs` returns the RENDERING, not its content field.
+///
+/// The content field is `logs`, an ARRAY, and the body rule takes a content
+/// field only when it is a string. Every `export_logs` call here passed a path,
+/// so the rule had no test on this surface.
+#[tokio::test]
+async fn export_logs_with_no_path_returns_the_rendering_not_the_record_array() {
+    let (daemon, _) = spawn_with_cli().await;
+    daemon.inject_log(Level::Info, "mcp-export-marker").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let socket = daemon.socket_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let mut mcp = Mcp::start(&socket, scratch.path());
+        let text = mcp.call("export_logs", json!({})).expect("exported");
+
+        assert!(
+            serde_json::from_str::<Value>(&text).is_err(),
+            "the record array came back as JSON rather than rendered: {text}"
+        );
+        let record = text
+            .lines()
+            .find(|l| l.contains("mcp-export-marker"))
+            .unwrap_or_else(|| panic!("the record is missing: {text}"));
+        assert!(
+            record.starts_with('[') && record.ends_with("INFO  mcp-export-marker"),
+            "a block record line, not a JSON element: {record:?}"
+        );
+    })
+    .await
+    .expect("blocking work");
+    drop(daemon);
+}
+
+/// A document tool given no path returns the DOCUMENT, even when the same
+/// reply carries a rendering: `body.or_else(rendered)`, in that order.
+///
+/// No method has both a renderer and a string content field today, so the
+/// order is unobservable against the real daemon — swapping it left the suite
+/// green, and the first renderer added to a document tool would have replaced
+/// its document silently. The proxy makes `collectors.document` carry both.
+#[tokio::test]
+async fn a_document_body_outranks_a_rendering_of_the_same_reply() {
+    const INJECTED: &str = "INJECTED-RENDERING";
+    let (daemon, _) = spawn_with_cli().await;
+    let (dir, proxy) = display_injecting_proxy(
+        daemon.socket_path.clone(),
+        &["collectors.document", "collectors.list"],
+        INJECTED,
+    )
+    .await;
+
+    tokio::task::spawn_blocking(move || {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let mut mcp = Mcp::start(&proxy, scratch.path());
+        mcp.call(
+            "add_collector",
+            json!({ "name": "o", "filter": "ALL", "level": "tree" }),
+        )
+        .expect("armed");
+        mcp.call(
+            "snapshot_collector",
+            json!({ "name": "o", "label": "base" }),
+        )
+        .expect("snapshotted");
+
+        // The proxy does inject: a tool with no content field returns it.
+        let listed = mcp.call("list_collectors", json!({})).expect("listed");
+        assert_eq!(listed, INJECTED, "the proxy injected nothing: {listed}");
+
+        let text = mcp
+            .call("document_collectors", json!({ "names": ["o@base"] }))
+            .expect("documented");
+        let head = text.lines().next().unwrap_or("");
+        assert!(
+            text.starts_with("---"),
+            "the markdown document, not the rendering — got {head:?}"
+        );
+        assert!(
+            !text.contains(INJECTED),
+            "the rendering displaced the document — got {head:?}"
+        );
+    })
+    .await
+    .expect("blocking work");
+    drop(dir);
+    drop(daemon);
 }
 
 /// `collectors document` produces a document AND a companion file beside it.

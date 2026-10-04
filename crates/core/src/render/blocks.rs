@@ -328,4 +328,58 @@ mod tests {
         assert_eq!(log_line(&json!({})), "[0]  ?     ");
         assert_eq!(log_line(&json!("not an object")), "[0]  ?     ");
     }
+
+    /// A field VALUE is caller text too, and `scalar` flattens it for the same
+    /// reason `message` is flattened: a newline inside it would start a line
+    /// that reads as a record of its own. The locator loop was pinned; the
+    /// value path through `scalar` was not.
+    #[test]
+    fn a_multi_line_field_value_stays_on_its_continuation_line() {
+        let mut e = entry(3, "Error", "boom");
+        e["additional_fields"] = json!({"backtrace": "frame 0\nframe 1"});
+        assert_eq!(
+            log_line(&e),
+            "[3] 2026-08-02T03:29:02 ERROR boom\n    backtrace=frame 0 frame 1"
+        );
+    }
+
+    /// The never-panic rule on the timestamp trim. `&ts[..19]` would panic on a
+    /// multi-byte codepoint straddling byte 19 — inside the per-connection loop,
+    /// with no `catch_unwind` above it. The doc comment states the rule; this
+    /// pins it.
+    #[test]
+    fn a_codepoint_straddling_the_trim_point_neither_panics_nor_is_split() {
+        // `é` is two bytes. At byte 18 it occupies bytes 18-19, so 19 is not a
+        // char boundary — the one place a byte slice there goes wrong.
+        let ts = "2026-08-02T03:29:0\u{e9}5.961654Z";
+        assert!(
+            !ts.is_char_boundary(19),
+            "the fixture must straddle byte 19"
+        );
+        let e = json!({"seq": 1, "timestamp": ts, "level": "Info", "message": "m"});
+        assert_eq!(log_line(&e), "[1] 2026-08-02T03:29:0\u{e9} INFO  m");
+    }
+
+    /// The duration is right-aligned in a ten-column field, so the service and
+    /// name columns line up down a list of spans whatever the duration's width.
+    #[test]
+    fn a_span_line_aligns_its_duration_in_a_ten_column_field() {
+        let slow = json!({"seq": 9, "name": "put", "service_name": "svc",
+                          "duration_ms": 11017.13});
+        let instant = json!({"seq": 9, "name": "get", "service_name": "svc",
+                             "duration_ms": 0.0});
+        assert_eq!(span_line(&slow), "[9]    11017ms  svc  put");
+        assert_eq!(span_line(&instant), "[9]        0ms  svc  get");
+    }
+
+    /// Some exporters repeat `trace_id` inside `attributes`. It is already on
+    /// the continuation line from the span itself, so it renders once.
+    #[test]
+    fn a_trace_id_repeated_in_attributes_renders_once() {
+        let s = json!({"seq": 1, "name": "put", "service_name": "svc", "duration_ms": 1.0,
+                       "trace_id": "7f3a",
+                       "attributes": {"trace_id": "7f3a", "key": "v"}});
+        let line = span_line(&s);
+        assert_eq!(line, "[1]      1.0ms  svc  put\n    trace_id=7f3a  key=v");
+    }
 }
