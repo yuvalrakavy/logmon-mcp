@@ -390,7 +390,8 @@ impl PersistedSnapshot {
 /// has one more part than any full name and so cannot equal one.
 pub fn collector_path(dir: &Path, owner: &str, name: &str) -> PathBuf {
     let (owner_enc, name_enc) = (encode(owner), encode(name));
-    let file = if owner_enc.len() + name_enc.len() + ".json".len() + 1 <= MAX_FULL_NAME {
+    let full_len = owner_enc.len() + ".".len() + name_enc.len() + ".json".len();
+    let file = if full_len <= MAX_FULL_NAME {
         format!("{owner_enc}.{name_enc}.json")
     } else {
         let hash = fnv1a64(owner.bytes().chain([0xFF]).chain(name.bytes()));
@@ -466,10 +467,26 @@ fn set_aside(path: &Path, suffix: &str) -> Option<PathBuf> {
 }
 
 /// Where a file is staged on its way to its canonical name — still a `.json`, so a crash
-/// between the two moves leaves a file the next boot reads like any other copy. It has one more
-/// part than any canonical name (full or shortened), so it cannot equal one.
+/// between the two moves leaves a file the next boot reads like any other copy. It cannot equal
+/// a canonical name: a full one is `{owner}.{name}.json`, a shortened one has a 16-hex-digit
+/// third part, and a staging name's next-to-last part is `moving` (never hex, and never inside
+/// an encoded part, which has no `.`).
 fn staging_path(canonical: &Path) -> PathBuf {
     canonical.with_extension("moving.json")
+}
+
+/// `rename`, refusing to replace anything at `to`. POSIX `rename` silently replaces its target,
+/// and every target in a migration is a name some other file may hold (one placed by hand, or
+/// left by an earlier failed move); replacing it would destroy that file. Checked then renamed:
+/// the migration runs at boot, before anything else writes this directory.
+fn rename_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is taken", to.display()),
+        ));
+    }
+    std::fs::rename(from, to)
 }
 
 pub fn save(dir: &Path, file: &PersistedCollector) -> anyhow::Result<()> {
@@ -569,7 +586,12 @@ pub fn load_all(dir: &Path) -> LoadOutcome {
             continue;
         }
         let staging = staging_path(canonical);
-        match std::fs::rename(path, &staging) {
+        if *path == staging {
+            // Already staged: a crash between the two moves of an earlier boot.
+            staged.push((i, staging));
+            continue;
+        }
+        match rename_no_clobber(path, &staging) {
             Ok(()) => staged.push((i, staging)),
             // Loaded anyway, from where it is; the next boot tries again.
             Err(e) => tracing::warn!(?path, ?canonical, error = %e,
@@ -579,15 +601,17 @@ pub fn load_all(dir: &Path) -> LoadOutcome {
     let mut final_paths: Vec<PathBuf> = winners.iter().map(|w| w.0.clone()).collect();
     for (i, staging) in staged {
         let (original, canonical, _) = &winners[i];
-        if !canonical.exists() && std::fs::rename(&staging, canonical).is_ok() {
+        if rename_no_clobber(&staging, canonical).is_ok() {
             final_paths[i] = canonical.clone();
             continue;
         }
         tracing::warn!(path = ?original, ?canonical,
             "a collector file's canonical name is occupied by something else; left where it was");
-        if std::fs::rename(&staging, original).is_err() {
+        if rename_no_clobber(&staging, original).is_err() {
             // Still a `.json`: read like any other copy at the next boot.
             final_paths[i] = staging;
+        } else {
+            final_paths[i] = original.clone();
         }
     }
     for (i, moved) in losers {

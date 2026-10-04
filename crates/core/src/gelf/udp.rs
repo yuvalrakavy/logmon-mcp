@@ -1,7 +1,10 @@
 use crate::gelf::message::{parse_gelf_message, LogEntry};
 use crate::receiver::{ReceiverMetrics, ReceiverSource};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static MALFORMED: AtomicU64 = AtomicU64::new(0);
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -61,7 +64,16 @@ pub async fn start_udp_listener(
                             Ok(entry) => {
                                 let _ = metrics.try_send_log(&sender, entry, ReceiverSource::GelfUdp);
                             }
-                            Err(e) => { eprintln!("malformed GELF UDP: {e}"); }
+                            Err(e) => {
+                                // Throttled and non-panicking, as for TCP: any host can send
+                                // malformed datagrams, and each was a line in an unrotated log.
+                                let n = MALFORMED.fetch_add(1, Ordering::Relaxed) + 1;
+                                if crate::gelf::tcp::log_now(n) {
+                                    crate::gelf::tcp::note(format_args!(
+                                        "malformed GELF UDP ({n} so far): {e}"
+                                    ));
+                                }
+                            }
                         }
                     }
                 }

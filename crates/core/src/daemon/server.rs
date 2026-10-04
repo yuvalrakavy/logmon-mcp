@@ -35,7 +35,9 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// How long one message may take to write to a connection's client. A client that stopped
 /// reading filled its socket, and the write then waited for as long as the client stayed
 /// connected — its session marked connected, so its name was refused to anyone else. Past this
-/// the connection is closed (and its session disconnected) instead.
+/// the connection is closed (and its session disconnected) instead. The bound is on the whole
+/// message, so a client still reading, but too slowly to take one message in 30 s, is closed
+/// too; every client here reads on a task of its own, over a local socket.
 const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// [`write_message`] bounded by [`WRITE_TIMEOUT`] — every write a connection makes goes
@@ -46,7 +48,11 @@ async fn write_bounded<W: tokio::io::AsyncWriteExt + Unpin>(
 ) -> anyhow::Result<()> {
     tokio::time::timeout(WRITE_TIMEOUT, write_message(writer, msg))
         .await
-        .map_err(|_| anyhow::anyhow!("the client read nothing for {WRITE_TIMEOUT:?}"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "a message to the client did not finish writing within {WRITE_TIMEOUT:?}"
+            )
+        })?
 }
 
 /// Convert an internal [`PipelineEvent`] (engine-side observability struct)

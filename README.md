@@ -1069,7 +1069,7 @@ Environment variable overrides:
 
 A noisy producer should slow itself down, not take the broker down. Concretely:
 
-- GELF receivers use `try_send` into the pipeline channel — full channel means the entry is dropped at the receiver, not enqueued without bound.
+- GELF receivers use `try_send` into the pipeline channel — full channel means the entry is dropped at the receiver, not enqueued without bound. A GELF TCP message over 64 KB is dropped at the receiver too, and counted with these.
 - GELF UDP sets `SO_RCVBUF` to **8 MB** so a slow consumer has a sizeable OS-side cushion before datagrams start falling on the floor.
 - OTLP gRPC and OTLP HTTP both check channel fill before consuming a payload. At **≥ 80% full**, gRPC returns `UNAVAILABLE` and HTTP returns `429`. The producer is expected to retry with backoff. The protocol-level rejection *is* the backpressure signal — per-source drop counters aren't bumped, because nothing was silently dropped.
 - Per-source drop counts surface in `status.get` under `receiver_drops` (`gelf_udp`, `gelf_tcp`, `otlp_http_logs`, `otlp_http_traces`, `otlp_grpc_logs`, `otlp_grpc_traces`). Healthy operation keeps all six at zero.
@@ -1081,14 +1081,16 @@ That remedy is for channel-full drops only: a `shed_batches` count means the pro
 told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
 unusable trace id) — no buffer size changes either.
 
-**Memory.** The log and span stores are bounded by record COUNT (`buffer_size`,
-`span_buffer_size`), not by bytes — what they hold is that count times the size of the records
-that arrive. A GELF message is at most 64 KB on either transport (a UDP datagram's limit; the
-TCP input refuses longer messages and closes the connection, and keeps at most 128 connections
-open), so GELF alone can fill the log store to `buffer_size` × 64 KB — 640 MB at the default
-10,000, far more at a large per-domain buffer. OTLP records are bounded only by the OTLP
-receivers' request-size limits, which are larger. Size buffers for the records you actually
-send, and keep the ingest ports off networks you do not trust: they take no authentication.
+**Memory.** The log and span stores — and the 65,536-entry ingest channel in front of them —
+are bounded by record COUNT (`buffer_size`, `span_buffer_size`), not by bytes: what they hold is
+that count times the size of the records that arrive. A GELF message is at most 64 KB on the
+wire on either transport (a UDP datagram's limit; the TCP input drops a longer message, counts
+it in `receiver_drops.gelf_tcp`, and carries on with the next one). In memory a parsed record
+can be much larger than its wire size — a message made of many small fields can take ten times
+as much or more — and OTLP records are bounded only by the OTLP receivers' request-size limits,
+which are larger. So size buffers for the records you actually send, and keep the ingest ports
+off networks you do not trust: they take no authentication, and any sender can make every
+record as large as those limits allow.
 
 ## Reinstalling after a change
 

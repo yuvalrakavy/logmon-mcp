@@ -256,13 +256,15 @@ that merely reconnects already counted while disconnected, so nothing changed fo
   name is removed rather than kept: kept, a restart would have restored a dead session's
   collector under the renamed session's name.
 - A collector file's removal is decided by what is on disk, not by who holds the name: a file is
-  removed only if nothing has written to it since the removal was decided. Deciding by who held
-  the name got both cases wrong under a race — it could delete the file a new holder of the name
-  had just written, and it kept a dropped session's file when a new holder's own write had
-  failed (the restart then restored the dead collector under the live name). Writes and removals
-  of one file take one lock of their own; different collectors' files never wait on each other.
-  And a write prepared before its collector was removed is no longer written after the removal:
-  it put the file back, and the removed collector returned at the next boot.
+  removed only if no write that began after the removal was decided has landed on it. Deciding by
+  who held the name got both cases wrong under a race — it could delete the file a new holder of
+  the name had just written, and it kept a dropped session's file when a new holder's own write
+  had failed (the restart then restored the dead collector under the live name). A write that was
+  already under way when a removal came in is the removal's to delete. Writes and removals of one
+  file take one lock of their own; different collectors' files never wait on each other. A write
+  prepared before its collector was removed is not written after the removal (it put the file
+  back, and the removed collector returned at the next boot), and a removal that cannot delete a
+  file says so in the log instead of silently leaving it to come back.
 - The record of evicted cursors — what makes a recreated cursor warn that it lost its place —
   stayed under the old name on a rename (the warning was lost) and outlived a dropped or
   disposed session (a later holder of the name was warned about a cursor it never had). It
@@ -292,16 +294,18 @@ with its session marked connected, so its name was refused to anyone else.
 
 The GELF TCP input read each message up to its NUL terminator with no limit, on a port that
 listens on every interface without authentication — so any host that could reach it could send
-bytes with no NUL and grow the broker's memory until it died. A message is now at most 64 KB —
-the same ceiling as a GELF UDP datagram, so TCP lets a sender store no larger record than UDP
-already did — and a longer one closes its connection. At most 128 GELF TCP connections are open
-at once (one past that is closed on accept), which bounds what the TCP input buffers in total.
-And a failed `accept` (out of file descriptors) is retried after a pause; it was retried at
-once, spinning a core for as long as it lasted.
+bytes with no NUL and grow the broker's memory until it died. A message is now at most 64 KB on
+the wire — the same ceiling as a GELF UDP datagram — and a longer one is dropped, counted in
+`receiver_drops.gelf_tcp`, and skipped to the NUL that ends it in bounded memory, so the
+connection carries on with the next message. A failed `accept` that repeats (out of file
+descriptors) is retried after a pause; it was retried at once, spinning a core for as long as
+it lasted. And the GELF receivers no longer log every malformed message (any sender could fill
+the disk through the log, and a write to a full disk panicked the task that logged — a
+connection, or the TCP accept loop): those lines are throttled and cannot panic.
 
-Known limit, unchanged: the log store is bounded by record COUNT (`buffer_size`), not by bytes,
-for every input — GELF records of up to 64 KB each, OTLP records up to the OTLP receivers'
-request limits. See the README's "Memory" note.
+Known limit, unchanged: the log store (and the ingest channel in front of it) is bounded by
+record COUNT, not by bytes, for every input — and a parsed record can take many times its wire
+size. See the README's "Memory" note.
 
 ### Fixed — two collectors could share one file
 

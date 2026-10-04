@@ -228,6 +228,34 @@ impl ReceiverMetrics {
         }
     }
 
+    /// Count a message dropped at the receiver for exceeding the size limit — in the same
+    /// `receiver_drops` counter as a full channel's drops (both are messages a sender sent and
+    /// the broker did not keep), with its own warning, rate-limited like that one.
+    pub(crate) fn record_oversize_drop(&self, source: ReceiverSource) {
+        let counter = match source {
+            ReceiverSource::GelfUdp => &self.gelf_udp,
+            ReceiverSource::GelfTcp => &self.gelf_tcp,
+            ReceiverSource::OtlpHttpLogs => &self.otlp_http_logs,
+            ReceiverSource::OtlpHttpTraces => &self.otlp_http_traces,
+            ReceiverSource::OtlpGrpcLogs => &self.otlp_grpc_logs,
+            ReceiverSource::OtlpGrpcTraces => &self.otlp_grpc_traces,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        let now_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+        let last = self.last_warn_nanos.load(Ordering::Relaxed);
+        if now_nanos.saturating_sub(last) >= WARN_INTERVAL_NANOS
+            && self
+                .last_warn_nanos
+                .compare_exchange(last, now_nanos, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                source = source.as_str(),
+                "receiver dropped a message over the size limit"
+            );
+        }
+    }
+
     /// Record one trace request body refused wholesale under backpressure.
     ///
     /// Called from the 429 / UNAVAILABLE gate, which returns *before* any span

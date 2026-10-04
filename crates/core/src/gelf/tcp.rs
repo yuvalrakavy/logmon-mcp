@@ -1,6 +1,6 @@
 use crate::gelf::message::{parse_gelf_message, LogEntry};
 use crate::receiver::{ReceiverMetrics, ReceiverSource};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -23,47 +23,57 @@ impl TcpListenerHandle {
 }
 
 /// The longest GELF message one TCP connection may send, its NUL terminator included — the
-/// same ceiling a UDP datagram has, so the TCP input lets a sender put no larger record into
-/// the store than UDP already does. A message was read to its NUL with no limit, on a port
-/// bound to every interface without authentication — so any host that could reach it could
-/// stream bytes with no NUL and grow the broker's memory until it died. A longer message closes
-/// its connection: what follows it cannot be told apart from the next message.
+/// same ceiling a UDP datagram has, so the TCP input accepts no larger message than UDP does.
+/// A message was read to its NUL with no limit, on a port bound to every interface without
+/// authentication — so any host that could reach it could stream bytes with no NUL and grow the
+/// broker's memory until it died. A longer message is dropped (counted in
+/// `receiver_drops.gelf_tcp`), and the reader skips to the NUL that ends it in bounded memory
+/// and carries on: JSON cannot contain a raw NUL, so the next message starts cleanly.
 ///
-/// (The store itself is bounded by record COUNT, not bytes, for every input — UDP included:
-/// the most it can hold is its buffer size times this. See the README's known limits.)
+/// This bounds what one connection buffers, not what the store holds — see the README's
+/// "Memory" note.
 pub const MAX_GELF_TCP_MESSAGE_BYTES: usize = 64 * 1024;
-
-/// How many GELF TCP connections may be open at once. Each holds a read buffer of up to two
-/// [`MAX_GELF_TCP_MESSAGE_BYTES`] (with the allocator's growth), so this bounds what the TCP
-/// input can hold in total; a connection past it is closed on accept.
-pub const MAX_GELF_TCP_CONNECTIONS: u32 = 128;
 
 pub async fn start_tcp_listener(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
     metrics: Arc<ReceiverMetrics>,
 ) -> anyhow::Result<TcpListenerHandle> {
-    start_tcp_listener_with_limits(
-        addr,
-        sender,
-        metrics,
-        MAX_GELF_TCP_MESSAGE_BYTES,
-        MAX_GELF_TCP_CONNECTIONS,
-    )
-    .await
+    start_tcp_listener_with_limit(addr, sender, metrics, MAX_GELF_TCP_MESSAGE_BYTES).await
 }
 
-/// Log the 1st, 2nd, 4th, 8th... occurrence of something an attacker can repeat at will.
-fn log_now(count: u64) -> bool {
+/// Write a line to stderr without ever panicking. `eprintln!` panics when stderr cannot be
+/// written — a full disk under the auto-started broker's log file — and the panic killed the
+/// task that logged: a connection, or the accept loop itself.
+pub(crate) fn note(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "{args}");
+}
+
+/// Whether to log the `count`th occurrence of something a remote sender can repeat at will:
+/// the 1st, 2nd, 4th, 8th… — so an attacker cannot fill the disk through the log.
+pub(crate) fn log_now(count: u64) -> bool {
     count.is_power_of_two()
 }
 
-async fn start_tcp_listener_with_limits(
+static MALFORMED: AtomicU64 = AtomicU64::new(0);
+static READ_ERRORS: AtomicU64 = AtomicU64::new(0);
+static ACCEPT_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts an open connection, and uncounts it when its task ends — however it ends.
+struct Open(Arc<AtomicU32>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn start_tcp_listener_with_limit(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
     metrics: Arc<ReceiverMetrics>,
     max_message: usize,
-    max_connections: u32,
 ) -> anyhow::Result<TcpListenerHandle> {
     let listener = TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
@@ -72,98 +82,38 @@ async fn start_tcp_listener_with_limits(
     let connected_clone = connected.clone();
 
     tokio::spawn(async move {
-        let (mut refused, mut accept_errors) = (0u64, 0u64);
+        let mut failures_in_a_row = 0u32;
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let stream = match result {
-                        Ok((stream, _addr)) => stream,
+                        Ok((stream, _addr)) => {
+                            failures_in_a_row = 0;
+                            stream
+                        }
                         Err(e) => {
-                            // Out of file descriptors, typically. Retrying at once returned
-                            // the same error at once — a spin at full CPU for as long as it
-                            // lasted.
-                            accept_errors += 1;
-                            if log_now(accept_errors) {
-                                eprintln!("GELF TCP accept failed ({accept_errors} so far): {e}");
+                            // A one-off failure (a peer that reset before it was accepted) is
+                            // retried at once. One that repeats — out of file descriptors,
+                            // typically — was retried at once too, returning the same error at
+                            // once: a spin at full CPU for as long as it lasted.
+                            failures_in_a_row = failures_in_a_row.saturating_add(1);
+                            let n = ACCEPT_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if log_now(n) {
+                                note(format_args!("GELF TCP accept failed ({n} so far): {e}"));
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            if failures_in_a_row > 1 {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
                             continue;
                         }
                     };
-                    if connected_clone.load(Ordering::Relaxed) >= max_connections {
-                        refused += 1;
-                        if log_now(refused) {
-                            eprintln!(
-                                "GELF TCP: {max_connections} connections open; closed a new one \
-                                 ({refused} so far)"
-                            );
-                        }
-                        drop(stream);
-                        continue;
-                    }
-                    {
-                        let sender = sender.clone();
-                        let metrics = metrics.clone();
-                        let connected = connected_clone.clone();
-                        connected.fetch_add(1, Ordering::Relaxed);
-
-                        tokio::spawn(async move {
-                            let mut reader = BufReader::new(stream);
-                            let mut buf = Vec::new();
-
-                            loop {
-                                buf.clear();
-                                // One byte past the limit is enough to know it was passed.
-                                let bytes_read = match (&mut reader)
-                                    .take(max_message as u64 + 1)
-                                    .read_until(b'\0', &mut buf)
-                                    .await
-                                {
-                                    Ok(n) => n,
-                                    Err(e) => {
-                                        eprintln!("TCP read error: {e}");
-                                        break;
-                                    }
-                                };
-
-                                if bytes_read == 0 {
-                                    break; // EOF
-                                }
-                                if buf.len() > max_message {
-                                    eprintln!(
-                                        "GELF TCP message exceeds {max_message} bytes; closing \
-                                         the connection"
-                                    );
-                                    break;
-                                }
-
-                                // Remove trailing null byte
-                                if buf.last() == Some(&0) {
-                                    buf.pop();
-                                }
-
-                                if buf.is_empty() {
-                                    continue;
-                                }
-
-                                // Parse with seq=0 — daemon assigns real seq later
-                                match parse_gelf_message(&buf, 0) {
-                                    Ok(entry) => {
-                                        let _ = metrics.try_send_log(
-                                            &sender,
-                                            entry,
-                                            ReceiverSource::GelfTcp,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("malformed GELF TCP: {e}");
-                                    }
-                                }
-                            }
-
-                            connected.fetch_sub(1, Ordering::Relaxed);
-                        });
-                    }
+                    let (sender, metrics) = (sender.clone(), metrics.clone());
+                    connected_clone.fetch_add(1, Ordering::Relaxed);
+                    let open = Open(connected_clone.clone());
+                    tokio::spawn(async move {
+                        let _open = open;
+                        serve_connection(stream, &sender, &metrics, max_message).await;
+                    });
                 }
                 _ = &mut rx => break,
             }
@@ -177,6 +127,80 @@ async fn start_tcp_listener_with_limits(
     })
 }
 
+/// Read NUL-terminated GELF messages from one connection until it ends.
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    sender: &mpsc::Sender<LogEntry>,
+    metrics: &ReceiverMetrics,
+    max_message: usize,
+) {
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        // One byte past the limit is enough to know it was passed.
+        let bytes_read = match (&mut reader)
+            .take(max_message as u64 + 1)
+            .read_until(b'\0', &mut buf)
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                let n = READ_ERRORS.fetch_add(1, Ordering::Relaxed) + 1;
+                if log_now(n) {
+                    note(format_args!("GELF TCP read error ({n} so far): {e}"));
+                }
+                return;
+            }
+        };
+        if bytes_read == 0 {
+            return; // EOF
+        }
+        if buf.len() > max_message {
+            metrics.record_oversize_drop(ReceiverSource::GelfTcp);
+            if buf.last() != Some(&0) && !skip_past_nul(&mut reader, &mut buf).await {
+                return;
+            }
+            continue;
+        }
+
+        // Remove trailing null byte
+        if buf.last() == Some(&0) {
+            buf.pop();
+        }
+        if buf.is_empty() {
+            continue;
+        }
+
+        // Parse with seq=0 — daemon assigns real seq later
+        match parse_gelf_message(&buf, 0) {
+            Ok(entry) => {
+                let _ = metrics.try_send_log(sender, entry, ReceiverSource::GelfTcp);
+            }
+            Err(e) => {
+                let n = MALFORMED.fetch_add(1, Ordering::Relaxed) + 1;
+                if log_now(n) {
+                    note(format_args!("malformed GELF TCP ({n} so far): {e}"));
+                }
+            }
+        }
+    }
+}
+
+/// Discard input through the next NUL, a bounded chunk at a time. `false` at end of input or
+/// on a read error.
+async fn skip_past_nul(reader: &mut BufReader<tokio::net::TcpStream>, buf: &mut Vec<u8>) -> bool {
+    const CHUNK: u64 = 8 * 1024;
+    loop {
+        buf.clear();
+        match (&mut *reader).take(CHUNK).read_until(b'\0', buf).await {
+            Ok(0) | Err(_) => return false,
+            Ok(_) if buf.last() == Some(&0) => return true,
+            Ok(_) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,106 +211,53 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
-    /// A message past the limit closes its connection instead of growing a buffer without end,
-    /// and the listener keeps serving other connections.
+    /// A message past the limit is dropped — counted in `receiver_drops.gelf_tcp` — without
+    /// buffering it whole, and the reader skips to the NUL that ends it: the next message on the
+    /// SAME connection arrives. When the connection ends, it is no longer counted as open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_message_past_the_limit_closes_its_connection() {
-        use tokio::io::AsyncReadExt;
+    async fn a_message_past_the_limit_is_dropped_and_the_next_one_arrives() {
         let (sender, mut rx) = mpsc::channel(16);
         let metrics = Arc::new(ReceiverMetrics::new());
         let payload =
-            br#"{"version":"1.1","host":"h","short_message":"x","level":6,"timestamp":1.0}"#;
-        let handle = start_tcp_listener_with_limits(
+            br#"{"version":"1.1","host":"h","short_message":"after","level":6,"timestamp":1.0}"#;
+        let handle = start_tcp_listener_with_limit(
             "127.0.0.1:0",
             sender,
-            metrics,
+            metrics.clone(),
             payload.len() + 1,
-            MAX_GELF_TCP_CONNECTIONS,
         )
         .await
         .unwrap();
         let addr = format!("127.0.0.1:{}", handle.port());
 
-        let mut flood = TcpStream::connect(&addr).await.unwrap();
-        flood.write_all(&[b'x'; 200]).await.unwrap();
-        let mut byte = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(10), flood.read(&mut byte))
-            .await
-            .expect("the daemon closes the connection")
-            .unwrap_or(0);
-        assert_eq!(n, 0, "closed, not answered");
-
-        // A message at the limit still arrives, on a new connection.
-        let mut ok = TcpStream::connect(&addr).await.unwrap();
-        ok.write_all(payload).await.unwrap();
-        ok.write_all(&[0u8]).await.unwrap();
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        // An oversize message — longer than the limit by far, sent in pieces — then its NUL,
+        // then an ordinary message.
+        for _ in 0..50 {
+            stream.write_all(&[b'x'; 1000]).await.unwrap();
+        }
+        stream.write_all(&[0u8]).await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        stream.write_all(&[0u8]).await.unwrap();
         let entry = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
-            .expect("the message arrives")
+            .expect("the next message arrives")
             .expect("the channel is open");
-        assert_eq!(entry.message, "x");
-    }
-
-    /// Past the connection cap a new connection is closed on accept, so the TCP input's total
-    /// buffers stay bounded however many connections a sender opens; once one closes, a new
-    /// one is served again.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_connection_past_the_cap_is_closed() {
-        use tokio::io::AsyncReadExt;
-        let (sender, mut rx) = mpsc::channel(16);
-        let metrics = Arc::new(ReceiverMetrics::new());
-        let handle = start_tcp_listener_with_limits(
-            "127.0.0.1:0",
-            sender,
-            metrics,
-            MAX_GELF_TCP_MESSAGE_BYTES,
-            2,
-        )
-        .await
-        .unwrap();
-        let addr = format!("127.0.0.1:{}", handle.port());
-
-        let held = [
-            TcpStream::connect(&addr).await.unwrap(),
-            TcpStream::connect(&addr).await.unwrap(),
-        ];
-        for _ in 0..500 {
-            if handle.connected_clients() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        assert_eq!(entry.message, "after");
         assert_eq!(
-            handle.connected_clients(),
-            2,
-            "both held connections are served"
+            metrics.snapshot().gelf_tcp,
+            1,
+            "the oversize message is counted"
         );
 
-        let mut third = TcpStream::connect(&addr).await.unwrap();
-        let mut byte = [0u8; 1];
-        let n = tokio::time::timeout(Duration::from_secs(10), third.read(&mut byte))
-            .await
-            .expect("the third is closed")
-            .unwrap_or(0);
-        assert_eq!(n, 0, "closed, not served");
-
-        drop(held);
+        drop(stream);
         for _ in 0..500 {
             if handle.connected_clients() == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let payload =
-            br#"{"version":"1.1","host":"h","short_message":"after","level":6,"timestamp":1.0}"#;
-        let mut again = TcpStream::connect(&addr).await.unwrap();
-        again.write_all(payload).await.unwrap();
-        again.write_all(&[0u8]).await.unwrap();
-        let entry = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("served again")
-            .expect("the channel is open");
-        assert_eq!(entry.message, "after");
+        assert_eq!(handle.connected_clients(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

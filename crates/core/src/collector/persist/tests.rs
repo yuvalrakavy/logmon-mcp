@@ -502,6 +502,77 @@ fn two_files_at_each_other_s_names_both_move_into_place() {
     }
 }
 
+/// Every readable collector file in the directory, as `(owner, name)`.
+fn collectors_on_disk(d: &Path) -> Vec<(String, String)> {
+    let mut on_disk: Vec<(String, String)> = std::fs::read_dir(d.join(COLLECTORS_DIR))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .map(|e| {
+            let c: PersistedCollector =
+                serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap();
+            (c.owner, c.name)
+        })
+        .collect();
+    on_disk.sort();
+    on_disk
+}
+
+/// A migration move never replaces what sits at its target: here a staging name holds ANOTHER
+/// collector's file (placed by hand). `rename` would have replaced it silently, losing that
+/// collector.
+#[test]
+fn a_staging_move_never_replaces_another_collector_s_file() {
+    let d = tmp();
+    std::fs::create_dir_all(d.path().join(COLLECTORS_DIR)).unwrap();
+    let canonical_ac = collector_path(d.path(), "a", "c");
+    let mut occupant = file_with(vec![]);
+    occupant.owner = "b".into();
+    occupant.name = "d".into();
+    std::fs::write(
+        staging_path(&canonical_ac),
+        serde_json::to_vec(&occupant).unwrap(),
+    )
+    .unwrap();
+    let mut legacy = file_with(vec![]);
+    legacy.owner = "a".into();
+    legacy.name = "c".into();
+    std::fs::write(
+        d.path().join(COLLECTORS_DIR).join("a__c.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 2);
+    assert_eq!(
+        collectors_on_disk(d.path()),
+        vec![
+            ("a".to_string(), "c".to_string()),
+            ("b".to_string(), "d".to_string())
+        ],
+        "both collectors are still on disk"
+    );
+}
+
+/// A file left at its staging name by a crash between the migration's two moves finishes the
+/// move at the next boot.
+#[test]
+fn a_file_left_staged_by_a_crash_moves_into_place() {
+    let d = tmp();
+    let canonical = collector_path(d.path(), "sess", "perf");
+    std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+    std::fs::write(
+        staging_path(&canonical),
+        serde_json::to_vec(&file_with(vec![])).unwrap(),
+    )
+    .unwrap();
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 1);
+    assert!(canonical.exists(), "moved into place");
+    assert!(!staging_path(&canonical).exists());
+}
+
 /// Names have no length limit and a filename does: a name whose encoding would come near it
 /// gets a shortened, hashed filename — short enough to write, and still one per collector when
 /// two long names share their readable prefix.
