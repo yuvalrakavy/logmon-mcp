@@ -812,6 +812,7 @@ async fn run_initialized(
                             crate::throttle::pace_after_error(
                                 &ACCEPT_ERRORS,
                                 &mut accept_failures_in_a_row,
+                                &e,
                                 |n| error!("accept error ({n} so far): {e}"),
                             )
                             .await;
@@ -913,6 +914,7 @@ async fn run_initialized(
                             crate::throttle::pace_after_error(
                                 &ACCEPT_ERRORS,
                                 &mut accept_failures_in_a_row,
+                                &e,
                                 |n| error!("accept error ({n} so far): {e}"),
                             )
                             .await;

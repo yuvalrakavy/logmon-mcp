@@ -333,7 +333,8 @@ impl FileLedger {
     /// here. A later write starts a fresh entry, its stamp from the same global sequence.
     ///
     /// **Called with the path's lock still held** — `held` is the caller's guard on `lock`, so
-    /// the other order does not compile. Released first, a write already waiting on it could
+    /// the call cannot be written after the caller's guard is dropped, and a debug build checks
+    /// the guard is this lock's (by address). Released first, a write already waiting on it could
     /// land — its stamp in this entry — and finish before the count was read, and the entry
     /// went with its stamp: a stale delete arriving later found a fresh entry at 0 and removed a
     /// live collector's only file. Holding it here cannot deadlock: nothing waits on a path's
@@ -344,8 +345,16 @@ impl FileLedger {
         lock: &Arc<Mutex<u64>>,
         held: &std::sync::MutexGuard<'_, u64>,
     ) {
-        let _ = held;
-        debug_assert!(lock.try_lock().is_err(), "`held` is not a guard on `lock`");
+        // The guard's value lives inside `lock`'s mutex: compare addresses. (Proves the guard is
+        // on this lock; a guard taken again after a release would pass — don't.)
+        debug_assert!(
+            {
+                let base = Arc::as_ptr(lock) as usize;
+                let value = &**held as *const u64 as usize;
+                value.wrapping_sub(base) < std::mem::size_of::<Mutex<u64>>()
+            },
+            "`held` is not a guard on `lock`"
+        );
         let mut paths = self
             .paths
             .lock()

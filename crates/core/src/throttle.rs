@@ -58,16 +58,33 @@ pub(crate) fn note(args: std::fmt::Arguments<'_>) {
     let _ = writeln!(std::io::stderr(), "{args}");
 }
 
+/// Whether `e` belongs to one connection — a peer that reset or aborted while queued, an
+/// interrupted call — rather than to the listener. Such an error uses up what caused it, so it
+/// cannot repeat into a spin, and pausing for it would let any host that can reach the port
+/// slow every accept down. tonic and axum treat the same kinds the same way.
+pub(crate) fn is_per_connection(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        ConnectionRefused | ConnectionAborted | ConnectionReset | Interrupted
+    )
+}
+
 /// What a loop around an accept or a receive does after one fails: log it (throttled), and
-/// pause if the failure repeats. A one-off failure — a peer that reset before it was accepted —
-/// is retried at once. One that repeats — out of file descriptors, typically — returned the
-/// same error at once on every retry: a spin at full CPU, and a log line per turn, for as long
-/// as it lasted. `failures_in_a_row` is the loop's own, reset by it on a success.
+/// pause if the failure repeats. A one-off failure is retried at once. One that repeats — out
+/// of file descriptors, typically — returned the same error at once on every retry: a spin at
+/// full CPU, and a log line per turn, for as long as it lasted. A per-connection error
+/// ([`is_per_connection`]) is neither counted, logged nor paused for. `failures_in_a_row` is the
+/// loop's own, reset by it on a success.
 pub(crate) async fn pace_after_error(
     throttle: &Throttle,
     failures_in_a_row: &mut u32,
+    e: &std::io::Error,
     log: impl FnOnce(u64),
 ) {
+    if is_per_connection(e) {
+        return;
+    }
     *failures_in_a_row = failures_in_a_row.saturating_add(1);
     if let Some(n) = throttle.hit() {
         log(n);
@@ -127,6 +144,8 @@ where
         };
         match &item {
             Some(Ok(_)) => self.failures_in_a_row = 0,
+            // Passed through untouched, as `pace_after_error` does: it cannot spin.
+            Some(Err(e)) if is_per_connection(e) => {}
             Some(Err(e)) => {
                 self.failures_in_a_row = self.failures_in_a_row.saturating_add(1);
                 if let Some(n) = self.throttle.hit() {
@@ -174,10 +193,16 @@ mod tests {
     async fn only_a_repeated_failure_pauses() {
         let t = Throttle::new();
         let mut failures = 0;
+        let emfile = std::io::Error::other("emfile");
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
         let start = tokio::time::Instant::now();
-        pace_after_error(&t, &mut failures, |_| {}).await;
+        pace_after_error(&t, &mut failures, &emfile, |_| {}).await;
         assert_eq!(start.elapsed(), std::time::Duration::ZERO);
-        pace_after_error(&t, &mut failures, |_| {}).await;
+        // A per-connection error is not a repeat, and never pauses.
+        pace_after_error(&t, &mut failures, &reset, |_| {}).await;
+        pace_after_error(&t, &mut failures, &reset, |_| {}).await;
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        pace_after_error(&t, &mut failures, &emfile, |_| {}).await;
         assert_eq!(start.elapsed(), std::time::Duration::from_millis(100));
     }
 
@@ -209,5 +234,22 @@ mod tests {
                 (true, ms(100)), // ...which the next accept waits out
             ]
         );
+    }
+
+    /// Per-connection errors in a row — peers resetting while queued — never pause accepts:
+    /// any host that can reach the port could otherwise slow every accept down.
+    #[tokio::test(start_paused = true)]
+    async fn per_connection_errors_never_pause_a_paced_accept_stream() {
+        use tokio_stream::StreamExt;
+        static T: Throttle = Throttle::new();
+        let reset = || Err::<u8, _>(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let mut s = PacedAccepts::new(
+            tokio_stream::iter(vec![reset(), reset(), reset(), Ok(1)]),
+            &T,
+            "test",
+        );
+        let start = tokio::time::Instant::now();
+        while s.next().await.is_some() {}
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 }

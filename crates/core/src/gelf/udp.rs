@@ -68,6 +68,7 @@ pub async fn start_udp_listener(
                             crate::throttle::pace_after_error(
                                 &RECV_ERRORS,
                                 &mut failures_in_a_row,
+                                &e,
                                 |n| note(format_args!("GELF UDP receive failed ({n} so far): {e}")),
                             )
                             .await;

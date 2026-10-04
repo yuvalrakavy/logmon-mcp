@@ -326,7 +326,9 @@ The broker also holds connections it can no longer use for less long:
   GELF TCP and OTLP gRPC inputs and on the broker's own client sockets alike. It was retried at
   once, spinning a core for as long as it lasted, and on the client sockets writing an ERROR
   line per turn. A GELF UDP receive error, ignored outright before, is logged and paced the
-  same way. (The OTLP HTTP input already paused.)
+  same way. (The OTLP HTTP input already paused.) An error that belongs to one connection — a
+  peer that reset while queued — is not counted as a repeat and never pauses, so a remote host
+  cannot use it to slow accepts down.
 - The GELF receivers no longer log every malformed message (any sender could fill the disk
   through the log, and a write to a full disk panicked the task that logged — a connection, or
   the TCP accept loop). Each such line is now logged at most once a minute, with a running count,

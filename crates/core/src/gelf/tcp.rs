@@ -85,7 +85,7 @@ async fn start_tcp_listener_with_limit(
                             stream
                         }
                         Err(e) => {
-                            pace_after_error(&ACCEPT_ERRORS, &mut failures_in_a_row, |n| {
+                            pace_after_error(&ACCEPT_ERRORS, &mut failures_in_a_row, &e, |n| {
                                 note(format_args!("GELF TCP accept failed ({n} so far): {e}"));
                             })
                             .await;
