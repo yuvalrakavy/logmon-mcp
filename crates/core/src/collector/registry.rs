@@ -284,6 +284,29 @@ pub struct CollectorRegistry {
     dir: Option<PathBuf>,
 }
 
+/// File work a lifecycle change left for after the caller's locks — see
+/// [`CollectorRegistry::finish`]. Dropped unfinished, its files stay on disk (to be restored
+/// at the next boot), so it is `must_use`.
+#[derive(Default)]
+#[must_use = "pass it to CollectorRegistry::finish once the caller's locks are released"]
+pub struct PendingFiles {
+    /// `(old owner, new owner, name)` of each collector that changed owner.
+    moved: Vec<(SessionId, SessionId, String)>,
+    /// `(owner, name)` of each detached collector's file.
+    unlink: Vec<(SessionId, String)>,
+    /// The detached collectors themselves, so their memory is freed off every lock.
+    detached: Vec<Entry>,
+}
+
+impl PendingFiles {
+    /// Fold `other`'s work into this one.
+    pub fn absorb(&mut self, other: PendingFiles) {
+        self.moved.extend(other.moved);
+        self.unlink.extend(other.unlink);
+        self.detached.extend(other.detached);
+    }
+}
+
 impl CollectorRegistry {
     pub fn new() -> Self {
         Self::with_budget(DEFAULT_MAX_TOTAL_SAMPLE_BYTES)
@@ -869,28 +892,30 @@ impl CollectorRegistry {
     /// TTL sweep (it iterates the session map) — while still holding their
     /// share of a daemon-wide reservation that only four collectors fit inside.
     pub fn rename_owner(&self, old: &SessionId, new: &SessionId) -> usize {
-        // A rename to the session's own name moves nothing. Taken through the move below, each
-        // collector's file was written and then deleted — the same path both times — so every
-        // collector was gone at the next restart.
+        let (moved, files) = self.move_owner(old, new);
+        self.finish(files);
+        moved
+    }
+
+    /// [`Self::rename_owner`]'s in-memory half: the entries change owner now, and the files
+    /// move when the returned work is [`finish`](Self::finish)ed. Split so a caller can make the
+    /// ownership change under its own lock and the file I/O after it. A rename to the
+    /// session's own name moves nothing — taken through the move, each collector's file was
+    /// written and then deleted at the same path, so every collector was gone at the next
+    /// restart.
+    pub fn move_owner(&self, old: &SessionId, new: &SessionId) -> (usize, PendingFiles) {
+        let mut pending = PendingFiles::default();
         if old == new {
-            return 0;
+            return (0, pending);
         }
-        let files: Vec<_> = {
-            let mut g = self.entries.write().expect("registry lock poisoned");
-            let mut moved = Vec::new();
-            for e in g.iter_mut().filter(|e| &e.owner == old) {
-                e.owner = new.clone();
-                moved.push((e.to_persisted(), e.collector.def().name.clone()));
-            }
-            moved
-        };
-        // The filename embeds the owner, so a rename is a new file plus an old
-        // one to unlink — done outside the lock, like every other write.
-        for (file, name) in &files {
-            let _ = self.write(file);
-            self.delete_file(old, name);
+        let mut g = self.entries.write().expect("registry lock poisoned");
+        for e in g.iter_mut().filter(|e| &e.owner == old) {
+            e.owner = new.clone();
+            pending
+                .moved
+                .push((old.clone(), new.clone(), e.collector.def().name.clone()));
         }
-        files.len()
+        (pending.moved.len(), pending)
     }
 
     fn delete_file(&self, owner: &SessionId, name: &str) {
@@ -902,22 +927,72 @@ impl CollectorRegistry {
     /// Drop every collector owned by a session — the lifecycle counterpart of
     /// session disposal.
     pub fn drop_session(&self, owner: &SessionId) -> usize {
-        let doomed: Vec<String> = {
-            let mut g = self.entries.write().expect("registry lock poisoned");
-            let doomed: Vec<String> = g
-                .iter()
-                .filter(|e| &e.owner == owner)
-                .map(|e| e.collector.def().name.clone())
-                .collect();
-            g.retain(|e| &e.owner != owner);
-            doomed
-        };
-        // Unlink outside the lock: it is filesystem work on the path that gates
-        // every domain's ingest.
-        for name in &doomed {
-            self.delete_file(owner, name);
+        let (dropped, files) = self.detach_session(owner);
+        self.finish(files);
+        dropped
+    }
+
+    /// [`Self::drop_session`]'s in-memory half: the session's collectors leave the registry
+    /// (and their reservation is released) now; their files are unlinked, and their memory
+    /// freed, when the returned work is [`finish`](Self::finish)ed.
+    pub fn detach_session(&self, owner: &SessionId) -> (usize, PendingFiles) {
+        let mut pending = PendingFiles::default();
+        let mut g = self.entries.write().expect("registry lock poisoned");
+        let (doomed, kept): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut *g)
+            .into_iter()
+            .partition(|e| &e.owner == owner);
+        *g = kept;
+        for e in &doomed {
+            pending
+                .unlink
+                .push((owner.clone(), e.collector.def().name.clone()));
         }
-        doomed.len()
+        pending.detached = doomed;
+        (pending.unlink.len(), pending)
+    }
+
+    /// Do the file work [`Self::detach_session`] and [`Self::move_owner`] left, with no lock
+    /// held: file I/O on the path that gates every domain's ingest — here or under the caller's
+    /// lock — lets one slow disk stall telemetry daemon-wide.
+    ///
+    /// A path is unlinked only if no live collector holds it now: the name may have a new
+    /// holder by the time this runs, and its collector's file is not this work's to remove. (A
+    /// holder arriving between that check and the unlink — microseconds — is the window every
+    /// write outside the lock already has.) A moved collector is written to its new path from
+    /// its CURRENT state, and its old file is unlinked only once that write succeeded: the old
+    /// file is otherwise its only copy on disk.
+    pub fn finish(&self, pending: PendingFiles) {
+        for (old, new, name) in &pending.moved {
+            let file = self
+                .entries
+                .read()
+                .expect("registry lock poisoned")
+                .iter()
+                .find(|e| &e.owner == new && &e.collector.def().name == name)
+                .map(|e| e.to_persisted());
+            let written = match file {
+                Some(file) => self.write(&file).is_ok(),
+                // Removed since it moved: its old file has nothing left to protect.
+                None => true,
+            };
+            if written && !self.is_live(old, name) {
+                self.delete_file(old, name);
+            }
+        }
+        for (owner, name) in &pending.unlink {
+            if !self.is_live(owner, name) {
+                self.delete_file(owner, name);
+            }
+        }
+        // `detached` is dropped here, freeing the detached collectors' samples off every lock.
+    }
+
+    fn is_live(&self, owner: &SessionId, name: &str) -> bool {
+        self.entries
+            .read()
+            .expect("registry lock poisoned")
+            .iter()
+            .any(|e| &e.owner == owner && e.collector.def().name == name)
     }
 
     /// Every distinct owner with at least one live collector.
@@ -1040,6 +1115,65 @@ mod tests {
 
     fn dom(n: &str) -> DomainId {
         DomainId::new(n).expect("valid domain name")
+    }
+
+    /// A detached collector's file is unlinked only if nothing holds its path when the work is
+    /// finished: by then the name may have a new holder that armed a collector of the same
+    /// name, and that file is the new collector's only copy on disk.
+    #[test]
+    fn finishing_a_detach_spares_a_file_a_new_holder_wrote() {
+        let d = tempfile::TempDir::new().unwrap();
+        let r = CollectorRegistry::new().with_persistence(d.path().to_path_buf());
+        let path = crate::collector::persist::collector_path(d.path(), "s", "c");
+        r.add(
+            &sid("s"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed");
+        assert!(path.exists());
+
+        let (detached, pending) = r.detach_session(&sid("s"));
+        assert_eq!(detached, 1);
+        // The name's next holder arms its own `c` before the detach's files are dealt with.
+        r.add(
+            &sid("s"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed again");
+        r.finish(pending);
+        assert!(path.exists(), "the new holder's file survives");
+
+        // The instrument fires: with no new holder, the file goes.
+        let (_, pending) = r.detach_session(&sid("s"));
+        r.finish(pending);
+        assert!(!path.exists());
+    }
+
+    /// A moved collector's old file goes only once its new file is written, and the new file
+    /// holds the collector as it is when the move is finished.
+    #[test]
+    fn finishing_a_move_writes_the_new_file_then_removes_the_old() {
+        let d = tempfile::TempDir::new().unwrap();
+        let r = CollectorRegistry::new().with_persistence(d.path().to_path_buf());
+        r.add(
+            &sid("old"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed");
+        let (moved, pending) = r.move_owner(&sid("old"), &sid("new"));
+        assert_eq!(moved, 1);
+        r.finish(pending);
+        assert!(crate::collector::persist::collector_path(d.path(), "new", "c").exists());
+        assert!(!crate::collector::persist::collector_path(d.path(), "old", "c").exists());
     }
 
     #[test]

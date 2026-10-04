@@ -15,7 +15,7 @@ use logmon_broker_core::filter::parser::parse_filter;
 use logmon_broker_core::receiver::ReceiverMetrics;
 use logmon_broker_core::span::types::{SpanEntry, SpanKind, SpanStatus};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Writer threads. Enough to interleave, few enough to stay fast in CI.
@@ -58,6 +58,19 @@ fn span(i: usize) -> SpanEntry {
     }
 }
 
+/// Block a writer until `ready()` — the other thread has acted at least twice — so the overlap
+/// a test needs is arranged, not hoped for. Left to the scheduler, a loaded machine ran the four
+/// writers to completion before the other thread got a turn: measured, 12 of 80 runs under 60
+/// CPU burners, every one failing only the overlap guard. Bounded: a thread that never acts
+/// fails the test by name instead of parking it.
+fn wait_for(ready: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "{what} never ran");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn armed(name: &str) -> (Arc<CollectorRegistry>, SessionId, DomainId) {
     let registry = Arc::new(CollectorRegistry::new());
     let owner = SessionId::Named("bench".into());
@@ -78,13 +91,18 @@ fn armed(name: &str) -> (Arc<CollectorRegistry>, SessionId, DomainId) {
 fn a14_a_reader_never_sees_the_two_tiers_disagree() {
     let (registry, owner, domain) = armed("c");
     let stop = Arc::new(AtomicBool::new(false));
+    let reads_done = Arc::new(AtomicU64::new(0));
 
     let writers: Vec<_> = (0..WRITERS)
         .map(|w| {
             let registry = registry.clone();
             let domain = domain.clone();
+            let reads_done = reads_done.clone();
             std::thread::spawn(move || {
                 for i in 0..PER_WRITER {
+                    if i == PER_WRITER / 2 {
+                        wait_for(|| reads_done.load(Ordering::Relaxed) >= 2, "the reader");
+                    }
                     registry.ingest_span(&domain, &span(w * PER_WRITER + i));
                 }
             })
@@ -95,6 +113,7 @@ fn a14_a_reader_never_sees_the_two_tiers_disagree() {
         let registry = registry.clone();
         let owner = owner.clone();
         let stop = stop.clone();
+        let reads_done = reads_done.clone();
         std::thread::spawn(move || {
             let mut reads = 0u64;
             while !stop.load(Ordering::Relaxed) {
@@ -110,6 +129,7 @@ fn a14_a_reader_never_sees_the_two_tiers_disagree() {
                     "a reader observed the exact tier and the sample tier out of step"
                 );
                 reads += 1;
+                reads_done.store(reads, Ordering::Relaxed);
             }
             reads
         })
@@ -140,13 +160,18 @@ fn a4_a_reset_during_ingest_takes_everything_or_nothing() {
     // and not others would lose spans here, and only here.
     let (registry, owner, domain) = armed("c");
     let stop = Arc::new(AtomicBool::new(false));
+    let resets_done = Arc::new(AtomicU64::new(0));
 
     let writers: Vec<_> = (0..WRITERS)
         .map(|w| {
             let registry = registry.clone();
             let domain = domain.clone();
+            let resets_done = resets_done.clone();
             std::thread::spawn(move || {
                 for i in 0..PER_WRITER {
+                    if i == PER_WRITER / 2 {
+                        wait_for(|| resets_done.load(Ordering::Relaxed) >= 2, "the resetter");
+                    }
                     registry.ingest_span(&domain, &span(w * PER_WRITER + i));
                 }
             })
@@ -157,6 +182,7 @@ fn a4_a_reset_during_ingest_takes_everything_or_nothing() {
         let registry = registry.clone();
         let owner = owner.clone();
         let stop = stop.clone();
+        let resets_done = resets_done.clone();
         std::thread::spawn(move || {
             let mut taken_count = 0u64;
             let mut taken_ns = 0i128;
@@ -166,6 +192,7 @@ fn a4_a_reset_during_ingest_takes_everything_or_nothing() {
                 taken_count += s.total.count;
                 taken_ns += s.total.total_ns;
                 resets += 1;
+                resets_done.store(resets, Ordering::Relaxed);
                 std::thread::yield_now();
             }
             (taken_count, taken_ns, resets)

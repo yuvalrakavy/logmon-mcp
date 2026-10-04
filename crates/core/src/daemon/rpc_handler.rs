@@ -8,7 +8,7 @@ use crate::collector::state::{Collector, CollectorDef, DEFAULT_MAX_SAMPLE_BYTES}
 use crate::daemon::domain::{Domain, DomainId, DomainRegistry, DomainSource};
 use crate::daemon::domain_lifecycle::{spawn_ephemeral_domain, DomainPortSpec};
 use crate::daemon::log_processor::sync_pre_buffer_size_for_domain;
-use crate::daemon::session::{SessionId, SessionRegistry};
+use crate::daemon::session::{DisposeOutcome, SessionId, SessionRegistry};
 use crate::domain_data::ScopedData;
 use crate::gelf::message::LogEntry;
 use crate::span::types::SlowGroupBy;
@@ -26,6 +26,17 @@ pub struct DomainPolicy {
     pub default_span_buffer_size: usize,
     /// Idle-seconds threshold above which a domain is reported `stale` (#2).
     pub stale_after_secs: u64,
+}
+
+/// What [`RpcHandler::dispose_expired_session`] did, for the TTL sweep's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredDisposal {
+    /// Disposed of, with the bookmarks and collectors that went with it.
+    Disposed { bookmarks: usize, collectors: usize },
+    /// Connected again, or seen again within the TTL, since the sweep listed it — kept.
+    NotAbandoned,
+    /// Already gone (dropped, or displaced by a rename) since the sweep listed it.
+    Gone,
 }
 
 /// Project a live [`Domain`] into its wire [`DomainInfo`] (used by
@@ -824,56 +835,55 @@ impl RpcHandler {
     ) -> Result<Value, String> {
         let req: SessionsRename = serde_json::from_value(params.clone())
             .map_err(|e| format!("invalid sessions.rename params: {e}"))?;
+        // Everything keyed by a session's NAME changes hands inside the registry's rename, under
+        // its lock (`SessionRegistry::rename` says why); the collector files move after it.
+        let mut files = crate::collector::registry::PendingFiles::default();
+        let mut displaced_cleared = (0, 0);
+        let mut moved = (0, 0);
         let (new_id, displaced) = self
             .sessions
-            .rename(session_id, &req.name)
-            .map_err(|e| e.to_string())?;
-        let displaced_stale_holder = match displaced {
-            Some(touched) => {
-                // The stale holder's bookmarks are keyed by the NAME the
-                // renamed session now owns — sweep them so the live session
-                // doesn't inherit a dead conversation's bookmarks. (It has
-                // made none under this name yet, so the sweep is safe.)
-                let key = new_id.to_string();
-                let mut cleared = 0;
-                for domain_id in &touched {
-                    if let Some(d) = self.domains.get(domain_id) {
-                        cleared += d.bookmarks.clear_session(&key);
-                    }
+            .rename(session_id, &req.name, |new_id, displaced| {
+                if displaced {
+                    // The stale holder's bookmarks and collectors are keyed by the NAME the
+                    // renamed session now owns. Left behind, the live session would inherit a
+                    // dead conversation's bookmarks, and its collectors — live window AND
+                    // recorded history — would be readable and removable by whoever took the
+                    // name. Detached BEFORE the renamer's state moves in, which is what keeps
+                    // the renamer's own.
+                    let (bookmarks, collectors, pending) =
+                        self.detach_name_keyed_state(new_id, true);
+                    displaced_cleared = (bookmarks, collectors);
+                    files.absorb(pending);
                 }
-                // Collectors follow the bookmarks, for the same reason and now
-                // actually. Left behind, the displaced session's collectors —
-                // their live window AND their recorded history — would become
-                // readable and removable by whoever took the name, which is a
-                // different conversation's measurements.
-                let inherited = self.collectors.drop_session(&new_id);
-                // The displaced holder went with its triggers, so its `pre_window`s no longer
-                // size any buffer — the fourth way a session is removed (gh #25).
-                self.resync_pre_buffers();
-                tracing::info!(name = %key, bookmarks_cleared = cleared,
-                    collectors_cleared = inherited,
-                    "displaced a disconnected session holding the target name");
-                true
-            }
-            None => false,
-        };
-        // The renaming session keeps its OWN collectors: their owner moves with
-        // it. Without this they are orphaned under a name nothing resolves —
-        // invisible to an owner-scoped list, unreachable by sessions.drop, and
-        // never swept, while still holding their share of the reservation.
-        let moved = self.collectors.rename_owner(session_id, &new_id);
-        // Its bookmarks move too, for the same reason: keyed by the old name, they were
-        // orphaned, and its cursors auto-created at 0 under the new one and replayed everything
-        // they had already returned.
-        let (old_key, new_key) = (session_id.to_string(), new_id.to_string());
-        let bookmarks_moved: usize = self
-            .domains
-            .list()
-            .iter()
-            .map(|d| d.bookmarks.rename_session(&old_key, &new_key))
-            .sum();
-        tracing::info!(old = %session_id, new = %new_id, collectors_moved = moved,
-            bookmarks_moved, "session renamed");
+                // The renaming session keeps its OWN collectors and bookmarks: they move with
+                // it. Left under the old name, the collectors are orphaned — invisible to an
+                // owner-scoped list, unreachable by sessions.drop, never swept, still holding
+                // their share of the reservation — and its cursors auto-create at 0 under the
+                // new name and replay everything they had already returned.
+                let (collectors, pending) = self.collectors.move_owner(session_id, new_id);
+                files.absorb(pending);
+                let (old_key, new_key) = (session_id.to_string(), new_id.to_string());
+                let bookmarks: usize = self
+                    .domains
+                    .list()
+                    .iter()
+                    .map(|d| d.bookmarks.rename_session(&old_key, &new_key))
+                    .sum();
+                moved = (bookmarks, collectors);
+            })
+            .map_err(|e| e.to_string())?;
+        self.collectors.finish(files);
+        if displaced {
+            // The displaced holder went with its triggers, so its `pre_window`s no longer
+            // size any buffer — the fourth way a session is removed (gh #25).
+            self.resync_pre_buffers();
+            tracing::info!(name = %new_id, bookmarks_cleared = displaced_cleared.0,
+                collectors_cleared = displaced_cleared.1,
+                "displaced a disconnected session holding the target name");
+        }
+        let displaced_stale_holder = displaced;
+        tracing::info!(old = %session_id, new = %new_id, bookmarks_moved = moved.0,
+            collectors_moved = moved.1, "session renamed");
         serde_json::to_value(SessionsRenameResult {
             name: req.name,
             displaced_stale_holder,
@@ -3061,20 +3071,30 @@ impl RpcHandler {
         let name = req_str(params, "name")?;
         let id = SessionId::Named(name.to_string());
         // Everything keyed by the name — its bookmarks in every domain, its collectors and their
-        // share of a reservation only four default-sized collectors fit inside — is cleared
-        // inside the registry's decision, under its lock. Never for a CONNECTED session: it is
-        // refused and loses nothing (the collectors used to be released before the refusal,
-        // destroying a live session's collectors and replying `dropped` while it stayed). Never
-        // after a new holder could take the name (`drop_session` says why). And also when no
-        // session holds the name, so a reservation that outlived its session is still reclaimed
-        // — boot re-registers every named collector owner, so that should not arise, but if it
-        // does the budget comes back and the reply counts it. The bookmarks are cleared too: a
-        // later session of the same name inherited them — its cursors resumed from the old
-        // positions and `bookmarks.add` refused names it had never used.
+        // share of a reservation only four default-sized collectors fit inside — is detached
+        // inside the registry's decision, under its lock; the collector files are unlinked after
+        // it. Never for a CONNECTED session: it is refused and loses nothing (the collectors
+        // used to be released before the refusal, destroying a live session's collectors and
+        // replying `dropped` while it stayed). Never after a new holder could take the name
+        // (`drop_session` says why). The bookmarks go too: a later session of the same name
+        // inherited them — its cursors resumed from the old positions and `bookmarks.add`
+        // refused names it had never used.
+        //
+        // When no session holds the name, only its collectors are reclaimed — boot re-registers
+        // every named collector owner, so that should not arise, but if it does the budget comes
+        // back and the reply counts it. Not its bookmarks: they are keyed by the bare name, and
+        // the name may be a live anonymous session's id (`sessions.list` shows those), whose
+        // bookmarks and cursors this would have wiped while replying "not found".
         let mut released = (0, 0);
-        let session_result = self.sessions.drop_session(name, || {
-            released = self.clear_name_keyed_state(&id);
+        let mut files = None;
+        let session_result = self.sessions.drop_session(name, |existed| {
+            let (bookmarks, collectors, pending) = self.detach_name_keyed_state(&id, existed);
+            released = (bookmarks, collectors);
+            files = Some(pending);
         });
+        if let Some(files) = files {
+            self.collectors.finish(files);
+        }
         if let Err(e) = &session_result {
             if matches!(e, crate::daemon::session::SessionError::AlreadyConnected(_)) {
                 return Err(e.to_string());
@@ -3226,46 +3246,69 @@ impl RpcHandler {
 
     /// Dispose of a session the TTL sweep listed as disconnected past `ttl`: the session, its
     /// bookmarks in every domain, its collectors (and their reservation), and then the
-    /// pre-trigger buffer sizes its triggers no longer set. Returns the bookmarks and collectors
-    /// cleared, or `None` if the session is no longer abandoned and was left alone. The sweep's
-    /// whole per-session body, here rather than inline in `server.rs` so a test reaches it
-    /// without waiting a sweep period (60 s at the least).
+    /// pre-trigger buffer sizes its triggers no longer set. The sweep's whole per-session body,
+    /// here rather than inline in `server.rs` so a test reaches it without waiting a sweep
+    /// period (60 s at the least).
     pub fn dispose_expired_session(
         &self,
         session_id: &SessionId,
         ttl: std::time::Duration,
-    ) -> Option<(usize, usize)> {
-        // Decided and cleared under the registry's lock (`dispose_if_expired` says why). The
-        // TTL is what bounds the collector reservation: a named session keeps its collectors
-        // across a disconnect (that is the arm-run-read workflow), so this sweep and
-        // `sessions.drop` are the only things that ever hand the budget back.
+    ) -> ExpiredDisposal {
+        // Decided and cleared under the registry's lock (`dispose_if_expired` says why); the
+        // collector files are unlinked after it. The TTL is what bounds the collector
+        // reservation: a named session keeps its collectors across a disconnect (that is the
+        // arm-run-read workflow), so this sweep and `sessions.drop` are the only things that
+        // ever hand the budget back.
         let mut cleared = (0, 0);
-        let disposed = self.sessions.dispose_if_expired(session_id, ttl, || {
-            cleared = self.clear_name_keyed_state(session_id);
+        let mut files = None;
+        let outcome = self.sessions.dispose_if_expired(session_id, ttl, || {
+            let (bookmarks, collectors, pending) = self.detach_name_keyed_state(session_id, true);
+            cleared = (bookmarks, collectors);
+            files = Some(pending);
         });
-        if !disposed {
-            return None;
+        if let Some(files) = files {
+            self.collectors.finish(files);
         }
-        self.resync_pre_buffers();
-        Some(cleared)
+        match outcome {
+            DisposeOutcome::Disposed => {
+                self.resync_pre_buffers();
+                ExpiredDisposal::Disposed {
+                    bookmarks: cleared.0,
+                    collectors: cleared.1,
+                }
+            }
+            DisposeOutcome::NotAbandoned => ExpiredDisposal::NotAbandoned,
+            DisposeOutcome::Gone => ExpiredDisposal::Gone,
+        }
     }
 
-    /// Clear what is keyed by a session's NAME rather than held by the session — its bookmarks
-    /// in every domain, and its collectors with their reservation. Returns `(bookmarks,
-    /// collectors)` cleared. Every domain rather than the ones the session touched: the call
-    /// runs inside the registry's lock, and a bookmark found anywhere under the name belongs to
-    /// nobody else. Takes only leaf locks (domains, bookmarks, collectors), which is what lets
-    /// [`SessionRegistry::dispose_if_expired`] and [`SessionRegistry::drop_session`] run it
-    /// under theirs.
-    fn clear_name_keyed_state(&self, session_id: &SessionId) -> (usize, usize) {
-        let key = session_id.to_string();
-        let bookmarks = self
-            .domains
-            .list()
-            .iter()
-            .map(|d| d.bookmarks.clear_session(&key))
-            .sum();
-        (bookmarks, self.clear_session_collectors(session_id))
+    /// Detach what is keyed by a session's NAME rather than held by the session — its
+    /// bookmarks in every domain (when `bookmarks`), and its collectors with their reservation.
+    /// Returns `(bookmarks, collectors)` cleared and the collectors' file work, which the
+    /// caller [`finish`](CollectorRegistry::finish)es once its locks are released. Every domain
+    /// rather than the ones the session touched: the call runs inside the registry's lock, and
+    /// there a bookmark under the name belongs to nobody else — a named session can never hold
+    /// a live anonymous session's id ([`SessionRegistry::claim_named`]). Takes only leaf locks
+    /// (domains, bookmarks, collectors) and does no file I/O, which is what lets
+    /// [`SessionRegistry::dispose_if_expired`], [`SessionRegistry::drop_session`] and
+    /// [`SessionRegistry::rename`] run it under theirs.
+    fn detach_name_keyed_state(
+        &self,
+        session_id: &SessionId,
+        bookmarks: bool,
+    ) -> (usize, usize, crate::collector::registry::PendingFiles) {
+        let cleared = if bookmarks {
+            let key = session_id.to_string();
+            self.domains
+                .list()
+                .iter()
+                .map(|d| d.bookmarks.clear_session(&key))
+                .sum()
+        } else {
+            0
+        };
+        let (collectors, files) = self.collectors.detach_session(session_id);
+        (cleared, collectors, files)
     }
 
     /// Re-derive every domain's pre-trigger buffer size from the sessions bound to it NOW.

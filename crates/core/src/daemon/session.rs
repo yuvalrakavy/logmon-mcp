@@ -94,6 +94,44 @@ pub enum SessionError {
     TriggerError(#[from] TriggerError),
 }
 
+/// What [`SessionRegistry::dispose_if_expired`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisposeOutcome {
+    /// Removed, and its cleanup run.
+    Disposed,
+    /// Connected again, or seen again within the TTL — left alone.
+    NotAbandoned,
+    /// No longer registered (dropped, or displaced by a rename) — nothing to do.
+    Gone,
+}
+
+/// A named session may not take a name a live ANONYMOUS session holds as its id. Both
+/// stringify to the bare name, and bookmarks are keyed by that string — so the two would
+/// share bookmarks, and the anonymous one's disconnect, which clears its own, would wipe the
+/// named one's. Anonymous ids are fresh UUIDs, so this refuses only a name copied from one.
+fn refuse_an_anonymous_id(
+    sessions: &HashMap<SessionId, SessionState>,
+    name: &str,
+) -> Result<(), SessionError> {
+    if sessions.contains_key(&SessionId::Anonymous(name.to_string())) {
+        return Err(SessionError::AlreadyConnected(name.to_string()));
+    }
+    Ok(())
+}
+
+/// Run work that executes under the session registry's write lock, containing a panic so it
+/// cannot unwind through the guard. A poisoned registry lock stops every domain's ingest and
+/// every connection for good; the work's own failure — a leaf lock poisoned by some earlier
+/// panic — leaves only what it was clearing behind, and is logged.
+fn run_contained(what: &str, work: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+        tracing::error!(
+            what,
+            "work under the session registry's lock panicked; contained, so the registry stays usable"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Private types
 // ---------------------------------------------------------------------------
@@ -249,6 +287,7 @@ impl SessionRegistry {
 
         let id = SessionId::Named(name.to_string());
         let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        refuse_an_anonymous_id(&sessions, name)?;
 
         if let Some(existing) = sessions.get(&id) {
             if existing.connected.load(Ordering::Relaxed) {
@@ -262,6 +301,33 @@ impl SessionRegistry {
         let state = SessionState::new_named(name);
         sessions.insert(id.clone(), state);
         Ok(id)
+    }
+
+    /// Claim the named session `name` for a connection: create it, or take over a disconnected
+    /// one, decided in one step under the write lock. Returns the id and whether it is new.
+    /// `session.start` used to `create_named` and, when that failed, `reconnect` — and a
+    /// disposal between the two (the TTL sweep, `sessions.drop`) failed the handshake with
+    /// "not found" where a fresh session was the answer.
+    pub fn claim_named(&self, name: &str) -> Result<(SessionId, bool), SessionError> {
+        if !is_valid_name(name) {
+            return Err(SessionError::InvalidName(name.to_string()));
+        }
+        let id = SessionId::Named(name.to_string());
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        refuse_an_anonymous_id(&sessions, name)?;
+        match sessions.get(&id) {
+            Some(existing) => {
+                if existing.connected.swap(true, Ordering::Relaxed) {
+                    return Err(SessionError::AlreadyConnected(name.to_string()));
+                }
+                existing.touch();
+                Ok((id, false))
+            }
+            None => {
+                sessions.insert(id.clone(), SessionState::new_named(name));
+                Ok((id, true))
+            }
+        }
     }
 
     pub fn reconnect(&self, id: &SessionId) -> Result<(), SessionError> {
@@ -343,56 +409,62 @@ impl SessionRegistry {
     ///   returned so the caller can clear its bookmarks: bookmark stores key
     ///   by the session NAME, which the renamed session now inherits — without
     ///   the sweep it would silently adopt a dead conversation's bookmarks.
-    /// - renaming to one's own current name is a no-op.
+    /// - renaming to one's own current name is a no-op;
+    /// - a name a live ANONYMOUS session holds as its id → `AlreadyConnected` (see
+    ///   [`refuse_an_anonymous_id`]).
     ///
     /// Anonymous → named is allowed (the session becomes persistent).
+    ///
+    /// `transfer(new_id, displaced)` runs under the write lock once the registry entry has
+    /// moved — `displaced` says a stale holder was removed. It is where the caller moves what
+    /// is keyed by the old NAME (bookmarks, collectors) and clears what the displaced holder
+    /// left under the new one: done after the lock, another request could take the old name,
+    /// or drop it, in between, and lose its state or take the renamer's. Contained like
+    /// [`Self::dispose_if_expired`]'s cleanup, and like it must take only leaf locks. Not run
+    /// for a no-op rename. Returns the new id and whether a stale holder was displaced.
     pub fn rename(
         &self,
         old: &SessionId,
         new_name: &str,
-    ) -> Result<(SessionId, Option<Vec<DomainId>>), SessionError> {
+        transfer: impl FnOnce(&SessionId, bool),
+    ) -> Result<(SessionId, bool), SessionError> {
         if !is_valid_name(new_name) {
             return Err(SessionError::InvalidName(new_name.to_string()));
         }
         let new_id = SessionId::Named(new_name.to_string());
         if *old == new_id {
-            return Ok((new_id, None));
+            return Ok((new_id, false));
         }
 
         let mut sessions = self.sessions.write().expect("sessions lock poisoned");
         if !sessions.contains_key(old) {
             return Err(SessionError::NotFound(old.to_string()));
         }
-        let displaced_domains = match sessions.get(&new_id) {
+        // An anonymous session renaming itself to its own id leaves no anonymous holder.
+        if *old != SessionId::Anonymous(new_name.to_string()) {
+            refuse_an_anonymous_id(&sessions, new_name)?;
+        }
+        let displaced = match sessions.get(&new_id) {
             Some(existing) if existing.connected.load(Ordering::Relaxed) => {
                 return Err(SessionError::AlreadyConnected(new_name.to_string()));
             }
-            Some(stale) => {
-                // Capture BEFORE the remove/overwrite — after it, the registry
-                // no longer knows which domains the dead session touched.
-                let touched = stale
-                    .touched_domains
-                    .read()
-                    .expect("touched_domains lock poisoned")
-                    .iter()
-                    .cloned()
-                    .collect();
+            Some(_) => {
                 sessions.remove(&new_id);
-                Some(touched)
+                true
             }
-            None => None,
+            None => false,
         };
 
         let mut state = sessions.remove(old).expect("checked above");
         state.name = Some(new_name.to_string());
         state.touch();
         sessions.insert(new_id.clone(), state);
-        Ok((new_id, displaced_domains))
+        run_contained("sessions.rename", || transfer(&new_id, displaced));
+        Ok((new_id, displaced))
     }
 
     /// Dispose of `id` if it is STILL abandoned — disconnected and last seen more than `ttl`
-    /// ago — deciding under the write lock and running `cleanup` before releasing it. Returns
-    /// whether the session was disposed of.
+    /// ago — deciding under the write lock and running `cleanup` before releasing it.
     ///
     /// The TTL sweep lists its candidates first and disposes of them one by one; a session
     /// that reconnected in the meantime is live, and one that reconnected and left again is no
@@ -400,16 +472,18 @@ impl SessionRegistry {
     /// made. `cleanup` runs under the lock because what it clears (bookmarks, collectors) is
     /// keyed by NAME: after the lock, a new holder of the name could already exist — a rename
     /// onto it is a single request — and lose its own state to this disposal. It must take
-    /// only leaf locks, never this registry's.
+    /// only leaf locks, never this registry's, and must do no slow work (file I/O): every
+    /// record of every domain reads this lock. It is contained: a panic in it is logged, and
+    /// never unwinds through the guard to poison the registry for the whole daemon.
     pub fn dispose_if_expired(
         &self,
         id: &SessionId,
         ttl: std::time::Duration,
         cleanup: impl FnOnce(),
-    ) -> bool {
+    ) -> DisposeOutcome {
         let mut sessions = self.sessions.write().expect("sessions lock poisoned");
         let Some(state) = sessions.get(id) else {
-            return false;
+            return DisposeOutcome::Gone;
         };
         let abandoned = !state.connected.load(Ordering::Relaxed)
             && state
@@ -419,11 +493,11 @@ impl SessionRegistry {
                 .elapsed()
                 > ttl;
         if !abandoned {
-            return false;
+            return DisposeOutcome::NotAbandoned;
         }
         sessions.remove(id);
-        cleanup();
-        true
+        run_contained("session disposal", cleanup);
+        DisposeOutcome::Disposed
     }
 
     /// Move `id`'s `last_seen` back by `by`, so a test can make a session look abandoned
@@ -567,18 +641,18 @@ impl SessionRegistry {
         }
     }
 
-    /// Drop the disconnected named session `name`, running `cleanup` under the write lock —
-    /// also when no such session exists (`NotFound`), since state keyed by the name can outlive
-    /// it; never when it is connected (`AlreadyConnected`, nothing touched). Under the lock for
-    /// the reason [`Self::dispose_if_expired`] gives: what `cleanup` clears is keyed by NAME,
-    /// and a new holder could otherwise take the name between the removal and the clear.
-    /// `cleanup` must take only leaf locks, never this registry's.
-    pub fn drop_session(&self, name: &str, cleanup: impl FnOnce()) -> Result<(), SessionError> {
+    /// Drop the disconnected named session `name`, running `cleanup(existed)` under the write
+    /// lock: `true` after removing it, `false` when no such session exists — state keyed by
+    /// its typed id can outlive it, but `false` licenses nothing keyed by the bare NAME, which
+    /// may be a live anonymous session's id. Never run for a connected session
+    /// (`AlreadyConnected`, nothing touched). Under the lock, and contained, for the reasons
+    /// [`Self::dispose_if_expired`] gives, with the same rules for `cleanup`.
+    pub fn drop_session(&self, name: &str, cleanup: impl FnOnce(bool)) -> Result<(), SessionError> {
         let id = SessionId::Named(name.to_string());
         let mut sessions = self.sessions.write().expect("sessions lock poisoned");
 
         let Some(state) = sessions.get(&id) else {
-            cleanup();
+            run_contained("sessions.drop", || cleanup(false));
             return Err(SessionError::NotFound(name.to_string()));
         };
 
@@ -587,7 +661,7 @@ impl SessionRegistry {
         }
 
         sessions.remove(&id);
-        cleanup();
+        run_contained("sessions.drop", || cleanup(true));
         Ok(())
     }
 

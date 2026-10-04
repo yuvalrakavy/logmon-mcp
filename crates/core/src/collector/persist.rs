@@ -24,6 +24,7 @@ use crate::receiver::TraceIngestLoss;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::{PathRow, ProfileSampled};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -373,29 +374,33 @@ impl PersistedSnapshot {
     }
 }
 
-/// Where a collector's file lives. The name is validated at `collectors.add`
-/// to `[A-Za-z0-9_-]`, which is what makes this safe to build by
-/// concatenation.
+/// Where a collector's file lives: `{owner}.{name}.json`, each part [`encode`]d.
+///
+/// Owner and name both reach the filename, so two sessions may each hold a collector called
+/// `perf` without colliding on disk — and the mapping is one-to-one, so no two collectors share
+/// a file. It was `{owner}__{name}.json`, and both parts may contain `_`: owner `a__b` with
+/// collector `c` and owner `a` with collector `b__c` wrote one file, each overwriting the
+/// other's definition and history. `.` never appears inside an encoded part, so it cannot be
+/// confused with the separator.
 pub fn collector_path(dir: &Path, owner: &str, name: &str) -> PathBuf {
-    // Owner and name both reach the filename, so two sessions may each hold a
-    // collector called `perf` without colliding on disk.
     dir.join(COLLECTORS_DIR)
-        .join(format!("{}__{}.json", sanitize(owner), name))
+        .join(format!("{}.{}.json", encode(owner), encode(name)))
 }
 
-/// Session names are `[A-Za-z0-9_-]` by the same rule as collector names, but
-/// they arrive from a wider surface (anonymous ids are UUIDs), so anything
-/// unexpected is folded to `_` rather than trusted into a path.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// Keep `[A-Za-z0-9_-]`; percent-encode every other byte (`%` included, so the encoding is
+/// one-to-one). Session and collector names are already `[A-Za-z0-9_-]` by validation, so this
+/// is the identity on every real name — it exists so nothing unexpected (an anonymous id from a
+/// wider surface, a `..`) is ever trusted into a path, without folding two names into one.
+fn encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub fn save(dir: &Path, file: &PersistedCollector) -> anyhow::Result<()> {
@@ -418,7 +423,7 @@ pub struct LoadOutcome {
 }
 
 pub fn load_all(dir: &Path) -> LoadOutcome {
-    let mut collectors = Vec::new();
+    let mut collectors: Vec<PersistedCollector> = Vec::new();
     let mut quarantined = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir.join(COLLECTORS_DIR)) else {
         return LoadOutcome {
@@ -426,19 +431,47 @@ pub fn load_all(dir: &Path) -> LoadOutcome {
             quarantined,
         };
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
+    // Listed up front: files are renamed below, and a directory read while it changes may or
+    // may not show the new names — which could load one collector twice.
+    let paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    let mut read: Vec<(PathBuf, PersistedCollector)> = Vec::new();
+    for path in paths {
         match read_one(&path) {
-            Ok(c) => collectors.push(c),
+            Ok(c) => read.push((path, c)),
             Err(reason) => {
                 let moved = path.with_extension("json.corrupt");
                 let _ = std::fs::rename(&path, &moved);
                 quarantined.push((moved, reason));
             }
         }
+    }
+    // A file not at its collector's canonical path was written under an earlier naming (or
+    // moved by hand). It is renamed into place; if the canonical file exists too, that one is
+    // the collector and this one is moved aside — never deleted, like an unreadable file.
+    // Files at canonical paths first, so a canonical file always wins over a stray copy.
+    read.sort_by_key(|(path, c)| *path != collector_path(dir, &c.owner, &c.name));
+    let mut loaded: HashSet<(String, String)> = HashSet::new();
+    for (path, c) in read {
+        let canonical = collector_path(dir, &c.owner, &c.name);
+        if !loaded.insert((c.owner.clone(), c.name.clone())) {
+            let moved = path.with_extension("json.superseded");
+            let _ = std::fs::rename(&path, &moved);
+            quarantined.push((moved, format!("superseded by {}", canonical.display())));
+            continue;
+        }
+        if path != canonical {
+            if let Err(e) = std::fs::rename(&path, &canonical) {
+                // Loaded anyway; the next write goes to the canonical path, and the next boot
+                // finds this one superseded.
+                tracing::warn!(?path, ?canonical, error = %e,
+                    "could not move a collector file to its canonical name");
+            }
+        }
+        collectors.push(c);
     }
     LoadOutcome {
         collectors,

@@ -224,22 +224,38 @@ that merely reconnects already counted while disconnected, so nothing changed fo
   disconnected AND last seen past the TTL — decided under the registry's lock, and the sweep
   logs a spared session as kept rather than disposed.
 - The sweep and `sessions.drop` cleared the session's bookmarks and collectors AFTER removing it
-  from the registry. Both are keyed by the session's NAME, so a new holder of the name — a
-  rename onto it is a single request — could lose its own to the clear. The clear now runs
-  inside the registry's lock, before any new holder can exist.
+  from the registry, and `sessions.rename` moved them after renaming it. All of it is keyed by
+  the session's NAME, so another request in between — a rename onto the freed name, a drop of
+  the old one — could lose its state or take the renamer's (a drop of the old name released the
+  renaming session's collectors and replied `dropped`). Each of them now changes that state
+  inside the registry's lock, before any other request can see the name; the collector files
+  are written and removed after it, sparing any a new holder of the name has written since.
 - `sessions.drop` on a CONNECTED session released its collectors (destroying their windows and
   history) and replied `dropped`, while the session itself was refused and stayed. It is now
   refused with nothing touched.
 - `sessions.drop` left the session's bookmarks behind, and a later session of the same name
   inherited them: its cursors resumed from the old positions and `bookmarks.add` refused names it
-  had never used. They are cleared with the session.
+  had never used. They are cleared with the session. (A drop of a name no session holds still
+  reclaims only collectors — the name may be a live anonymous session's id.)
+- A named session could take a live ANONYMOUS session's id as its name (`session.start` or
+  `sessions.rename` to the UUID `get_sessions` shows). Both are keyed by that string, so they
+  shared bookmarks, and the anonymous session's disconnect, which clears its own, wiped the named
+  one's. Such a name is refused as "already connected".
+- `session.start` for a named session created it or, failing that, reconnected — two steps, so
+  a disposal of the name in between (the TTL sweep, `sessions.drop`) failed the handshake with
+  "session not found" where a fresh session was the answer. It is one step now.
 - `sessions.rename` moved the session's collectors but not its bookmarks. Left under the old
   name, its cursors auto-created at 0 under the new one and replayed everything they had already
   returned (and an anonymous session's bookmarks stayed in memory until a restart). Bookmarks now
   move with the session, positions intact.
 - A rename to the session's OWN name deleted every one of its collector files (each was written
   and then deleted at the same path), so the next restart found no collectors. It moves nothing
-  now.
+  now. And a rename removes a collector's old file only once the new one is written: a failed
+  write (a full disk) used to delete the only copy.
+- The record of evicted cursors — what makes a recreated cursor warn that it lost its place —
+  stayed under the old name on a rename (the warning was lost) and outlived a dropped or
+  disposed session (a later holder of the name was warned about a cursor it never had). It
+  moves and goes with the session's bookmarks.
 - Two `session.start`s for the same disconnected name could both succeed: the claim was a check
   and then a set, so both passed the check and both connections owned one session. When the
   first left, the other's live session read as disconnected, open to the TTL sweep and to
@@ -252,6 +268,20 @@ and each read went into a buffer of its own. When a notification won while a req
 partly received — the SDK and the shim write a request and its newline as two writes — the bytes
 already read were dropped, the rest failed to parse, and the broker closed the connection. A
 request now survives the race: what arrived stays buffered until the line completes.
+
+A request line is also capped now, at 64 MiB: a client that streamed bytes with no newline grew
+the buffer until the broker ran out of memory. A longer line closes the connection with a
+warning.
+
+### Fixed — two collectors could share one file
+
+A collector's file was named `{session}__{name}.json`, and both parts may contain `_`, so
+session `a__b`'s collector `c` and session `a`'s collector `b__c` were one file — each
+overwriting the other's definition and recorded history. Files are now named
+`{session}.{name}.json`, with anything outside `[A-Za-z0-9_-]` percent-encoded, which no two
+collectors can share. Existing files are moved to the new names at the first start; a file that
+duplicates one already at its new name is set aside as `*.json.superseded`, never deleted. (A
+pair that had already collided cannot be recovered: only the last write survived.)
 
 ### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
 

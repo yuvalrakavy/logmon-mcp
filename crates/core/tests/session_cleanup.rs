@@ -56,16 +56,31 @@ async fn a_failed_rename_reply_still_disconnects_the_session_by_its_new_name() {
     drop(w);
     drop(lines);
 
+    // Wait for the rename to land and its connection to be cleaned up, watched from another
+    // session — connecting to `renamed` first could be served before the daemon handled the
+    // rename, create a fresh `renamed`, and pass without the rename ever happening.
+    let mut observer = daemon.connect_named("observer", None).await;
     for _ in 0..200 {
-        if let Ok(c) = daemon.try_connect_named("renamed", None).await {
-            // Vacuity: a connect served before the daemon handled the rename would create a
-            // fresh `renamed` and pass without the rename ever happening.
-            assert!(
-                !c.session_start_result.is_new,
-                "reached the renamed session, not a new one"
-            );
-            c.close().await.unwrap();
-            return;
+        let listed: serde_json::Value = observer
+            .call("sessions.list", serde_json::json!({}))
+            .await
+            .unwrap();
+        let renamed = listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "renamed")
+            .cloned();
+        if let Some(s) = renamed {
+            if s["connected"] == false {
+                let c = daemon
+                    .try_connect_named("renamed", None)
+                    .await
+                    .expect("a disconnected session can be resumed");
+                assert!(!c.session_start_result.is_new, "the renamed session itself");
+                c.close().await.unwrap();
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

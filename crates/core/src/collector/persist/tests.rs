@@ -298,13 +298,91 @@ fn two_sessions_may_each_hold_a_collector_of_the_same_name() {
     assert!(a.to_string_lossy().contains("collectors/"));
 }
 
+/// Owner `a__b` with collector `c` and owner `a` with collector `b__c` are two collectors and
+/// get two files. Under `{owner}__{name}.json` both were `a__b__c.json`, each overwriting the
+/// other's definition and history.
+#[test]
+fn names_that_join_the_same_way_still_get_two_files() {
+    let d = tmp();
+    assert_ne!(
+        collector_path(d.path(), "a__b", "c"),
+        collector_path(d.path(), "a", "b__c")
+    );
+    for (owner, name) in [("a__b", "c"), ("a", "b__c")] {
+        let mut f = file_with(vec![]);
+        f.owner = owner.into();
+        f.name = name.into();
+        save(d.path(), &f).expect("saved");
+    }
+    let mut got: Vec<(String, String)> = load_all(d.path())
+        .collectors
+        .into_iter()
+        .map(|c| (c.owner, c.name))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("a".to_string(), "b__c".to_string()),
+            ("a__b".to_string(), "c".to_string())
+        ]
+    );
+}
+
+/// A file written under the earlier `{owner}__{name}.json` naming is loaded and moved to its
+/// canonical path, so the next write and delete find it.
+#[test]
+fn a_file_under_the_earlier_naming_is_moved_to_its_canonical_path() {
+    let d = tmp();
+    let legacy = d.path().join(COLLECTORS_DIR).join("sess__perf.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, serde_json::to_vec(&file_with(vec![])).unwrap()).unwrap();
+
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 1);
+    assert!(out.quarantined.is_empty(), "{:?}", out.quarantined);
+    assert!(!legacy.exists(), "the earlier name is gone");
+    assert!(collector_path(d.path(), "sess", "perf").exists());
+    assert!(
+        delete(d.path(), "sess", "perf"),
+        "and a delete now finds it"
+    );
+}
+
+/// A stray copy beside the canonical file is moved aside, never loaded as a second collector
+/// and never deleted. The canonical file wins whichever the directory lists first.
+#[test]
+fn a_stray_copy_beside_the_canonical_file_is_moved_aside() {
+    let d = tmp();
+    save(d.path(), &file_with(vec![])).expect("saved");
+    let mut stray = file_with(vec![]);
+    stray.description = Some("the stray".into());
+    let legacy = d.path().join(COLLECTORS_DIR).join("sess__perf.json");
+    std::fs::write(&legacy, serde_json::to_vec(&stray).unwrap()).unwrap();
+
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 1);
+    assert_eq!(
+        out.collectors[0].description.as_deref(),
+        Some("the read-through cache"),
+        "the canonical file is the collector"
+    );
+    assert_eq!(out.quarantined.len(), 1, "{:?}", out.quarantined);
+    assert!(out.quarantined[0].1.contains("superseded"));
+    assert!(
+        legacy.with_extension("json.superseded").exists(),
+        "kept, aside"
+    );
+}
+
 #[test]
 fn a_session_name_cannot_walk_out_of_the_collectors_directory() {
     // Collector names are validated at add; session ids arrive from a wider
-    // surface, so anything unexpected is folded rather than trusted.
+    // surface, so anything unexpected is encoded rather than trusted.
     let p = collector_path(Path::new("/d"), "../../etc", "perf");
     let s = p.to_string_lossy();
     assert!(!s.contains(".."), "got: {s}");
+    assert!(!s["/d/collectors/".len()..].contains('/'), "got: {s}");
     assert!(s.contains("collectors/"));
 }
 

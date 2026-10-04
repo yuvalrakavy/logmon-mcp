@@ -8,7 +8,7 @@
 use logmon_broker_core::daemon::domain::{
     Domain, DomainConfig, DomainId, DomainRegistry, DomainSource,
 };
-use logmon_broker_core::daemon::rpc_handler::{DomainPolicy, RpcHandler};
+use logmon_broker_core::daemon::rpc_handler::{DomainPolicy, ExpiredDisposal, RpcHandler};
 use logmon_broker_core::daemon::session::{SessionId, SessionRegistry};
 use logmon_broker_core::engine::pipeline::LogPipeline;
 use logmon_broker_core::engine::seq_counter::SeqCounter;
@@ -100,7 +100,10 @@ fn a_session_that_reconnected_after_the_sweep_listed_it_is_not_disposed() {
     );
     // It reconnects before the disposal.
     sessions.reconnect(&id).unwrap();
-    assert_eq!(handler.dispose_expired_session(&id, TTL), None);
+    assert_eq!(
+        handler.dispose_expired_session(&id, TTL),
+        ExpiredDisposal::NotAbandoned
+    );
     assert!(sessions.is_connected(&id), "still registered and connected");
     assert_eq!(
         count(&handler, &id, "bookmarks.list", "bookmarks"),
@@ -131,7 +134,10 @@ fn a_session_active_again_since_the_listing_is_not_disposed() {
     let reserved = collectors.reserved_bytes();
     assert!(reserved > 0);
 
-    assert_eq!(handler.dispose_expired_session(&id, TTL), None);
+    assert_eq!(
+        handler.dispose_expired_session(&id, TTL),
+        ExpiredDisposal::NotAbandoned
+    );
     assert_eq!(
         collectors.reserved_bytes(),
         reserved,
@@ -141,8 +147,42 @@ fn a_session_active_again_since_the_listing_is_not_disposed() {
 
     // The instrument fires: abandoned for real, it is disposed of.
     sessions.backdate_last_seen(&id, LONG_AGO);
-    assert_eq!(handler.dispose_expired_session(&id, TTL), Some((0, 1)));
+    assert_eq!(
+        handler.dispose_expired_session(&id, TTL),
+        ExpiredDisposal::Disposed {
+            bookmarks: 0,
+            collectors: 1
+        }
+    );
     assert_eq!(collectors.reserved_bytes(), 0);
+    // And a session already gone is reported so, not as kept.
+    assert_eq!(
+        handler.dispose_expired_session(&id, TTL),
+        ExpiredDisposal::Gone
+    );
+}
+
+/// `sessions.drop` given a name no session holds reclaims nothing keyed by the bare name — the
+/// name may be a live anonymous session's id (`sessions.list` shows those), and that session's
+/// bookmarks and cursors used to be wiped while the drop replied "not found".
+#[test]
+fn dropping_an_anonymous_session_s_id_leaves_its_bookmarks_alone() {
+    let (handler, sessions, _) = single_domain_handler();
+    let anon = sessions.create_anonymous();
+    let add = RpcRequest::new(1, "bookmarks.add", json!({ "name": "mark" }));
+    assert!(handler.handle(&anon, &add).error.is_none());
+
+    let other = sessions.create_named("other").unwrap();
+    let resp = handler.handle(
+        &other,
+        &RpcRequest::new(2, "sessions.drop", json!({ "name": anon.to_string() })),
+    );
+    assert!(resp.error.is_some(), "no named session holds that name");
+    assert_eq!(
+        count(&handler, &anon, "bookmarks.list", "bookmarks"),
+        1,
+        "the anonymous session's bookmark survived"
+    );
 }
 
 /// `sessions.drop` clears the session's bookmarks. A later session of the same name used to
@@ -262,7 +302,10 @@ fn an_expired_session_stops_sizing_the_buffer_in_every_domain() {
     for id in [&big_default, &big_other] {
         sessions.disconnect(id);
         sessions.backdate_last_seen(id, LONG_AGO);
-        assert!(handler.dispose_expired_session(id, TTL).is_some());
+        assert!(matches!(
+            handler.dispose_expired_session(id, TTL),
+            ExpiredDisposal::Disposed { .. }
+        ));
     }
     assert_eq!(default_pipeline.pre_buffer_capacity(), 500);
     assert_eq!(other_pipeline.pre_buffer_capacity(), 500);

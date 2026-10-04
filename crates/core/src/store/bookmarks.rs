@@ -330,6 +330,13 @@ impl BookmarkStore {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         let before = map.len();
         map.retain(|_, b| b.session != session);
+        // Its record of evicted cursors goes too: kept, a later session of the same name got a
+        // "cursor was evicted" warning for a cursor it never had. (Lock order as `sweep`.)
+        let prefix = format!("{session}/");
+        self.recently_evicted
+            .lock()
+            .expect("recently_evicted poisoned")
+            .retain(|q| !q.starts_with(&prefix));
         before - map.len()
     }
 
@@ -354,6 +361,22 @@ impl BookmarkStore {
             b.session = new.to_string();
             b.qualified_name = format!("{new}/{}", b.name);
             map.insert(b.qualified_name.clone(), b);
+        }
+        // Its record of evicted cursors moves with it, so a cursor evicted before the rename
+        // still warns when it is recreated after it. (Lock order as `sweep`.)
+        let old_prefix = format!("{old}/");
+        let mut recent = self
+            .recently_evicted
+            .lock()
+            .expect("recently_evicted poisoned");
+        let moved: Vec<String> = recent
+            .iter()
+            .filter(|q| q.starts_with(&old_prefix))
+            .cloned()
+            .collect();
+        for q in moved {
+            recent.remove(&q);
+            recent.insert(format!("{new}/{}", &q[old_prefix.len()..]));
         }
         keys.len()
     }
@@ -449,6 +472,30 @@ impl BookmarkStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record of evicted cursors (what makes a recreated cursor warn) follows the session:
+    /// moved by a rename, removed with the session's bookmarks.
+    #[test]
+    fn the_record_of_evicted_cursors_follows_the_session() {
+        let store = BookmarkStore::new();
+        for q in ["old/cur", "other/cur"] {
+            store.recently_evicted.lock().unwrap().insert(q.into());
+        }
+        store.rename_session("old", "new");
+        {
+            let r = store.recently_evicted.lock().unwrap();
+            assert!(r.contains("new/cur"), "{r:?}");
+            assert!(!r.contains("old/cur"), "{r:?}");
+            assert!(r.contains("other/cur"), "{r:?}");
+        }
+        store.clear_session("new");
+        let r = store.recently_evicted.lock().unwrap();
+        assert!(!r.contains("new/cur"), "{r:?}");
+        assert!(
+            r.contains("other/cur"),
+            "another session's record is untouched: {r:?}"
+        );
+    }
 
     #[test]
     fn add_then_list_returns_bookmark() {

@@ -673,16 +673,22 @@ async fn run_initialized(
             loop {
                 interval.tick().await;
                 for id in sessions.expired_disconnected(ttl) {
+                    use crate::daemon::rpc_handler::ExpiredDisposal;
                     match handler.dispose_expired_session(&id, ttl) {
-                        Some((cleared, collectors)) => {
-                            info!(session = %id, bookmarks_cleared = cleared,
+                        ExpiredDisposal::Disposed {
+                            bookmarks,
+                            collectors,
+                        } => {
+                            info!(session = %id, bookmarks_cleared = bookmarks,
                                 collectors_released = collectors,
                                 "session TTL sweep: disposed (disconnected past TTL)");
                         }
-                        None => {
+                        ExpiredDisposal::NotAbandoned => {
                             info!(session = %id,
                                 "session TTL sweep: kept (active again since it was listed)");
                         }
+                        // Dropped or displaced since the listing: nothing happened, nothing to say.
+                        ExpiredDisposal::Gone => {}
                     }
                 }
             }
@@ -998,27 +1004,16 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     // 3. Create/reconnect session
     let (mut session_id, is_new) = match &params.name {
-        Some(name) => {
-            // Try create_named first; if it fails (already exists), try reconnect
-            match sessions.create_named(name) {
-                Ok(id) => (id, true),
-                Err(_) => {
-                    let id = SessionId::Named(name.clone());
-                    match sessions.reconnect(&id) {
-                        Ok(()) => (id, false),
-                        Err(e) => {
-                            let resp = RpcResponse::error(
-                                first_request.id,
-                                -32600,
-                                &format!("session error: {e}"),
-                            );
-                            write_message(&mut writer, &resp).await?;
-                            return Ok(());
-                        }
-                    }
-                }
+        // Create or take over, in one step (`claim_named` says why).
+        Some(name) => match sessions.claim_named(name) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                let resp =
+                    RpcResponse::error(first_request.id, -32600, &format!("session error: {e}"));
+                write_message(&mut writer, &resp).await?;
+                return Ok(());
             }
-        }
+        },
         None => {
             let id = sessions.create_anonymous();
             (id, true)
