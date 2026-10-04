@@ -32,6 +32,23 @@ const TRIGGER_FIRED_METHOD: &str = "trigger_fired";
 /// it stayed connected.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long one message may take to write to a connection's client. A client that stopped
+/// reading filled its socket, and the write then waited for as long as the client stayed
+/// connected — its session marked connected, so its name was refused to anyone else. Past this
+/// the connection is closed (and its session disconnected) instead.
+const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// [`write_message`] bounded by [`WRITE_TIMEOUT`] — every write a connection makes goes
+/// through here.
+async fn write_bounded<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, write_message(writer, msg))
+        .await
+        .map_err(|_| anyhow::anyhow!("the client read nothing for {WRITE_TIMEOUT:?}"))?
+}
+
 /// Convert an internal [`PipelineEvent`] (engine-side observability struct)
 /// into a wire-shape JSON value matching
 /// [`logmon_broker_protocol::TriggerFiredPayload`].
@@ -961,7 +978,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             -32600,
             "first request must be session.start",
         );
-        write_message(&mut writer, &resp).await?;
+        write_bounded(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -983,7 +1000,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 params.protocol_version, PROTOCOL_VERSION
             ),
         );
-        write_message(&mut writer, &resp).await?;
+        write_bounded(&mut writer, &resp).await?;
         return Ok(());
     }
 
@@ -994,7 +1011,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         if serialized.len() > 4096 {
             let resp =
                 RpcResponse::error(first_request.id, -32602, "client_info exceeds 4 KB limit");
-            write_message(&mut writer, &resp).await?;
+            write_bounded(&mut writer, &resp).await?;
             return Ok(());
         }
     }
@@ -1011,7 +1028,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     -32602,
                     &format!("domain \"{id}\" does not exist — create it first"),
                 );
-                write_message(&mut writer, &resp).await?;
+                write_bounded(&mut writer, &resp).await?;
                 return Ok(());
             }
             Err(e) => {
@@ -1020,7 +1037,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     -32602,
                     &format!("invalid domain name: {e}"),
                 );
-                write_message(&mut writer, &resp).await?;
+                write_bounded(&mut writer, &resp).await?;
                 return Ok(());
             }
         },
@@ -1035,7 +1052,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             Err(e) => {
                 let resp =
                     RpcResponse::error(first_request.id, -32600, &format!("session error: {e}"));
-                write_message(&mut writer, &resp).await?;
+                write_bounded(&mut writer, &resp).await?;
                 return Ok(());
             }
         },
@@ -1081,14 +1098,14 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let mut start_result = handler.build_session_start_result(&session_id);
     start_result.is_new = is_new;
     let resp = RpcResponse::success(first_request.id, serde_json::to_value(&start_result)?);
-    write_message(&mut writer, &resp).await?;
+    write_bounded(&mut writer, &resp).await?;
 
     // 5. Drain queued notifications and send each as RPC notification
     let queued = sessions.drain_notifications(&session_id);
     for event in queued {
         let payload = pipeline_event_to_trigger_fired(&event)?;
         let notification = RpcNotification::new(TRIGGER_FIRED_METHOD, payload);
-        write_message(&mut writer, &notification).await?;
+        write_bounded(&mut writer, &notification).await?;
     }
 
     // 6. Subscribe to the CONNECT-TIME domain's pipeline events for live
@@ -1137,7 +1154,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                                 cleanup.session_id = session_id.clone();
                             }
                         }
-                        write_message(&mut writer, &response).await?;
+                        write_bounded(&mut writer, &response).await?;
                         // §9.4: if the request rebound this session (domains.use),
                         // re-point the event subscription at the newly-bound
                         // domain's channel so live trigger notifications follow
@@ -1174,7 +1191,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             TRIGGER_FIRED_METHOD,
                             payload,
                         );
-                        if let Err(e) = write_message(&mut writer, &notification).await {
+                        if let Err(e) = write_bounded(&mut writer, &notification).await {
                             warn!(?session_id, "write error sending notification: {e}");
                             break;
                         }

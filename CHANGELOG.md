@@ -255,9 +255,14 @@ that merely reconnects already counted while disconnected, so nothing changed fo
   holder with a collector of the same name, and the write fails, the stale holder's file at that
   name is removed rather than kept: kept, a restart would have restored a dead session's
   collector under the renamed session's name.
-- Collector files are written and removed under one lock of their own, and a removal first
-  checks that no collector holds the path: a removal that raced a new holder of the name could
-  otherwise delete the file that new holder had just written.
+- A collector file's removal is decided by what is on disk, not by who holds the name: a file is
+  removed only if nothing has written to it since the removal was decided. Deciding by who held
+  the name got both cases wrong under a race — it could delete the file a new holder of the name
+  had just written, and it kept a dropped session's file when a new holder's own write had
+  failed (the restart then restored the dead collector under the live name). Writes and removals
+  of one file take one lock of their own; different collectors' files never wait on each other.
+  And a write prepared before its collector was removed is no longer written after the removal:
+  it put the file back, and the removed collector returned at the next boot.
 - The record of evicted cursors — what makes a recreated cursor warn that it lost its place —
   stayed under the old name on a rename (the warning was lost) and outlived a dropped or
   disposed session (a later holder of the name was warned about a cursor it never had). It
@@ -277,16 +282,26 @@ request now survives the race: what arrived stays buffered until the line comple
 
 Every request line is also capped now, at 64 MiB, the first one (`session.start`) included: a
 client that streamed bytes with no newline grew the buffer until the broker ran out of memory. A
-longer line closes the connection with a warning. And a connection must send `session.start`
-within 30 seconds: one that never did held a task and a socket for as long as it stayed open.
+longer line closes the connection with a warning. A connection must send `session.start` within
+30 seconds: one that never did held a task and a socket for as long as it stayed open. And each
+message the broker writes to a client must complete within 30 seconds: a client that stopped
+reading filled its socket, and the write then waited for as long as the client stayed connected —
+with its session marked connected, so its name was refused to anyone else.
 
-### Fixed — a GELF TCP sender could exhaust the broker's memory
+### Fixed — a GELF TCP sender could buffer without limit
 
 The GELF TCP input read each message up to its NUL terminator with no limit, on a port that
 listens on every interface without authentication — so any host that could reach it could send
-bytes with no NUL and grow the broker's memory until it died. A message is now at most 8 MiB
-(real GELF messages are far smaller: chunked GELF over UDP tops out near 1 MB, and Graylog's own
-TCP input defaults to 2 MB); a longer one closes its connection.
+bytes with no NUL and grow the broker's memory until it died. A message is now at most 64 KB —
+the same ceiling as a GELF UDP datagram, so TCP lets a sender store no larger record than UDP
+already did — and a longer one closes its connection. At most 128 GELF TCP connections are open
+at once (one past that is closed on accept), which bounds what the TCP input buffers in total.
+And a failed `accept` (out of file descriptors) is retried after a pause; it was retried at
+once, spinning a core for as long as it lasted.
+
+Known limit, unchanged: the log store is bounded by record COUNT (`buffer_size`), not by bytes,
+for every input — GELF records of up to 64 KB each, OTLP records up to the OTLP receivers'
+request limits. See the README's "Memory" note.
 
 ### Fixed — two collectors could share one file
 
@@ -294,13 +309,16 @@ A collector's file was named `{session}__{name}.json`, and both parts may contai
 session `a__b`'s collector `c` and session `a`'s collector `b__c` were one file — each
 overwriting the other's definition and recorded history. Names differing only in case (`Perf`,
 `perf`) were one file too on a case-insensitive filesystem, the macOS default. Files are now
-named `{session}.{name}.json`, each part with anything outside `[a-z0-9_-]` percent-encoded —
-uppercase letters included — which no two collectors can share on any filesystem. Existing
-files are moved to the new names at the first start. Where two files hold the same collector
-(an earlier naming's beside the current one), the most recently written is the collector and
-the other is set aside as `*.json.superseded` — never deleted, and never over an earlier
-set-aside copy. A file is never moved onto a name another collector's file holds. (A pair that
-had already collided cannot be recovered: only the last write survived.)
+named `{session}.{name}.json`, each part keeping `[a-z0-9_-]`, writing an uppercase letter as
+`^` and the letter, and percent-encoding anything else — a name no two collectors can share on
+any filesystem. Names too long to fit a filename this way (names have no length limit) are
+shortened to readable prefixes plus a hash of the full names; they used to fail to be written
+at all. Existing files are moved to the new names at the first start. Where two files hold the
+same collector (an earlier naming's beside the current one), the most recently written is the
+collector and the other is set aside as `*.json.superseded` — never deleted, and never over an
+earlier set-aside copy. The move into place never overwrites another collector's file, even two
+files swapped by hand. (A pair that had already collided cannot be recovered: only the last
+write survived.)
 
 ### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
 

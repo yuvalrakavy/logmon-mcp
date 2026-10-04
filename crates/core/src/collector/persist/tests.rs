@@ -477,6 +477,56 @@ fn moving_a_file_into_place_never_overwrites_another_collector() {
     );
 }
 
+/// Two collector files that each sit at the OTHER's canonical name (swapped by hand) both end up
+/// at their own: staged first, then moved in, so neither blocks the other and neither is
+/// overwritten.
+#[test]
+fn two_files_at_each_other_s_names_both_move_into_place() {
+    let d = tmp();
+    let (a, b) = (
+        collector_path(d.path(), "a", "c"),
+        collector_path(d.path(), "b", "c"),
+    );
+    std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+    for (owner, at) in [("a", &b), ("b", &a)] {
+        let mut f = file_with(vec![]);
+        f.owner = owner.into();
+        f.name = "c".into();
+        std::fs::write(at, serde_json::to_vec(&f).unwrap()).unwrap();
+    }
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 2);
+    for (owner, at) in [("a", &a), ("b", &b)] {
+        let c: PersistedCollector = serde_json::from_slice(&std::fs::read(at).unwrap()).unwrap();
+        assert_eq!(c.owner, owner, "{at:?} holds its own collector");
+    }
+}
+
+/// Names have no length limit and a filename does: a name whose encoding would come near it
+/// gets a shortened, hashed filename — short enough to write, and still one per collector when
+/// two long names share their readable prefix.
+#[test]
+fn a_very_long_name_gets_a_short_unique_filename() {
+    let d = tmp();
+    let long = |tail: &str| format!("{}{tail}", "Q".repeat(150));
+    let (p1, p2) = (
+        collector_path(d.path(), &long("x"), "perf"),
+        collector_path(d.path(), &long("y"), "perf"),
+    );
+    assert_ne!(p1, p2);
+    for p in [&p1, &p2] {
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert!(name.len() <= 200, "{} bytes: {name}", name.len());
+    }
+    let mut f = file_with(vec![]);
+    f.owner = long("x");
+    save(d.path(), &f).expect("a long-named collector can be written");
+    let out = load_all(d.path());
+    assert_eq!(out.collectors.len(), 1);
+    assert_eq!(out.collectors[0].owner, long("x"));
+    assert!(p1.exists(), "and it stays at its own name");
+}
+
 /// Names that differ only in case are two collectors and get two files even where the
 /// filesystem folds case (the macOS default) — the letters alone would be one file there.
 #[test]

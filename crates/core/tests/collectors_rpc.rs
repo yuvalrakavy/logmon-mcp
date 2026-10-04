@@ -429,11 +429,14 @@ fn restart_over_at(dir: &std::path::Path, now: chrono::DateTime<chrono::Utc>) ->
     let report = h
         .collectors
         .restore(now, |_| Arc::new(ReceiverMetrics::new()));
+    // Superseded files too: a restart that found two copies of one collector set one aside,
+    // which no restart in these tests should ever produce.
     assert!(
-        report.quarantined.is_empty() && report.rejected.is_empty(),
-        "restore had problems: {:?} {:?}",
+        report.quarantined.is_empty() && report.rejected.is_empty() && report.superseded.is_empty(),
+        "restore had problems: {:?} {:?} {:?}",
         report.quarantined,
-        report.rejected
+        report.rejected,
+        report.superseded
     );
     h
 }

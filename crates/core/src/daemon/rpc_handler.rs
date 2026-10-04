@@ -858,7 +858,7 @@ impl RpcHandler {
                 // Collectors before bookmarks: their reservation is the scarce resource, so a
                 // panic in a bookmark step (a lock poisoned earlier) must not strand them.
                 if displaced {
-                    let (_, collectors, pending) = self.detach_name_keyed_state(new_id, false);
+                    let (collectors, pending) = self.collectors.detach_session(new_id);
                     displaced_cleared.1 = collectors;
                     files.absorb(pending);
                 }
@@ -3090,9 +3090,13 @@ impl RpcHandler {
         let mut released = (0, 0);
         let mut files = None;
         let session_result = self.sessions.drop_session(name, |existed| {
-            let (bookmarks, collectors, pending) = self.detach_name_keyed_state(&id, existed);
-            released = (bookmarks, collectors);
+            // Collectors first, their file work recorded before the bookmark step.
+            let (collectors, pending) = self.collectors.detach_session(&id);
+            released.1 = collectors;
             files = Some(pending);
+            if existed {
+                released.0 = self.clear_bookmarks_everywhere(&id);
+            }
         });
         if let Some(files) = files {
             self.collectors.finish(files);
@@ -3264,9 +3268,11 @@ impl RpcHandler {
         let mut cleared = (0, 0);
         let mut files = None;
         let outcome = self.sessions.dispose_if_expired(session_id, ttl, || {
-            let (bookmarks, collectors, pending) = self.detach_name_keyed_state(session_id, true);
-            cleared = (bookmarks, collectors);
+            // Collectors first, their file work recorded before the bookmark step.
+            let (collectors, pending) = self.collectors.detach_session(session_id);
+            cleared.1 = collectors;
             files = Some(pending);
+            cleared.0 = self.clear_bookmarks_everywhere(session_id);
         });
         if let Some(files) = files {
             self.collectors.finish(files);
@@ -3284,35 +3290,23 @@ impl RpcHandler {
         }
     }
 
-    /// Detach what is keyed by a session's NAME rather than held by the session — its
-    /// bookmarks in every domain (when `bookmarks`), and its collectors with their reservation.
-    /// Returns `(bookmarks, collectors)` cleared and the collectors' file work, which the
-    /// caller [`finish`](CollectorRegistry::finish)es once its locks are released. Every domain
-    /// rather than the ones the session touched: the call runs inside the registry's lock, and
-    /// there a bookmark under the name belongs to nobody else — a named session can never hold
-    /// a live anonymous session's id ([`SessionRegistry::claim_named`]). Takes only leaf locks
-    /// (domains, bookmarks, collectors) and does no file I/O, which is what lets
-    /// [`SessionRegistry::dispose_if_expired`], [`SessionRegistry::drop_session`] and
-    /// [`SessionRegistry::rename`] run it under theirs.
-    fn detach_name_keyed_state(
-        &self,
-        session_id: &SessionId,
-        bookmarks: bool,
-    ) -> (usize, usize, crate::collector::registry::PendingFiles) {
-        // Collectors first: their reservation is the scarce resource, so a panic in the
-        // bookmark step (a lock poisoned earlier) must not leave them stranded.
-        let (collectors, files) = self.collectors.detach_session(session_id);
-        let cleared = if bookmarks {
-            let key = session_id.to_string();
-            self.domains
-                .list()
-                .iter()
-                .map(|d| d.bookmarks.clear_session(&key))
-                .sum()
-        } else {
-            0
-        };
-        (cleared, collectors, files)
+    /// Clear a session's bookmarks in every domain — keyed by its NAME, so a step of the
+    /// name-keyed cleanup that drop, disposal and rename run under the session registry's lock.
+    /// Every domain rather than the ones the session touched: under that lock a bookmark under
+    /// the name belongs to nobody else — a named session can never hold a live anonymous
+    /// session's id ([`SessionRegistry::claim_named`]). Takes only leaf locks.
+    ///
+    /// Callers detach the session's collectors FIRST and record their file work before calling
+    /// this: the reservation is the scarce resource, and a panic here (a bookmark lock poisoned
+    /// earlier; contained by the registry) must neither strand the collectors nor lose the
+    /// `PendingFiles` that removes their files — unremoved, they came back at the next boot.
+    fn clear_bookmarks_everywhere(&self, session_id: &SessionId) -> usize {
+        let key = session_id.to_string();
+        self.domains
+            .list()
+            .iter()
+            .map(|d| d.bookmarks.clear_session(&key))
+            .sum()
     }
 
     /// Re-derive every domain's pre-trigger buffer size from the sessions bound to it NOW.

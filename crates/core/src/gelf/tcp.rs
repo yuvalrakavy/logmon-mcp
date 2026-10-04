@@ -22,27 +22,48 @@ impl TcpListenerHandle {
     }
 }
 
-/// The longest GELF message one TCP connection may send, its NUL terminator included. A
-/// message was read to its NUL with no limit, on a port bound to every interface without
-/// authentication — so any host that could reach it could stream bytes with no NUL and grow the
-/// daemon's memory until it died. Generous next to real logs (chunked GELF over UDP tops out
-/// near 1 MB; Graylog's own TCP input defaults to 2 MB). A longer message closes its
-/// connection: what follows it cannot be told apart from the next message.
-pub const MAX_GELF_TCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// The longest GELF message one TCP connection may send, its NUL terminator included — the
+/// same ceiling a UDP datagram has, so the TCP input lets a sender put no larger record into
+/// the store than UDP already does. A message was read to its NUL with no limit, on a port
+/// bound to every interface without authentication — so any host that could reach it could
+/// stream bytes with no NUL and grow the broker's memory until it died. A longer message closes
+/// its connection: what follows it cannot be told apart from the next message.
+///
+/// (The store itself is bounded by record COUNT, not bytes, for every input — UDP included:
+/// the most it can hold is its buffer size times this. See the README's known limits.)
+pub const MAX_GELF_TCP_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// How many GELF TCP connections may be open at once. Each holds a read buffer of up to two
+/// [`MAX_GELF_TCP_MESSAGE_BYTES`] (with the allocator's growth), so this bounds what the TCP
+/// input can hold in total; a connection past it is closed on accept.
+pub const MAX_GELF_TCP_CONNECTIONS: u32 = 128;
 
 pub async fn start_tcp_listener(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
     metrics: Arc<ReceiverMetrics>,
 ) -> anyhow::Result<TcpListenerHandle> {
-    start_tcp_listener_with_limit(addr, sender, metrics, MAX_GELF_TCP_MESSAGE_BYTES).await
+    start_tcp_listener_with_limits(
+        addr,
+        sender,
+        metrics,
+        MAX_GELF_TCP_MESSAGE_BYTES,
+        MAX_GELF_TCP_CONNECTIONS,
+    )
+    .await
 }
 
-async fn start_tcp_listener_with_limit(
+/// Log the 1st, 2nd, 4th, 8th... occurrence of something an attacker can repeat at will.
+fn log_now(count: u64) -> bool {
+    count.is_power_of_two()
+}
+
+async fn start_tcp_listener_with_limits(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
     metrics: Arc<ReceiverMetrics>,
     max_message: usize,
+    max_connections: u32,
 ) -> anyhow::Result<TcpListenerHandle> {
     let listener = TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
@@ -51,10 +72,36 @@ async fn start_tcp_listener_with_limit(
     let connected_clone = connected.clone();
 
     tokio::spawn(async move {
+        let (mut refused, mut accept_errors) = (0u64, 0u64);
         loop {
             tokio::select! {
                 result = listener.accept() => {
-                    if let Ok((stream, _addr)) = result {
+                    let stream = match result {
+                        Ok((stream, _addr)) => stream,
+                        Err(e) => {
+                            // Out of file descriptors, typically. Retrying at once returned
+                            // the same error at once — a spin at full CPU for as long as it
+                            // lasted.
+                            accept_errors += 1;
+                            if log_now(accept_errors) {
+                                eprintln!("GELF TCP accept failed ({accept_errors} so far): {e}");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                    };
+                    if connected_clone.load(Ordering::Relaxed) >= max_connections {
+                        refused += 1;
+                        if log_now(refused) {
+                            eprintln!(
+                                "GELF TCP: {max_connections} connections open; closed a new one \
+                                 ({refused} so far)"
+                            );
+                        }
+                        drop(stream);
+                        continue;
+                    }
+                    {
                         let sender = sender.clone();
                         let metrics = metrics.clone();
                         let connected = connected_clone.clone();
@@ -149,10 +196,15 @@ mod tests {
         let metrics = Arc::new(ReceiverMetrics::new());
         let payload =
             br#"{"version":"1.1","host":"h","short_message":"x","level":6,"timestamp":1.0}"#;
-        let handle =
-            start_tcp_listener_with_limit("127.0.0.1:0", sender, metrics, payload.len() + 1)
-                .await
-                .unwrap();
+        let handle = start_tcp_listener_with_limits(
+            "127.0.0.1:0",
+            sender,
+            metrics,
+            payload.len() + 1,
+            MAX_GELF_TCP_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         let addr = format!("127.0.0.1:{}", handle.port());
 
         let mut flood = TcpStream::connect(&addr).await.unwrap();
@@ -173,6 +225,68 @@ mod tests {
             .expect("the message arrives")
             .expect("the channel is open");
         assert_eq!(entry.message, "x");
+    }
+
+    /// Past the connection cap a new connection is closed on accept, so the TCP input's total
+    /// buffers stay bounded however many connections a sender opens; once one closes, a new
+    /// one is served again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_past_the_cap_is_closed() {
+        use tokio::io::AsyncReadExt;
+        let (sender, mut rx) = mpsc::channel(16);
+        let metrics = Arc::new(ReceiverMetrics::new());
+        let handle = start_tcp_listener_with_limits(
+            "127.0.0.1:0",
+            sender,
+            metrics,
+            MAX_GELF_TCP_MESSAGE_BYTES,
+            2,
+        )
+        .await
+        .unwrap();
+        let addr = format!("127.0.0.1:{}", handle.port());
+
+        let held = [
+            TcpStream::connect(&addr).await.unwrap(),
+            TcpStream::connect(&addr).await.unwrap(),
+        ];
+        for _ in 0..500 {
+            if handle.connected_clients() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            handle.connected_clients(),
+            2,
+            "both held connections are served"
+        );
+
+        let mut third = TcpStream::connect(&addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(10), third.read(&mut byte))
+            .await
+            .expect("the third is closed")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "closed, not served");
+
+        drop(held);
+        for _ in 0..500 {
+            if handle.connected_clients() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let payload =
+            br#"{"version":"1.1","host":"h","short_message":"after","level":6,"timestamp":1.0}"#;
+        let mut again = TcpStream::connect(&addr).await.unwrap();
+        again.write_all(payload).await.unwrap();
+        again.write_all(&[0u8]).await.unwrap();
+        let entry = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("served again")
+            .expect("the channel is open");
+        assert_eq!(entry.message, "after");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

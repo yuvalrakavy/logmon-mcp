@@ -284,12 +284,48 @@ pub struct CollectorRegistry {
     /// whatever directory it was handed, and the live daemon's is one wrong
     /// argument away.
     dir: Option<PathBuf>,
-    /// Serializes every write and delete of a collector file, and is held across a delete's
-    /// liveness check. Without it a delete could check "nobody holds this path", lose the CPU,
-    /// and then remove the file a new holder of the name wrote meanwhile. Never taken while
-    /// `entries` is held — `write` runs outside that lock by design — and never by ingest, so
-    /// the file I/O under it stalls only other collector bookkeeping.
-    files: Mutex<()>,
+    /// Who wrote each collector file last, and the lock its writes and deletes take.
+    files: FileLedger,
+}
+
+/// The collector files' bookkeeping. Each path has a lock that its writes and deletes take,
+/// guarding the sequence number of the path's last successful write (0: none in this run).
+///
+/// A deferred delete is decided by BYTES, not by who holds the path: it carries the sequence
+/// number current when the delete was decided, and removes the file only if no write to that
+/// path has landed since. Bytes written since belong to whoever wrote them — a new holder of
+/// the name, a collector that moved onto the path — not to the collector being deleted; bytes
+/// not rewritten are still that collector's, whoever holds the name now (kept, a restart would
+/// restore a dead collector under a live name). Deciding by liveness got both wrong: a new
+/// holder whose own write had FAILED made the dead bytes read as held.
+///
+/// Per path, so one collector's slow fsync never waits on another's, and never by ingest. Never
+/// taken while `entries` is held: writes and deletes run outside that lock by design (a write
+/// takes `entries` for reading INSIDE its path lock, to check the collector still exists).
+#[derive(Default)]
+struct FileLedger {
+    paths: Mutex<std::collections::HashMap<PathBuf, Arc<Mutex<u64>>>>,
+    seq: std::sync::atomic::AtomicU64,
+}
+
+impl FileLedger {
+    fn path_lock(&self, path: &std::path::Path) -> Arc<Mutex<u64>> {
+        self.paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(path.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    /// The sequence number of the latest write so far — what a deferred delete carries.
+    fn now(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn next(&self) -> u64 {
+        self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
 }
 
 /// File work a lifecycle change left for after the caller's locks — see
@@ -298,10 +334,10 @@ pub struct CollectorRegistry {
 #[derive(Default)]
 #[must_use = "pass it to CollectorRegistry::finish once the caller's locks are released"]
 pub struct PendingFiles {
-    /// `(old owner, new owner, name)` of each collector that changed owner.
-    moved: Vec<(SessionId, SessionId, String)>,
-    /// `(owner, name)` of each detached collector's file.
-    unlink: Vec<(SessionId, String)>,
+    /// `(old owner, new owner, name, ledger seq at the move)` of each collector that moved.
+    moved: Vec<(SessionId, SessionId, String, u64)>,
+    /// `(owner, name, ledger seq at the detach)` of each detached collector's file.
+    unlink: Vec<(SessionId, String, u64)>,
     /// The detached collectors themselves, so their memory is freed off every lock.
     detached: Vec<Entry>,
 }
@@ -325,7 +361,7 @@ impl CollectorRegistry {
             entries: RwLock::new(Vec::new()),
             max_total_sample_bytes,
             dir: None,
-            files: Mutex::new(()),
+            files: FileLedger::default(),
         }
     }
 
@@ -462,34 +498,47 @@ impl CollectorRegistry {
     /// write under the lock lets one slow fsync stall span ingest daemon-wide
     /// until the 65 536-slot channel overflows and starts dropping. Bookkeeping
     /// must not be able to cost telemetry.
+    ///
+    /// A collector that no longer exists is not written: a write prepared before a removal and
+    /// landing after its delete put the file back, and the removed collector returned at the
+    /// next boot. Checked under the path's lock, which the delete also takes.
     fn write(&self, file: &crate::collector::persist::PersistedCollector) -> Result<(), String> {
         let Some(dir) = &self.dir else { return Ok(()) };
-        let _files = self.files.lock().expect("collector files lock poisoned");
-        crate::collector::persist::save(dir, file).map_err(|e| {
-            tracing::error!(
-                collector = %file.name, owner = %file.owner, error = %e,
-                "could not persist collector; a restart restores its last saved state, if any"
-            );
-            e.to_string()
-        })
-    }
-
-    /// Delete `owner`'s file for `name` unless a live collector holds that path now — checked
-    /// and deleted under [`Self::files`], so a new holder's write cannot land in between.
-    fn delete_unless_held(&self, owner: &SessionId, name: &str) {
-        let Some(dir) = &self.dir else { return };
-        let _files = self.files.lock().expect("collector files lock poisoned");
-        if !self.is_live(owner, name) {
-            crate::collector::persist::delete(dir, &owner.to_string(), name);
+        let path = crate::collector::persist::collector_path(dir, &file.owner, &file.name);
+        let lock = self.files.path_lock(&path);
+        let mut last = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.is_live(&SessionId::Named(file.owner.clone()), &file.name) {
+            return Err(format!("collector `{}` no longer exists", file.name));
+        }
+        match crate::collector::persist::save(dir, file) {
+            Ok(()) => {
+                *last = self.files.next();
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    collector = %file.name, owner = %file.owner, error = %e,
+                    "could not persist collector; a restart restores its last saved state, if any"
+                );
+                Err(e.to_string())
+            }
         }
     }
 
-    /// Delete `owner`'s file for `name` whoever holds the path: for bytes known to belong to a
-    /// collector that is gone. Under [`Self::files`] like every file operation.
-    fn delete_regardless(&self, owner: &SessionId, name: &str) {
+    /// Delete `owner`'s file for `name` unless a write to that path has landed since `since`
+    /// (a [`FileLedger::now`] taken when the delete was decided) — see [`FileLedger`].
+    fn delete_unless_written_since(&self, owner: &SessionId, name: &str, since: u64) {
         let Some(dir) = &self.dir else { return };
-        let _files = self.files.lock().expect("collector files lock poisoned");
-        crate::collector::persist::delete(dir, &owner.to_string(), name);
+        let path = crate::collector::persist::collector_path(dir, &owner.to_string(), name);
+        let lock = self.files.path_lock(&path);
+        let last = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last <= since {
+            crate::collector::persist::delete(dir, &owner.to_string(), name);
+        }
     }
 
     pub fn add(
@@ -905,14 +954,15 @@ impl CollectorRegistry {
         if g.len() == before {
             return Err(RegistryError::NotFound(name.to_string()));
         }
-        // The file is deleted after the lock — file I/O never runs under it — and only if no
-        // collector has taken the path since (`delete_unless_held`).
+        // The file is deleted after the lock — file I/O never runs under it — unless a write has
+        // landed on the path since the removal (see `FileLedger`).
+        let since = self.files.now();
         drop(g);
         // Removal takes the history with it. §10 could not have it both ways:
         // if disposal took history AND snapshots outlived the session, a
         // daemon whose sessions are swept every 24 hours would leak files
         // forever.
-        self.delete_unless_held(owner, name);
+        self.delete_unless_written_since(owner, name, since);
         Ok(())
     }
 
@@ -941,11 +991,15 @@ impl CollectorRegistry {
             return (0, pending);
         }
         let mut g = self.entries.write().expect("registry lock poisoned");
+        let since = self.files.now();
         for e in g.iter_mut().filter(|e| &e.owner == old) {
             e.owner = new.clone();
-            pending
-                .moved
-                .push((old.clone(), new.clone(), e.collector.def().name.clone()));
+            pending.moved.push((
+                old.clone(),
+                new.clone(),
+                e.collector.def().name.clone(),
+                since,
+            ));
         }
         (pending.moved.len(), pending)
     }
@@ -964,6 +1018,7 @@ impl CollectorRegistry {
     pub fn detach_session(&self, owner: &SessionId) -> (usize, PendingFiles) {
         let mut pending = PendingFiles::default();
         let mut g = self.entries.write().expect("registry lock poisoned");
+        let since = self.files.now();
         let (doomed, kept): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut *g)
             .into_iter()
             .partition(|e| &e.owner == owner);
@@ -971,7 +1026,7 @@ impl CollectorRegistry {
         for e in &doomed {
             pending
                 .unlink
-                .push((owner.clone(), e.collector.def().name.clone()));
+                .push((owner.clone(), e.collector.def().name.clone(), since));
         }
         pending.detached = doomed;
         (pending.unlink.len(), pending)
@@ -981,22 +1036,15 @@ impl CollectorRegistry {
     /// held: file I/O on the path that gates every domain's ingest — here or under the caller's
     /// lock — lets one slow disk stall telemetry daemon-wide.
     ///
-    /// A path is unlinked only if no live collector holds it now, checked and unlinked under
-    /// [`Self::files`]: the name may have a new holder by the time this runs, and its
-    /// collector's file is not this work's to remove. A moved collector is written to its new
-    /// path from its CURRENT state, and its old file is unlinked only once that write
-    /// succeeded: the old file is otherwise its only copy on disk.
-    ///
-    /// One path is decided by bytes, not by who holds it: a detached collector's path that a
-    /// moved collector took over (a rename displacing a stale holder of the same collector
-    /// name). The mover holds it, so it reads as live — but until the mover's write lands the
-    /// bytes there are the DETACHED collector's, and kept, a restart would restore a dead
-    /// conversation's definition and history under the renamer's name. It goes unless that
-    /// write succeeded.
+    /// Every delete here is decided by bytes ([`FileLedger`]): a path goes only if no write has
+    /// landed on it since the detach or move — whoever holds the name now. A moved collector is
+    /// written to its new path from its CURRENT state, and its old file goes only once that
+    /// write succeeded: until then it is the collector's only copy on disk. A detached
+    /// collector's path that a moved collector took over (a rename displacing a stale holder of
+    /// the same collector name) needs no special case: the mover's write, if it lands, is a
+    /// write since the detach.
     pub fn finish(&self, pending: PendingFiles) {
-        let mut written: std::collections::HashSet<(SessionId, String)> =
-            std::collections::HashSet::new();
-        for (old, new, name) in &pending.moved {
+        for (old, new, name, since) in &pending.moved {
             let file = self
                 .entries
                 .read()
@@ -1005,30 +1053,16 @@ impl CollectorRegistry {
                 .find(|e| &e.owner == new && &e.collector.def().name == name)
                 .map(|e| e.to_persisted());
             let landed = match file {
-                Some(file) => {
-                    let ok = self.write(&file).is_ok();
-                    if ok {
-                        written.insert((new.clone(), name.clone()));
-                    }
-                    ok
-                }
+                Some(file) => self.write(&file).is_ok(),
                 // Removed since it moved: its old file has nothing left to protect.
                 None => true,
             };
             if landed {
-                self.delete_unless_held(old, name);
+                self.delete_unless_written_since(old, name, *since);
             }
         }
-        for (owner, name) in &pending.unlink {
-            let moved_into = pending
-                .moved
-                .iter()
-                .any(|(_, new, n)| new == owner && n == name);
-            if !moved_into {
-                self.delete_unless_held(owner, name);
-            } else if !written.contains(&(owner.clone(), name.clone())) {
-                self.delete_regardless(owner, name);
-            }
+        for (owner, name, since) in &pending.unlink {
+            self.delete_unless_written_since(owner, name, *since);
         }
         // `detached` is dropped here, freeing the detached collectors' samples off every lock.
     }
@@ -1231,6 +1265,69 @@ mod tests {
             crate::daemon::persistence::TEMP_SUFFIX
         );
         std::fs::create_dir_all(tmp).unwrap();
+    }
+
+    /// A dropped session's collector file goes even though a NEW holder of the name has armed a
+    /// collector of the same name — when that holder's own write failed, the bytes at the path
+    /// are still the dropped collector's, and kept, a restart restored it under the live name.
+    /// The path reads as held, which is why the delete is decided by writes, not by liveness.
+    #[test]
+    fn a_detach_removes_the_dead_bytes_under_a_new_holder_whose_write_failed() {
+        let d = tempfile::TempDir::new().unwrap();
+        let r = CollectorRegistry::new().with_persistence(d.path().to_path_buf());
+        let path = crate::collector::persist::collector_path(d.path(), "s", "c");
+        r.add(
+            &sid("s"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed");
+        let (_, pending) = r.detach_session(&sid("s"));
+        block_write(d.path(), "s", "c");
+        r.add(
+            &sid("s"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed again, its write failing");
+        r.finish(pending);
+        assert!(!path.exists(), "the dropped collector's bytes are gone");
+    }
+
+    /// A file prepared before its collector was removed, and written after the removal's
+    /// delete, does not bring the collector back at the next boot.
+    #[test]
+    fn a_write_landing_after_a_removal_does_not_restore_the_file() {
+        let d = tempfile::TempDir::new().unwrap();
+        let r = CollectorRegistry::new().with_persistence(d.path().to_path_buf());
+        let path = crate::collector::persist::collector_path(d.path(), "s", "c");
+        r.add(
+            &sid("s"),
+            &dom("a"),
+            metrics(),
+            def("c", "sv=svc", 1 << 20),
+            now(),
+        )
+        .expect("armed");
+        let prepared = r
+            .entries
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.collector.def().name == "c")
+            .map(|e| e.to_persisted())
+            .expect("the entry");
+        r.remove(&sid("s"), "c").expect("removed");
+        assert!(!path.exists());
+        assert!(
+            r.write(&prepared).is_err(),
+            "refused: the collector is gone"
+        );
+        assert!(!path.exists(), "and the file stays gone");
     }
 
     /// A moved collector's old file stays when its new one cannot be written (a full disk): it

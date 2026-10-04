@@ -29,12 +29,17 @@ async fn a_handshake_line_past_the_cap_closes_the_connection() {
         .expect("connect");
     let (mut r, mut w) = stream.into_split();
     let chunk = vec![b'x'; 1 << 20];
-    // Until the daemon hangs up; a little past the cap is all it ever has to read.
-    for _ in 0..(MAX_REQUEST_BYTES >> 20) + 8 {
-        if w.write_all(&chunk).await.is_err() {
-            break;
+    // Until the daemon hangs up; a little past the cap is all it ever has to read. Bounded: a
+    // daemon that stopped reading without closing would otherwise park this loop for good.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for _ in 0..(MAX_REQUEST_BYTES >> 20) + 8 {
+            if w.write_all(&chunk).await.is_err() {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("the daemon keeps reading until the cap, then closes");
     // The write half stays open while the read decides: closing it would hand the daemon an
     // end-of-file, which closes the connection by itself — this test would then pass with no
     // cap at all.

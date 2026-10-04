@@ -1081,6 +1081,15 @@ That remedy is for channel-full drops only: a `shed_batches` count means the pro
 told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
 unusable trace id) — no buffer size changes either.
 
+**Memory.** The log and span stores are bounded by record COUNT (`buffer_size`,
+`span_buffer_size`), not by bytes — what they hold is that count times the size of the records
+that arrive. A GELF message is at most 64 KB on either transport (a UDP datagram's limit; the
+TCP input refuses longer messages and closes the connection, and keeps at most 128 connections
+open), so GELF alone can fill the log store to `buffer_size` × 64 KB — 640 MB at the default
+10,000, far more at a large per-domain buffer. OTLP records are bounded only by the OTLP
+receivers' request-size limits, which are larger. Size buffers for the records you actually
+send, and keep the ingest ports off networks you do not trust: they take no authentication.
+
 ## Reinstalling after a change
 
 The broker and `logmon-mcp` are separate binaries with separate lifetimes — the broker runs
