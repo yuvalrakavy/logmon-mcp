@@ -53,7 +53,8 @@ impl Receiver for GelfReceiver {
     }
 
     async fn shutdown(self: Box<Self>) {
-        // Dropping the handles triggers their oneshot shutdown channels
+        // Dropping the handles closes their shutdown channels: the UDP loop's, and the TCP
+        // accept loop's and every connection it accepted.
         drop(self);
     }
 }

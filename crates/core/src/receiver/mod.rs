@@ -1,4 +1,5 @@
 pub mod gelf;
+pub(crate) mod keepalive;
 pub mod metrics;
 pub mod otlp;
 

@@ -124,13 +124,16 @@ pub fn render(result: &Value) -> Option<String> {
     }
     // A line of its own, not a receiver drop: the sender's message was too big, the broker
     // was not behind, so the drops' remedy (a larger buffer) does nothing for it.
-    if let Some(n) = obj
+    // Anything but a zero is shown — a value that is not a count too, rather than vanishing
+    // behind its place in `KNOWN`.
+    if let Some(v) = obj
         .get("gelf_tcp_oversize_dropped")
-        .and_then(Value::as_u64)
-        .filter(|&n| n > 0)
+        .filter(|v| v.as_u64() != Some(0))
     {
         lines.push(format!(
-            "oversize dropped: gelf_tcp={n} (messages over the 64 KB limit)"
+            "oversize dropped: gelf_tcp={} (messages over the {} KB limit)",
+            super::blocks::compact(v),
+            crate::gelf::tcp::MAX_GELF_TCP_MESSAGE_BYTES / 1024
         ));
     }
 
@@ -185,9 +188,11 @@ pub fn render(result: &Value) -> Option<String> {
         "receiver_liveness",
         "broker_tools",
     ];
+    // A `null` says nothing — the daemon sends `postmortem: null` for every live domain, and
+    // listing it ended every status with noise. Anything else is shown.
     let mut unknown: Vec<String> = obj
         .keys()
-        .filter(|k| !KNOWN.contains(&k.as_str()) && !k.starts_with('_'))
+        .filter(|k| !KNOWN.contains(&k.as_str()) && !k.starts_with('_') && !obj[*k].is_null())
         .map(|k| format!("{k}={}", super::blocks::compact(&obj[k])))
         .collect();
     unknown.sort();
@@ -234,6 +239,14 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("receiver drops"), "{out}");
+
+        // A value that is not a count is shown as it is, not swallowed.
+        lossy["gelf_tcp_oversize_dropped"] = json!("unexpected");
+        let out = render(&lossy).expect("renders");
+        assert!(
+            out.contains("oversize dropped: gelf_tcp=unexpected"),
+            "{out}"
+        );
     }
 
     /// The rule this method exists to demonstrate: the tool list is noise to the
@@ -379,5 +392,19 @@ mod tests {
         r["alpha_metric"] = json!(2);
         let out = render(&r).expect("renders");
         assert!(out.contains("alpha_metric=2  zebra_metric=1"), "{out}");
+    }
+
+    /// An unknown key whose value is `null` says nothing and is left out — a live domain's
+    /// `postmortem: null` ended every status with it — while a value is still shown.
+    #[test]
+    fn an_unknown_key_with_no_value_is_left_out() {
+        let mut r = reply();
+        r["postmortem"] = Value::Null;
+        let out = render(&r).expect("renders");
+        assert!(!out.contains("postmortem"), "{out}");
+
+        r["postmortem"] = json!({"case": "c1"});
+        let out = render(&r).expect("renders");
+        assert!(out.contains("postmortem="), "{out}");
     }
 }

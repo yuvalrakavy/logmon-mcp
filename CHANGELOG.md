@@ -269,6 +269,12 @@ that merely reconnects already counted while disconnected, so nothing changed fo
   not move into place, or a moved collector's old file after its new one failed to write — is
   not found by it.) A snapshot whose collector is removed while the run is being written now
   says the run was not filed; it reported it as filed.
+- A collector is identified by more than its name when its file is written. A write prepared for
+  a collector that was then removed and re-armed under the same name used to land on the new
+  collector's file, putting the removed one's definition back at the next boot; an edit could
+  likewise apply to the re-armed collector after writing the removed one's file. And a session
+  renamed while a snapshot was being taken no longer loses the run: it read as removed, and the
+  run went into no history although the collector still had one.
 - The record of evicted cursors — what makes a recreated cursor warn that it lost its place —
   stayed under the old name on a rename (the warning was lost) and outlived a dropped or
   disposed session (a later holder of the name was warned about a cursor it never had). It
@@ -307,9 +313,10 @@ remedy for those, does nothing for a message that is too big.
 
 The broker also holds connections it can no longer use for less long:
 
-- A GELF TCP connection whose sender vanished without closing it (power or network lost) was
-  held, with its file descriptor, for the life of the broker. Accepted connections now use TCP
-  keepalive, so the system notices a dead peer within a few minutes and the connection ends.
+- A GELF TCP or OTLP connection whose sender vanished without closing it (power or network
+  lost) was held, with its file descriptor, for the life of the broker. Connections accepted on
+  every TCP ingest input now use TCP keepalive, so the system notices a dead peer within a few
+  minutes and the connection ends.
 - Deleting a domain closed its GELF TCP listener but not the connections it had accepted. They
   went on reading into the deleted domain, so a sender on a persistent connection fed a
   re-created domain on the same port nothing until it reconnected. They now close with the
@@ -321,7 +328,9 @@ The broker also holds connections it can no longer use for less long:
 - The GELF receivers no longer log every malformed message (any sender could fill the disk
   through the log, and a write to a full disk panicked the task that logged — a connection, or
   the TCP accept loop). Each such line is now logged at most once a minute, with a running count,
-  and cannot panic.
+  and cannot panic. The receivers' backpressure warning keeps the same once-a-minute rate on the
+  monotonic clock, so a wall-clock step backwards no longer silences it.
+- The rendered `get_status` no longer ends with `postmortem=null` on a live domain.
 
 Known limit: a host that can reach an ingest port can still hold connections open — the GELF and
 OTLP inputs take no authentication — and enough of them exhaust the broker's file descriptors.

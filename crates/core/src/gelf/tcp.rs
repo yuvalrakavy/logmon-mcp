@@ -1,9 +1,9 @@
 use crate::gelf::message::{parse_gelf_message, LogEntry};
+use crate::receiver::keepalive::keep_alive;
 use crate::receiver::{ReceiverMetrics, ReceiverSource};
 use crate::throttle::{note, pace_after_error, Throttle};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -40,28 +40,6 @@ impl TcpListenerHandle {
 /// limit — not what the store holds; see the README's "Memory" note.
 pub const MAX_GELF_TCP_MESSAGE_BYTES: usize = 64 * 1024;
 
-/// How long a connection may sit silent before the OS starts checking that its peer is still
-/// there, and how often it checks. A sender that lost power or its network never closes its
-/// connection, and without keepalive the broker held it — a file descriptor — for the life of
-/// the process; enough of them, and the broker could accept nothing, its clients included.
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Turn on keepalive for an accepted connection. Best effort: a connection it cannot be set on
-/// is still served.
-fn keep_alive(stream: &tokio::net::TcpStream) {
-    let params = socket2::TcpKeepalive::new()
-        .with_time(KEEPALIVE_IDLE)
-        .with_interval(KEEPALIVE_INTERVAL);
-    if let Err(e) = socket2::SockRef::from(stream).set_tcp_keepalive(&params) {
-        if let Some(n) = KEEPALIVE_ERRORS.hit() {
-            note(format_args!(
-                "could not turn on keepalive for a GELF TCP connection ({n} so far): {e}"
-            ));
-        }
-    }
-}
-
 pub async fn start_tcp_listener(
     addr: &str,
     sender: mpsc::Sender<LogEntry>,
@@ -74,7 +52,6 @@ pub async fn start_tcp_listener(
 static MALFORMED: Throttle = Throttle::new();
 static READ_ERRORS: Throttle = Throttle::new();
 static ACCEPT_ERRORS: Throttle = Throttle::new();
-static KEEPALIVE_ERRORS: Throttle = Throttle::new();
 
 /// Counts an open connection, and uncounts it when its task ends — however it ends.
 struct Open(Arc<AtomicU32>);
@@ -345,22 +322,6 @@ mod tests {
             .await
             .expect("the connection was closed when its listener went");
         assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
-    }
-
-    /// An accepted connection gets the broker's keepalive, so a sender that vanished without
-    /// closing it does not hold its file descriptor for the life of the process.
-    #[tokio::test]
-    async fn keep_alive_turns_on_keepalive_with_the_broker_s_timings() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _client = TcpStream::connect(addr).await.unwrap();
-        let (accepted, _) = listener.accept().await.unwrap();
-        let sock = socket2::SockRef::from(&accepted);
-        assert!(!sock.keepalive().unwrap(), "off before");
-        keep_alive(&accepted);
-        assert!(sock.keepalive().unwrap());
-        assert_eq!(sock.keepalive_time().unwrap(), KEEPALIVE_IDLE);
-        assert_eq!(sock.keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

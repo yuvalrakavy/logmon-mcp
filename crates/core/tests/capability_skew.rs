@@ -132,7 +132,8 @@ async fn the_typed_status_struct_drops_no_key_the_daemon_sends() {
     );
 }
 
-/// The other direction: every key the typed struct carries, the daemon sends. A field the
+/// The other direction: every key the typed struct carries, the daemon sends — at every level,
+/// since the counters live in nested objects (`receiver_drops`, `trace_ingest`). A field the
 /// daemon forgot to emit deserializes as its default — `0` drops, an empty list — which reads
 /// exactly like the real answer, so a counter added to the struct and not to `handle_status`
 /// would report "nothing lost" forever. The check above cannot see it: it asks only whether
@@ -146,13 +147,20 @@ async fn the_daemon_sends_every_key_the_typed_status_struct_carries() {
     let typed: StatusGetResult = serde_json::from_value(raw.clone()).unwrap();
     let round_tripped = serde_json::to_value(&typed).unwrap();
 
-    let sent = raw.as_object().unwrap();
-    let missing: Vec<&String> = round_tripped
-        .as_object()
-        .unwrap()
-        .keys()
-        .filter(|k| !sent.contains_key(*k))
-        .collect();
+    fn missing_keys(typed: &Value, sent: &Value, at: &str, out: &mut Vec<String>) {
+        let (Some(typed), Some(sent)) = (typed.as_object(), sent.as_object()) else {
+            return;
+        };
+        for (k, v) in typed {
+            let path = format!("{at}{k}");
+            match sent.get(k) {
+                None => out.push(path),
+                Some(s) => missing_keys(v, s, &format!("{path}."), out),
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    missing_keys(&round_tripped, &raw, "", &mut missing);
     assert!(
         missing.is_empty(),
         "StatusGetResult carries {missing:?}, which the daemon does not send — a \
