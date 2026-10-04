@@ -265,6 +265,15 @@ pub struct LogsRecentResult {
     pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had
+    /// already read past — so they arrive now, with seqs below records it returned earlier.
+    /// Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late: Option<u64>,
+    /// Cursor reads: late-stored records that left the buffer before any read of this cursor
+    /// could consider them. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late_lost: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -673,6 +682,15 @@ pub struct LogsExportResult {
     pub evicted_before_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had
+    /// already read past. The `verdict` window starts above the cursor, so it does not vouch
+    /// for these. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late: Option<u64>,
+    /// Cursor reads: late-stored records that left the buffer before any read of this cursor
+    /// could consider them. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late_lost: Option<u64>,
     /// `count` stopped this short of everything that matched the range.
     ///
     /// Stated rather than left to be inferred, because it **cannot** be
@@ -1096,6 +1114,10 @@ pub struct TracesLogsResult {
     pub count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_advanced_to: Option<u64>,
+    /// Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had
+    /// already read past — so they arrive now. Absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_late: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

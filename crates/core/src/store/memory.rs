@@ -1,9 +1,9 @@
-use crate::filter::matcher::matches_entry;
+use crate::filter::matcher::{matches_entry, matches_entry_past_cursor};
 use crate::filter::parser::ParsedFilter;
 use crate::gelf::message::LogEntry;
 use crate::store::traits::{LogStore, StoreStats};
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
@@ -28,6 +28,18 @@ struct StoreInner {
     entries: VecDeque<LogEntry>,
     /// Each trace's held seqs, ascending.
     trace_index: HashMap<u128, Vec<u64>>,
+    /// The held records that were stored LATE — below a seq this ring already held, which only
+    /// the merge does (a trigger's pre-window and trace flush) — by their late number, and the
+    /// same by seq. A cursor that already passed a late record's seq still owes it a look, and
+    /// finds it here by number (gh #23, [`InMemoryStore::cursor_read`]). Both maps hold exactly
+    /// the late records still in the ring: `unindex` (every record that leaves) and
+    /// `clear_locked` forget them, so on a domain with no filter they stay empty.
+    late: BTreeMap<u64, u64>,
+    late_by_seq: BTreeMap<u64, u64>,
+    /// Late numbers handed out so far — dense, never reset (a clear empties the maps, not the
+    /// count), so a cursor's mark compares across a clear and a gap in the numbers is a late
+    /// record that left the ring.
+    late_counter: u64,
 }
 
 impl StoreInner {
@@ -47,8 +59,12 @@ impl StoreInner {
         }
     }
 
-    /// Forget `seq` in its trace's list.
+    /// A record left the ring: forget it as a late record and in its trace's list. The late
+    /// half comes first — an untraced record leaves too.
     fn unindex(&mut self, trace_id: Option<u128>, seq: u64) {
+        if let Some(n) = self.late_by_seq.remove(&seq) {
+            self.late.remove(&n);
+        }
         let Some(tid) = trace_id else { return };
         if let Some(seqs) = self.trace_index.get_mut(&tid) {
             if let Ok(i) = seqs.binary_search(&seq) {
@@ -118,6 +134,9 @@ impl InMemoryStore {
             inner: RwLock::new(StoreInner {
                 entries: VecDeque::new(),
                 trace_index: HashMap::new(),
+                late: BTreeMap::new(),
+                late_by_seq: BTreeMap::new(),
+                late_counter: 0,
             }),
             max_capacity: capacity,
             total_stored: AtomicU64::new(0),
@@ -167,6 +186,9 @@ impl InMemoryStore {
             inner: RwLock::new(StoreInner {
                 entries,
                 trace_index,
+                late: BTreeMap::new(),
+                late_by_seq: BTreeMap::new(),
+                late_counter: 0,
             }),
             total_stored: AtomicU64::new(0),
             total_received: AtomicU64::new(0),
@@ -241,6 +263,8 @@ impl InMemoryStore {
         }
         inner.entries.clear();
         inner.trace_index.clear();
+        inner.late.clear();
+        inner.late_by_seq.clear();
     }
 
     /// Store a batch of records that may be OLDER than records already held — a trigger's
@@ -297,6 +321,19 @@ impl InMemoryStore {
         }
         self.reserve_ring(inner);
 
+        // The records stored LATE: below the newest seq held. Every on-arrival store is above
+        // it (the append fast path), so these are exactly the out-of-order ones — the records a
+        // cursor that already read past their seq has not yet considered (gh #23). Numbered
+        // below, once the overflow drop has said which of them are kept. Ascending, as `batch`.
+        let late_seqs: Vec<u64> = match inner.entries.back().map(|e| e.seq) {
+            Some(newest) => batch
+                .iter()
+                .map(|e| e.seq)
+                .take_while(|s| *s < newest)
+                .collect(),
+            None => Vec::new(),
+        };
+
         // The held records above the batch's lowest seq come off, to be merged back.
         let split = inner.entries.partition_point(|e| e.seq < batch[0].seq);
         let tail: Vec<LogEntry> = inner.entries.drain(split..).collect();
@@ -336,12 +373,24 @@ impl InMemoryStore {
             excess -= 1;
         }
         let mut merged = merged.into_iter();
+        // `merged` is ascending, so the dropped are exactly the seqs up to the last one dropped.
+        let mut dropped_through: Option<u64> = None;
         for dropped in merged.by_ref().take(excess) {
             self.lost_below
                 .fetch_max(dropped.seq.saturating_add(1), Ordering::Relaxed);
             inner.unindex(dropped.trace_id, dropped.seq);
+            dropped_through = Some(dropped.seq);
         }
         inner.entries.extend(merged);
+        for seq in late_seqs {
+            if dropped_through.is_some_and(|d| seq <= d) {
+                continue;
+            }
+            inner.late_counter += 1;
+            let n = inner.late_counter;
+            inner.late.insert(n, seq);
+            inner.late_by_seq.insert(seq, n);
+        }
         self.total_stored.fetch_add(stored, Ordering::Relaxed);
         moved
     }
@@ -356,7 +405,28 @@ impl InMemoryStore {
         filter: Option<&ParsedFilter>,
         oldest_first: bool,
     ) -> (Vec<LogEntry>, usize) {
+        let (entries, view) = self.recent_with_view(count, filter, oldest_first);
+        (entries, view.scanned)
+    }
+
+    /// The `recent` query and the ring it ran over, read under ONE lock: what it examined, the
+    /// ring's size and seq bounds, and the loss floor. A reply that paired the query with a
+    /// floor or bound read afterwards could see a record it returns evicted in between, and
+    /// report it gone while handing it out (gh #24).
+    pub fn recent_with_view(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        oldest_first: bool,
+    ) -> (Vec<LogEntry>, RingView) {
         let inner = self.inner.read().unwrap();
+        let mut view = RingView {
+            scanned: 0,
+            len: inner.entries.len(),
+            oldest_seq: inner.entries.front().map(|e| e.seq),
+            newest_seq: inner.entries.back().map(|e| e.seq),
+            lost_below: self.lost_below.load(Ordering::Relaxed),
+        };
         let mut result = Vec::new();
         let mut scanned = 0usize;
 
@@ -392,7 +462,178 @@ impl InMemoryStore {
             }
         }
 
-        (result, scanned)
+        view.scanned = scanned;
+        (result, view)
+    }
+
+    /// Late numbers handed out so far — the mark a cursor created NOW starts from, so it does
+    /// not replay late records stored before it (`bookmarks.add`; see `Bookmark::late_mark`).
+    pub fn late_counter(&self) -> u64 {
+        self.inner.read().unwrap().late_counter
+    }
+
+    /// A cursor read: up to `count` records, the cursor's LATE part first, then its normal part,
+    /// all under one lock (gh #23).
+    ///
+    /// - **Late part** — records stored late (by a trigger's flush) since the cursor's mark, at
+    ///   or below its seq position, matching `filter` with the cursor's own bound treated as
+    ///   passed: walked in late-number order, so a cut can resume at the last number taken.
+    ///   Skipped outright when the position is below every late seq.
+    /// - **Normal part** — the walk every cursor read always did: oldest first, `seq > position`
+    ///   (the filter's `CursorSeq`), up to the remaining budget.
+    ///
+    /// The store never decides the commit. The caller keeps a prefix of the result —
+    /// `logs.export` asks one more than it returns — and commits [`CursorRead::advance_for`]
+    /// that prefix; deciding here would advance past a record the caller then drops.
+    pub fn cursor_read(
+        &self,
+        count: usize,
+        filter: Option<&ParsedFilter>,
+        pos: CursorPos,
+    ) -> CursorRead {
+        let inner = self.inner.read().unwrap();
+        let mut view = RingView {
+            scanned: 0,
+            len: inner.entries.len(),
+            oldest_seq: inner.entries.front().map(|e| e.seq),
+            newest_seq: inner.entries.back().map(|e| e.seq),
+            lost_below: self.lost_below.load(Ordering::Relaxed),
+        };
+        let mut entries: Vec<(LogEntry, Option<LateTag>)> = Vec::new();
+
+        // Late part. `held` counts the late records numbered above the mark that are still
+        // held, as the walk passes them — what makes a gap in the numbering countable as loss.
+        let mut held: u64 = 0;
+        let mut late_exhausted = true;
+        let below_every_late_seq = inner
+            .late_by_seq
+            .keys()
+            .next()
+            .is_none_or(|lowest| pos.seq < *lowest);
+        if count == 0 {
+            // Takes nothing, so moves nothing: `advance_for` stays at `pos`.
+            late_exhausted = false;
+        } else if below_every_late_seq {
+            held = inner.late.range(pos.late_mark.saturating_add(1)..).count() as u64;
+        } else {
+            for (&number, &seq) in inner.late.range(pos.late_mark.saturating_add(1)..) {
+                held += 1;
+                if seq > pos.seq {
+                    // Above the position: the normal part's to judge.
+                    continue;
+                }
+                view.scanned += 1;
+                let Some(e) = inner.position(seq).and_then(|i| inner.entries.get(i)) else {
+                    continue;
+                };
+                if filter.is_some_and(|f| !matches_entry_past_cursor(f, e)) {
+                    continue;
+                }
+                entries.push((
+                    e.clone(),
+                    Some(LateTag {
+                        number,
+                        held_through: held,
+                    }),
+                ));
+                if entries.len() >= count {
+                    // Cut: whether more remain is unknown, so the commit resumes from here.
+                    late_exhausted = false;
+                    break;
+                }
+            }
+        }
+
+        // Normal part, with what budget is left — only when the late part was walked to the end.
+        if late_exhausted && entries.len() < count {
+            for e in inner.entries.iter() {
+                view.scanned += 1;
+                if filter.is_some_and(|f| !matches_entry(f, e)) {
+                    continue;
+                }
+                entries.push((e.clone(), None));
+                if entries.len() >= count {
+                    break;
+                }
+            }
+        }
+
+        CursorRead {
+            entries,
+            pos,
+            late_exhausted,
+            late_counter: inner.late_counter,
+            held_total: late_exhausted.then_some(held),
+            view,
+        }
+    }
+
+    /// [`Self::cursor_read`] for `traces.logs`: one trace's records, no count. The late part is
+    /// the trace's own late records — found through `trace_index`, so the read stays
+    /// O(trace), never a walk of the domain-wide late map (`logs_by_trace_id` was made O(k log n)
+    /// on purpose, and a harness polls this per trace). It does not count lost late records:
+    /// those carry no trace id once gone, so a count would be the whole domain's.
+    pub fn cursor_read_trace(
+        &self,
+        trace_id: u128,
+        filter: Option<&ParsedFilter>,
+        pos: CursorPos,
+    ) -> CursorRead {
+        let inner = self.inner.read().unwrap();
+        let view = RingView {
+            scanned: 0,
+            len: inner.entries.len(),
+            oldest_seq: inner.entries.front().map(|e| e.seq),
+            newest_seq: inner.entries.back().map(|e| e.seq),
+            lost_below: self.lost_below.load(Ordering::Relaxed),
+        };
+        let mut entries: Vec<(LogEntry, Option<LateTag>)> = Vec::new();
+        for &seq in inner.trace_index.get(&trace_id).into_iter().flatten() {
+            let Some(e) = inner.position(seq).and_then(|i| inner.entries.get(i)) else {
+                continue;
+            };
+            if seq <= pos.seq {
+                let Some(&number) = inner.late_by_seq.get(&seq) else {
+                    continue;
+                };
+                if number <= pos.late_mark
+                    || filter.is_some_and(|f| !matches_entry_past_cursor(f, e))
+                {
+                    continue;
+                }
+                entries.push((
+                    e.clone(),
+                    Some(LateTag {
+                        number,
+                        held_through: 0,
+                    }),
+                ));
+            } else if filter.is_none_or(|f| matches_entry(f, e)) {
+                entries.push((e.clone(), None));
+            }
+        }
+        CursorRead {
+            entries,
+            pos,
+            late_exhausted: true,
+            late_counter: inner.late_counter,
+            held_total: None,
+            view,
+        }
+    }
+
+    /// Whether the late maps describe the ring: the same records both ways round, every one
+    /// still held and stored below the ring's newest seq at some point — for the tests that
+    /// drive every writer against a model.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn late_maps_are_consistent(&self) -> bool {
+        let inner = self.inner.read().unwrap();
+        inner.late.len() == inner.late_by_seq.len()
+            && inner
+                .late
+                .iter()
+                .all(|(n, s)| inner.late_by_seq.get(s) == Some(n) && inner.holds(*s))
+            && inner.late.keys().all(|n| *n <= inner.late_counter)
     }
 
     /// Visit every stored record matching `filter`, oldest first, **without
@@ -431,6 +672,138 @@ impl InMemoryStore {
         }
         counts
     }
+}
+
+/// A cursor's position: the seq it has read past, and its late mark (see
+/// `store::bookmarks::Bookmark::late_mark`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorPos {
+    pub seq: u64,
+    pub late_mark: u64,
+}
+
+/// A record a cursor read took from its LATE part: its late number, and how many late records
+/// numbered in `(mark, number]` were still held — so a prefix ending here can say how many in
+/// that range left the ring unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LateTag {
+    number: u64,
+    held_through: u64,
+}
+
+/// What a cursor read took, in DELIVERY order (the late part by late number, then the normal
+/// part by seq), and what the commit needs to know about it — see
+/// [`InMemoryStore::cursor_read`].
+#[derive(Debug, Clone)]
+pub struct CursorRead {
+    entries: Vec<(LogEntry, Option<LateTag>)>,
+    pos: CursorPos,
+    /// The late part was walked to its end (not cut by the budget).
+    late_exhausted: bool,
+    /// The store's late counter at the read.
+    late_counter: u64,
+    /// Late records numbered above the mark still held at the read — when the late part was
+    /// walked to its end and the read counts loss.
+    held_total: Option<u64>,
+    /// The ring as the read saw it.
+    pub view: RingView,
+}
+
+/// Where a cursor moves after a read, and what to tell the reader about late records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorAdvance {
+    pub seq: u64,
+    pub late_mark: u64,
+    /// Kept records that came from the late part (`cursor_late`).
+    pub late: u64,
+    /// Late records the advance passes that left the ring before any read considered them
+    /// (`cursor_late_lost`); `None` when the read does not count loss (`traces.logs`).
+    pub late_lost: Option<u64>,
+}
+
+impl CursorRead {
+    /// Records taken (the most a caller can keep).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The first `kept` records, ascending by seq — what a reply lists. Late records sit at or
+    /// below the cursor's position, so they come first.
+    pub fn kept_entries(&self, kept: usize) -> Vec<LogEntry> {
+        let mut out: Vec<LogEntry> = self.entries[..kept.min(self.entries.len())]
+            .iter()
+            .map(|(e, _)| e.clone())
+            .collect();
+        out.sort_by_key(|e| e.seq);
+        out
+    }
+
+    /// The cursor's next position when the caller keeps the first `kept` records (gh #23):
+    ///
+    /// - every late candidate kept (the late part was walked to its end and nothing of it was
+    ///   dropped) — the mark moves to the store's late counter, so every late record numbered up
+    ///   to the read has been considered, and the seq to the highest normal record kept;
+    /// - otherwise — the seq stays, and the mark moves to the last late record kept, so the
+    ///   next read resumes at the first one not kept.
+    ///
+    /// Exactly once: a record not kept either has a late number above the new mark, or (normal
+    /// part, which is seq-ordered) a seq above the new position.
+    pub fn advance_for(&self, kept: usize) -> CursorAdvance {
+        let kept = kept.min(self.entries.len());
+        let late_total = self.entries.iter().filter(|(_, t)| t.is_some()).count();
+        let prefix = &self.entries[..kept];
+        let late_kept: Vec<LateTag> = prefix.iter().filter_map(|(_, t)| *t).collect();
+        let (seq0, mark0) = (self.pos.seq, self.pos.late_mark);
+        if self.late_exhausted && late_kept.len() == late_total {
+            let seq = prefix
+                .iter()
+                .filter(|(_, t)| t.is_none())
+                .map(|(e, _)| e.seq)
+                .fold(seq0, u64::max);
+            let late_mark = self.late_counter.max(mark0);
+            CursorAdvance {
+                seq,
+                late_mark,
+                late: late_kept.len() as u64,
+                late_lost: self
+                    .held_total
+                    .map(|h| (late_mark - mark0).saturating_sub(h)),
+            }
+        } else {
+            match late_kept.last() {
+                Some(t) => CursorAdvance {
+                    seq: seq0,
+                    late_mark: t.number,
+                    late: late_kept.len() as u64,
+                    late_lost: Some((t.number - mark0).saturating_sub(t.held_through)),
+                },
+                None => CursorAdvance {
+                    seq: seq0,
+                    late_mark: mark0,
+                    late: 0,
+                    late_lost: Some(0),
+                },
+            }
+        }
+    }
+}
+
+/// The ring as a `recent` query saw it, read under the query's own lock — see
+/// [`InMemoryStore::recent_with_view`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RingView {
+    /// Records the query examined (it early-stops at `count`).
+    pub scanned: usize,
+    /// Records held.
+    pub len: usize,
+    pub oldest_seq: Option<u64>,
+    pub newest_seq: Option<u64>,
+    /// The loss floor — see [`InMemoryStore::lost_below`].
+    pub lost_below: u64,
 }
 
 /// What a full-buffer walk examined and what it kept.
@@ -1323,6 +1696,10 @@ mod seq_order_tests {
                 "the ring holds exactly the model's records, ascending"
             );
             assert_eq!(store.lost_below(), model.floor, "the floor is exact");
+            assert!(
+                store.late_maps_are_consistent(),
+                "the late maps hold exactly the held late records, both ways round"
+            );
             let stats = store.stats();
             assert_eq!(
                 (stats.total_received, stats.total_stored),
@@ -1380,5 +1757,345 @@ mod seq_order_tests {
             nonempty > 1_000,
             "trace lookups that returned records: {nonempty}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cursor_late_tests {
+    //! A cursor considers every stored record exactly once, including records a trigger stores
+    //! LATE — below a seq the cursor already read past (gh #23). Driven against the store
+    //! alone: what makes a record late is a store-local fact (stored below the newest held
+    //! seq), so every interleaving a writer can produce is reachable here.
+
+    use super::*;
+    use crate::filter::parser::{Qualifier, SeqOp};
+    use crate::gelf::message::{Level, LogEntry};
+    use std::collections::BTreeSet;
+
+    fn entry(seq: u64) -> LogEntry {
+        let mut e = LogEntry::synthetic(Level::Info, "m");
+        e.seq = seq;
+        e
+    }
+
+    fn on_arrival(store: &InMemoryStore, seqs: impl IntoIterator<Item = u64>) {
+        for s in seqs {
+            store.append(entry(s));
+        }
+    }
+
+    fn late(store: &InMemoryStore, seqs: &[u64]) {
+        store.insert_sorted(seqs.iter().map(|&s| entry(s)).collect());
+    }
+
+    /// One cursor read as a handler does it: take up to `count`, keep the first `kept` (all of
+    /// them when `None`), commit for what was kept. Returns the kept seqs and the advance.
+    fn read(
+        store: &InMemoryStore,
+        cur: &mut CursorPos,
+        count: usize,
+        extra: Vec<Qualifier>,
+        kept: Option<usize>,
+    ) -> (Vec<u64>, CursorAdvance) {
+        let mut qs = vec![Qualifier::CursorSeq { after: cur.seq }];
+        qs.extend(extra);
+        let f = ParsedFilter::Qualifiers(qs);
+        let r = store.cursor_read(count, Some(&f), *cur);
+        let k = kept.unwrap_or(r.len()).min(r.len());
+        let adv = r.advance_for(k);
+        *cur = CursorPos {
+            seq: adv.seq,
+            late_mark: adv.late_mark,
+        };
+        (r.kept_entries(k).iter().map(|e| e.seq).collect(), adv)
+    }
+
+    /// 100 and 200 stored on arrival, the cursor reads both, then a flush stores 50-54 late.
+    fn read_past_then_flush() -> (InMemoryStore, CursorPos) {
+        let store = InMemoryStore::new(100);
+        on_arrival(&store, [100, 200]);
+        let mut cur = CursorPos::default();
+        let (got, _) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![100, 200]);
+        late(&store, &[50, 51, 52, 53, 54]);
+        (store, cur)
+    }
+
+    /// The issue's shape at the store: the late records come back on the next read, counted
+    /// as late, and never again. Today's cursor (seq only) returns nothing here.
+    #[test]
+    fn late_records_reach_a_cursor_that_already_read_past_them() {
+        let (store, mut cur) = read_past_then_flush();
+        let (got, adv) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![50, 51, 52, 53, 54]);
+        assert_eq!(adv.late, 5);
+        assert_eq!(cur.seq, 200, "late records do not move the seq position");
+        let (again, adv) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(again, Vec::<u64>::new());
+        assert_eq!(adv.late, 0);
+    }
+
+    /// V3: a count-limited cursor drains late then normal records, each exactly once.
+    #[test]
+    fn a_count_limited_cursor_drains_late_then_normal_records_once_each() {
+        let (store, mut cur) = read_past_then_flush();
+        on_arrival(&store, [300, 400]);
+        let mut seen = Vec::new();
+        for want in [vec![50, 51], vec![52, 53], vec![54, 300], vec![400], vec![]] {
+            let (got, _) = read(&store, &mut cur, 2, vec![], None);
+            assert_eq!(got, want);
+            seen.extend(got);
+        }
+        assert_eq!(seen, vec![50, 51, 52, 53, 54, 300, 400]);
+    }
+
+    /// V4: a caller that keeps a prefix (`logs.export` asks one more than it returns) commits
+    /// only what it kept — a record it dropped, late (a) or normal (b), comes back next read.
+    #[test]
+    fn a_dropped_record_from_the_probe_comes_back_next_read() {
+        // (a) the dropped record is late.
+        let (store, mut cur) = read_past_then_flush();
+        let (got, _) = read(&store, &mut cur, 3, vec![], Some(2));
+        assert_eq!(got, vec![50, 51]);
+        let (got, _) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![52, 53, 54]);
+
+        // (b) the dropped record is normal.
+        let (store, mut cur) = read_past_then_flush();
+        on_arrival(&store, [300, 400]);
+        let (got, _) = read(&store, &mut cur, 7, vec![], Some(6));
+        assert_eq!(got, vec![50, 51, 52, 53, 54, 300]);
+        let (got, _) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![400]);
+    }
+
+    /// A1: an explicit lower bound (`from_seq`) still excludes a late record below it — only
+    /// the cursor's OWN bound is passed in the late part.
+    #[test]
+    fn an_explicit_from_seq_still_excludes_late_records_below_it() {
+        let (store, mut cur) = read_past_then_flush();
+        let from_53 = Qualifier::SeqFilter {
+            op: SeqOp::Gt,
+            value: 52,
+        };
+        let (got, _) = read(&store, &mut cur, 10, vec![from_53], None);
+        assert_eq!(got, vec![53, 54]);
+    }
+
+    /// A2: a late record evicted before the cursor reads it is not returned, is counted as
+    /// lost, and does not stall the cursor.
+    #[test]
+    fn a_late_record_evicted_before_the_read_is_counted_lost() {
+        let store = InMemoryStore::new(4);
+        on_arrival(&store, [100, 200]);
+        let mut cur = CursorPos::default();
+        read(&store, &mut cur, 10, vec![], None);
+        late(&store, &[50, 51]); // ring: 50 51 100 200
+        on_arrival(&store, [300]); // evicts 50
+        let (got, adv) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![51, 300]);
+        assert_eq!((adv.late, adv.late_lost), (1, Some(1)));
+        let (again, adv) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!((again, adv.late_lost), (vec![], Some(0)));
+    }
+
+    /// A3: a clear forgets the late records; nothing comes back after it.
+    #[test]
+    fn a_clear_forgets_the_late_records() {
+        let (store, mut cur) = read_past_then_flush();
+        store.clear_through(1_000);
+        assert!(store.late_maps_are_consistent());
+        let (got, _) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, Vec::<u64>::new());
+    }
+
+    /// A4: a flush whose records straddle the cursor — 95 below it, 105 above — delivers each
+    /// once, 95 through the late part and 105 through the normal part.
+    #[test]
+    fn a_flush_straddling_the_cursor_delivers_each_record_once() {
+        let store = InMemoryStore::new(100);
+        on_arrival(&store, [100]);
+        let mut cur = CursorPos::default();
+        read(&store, &mut cur, 10, vec![], None);
+        on_arrival(&store, [110]); // the trigger's own record, stored first
+        late(&store, &[95, 105]);
+        let (got, adv) = read(&store, &mut cur, 10, vec![], None);
+        assert_eq!(got, vec![95, 105, 110]);
+        assert_eq!(adv.late, 1, "only 95 was below the cursor");
+        assert_eq!(
+            read(&store, &mut cur, 10, vec![], None).0,
+            Vec::<u64>::new()
+        );
+    }
+
+    /// A cursor created NOW (`bookmarks.add`: the late counter as its mark) does not replay
+    /// late records stored before it.
+    #[test]
+    fn a_cursor_marked_now_skips_earlier_late_records() {
+        let (store, _) = read_past_then_flush();
+        let mut fresh = CursorPos {
+            seq: 200,
+            late_mark: store.late_counter(),
+        };
+        assert_eq!(
+            read(&store, &mut fresh, 10, vec![], None).0,
+            Vec::<u64>::new()
+        );
+        late(&store, &[60]);
+        assert_eq!(read(&store, &mut fresh, 10, vec![], None).0, vec![60]);
+    }
+
+    /// A6: random interleavings of on-arrival stores, late flushes, evictions, clears and
+    /// cursor reads with random counts and kept prefixes. Nothing is delivered twice; a read
+    /// that took everything it could (kept all, under its count) has delivered every record
+    /// held; and the reported loss is exactly the late records that left the ring before the
+    /// cursor's mark passed their number. (A late record stored ABOVE the cursor that leaves
+    /// after the mark passed it is an ordinary record above the position, and its loss is
+    /// `evicted_before_window`'s to report — so "never delivered" over-counts.) The model
+    /// numbers late records itself, in the store's order: ascending within a flush, kept only.
+    #[test]
+    fn a_cursor_delivers_every_record_once_under_every_writer() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let (mut total_lost, mut total_late_kept) = (0u64, 0u64);
+        for _run in 0..20 {
+            let store = InMemoryStore::new(12);
+            let mut cur = CursorPos::default();
+            let mut next_seq = 1u64;
+            let mut kept_out: Vec<u64> = Vec::new(); // a filter's leftovers, flushable late
+            let mut delivered: BTreeSet<u64> = BTreeSet::new();
+            // seq -> late number, for the late records the model believes are held.
+            let mut late_held: BTreeMap<u64, u64> = BTreeMap::new();
+            let mut late_number = 0u64;
+            let mut late_seen = 0u64;
+            let mut lost_expected = 0u64;
+            let mut lost_reported = 0u64;
+            let mut full_reads = 0;
+            for step in 0..800 {
+                match next() % 10 {
+                    0..=3 => {
+                        on_arrival(&store, [next_seq]);
+                        next_seq += 1;
+                    }
+                    4 | 5 => {
+                        kept_out.push(next_seq);
+                        next_seq += 1;
+                    }
+                    6 => {
+                        // A trigger's flush: its own record on arrival, then some kept-out ones.
+                        on_arrival(&store, [next_seq]);
+                        next_seq += 1;
+                        let take = (next() % 4) as usize;
+                        let batch: Vec<u64> = kept_out.drain(..take.min(kept_out.len())).collect();
+                        let newest = store.newest_seq();
+                        let mut batch = batch;
+                        batch.sort_unstable();
+                        late(&store, &batch);
+                        for s in batch {
+                            if store.contains_seq(s) && newest.is_some_and(|n| s < n) {
+                                late_number += 1;
+                                late_held.insert(s, late_number);
+                                late_seen += 1;
+                            }
+                        }
+                    }
+                    7 if next() % 8 == 0 => {
+                        store.clear_through(next_seq);
+                        kept_out.clear();
+                    }
+                    _ => {
+                        let count = 1 + (next() % 6) as usize;
+                        let f =
+                            ParsedFilter::Qualifiers(vec![Qualifier::CursorSeq { after: cur.seq }]);
+                        let r = store.cursor_read(count, Some(&f), cur);
+                        let kept = if next() % 3 == 0 {
+                            (next() as usize) % (r.len() + 1)
+                        } else {
+                            r.len()
+                        };
+                        let adv = r.advance_for(kept);
+                        for e in r.kept_entries(kept) {
+                            assert!(
+                                delivered.insert(e.seq),
+                                "seq {} delivered twice (step {step})",
+                                e.seq
+                            );
+                        }
+                        lost_reported += adv.late_lost.unwrap_or(0);
+                        cur = CursorPos {
+                            seq: adv.seq,
+                            late_mark: adv.late_mark,
+                        };
+                        if kept == r.len() && r.len() < count {
+                            full_reads += 1;
+                            let held: Vec<u64> =
+                                (1..next_seq).filter(|s| store.contains_seq(*s)).collect();
+                            for s in held {
+                                assert!(
+                                    delivered.contains(&s),
+                                    "held seq {s} never delivered (step {step})"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Late records that left the ring since the last step: lost iff the cursor's
+                // mark had not yet passed them.
+                let gone: Vec<u64> = late_held
+                    .keys()
+                    .copied()
+                    .filter(|s| !store.contains_seq(*s))
+                    .collect();
+                for s in gone {
+                    let n = late_held.remove(&s).unwrap();
+                    if n > cur.late_mark {
+                        lost_expected += 1;
+                    }
+                }
+                assert!(store.late_maps_are_consistent(), "step {step}");
+            }
+            // Drain, then account for every late record.
+            loop {
+                let f = ParsedFilter::Qualifiers(vec![Qualifier::CursorSeq { after: cur.seq }]);
+                let r = store.cursor_read(1_000, Some(&f), cur);
+                let adv = r.advance_for(r.len());
+                for e in r.kept_entries(r.len()) {
+                    assert!(
+                        delivered.insert(e.seq),
+                        "seq {} delivered twice in the drain",
+                        e.seq
+                    );
+                }
+                lost_reported += adv.late_lost.unwrap_or(0);
+                cur = CursorPos {
+                    seq: adv.seq,
+                    late_mark: adv.late_mark,
+                };
+                if r.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(
+                lost_reported, lost_expected,
+                "the reported loss is exactly the late records gone before the mark passed them"
+            );
+            assert_eq!(
+                store.late_counter(),
+                late_number,
+                "the model numbers as the store does"
+            );
+            assert!(full_reads > 10, "the run made complete reads: {full_reads}");
+            assert!(late_seen > 0, "the run stored late records");
+            total_lost += lost_expected;
+            total_late_kept += late_seen - lost_expected;
+        }
+        // Both arms happened: late records lost, and late records that survived to be read.
+        assert!(total_lost > 0, "no run lost a late record");
+        assert!(total_late_kept > 0, "no late record survived to be read");
     }
 }

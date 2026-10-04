@@ -135,6 +135,83 @@ What the buffer ADMITS changes with or without filters:
   trigger with a smaller pre-window had drained newer ones, so a later flush could pull in
   records far older than N arrivals.
 
+### Fixed — a cursor never returned a record a trigger stored behind it (wire addition)
+
+A trigger stores its pre-window LATE: records a session filter had kept out, older than records
+already in the buffer. A cursor (`c>=` on `get_recent_logs`, `export_logs`, `get_trace_logs`)
+was a single seq that advanced to the highest seq returned, so once it had read past those seqs
+it never returned them — in any domain with a filter, the context around an error could be
+missing from a cursor-driven drain for good. A test harness draining by cursor and asserting "no
+warnings" saw a green run over warnings it never received.
+
+A cursor now returns every stored record exactly once. A record stored behind it arrives on the
+next read — oldest-first with everything else, so with a seq below records it returned earlier —
+and the reply counts them:
+
+- **`cursor_late`** — how many of the returned records were stored late. Absent when none.
+- **`cursor_late_lost`** — late records that left the buffer before any read could see them.
+  Absent when none; not on `get_trace_logs`.
+- **`cursor_advanced_to`** is still the cursor's new seq position, so it is now also absent when
+  the only records returned were late ones.
+
+A late record is judged by the filter of the first cursor read after it is stored, as any record
+behind a cursor always was. A bookmark added with `add_bookmark` and read as a cursor still means
+"from now": late records stored before the call are not replayed. `export_logs`'s `verdict`
+window starts above the cursor, so it does not vouch for late records.
+
+### Fixed — a broker that could not start restart-looped with no trace of why
+
+Under the launchd service (`install-service`), a broker that exits is restarted every 10 s,
+and its stderr was discarded. Of the ways startup can fail, only an oversize buffer was logged;
+the rest — the GELF port taken, another broker already running, an unreadable state file — went
+to stderr alone, so the broker restart-looped silently. Two changes:
+
+- Every error after the broker's log exists is now logged to `daemon.log.<date>` as
+  `logmon daemon failed: …` before the broker exits.
+- The launchd service writes stderr to `daemon.stderr.log` in the config directory
+  (`/var/log/logmon-broker.stderr.log` for a system install), which catches what happens before
+  that log exists — an unreadable `config.json`, a panic. **Re-run `logmon-broker
+  install-service` to pick this up**; an existing plist keeps discarding stderr. (systemd already
+  sends a service's stderr to the journal.)
+
+### Fixed — a broker that failed partway through startup never said `OTEL:OFFLINE`
+
+`OTEL:ONLINE` went out as soon as the OTLP receiver started. If startup then failed — writing
+the pid file, binding the socket — the broker exited without `OTEL:OFFLINE`, leaving producers
+pointed at a collector that was never serving. `ONLINE` now goes out once the listener is bound,
+the last step that can fail.
+
+### Fixed — a removed session's `pre_window` kept sizing the pre-trigger buffer
+
+The pre-trigger buffer is sized to the largest `pre_window` among a domain's sessions. Adding,
+editing or removing a trigger re-derived it; removing a whole session did not — `sessions.drop`,
+the TTL sweep, or an anonymous session's disconnect (the common one). The gone session's largest
+window kept the buffer that size, holding the memory and widening how far back a traced trigger
+firing reached, until something else re-derived it. All three now do.
+
+### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
+
+Both read the eviction floor, and the buffer's size and seq bounds, separately from the query
+that produced the records. Under ingest at the bottom of a full buffer an eviction could land in
+between, and the reply then reported `evicted_before_window` (and `export_logs` a verdict of
+`evicted`) about a record it was handing back. The floor and bounds now come from the query's
+own lock, as `create_case`, `list_log_fields` and `profile_logs` already did.
+
+### Fixed — a traced trigger firing scanned the whole pre-trigger buffer
+
+When a trigger fires on a record with a trace id, it also stores that trace's other entries
+still in the pre-trigger buffer. It found them by scanning every buffered entry under the
+buffer's lock — which every ingested record also takes — and the buffer may now be as large as
+the log ring. A per-trace index finds them in the trace's own size, with the same result.
+
+### Changed — a span collector keeps 256 distinct group tuples, up from 64
+
+Past the cap, group tuples fold into `__overflow__` in arrival order. At 64, a per-call-site
+breakdown (`group_keys` `code.file.path` + `code.line.number`) folded every call site first seen
+after 64 others — the hottest one included, if it showed up late. The cap now matches the
+per-name cap (each carries the same stats and duration sketch). Past 256 it still folds and sets
+`cardinality_capped`: narrow the filter until it clears.
+
 ### Fixed — `pre_window = N` stored N−1 records before the match
 
 A record joined the pre-trigger buffer before its own triggers were evaluated, so when it

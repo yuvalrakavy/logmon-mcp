@@ -22,7 +22,7 @@ pub enum Qualifier {
         op: BookmarkOp,
         name: String,
     },
-    /// Read-and-advance bookmark reference. Resolved to `SeqFilter` by
+    /// Read-and-advance bookmark reference. Resolved to `CursorSeq` by
     /// `bookmark_resolver::resolve_bookmarks` (which also acquires the
     /// CursorCommit handle from the BookmarkStore).
     CursorFilter {
@@ -37,6 +37,15 @@ pub enum Qualifier {
     SeqFilter {
         op: SeqOp,
         value: u64,
+    },
+    /// Internal-only: what `resolve_bookmarks` produces from a `CursorFilter` — the cursor's
+    /// seq position. Matches exactly as `SeqFilter { Gt, after }` everywhere a filter is
+    /// evaluated or a window derived; it is a variant of its own only so a cursor read can tell
+    /// its OWN bound apart from an explicit `from_seq`/`to_seq` range (which also lowers to
+    /// `SeqFilter`): a record stored late below the cursor is still eligible, while one below
+    /// an explicit `from_seq` is not (gh #23, `InMemoryStore::cursor_read`).
+    CursorSeq {
+        after: u64,
     },
 }
 
@@ -789,6 +798,9 @@ fn resolved_lower_bound(filter: &ParsedFilter) -> Option<u64> {
                     op: SeqOp::Gt,
                     value,
                 } => Some(*value),
+                // A cursor's own bound is a lower bound like any other — leaving it out
+                // dropped `truncated` / `evicted_before_window` for every cursor read.
+                Qualifier::CursorSeq { after } => Some(*after),
                 _ => None,
             })
             .max(),
@@ -815,16 +827,19 @@ pub fn resolved_seq_range(filter: Option<&ParsedFilter>) -> (Option<u64>, Option
     let mut lo: Option<u64> = None;
     let mut hi: Option<u64> = None;
     for q in qs {
-        if let Qualifier::SeqFilter { op, value } = q {
-            match op {
-                SeqOp::Gt => {
-                    let bound = value.saturating_add(1);
-                    lo = Some(lo.map_or(bound, |cur: u64| cur.max(bound)));
-                }
-                SeqOp::Lt => {
-                    let bound = value.saturating_sub(1);
-                    hi = Some(hi.map_or(bound, |cur: u64| cur.min(bound)));
-                }
+        let (op, value) = match q {
+            Qualifier::SeqFilter { op, value } => (*op, *value),
+            Qualifier::CursorSeq { after } => (SeqOp::Gt, *after),
+            _ => continue,
+        };
+        match op {
+            SeqOp::Gt => {
+                let bound = value.saturating_add(1);
+                lo = Some(lo.map_or(bound, |cur: u64| cur.max(bound)));
+            }
+            SeqOp::Lt => {
+                let bound = value.saturating_sub(1);
+                hi = Some(hi.map_or(bound, |cur: u64| cur.min(bound)));
             }
         }
     }
@@ -1039,6 +1054,18 @@ mod truncation_tests {
                                                               // missing, and reporting `truncated` here made `complete` unreachable
                                                               // for any window anchored at the start of the buffer.
         assert_eq!(evicted_before_window(&gt(9), 10), None);
+    }
+
+    /// A cursor's own bound (`CursorSeq`, what `c>=` resolves to) grades a window exactly as
+    /// `b>=` does: a cursor reading past an evicted stretch is told so, and its window starts
+    /// one above its position. Leaving it out of either helper was silent — every cursor read
+    /// came back `truncated: false` and with no window to grade (gh #23).
+    #[test]
+    fn a_cursor_bound_grades_the_window_like_a_bookmark() {
+        let cur = |after| ParsedFilter::Qualifiers(vec![Qualifier::CursorSeq { after }]);
+        assert_eq!(evicted_before_window(&cur(5), 10), Some(4));
+        assert_eq!(evicted_before_window(&cur(9), 10), None);
+        assert_eq!(resolved_seq_range(Some(&cur(5))), (Some(6), None));
     }
 
     #[test]

@@ -108,6 +108,8 @@ logmon-broker install-service --scope user
 
 This registers a launchd agent on macOS or a systemd user unit on Linux. The broker starts at login and restarts on crash. To remove it: `logmon-broker uninstall-service --scope user`.
 
+If the broker keeps restarting, the reason is in the config directory: `daemon.log.<date>` (a line starting `logmon daemon failed:`), or, for a failure before that log exists, `daemon.stderr.log` (launchd; on Linux, `journalctl --user -u logmon-broker`).
+
 If you skip this, the MCP shim auto-starts the broker the first time a client connects.
 
 ### Wire up your AI assistant
@@ -517,7 +519,7 @@ get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 get_recent_logs(filter="c>=test-run, l>=ERROR", count=500)
 ```
 
-When a `c>=` qualifier is present, results come back oldest-first within the cursor's window so paginated polls drain monotonically.
+When a `c>=` qualifier is present, results come back oldest-first, and a cursor returns every stored record exactly once. A trigger stores its pre-window *late* — records a filter had kept out, older than records already stored — so a cursor that already read past them gets them on its next read, counted in `cursor_late`; late records that left the buffer before any read could see them are counted in `cursor_late_lost`.
 
 `c>=` is allowed in `get_recent_logs`, `export_logs`, and `get_trace_logs`. Other query methods reject it because their results aren't seq-streamable.
 
@@ -995,7 +997,8 @@ Config and state live in `~/.config/logmon/` on both macOS and Linux:
 | `domain_data/` | The per-domain provenance registry, one file per domain, off the ingest path. |
 | `logmon.sock` | The JSON-RPC Unix domain socket. |
 | `daemon.pid` | PID file. |
-| `daemon.log` | Broker log output. |
+| `daemon.log.<date>` | Broker log output, one file per day. A startup failure is logged here as `logmon daemon failed: …`. |
+| `daemon.stderr.log` | The broker's stderr under the launchd service: what happens before `daemon.log` exists (an unreadable `config.json`), and panics. |
 
 Case documents are **not** here — `create_case` writes them to the absolute `dir` you
 name, because they belong beside the project they are evidence about.

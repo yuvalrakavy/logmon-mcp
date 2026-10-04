@@ -400,17 +400,61 @@ fn an_oversize_configured_buffer_is_refused_and_the_refusal_is_in_the_daemon_log
         d.diagnostics("refused.log")
     );
 
-    // The daemon's OWN log files only — stderr (`refused.log`) carries the error too, and
-    // would satisfy a check that read both.
-    let daemon_log: String = std::fs::read_dir(tmp.path())
+    let daemon_log = own_daemon_log(tmp.path());
+    assert!(
+        daemon_log.contains("logmon daemon failed") && daemon_log.contains("`buffer_size`"),
+        "the refusal must be in daemon.log.<date>; everything the broker wrote:\n{}",
+        d.diagnostics("refused.log")
+    );
+}
+
+/// Every startup failure after the broker's log exists is logged there, not only the buffer
+/// cap (gh #28): here "another broker is already running", which used to reach stderr alone —
+/// under launchd, nowhere — so a second broker restart-looped silently.
+#[test]
+fn a_broker_that_finds_another_running_says_so_in_the_daemon_log() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // This test process is alive, so its pid in `daemon.pid` reads as a running broker.
+    std::fs::write(
+        tmp.path().join("daemon.pid"),
+        std::process::id().to_string(),
+    )
+    .expect("write daemon.pid");
+    let mut d = Daemon::spawn_unchecked(tmp.path(), "second.log");
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = d.child.try_wait().expect("try_wait") {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the broker neither exited nor was refused within 90s; its log:\n{}",
+            d.diagnostics("second.log")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !status.success(),
+        "a second broker must not start; its log:\n{}",
+        d.diagnostics("second.log")
+    );
+    let daemon_log = own_daemon_log(tmp.path());
+    assert!(
+        daemon_log.contains("logmon daemon failed")
+            && daemon_log.contains("another broker is already running"),
+        "the refusal must be in daemon.log.<date>; everything the broker wrote:\n{}",
+        d.diagnostics("second.log")
+    );
+}
+
+/// The daemon's OWN log files only — stderr (the spawn's capture file) carries the error too,
+/// and would satisfy a check that read both.
+fn own_daemon_log(dir: &std::path::Path) -> String {
+    std::fs::read_dir(dir)
         .expect("read tempdir")
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("daemon.log"))
         .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
-        .collect();
-    assert!(
-        daemon_log.contains("refusing to start") && daemon_log.contains("`buffer_size`"),
-        "the refusal must be in daemon.log.<date>; everything the broker wrote:\n{}",
-        d.diagnostics("refused.log")
-    );
+        .collect()
 }

@@ -35,6 +35,20 @@ impl Scope {
         }
     }
 
+    /// Where launchd writes the broker's stderr. Without one it is discarded, and `KeepAlive`
+    /// restarts a broker that cannot start every 10 s with no trace of why: a failure before
+    /// the broker's own log exists (the config dir, `load_config`), a panic, `main`'s error
+    /// (gh #28). A user agent writes next to its `daemon.log`; a system daemon runs as root, so
+    /// its config dir is root's, and it writes under `/var/log` instead.
+    fn stderr_path(&self) -> PathBuf {
+        match self {
+            Scope::User => {
+                logmon_broker_core::daemon::persistence::config_dir().join("daemon.stderr.log")
+            }
+            Scope::System => PathBuf::from("/var/log/logmon-broker.stderr.log"),
+        }
+    }
+
     fn bootstrap_target(&self) -> String {
         match self {
             Scope::User => format!("gui/{}", current_uid()),
@@ -57,8 +71,18 @@ pub fn install(scope: Scope) -> Result<()> {
         .to_str()
         .with_context(|| format!("current_exe path is not valid UTF-8: {}", exe.display()))?;
     let plist_path = scope.plist_path()?;
-    let rendered = PLIST_TEMPLATE.replace("{BINARY_PATH}", exe_str);
+    let stderr_path = scope.stderr_path();
+    let stderr_str = stderr_path
+        .to_str()
+        .with_context(|| format!("stderr path is not valid UTF-8: {}", stderr_path.display()))?;
+    let rendered = render_plist(exe_str, stderr_str);
 
+    // launchd does not create the stderr file's directory; without it the redirect fails and
+    // stderr is lost again.
+    if let Some(parent) = stderr_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create stderr log dir: {}", parent.display()))?;
+    }
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create plist parent dir: {}", parent.display()))?;
@@ -103,4 +127,70 @@ fn bootout(scope: Scope) -> Result<()> {
         .args(["bootout", &format!("{target}/{LABEL}")])
         .status();
     Ok(())
+}
+
+/// The plist for this binary and stderr file. Both paths are XML-escaped: a path is free text,
+/// and an `&` or `<` in it would make the plist one launchd refuses to load.
+fn render_plist(binary: &str, stderr: &str) -> String {
+    PLIST_TEMPLATE
+        .replace("{BINARY_PATH}", &xml_escape(binary))
+        .replace("{STDERR_PATH}", &xml_escape(stderr))
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_plist_sends_stderr_to_the_file_it_was_given() {
+        let plist = render_plist(
+            "/opt/bin/logmon-broker",
+            "/Users/u/.config/logmon/daemon.stderr.log",
+        );
+        assert!(
+            plist.contains(
+                "<key>StandardErrorPath</key> <string>/Users/u/.config/logmon/daemon.stderr.log</string>"
+            ),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<string>/opt/bin/logmon-broker</string>"),
+            "{plist}"
+        );
+        assert!(!plist.contains('{'), "every placeholder is filled: {plist}");
+    }
+
+    #[test]
+    fn paths_are_xml_escaped() {
+        let plist = render_plist("/a&b/<bin>", "/x'y\"z.log");
+        assert!(
+            plist.contains("<string>/a&amp;b/&lt;bin&gt;</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<string>/x&apos;y&quot;z.log</string>"),
+            "{plist}"
+        );
+    }
+
+    #[test]
+    fn a_user_agent_writes_stderr_beside_its_daemon_log() {
+        let path = Scope::User.stderr_path();
+        assert_eq!(
+            path.parent(),
+            Some(logmon_broker_core::daemon::persistence::config_dir().as_path())
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("daemon.stderr.log")
+        );
+    }
 }

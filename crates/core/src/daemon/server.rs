@@ -64,6 +64,19 @@ fn send_otel_beacon(message: &str, target: Option<std::net::SocketAddr>) {
     }
 }
 
+/// Announce `OTEL:ONLINE` — once the broker can serve, i.e. after its listener is bound, the
+/// last fallible step of startup. Only a broker whose OTLP receiver started announces anything,
+/// and only that one owes `OTEL:OFFLINE` at shutdown (the same `_otlp_receiver.is_some()` gates
+/// both). Default-domain ONLY, by design (consumer #4/§18): the beacon carries no domain/port,
+/// so non-default domains never emit it (see `domain_lifecycle`, which sends none); a producer
+/// targeting a non-default domain uses `create_domain` returning (its OTLP port pre-binds
+/// synchronously) as the readiness signal.
+fn announce_online(otlp_started: bool, target: Option<std::net::SocketAddr>) {
+    if otlp_started {
+        send_otel_beacon("OTEL:ONLINE\n", target);
+    }
+}
+
 /// Wait for either SIGTERM or SIGINT (Unix), or `ctrl_c` (Windows).
 /// Production path uses this; the test harness injects a oneshot channel
 /// via [`DaemonOverrides::shutdown_rx`] instead.
@@ -178,14 +191,43 @@ pub async fn run_with_overrides(
 
     info!("logmon daemon starting");
 
-    // 2a. Refuse a buffer size no domain could allocate — it would otherwise abort the process
-    //     on that domain's first record. After tracing (which binds nothing) so the refusal
-    //     lands in `daemon.log`: under the launchd service stderr goes nowhere, and the agent
-    //     would restart-loop with no trace of why. Still before anything binds or allocates.
-    if let Err(e) = config.validate_buffer_sizes() {
-        error!("refusing to start: {e:#}");
-        return Err(e);
+    // Every error from here on is logged before it propagates, so it lands in `daemon.log`
+    // (gh #28). A service manager restarts a broker that exits, and under launchd stderr went
+    // nowhere, so a broker that could not start — the GELF port taken, another broker already
+    // running, an unreadable state file — restart-looped with no trace of why. A failure BEFORE
+    // this point (the config dir, tracing itself, `load_config` in `main`) still has only
+    // stderr, which the service definitions now capture (`daemon.stderr.log`).
+    let result = run_initialized(
+        config,
+        dir,
+        socket_override,
+        injected_log_rx,
+        shutdown_rx,
+        accept_paused,
+        beacon_target,
+    )
+    .await;
+    if let Err(e) = &result {
+        error!("logmon daemon failed: {e:#}");
     }
+    result
+}
+
+/// [`run_with_overrides`] from the config dir and tracing onward: everything that can fail
+/// once there is a log to say so in.
+async fn run_initialized(
+    config: DaemonConfig,
+    dir: PathBuf,
+    socket_override: Option<PathBuf>,
+    injected_log_rx: Option<mpsc::Receiver<LogEntry>>,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+    accept_paused: Option<Arc<AtomicBool>>,
+    beacon_target: Option<std::net::SocketAddr>,
+) -> anyhow::Result<()> {
+    // 2a. Refuse a buffer size no domain could allocate — it would otherwise abort the process
+    //     on that domain's first record. After tracing (which binds nothing), so the refusal
+    //     is logged by the caller; still before anything binds or allocates.
+    config.validate_buffer_sizes()?;
 
     // 2b. Stale-pid sweep. If a `daemon.pid` exists from a previous run:
     //     - and that pid is alive, refuse to start (someone else owns the
@@ -358,12 +400,10 @@ pub async fn run_with_overrides(
                         let otlp_info = otlp_receiver.listening_on();
                         info!(?otlp_info, "OTLP receiver started");
                         all_receivers_info.extend(otlp_info);
-                        // Default-domain ONLY, by design (consumer #4/§18): the beacon
-                        // carries no domain/port, so non-default domains never emit it
-                        // (see `domain_lifecycle`, which sends none). A producer
-                        // targeting a non-default domain uses `create_domain` returning
-                        // (its OTLP port pre-binds synchronously) as the readiness signal.
-                        send_otel_beacon("OTEL:ONLINE\n", beacon_target);
+                        // `OTEL:ONLINE` is NOT sent here: startup can still fail after this
+                        // point (the pid file, the socket bind), and a broker that announced
+                        // itself and then exited never says `OFFLINE` (gh #27). It goes out
+                        // once the listener is bound — see `announce_online`.
                         Some(otlp_receiver)
                     }
                     Err(e) => {
@@ -637,6 +677,7 @@ pub async fn run_with_overrides(
                     // thing that ever hands the budget back.
                     let collectors = handler.clear_session_collectors(&id);
                     sessions.dispose(&id);
+                    handler.resync_pre_buffers();
                     info!(session = %id, bookmarks_cleared = cleared,
                         collectors_released = collectors,
                         "session TTL sweep: disposed (disconnected past TTL)");
@@ -678,6 +719,7 @@ pub async fn run_with_overrides(
         let _ = std::fs::remove_file(&socket_path);
         let listener = tokio::net::UnixListener::bind(&socket_path)?;
         info!(?socket_path, "listening on Unix socket");
+        announce_online(_otlp_receiver.is_some(), beacon_target);
 
         // Track spawned connection-handler tasks so we can abort them on
         // shutdown. Without this, the accept loop exits but per-connection
@@ -779,6 +821,7 @@ pub async fn run_with_overrides(
         let _ = socket_override;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:12200").await?;
         info!("listening on TCP 127.0.0.1:12200");
+        announce_online(_otlp_receiver.is_some(), beacon_target);
 
         let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
@@ -1137,6 +1180,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Disconnect session
     sessions.disconnect(&session_id);
+    // An anonymous session is REMOVED on disconnect, with its triggers (a named one is kept).
+    if matches!(session_id, SessionId::Anonymous(_)) {
+        handler.resync_pre_buffers();
+    }
     info!(?session_id, "session disconnected");
     Ok(())
 }

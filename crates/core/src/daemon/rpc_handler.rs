@@ -1200,8 +1200,8 @@ impl RpcHandler {
     ///
     /// The second tuple element is the cursor commit handle when the filter
     /// contained a `c>=` qualifier. Callers that support cursor semantics
-    /// (`logs.recent`, `logs.export`, `traces.logs`) capture it and call
-    /// `commit_handle.commit(max_seq)` after the lock-free query phase. For
+    /// (`logs.recent`, `logs.export`, `traces.logs`) capture it, read through
+    /// the store's cursor read, and `commit_cursor` what they kept. For
     /// non-cursor handlers, the value is always `None`.
     fn parse_and_resolve_filter(
         &self,
@@ -1480,30 +1480,27 @@ impl RpcHandler {
 
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
-        let oldest_first = cursor_commit.is_some();
-        let (entries, stats) =
-            d.pipeline
-                .recent_logs_with_stats(count, resolved.as_ref(), oldest_first);
-
-        // Drive the cursor commit + populate cursor_advanced_to.
-        let advanced_to = if let Some(commit) = cursor_commit {
-            let max_seq = entries.iter().map(|e| e.seq).max();
-            if let Some(s) = max_seq {
-                commit.commit(s);
-                Some(s)
-            } else {
-                // No records returned: leave the cursor at its current position.
-                // Dropping the unused commit is a no-op.
-                drop(commit);
-                None
+        let (entries, stats, cursor) = match cursor_commit {
+            Some(commit) => {
+                // Oldest first, late records included (gh #23); everything taken is kept.
+                let read = d
+                    .pipeline
+                    .cursor_read(count, resolved.as_ref(), cursor_pos(&commit));
+                let kept = read.len();
+                let outcome = commit_cursor(commit, &read, kept);
+                (read.kept_entries(kept), read.view.into(), Some(outcome))
             }
-        } else {
-            None
+            None => {
+                let (entries, stats) =
+                    d.pipeline
+                        .recent_logs_with_stats(count, resolved.as_ref(), false);
+                (entries, stats, None)
+            }
         };
 
         let evicted_before_window = resolved
             .as_ref()
-            .and_then(|f| crate::filter::parser::evicted_before_window(f, d.pipeline.lost_below()));
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.lost_below));
 
         let mut result = json!({
             "logs": entries,
@@ -1515,8 +1512,8 @@ impl RpcHandler {
             "truncated": evicted_before_window.is_some(),
             "evicted_before_window": evicted_before_window,
         });
-        if let Some(s) = advanced_to {
-            result["cursor_advanced_to"] = json!(s);
+        if let Some(o) = cursor {
+            o.write_to(&mut result);
         }
         Ok(result)
     }
@@ -1543,36 +1540,42 @@ impl RpcHandler {
             opt_u64(params, "from_seq")?,
             opt_u64(params, "to_seq")?,
         );
-        let oldest_first = cursor_commit.is_some();
         // Asked for one more than requested, so `capped` is a fact rather than
         // an inference: "asked N, got N" is true both when the range was cut
         // short and when exactly N existed, and §4.2 forbids calling a capped
-        // range complete. `recent_with_scanned` takes the FIRST `count`
-        // matching in whichever direction it walks, so taking one extra and
-        // dropping it returns the same entries either way.
+        // range complete. Both reads take the FIRST `count` matching in the
+        // order they walk, so taking one extra and dropping it returns the same
+        // entries either way — and a cursor commits only the KEPT prefix, or it
+        // would advance past the dropped record (gh #23).
         let probe = count.saturating_add(1);
-        let (mut entries, stats) =
-            d.pipeline
-                .recent_logs_with_stats(probe, resolved.as_ref(), oldest_first);
-        let capped = entries.len() > count;
-        entries.truncate(count);
-
-        let advanced_to = if let Some(commit) = cursor_commit {
-            let max_seq = entries.iter().map(|e| e.seq).max();
-            if let Some(s) = max_seq {
-                commit.commit(s);
-                Some(s)
-            } else {
-                drop(commit);
-                None
+        let (entries, stats, capped, cursor) = match cursor_commit {
+            Some(commit) => {
+                let read = d
+                    .pipeline
+                    .cursor_read(probe, resolved.as_ref(), cursor_pos(&commit));
+                let capped = read.len() > count;
+                let kept = read.len().min(count);
+                let outcome = commit_cursor(commit, &read, kept);
+                (
+                    read.kept_entries(kept),
+                    read.view.into(),
+                    capped,
+                    Some(outcome),
+                )
             }
-        } else {
-            None
+            None => {
+                let (mut entries, stats): (Vec<_>, crate::engine::pipeline::RecentStats) = d
+                    .pipeline
+                    .recent_logs_with_stats(probe, resolved.as_ref(), false);
+                let capped = entries.len() > count;
+                entries.truncate(count);
+                (entries, stats, capped, None)
+            }
         };
 
         let evicted_before_window = resolved
             .as_ref()
-            .and_then(|f| crate::filter::parser::evicted_before_window(f, d.pipeline.lost_below()));
+            .and_then(|f| crate::filter::parser::evicted_before_window(f, stats.lost_below));
 
         // How much of this window the daemon can vouch for (§4.2).
         //
@@ -1618,7 +1621,7 @@ impl RpcHandler {
                     .epochs()
                     .origin_seq()
                     .saturating_add(1)
-                    .max(d.pipeline.lost_below())
+                    .max(stats.lost_below)
                     .max(d.pipeline.admit_from())
             });
             let to = hi.unwrap_or_else(|| d.pipeline.current_seq());
@@ -1660,8 +1663,8 @@ impl RpcHandler {
             "verdict": verdict,
             "narrowed_by": narrowed_by,
         });
-        if let Some(s) = advanced_to {
-            result["cursor_advanced_to"] = json!(s);
+        if let Some(o) = cursor {
+            o.write_to(&mut result);
         }
         Ok(result)
     }
@@ -2227,31 +2230,30 @@ impl RpcHandler {
         let (resolved, cursor_commit) =
             self.parse_and_resolve_filter(filter_str, session_id, &d.bookmarks)?;
 
-        // logs_by_trace_id returns logs in seq order (the ring is seq-ordered). A cursor
-        // commits the highest seq it returned, so it still never sees a lower seq that is
-        // STORED LATER — a trigger's pre-window, flushed after the read: late arrival, a
-        // semantic question this order does not change.
-        let mut logs = d.pipeline.logs_by_trace_id(trace_id);
-        if let Some(f) = resolved.as_ref() {
-            logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
-        }
-
-        let advanced_to = if let Some(commit) = cursor_commit {
-            let max_seq = logs.iter().map(|e| e.seq).max();
-            if let Some(s) = max_seq {
-                commit.commit(s);
-                Some(s)
-            } else {
-                drop(commit);
-                None
+        // The trace's logs in seq order (the ring is seq-ordered). A cursor also gets the
+        // trace's records a trigger stored LATE, below a seq it already read past, on the read
+        // after the flush (gh #23).
+        let (logs, cursor) = match cursor_commit {
+            Some(commit) => {
+                let read =
+                    d.pipeline
+                        .cursor_read_trace(trace_id, resolved.as_ref(), cursor_pos(&commit));
+                let kept = read.len();
+                let outcome = commit_cursor(commit, &read, kept);
+                (read.kept_entries(kept), Some(outcome))
             }
-        } else {
-            None
+            None => {
+                let mut logs = d.pipeline.logs_by_trace_id(trace_id);
+                if let Some(f) = resolved.as_ref() {
+                    logs.retain(|e| crate::filter::matcher::matches_entry(f, e));
+                }
+                (logs, None)
+            }
         };
 
         let mut result = json!({ "logs": logs, "count": logs.len() });
-        if let Some(s) = advanced_to {
-            result["cursor_advanced_to"] = json!(s);
+        if let Some(o) = cursor {
+            o.write_to(&mut result);
         }
         Ok(result)
     }
@@ -3030,6 +3032,9 @@ impl RpcHandler {
             .collectors
             .drop_session(&SessionId::Named(name.to_string()));
         let session_result = self.sessions.drop_session(name);
+        if session_result.is_ok() {
+            self.resync_pre_buffers();
+        }
         if collectors == 0 {
             // Nothing was reclaimed, so a missing session really is an error
             // worth reporting rather than a no-op dressed as success.
@@ -3062,9 +3067,18 @@ impl RpcHandler {
         self.sweep_bookmarks(&d);
 
         let session = session_id.to_string();
+        // The late counter NOW, so a `c>=` read on this bookmark means "from now" for records a
+        // trigger stores late too — those stored before the add are not replayed (gh #23).
         let (bookmark, replaced) = d
             .bookmarks
-            .add(&session, name, start_seq, description, replace)
+            .add_at(
+                &session,
+                name,
+                start_seq,
+                d.pipeline.late_counter(),
+                description,
+                replace,
+            )
             .map_err(|e| e.to_string())?;
         Ok(json!({
             "qualified_name": bookmark.qualified_name,
@@ -3157,6 +3171,21 @@ impl RpcHandler {
     /// `sessions.drop` are what bound the reservation.
     pub fn clear_session_collectors(&self, session_id: &SessionId) -> usize {
         self.collectors.drop_session(session_id)
+    }
+
+    /// Re-derive every domain's pre-trigger buffer size from the sessions bound to it NOW.
+    ///
+    /// For after a session is REMOVED — `sessions.drop`, the TTL sweep, an anonymous session's
+    /// disconnect. Every trigger add/edit/remove and every rebind already resyncs its domain;
+    /// a removal did not, so a gone session's largest `pre_window` kept sizing the buffer —
+    /// its memory, and how far back a traced firing reaches — until something else resynced
+    /// (gh #25). Every domain, because the session is gone by the time this runs and so is the
+    /// record of which domain it was in; there are few domains, and each resync is a max over
+    /// that domain's sessions.
+    pub fn resync_pre_buffers(&self) {
+        for d in self.domains.list() {
+            sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
+        }
     }
 
     fn sweep_bookmarks(&self, d: &Domain) {
@@ -4488,6 +4517,60 @@ fn quantile_ms(sorted: &[f64], q: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // domain_data.* helpers
 // ---------------------------------------------------------------------------
+
+/// A cursor's position as its read began.
+fn cursor_pos(commit: &crate::store::bookmarks::CursorCommit) -> crate::store::memory::CursorPos {
+    crate::store::memory::CursorPos {
+        seq: commit.lower_bound(),
+        late_mark: commit.late_mark(),
+    }
+}
+
+/// What a cursor read reports beyond its records.
+struct CursorOutcome {
+    /// The new seq position — absent when it did not move, which includes a reply of late
+    /// records only.
+    advanced_to: Option<u64>,
+    /// Records in the reply stored late, below a seq the cursor had already read past.
+    late: u64,
+    /// Late records that left the buffer before any read could consider them; `None` where the
+    /// read does not count them (`traces.logs`).
+    late_lost: Option<u64>,
+}
+
+impl CursorOutcome {
+    /// Each field only when there is something to say: the renderer prints every key present,
+    /// and an ordinary cursor read has no late records (gh #23).
+    fn write_to(&self, result: &mut Value) {
+        if let Some(s) = self.advanced_to {
+            result["cursor_advanced_to"] = json!(s);
+        }
+        if self.late > 0 {
+            result["cursor_late"] = json!(self.late);
+        }
+        if let Some(n) = self.late_lost.filter(|n| *n > 0) {
+            result["cursor_late_lost"] = json!(n);
+        }
+    }
+}
+
+/// Commit a cursor read for the first `kept` records it took. Always committed: a read of late
+/// records alone moves the late mark and not the seq, and a read that returned nothing may
+/// still move the mark past late records its filter passed by.
+fn commit_cursor(
+    commit: crate::store::bookmarks::CursorCommit,
+    read: &crate::store::memory::CursorRead,
+    kept: usize,
+) -> CursorOutcome {
+    let from = commit.lower_bound();
+    let adv = read.advance_for(kept);
+    commit.commit(adv.seq, adv.late_mark);
+    CursorOutcome {
+        advanced_to: (adv.seq != from).then_some(adv.seq),
+        late: adv.late,
+        late_lost: adv.late_lost,
+    }
+}
 
 /// Fold an inclusive `from_seq`/`to_seq` range into the parsed filter.
 ///

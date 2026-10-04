@@ -103,6 +103,24 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "cursor_late": {
+          "description": "Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had\nalready read past — so they arrive now, with seqs below records it returned earlier.\nAbsent when none.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cursor_late_lost": {
+          "description": "Cursor reads: late-stored records that left the buffer before any read of this cursor\ncould consider them. Absent when none.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "required": [
@@ -1453,6 +1471,24 @@
           "minimum": 0
         },
         "cursor_advanced_to": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cursor_late": {
+          "description": "Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had\nalready read past. The `verdict` window starts above the cursor, so it does not vouch\nfor these. Absent when none.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cursor_late_lost": {
+          "description": "Cursor reads: late-stored records that left the buffer before any read of this cursor\ncould consider them. Absent when none.",
           "type": [
             "integer",
             "null"
@@ -3079,6 +3115,15 @@
           "minimum": 0
         },
         "cursor_advanced_to": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cursor_late": {
+          "description": "Cursor reads: how many of `logs` a trigger stored LATE — below a seq this cursor had\nalready read past — so they arrive now. Absent when none.",
           "type": [
             "integer",
             "null"

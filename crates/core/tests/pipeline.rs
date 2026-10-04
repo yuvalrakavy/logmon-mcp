@@ -103,3 +103,50 @@ fn test_increment_malformed() {
     let stats = pipeline.store_stats();
     assert_eq!(stats.malformed_count, 2);
 }
+
+/// A `recent` reply's floor and bounds describe the instant of its query (gh #24). Read
+/// afterwards, an eviction in between moved the floor past a record the reply still returned —
+/// `logs.export` then graded the window `evicted` over a record it handed out. A writer churns
+/// a 4-record ring while the reader checks every reply: no returned record lies below the
+/// reply's floor, and every one is inside the reply's bounds.
+#[test]
+fn a_recent_reply_never_returns_a_record_below_its_own_floor() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let pipeline = Arc::new(LogPipeline::new(4));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (p, stop) = (pipeline.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut seq = 0;
+            while !stop.load(Ordering::Relaxed) {
+                seq += 1;
+                p.append_to_store(make_entry(seq, Level::Info, "x"));
+            }
+        })
+    };
+    let mut checked = 0;
+    for _ in 0..200_000 {
+        let (entries, stats) = pipeline.recent_logs_with_stats(4, None, true);
+        for e in &entries {
+            assert!(
+                e.seq >= stats.lost_below,
+                "seq {} returned with floor {}",
+                e.seq,
+                stats.lost_below
+            );
+            assert!(
+                stats.buffer_oldest_seq.is_some_and(|o| e.seq >= o)
+                    && stats.buffer_newest_seq.is_some_and(|n| e.seq <= n),
+                "seq {} outside the reply's bounds {:?}..{:?}",
+                e.seq,
+                stats.buffer_oldest_seq,
+                stats.buffer_newest_seq
+            );
+            checked += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(checked > 0, "the reader saw records");
+}
