@@ -554,4 +554,109 @@ mod tests {
         assert!(out.contains("11000"), "the one number explaining the row: {out}");
         assert!(out.contains("display_floor_ms=5000"), "{out}");
     }
+
+    /// A null diagnostic says nothing, so it renders nothing. `cursor_advanced_to`
+    /// is null whenever a read moved no cursor, and `cursor_advanced_to=null` on
+    /// every such reply is noise a reader has to learn to skip.
+    #[test]
+    fn a_null_diagnostic_is_left_out_rather_than_rendered_as_null() {
+        let out = for_method(
+            "logs.recent",
+            &json!({"logs": [], "count": 0, "cursor_advanced_to": null}),
+        )
+        .expect("renders");
+        assert_eq!(out, "(no logs)\ncount=0");
+    }
+
+    /// The diagnostics tail is sorted, so two renderings of identical data are
+    /// identical. `preserve_order` is on, so a map iterates in INSERTION order
+    /// and only the sort stands between the handler's field order and the text.
+    #[test]
+    fn the_diagnostics_tail_is_sorted_whatever_order_the_result_arrived_in() {
+        let result = json!({"truncated": false, "logs": [], "scanned": 0, "count": 0});
+        let keys: Vec<&String> = result.as_object().expect("an object").keys().collect();
+        assert!(
+            keys.windows(2).any(|w| w[0] > w[1]),
+            "the fixture must arrive out of order, or the sort has nothing to do: {keys:?}"
+        );
+        let out = for_method("logs.recent", &result).expect("renders");
+        assert_eq!(out, "(no logs)\ncount=0  scanned=0  truncated=false");
+    }
+
+    /// The header row and the first data row of a rendered table, as cells.
+    fn header_and_row(out: &str) -> (Vec<String>, Vec<String>) {
+        let cells = |line: &str| -> Vec<String> {
+            line.trim()
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .collect()
+        };
+        let lines: Vec<&str> = out.lines().collect();
+        (cells(lines[0]), cells(lines[2]))
+    }
+
+    /// Which columns a list renders, in what order, read from which field.
+    ///
+    /// Every value is distinct, so a column wired to the wrong key shows up as
+    /// a value under the wrong header — not only a dropped column.
+    #[test]
+    fn domains_list_renders_its_eight_columns_from_their_own_fields() {
+        let out = for_method(
+            "domains.list",
+            &json!({"domains": [{"name": "d1", "source": "config", "log_count": 11,
+                                 "span_count": 22, "oldest_seq": 33, "newest_seq": 44,
+                                 "idle_secs": 55, "stale": true}]}),
+        )
+        .expect("renders");
+        let (header, row) = header_and_row(&out);
+        assert_eq!(
+            header,
+            ["name", "src", "logs", "spans", "oldest", "newest", "idle_s", "stale"],
+            "{out}"
+        );
+        assert_eq!(
+            row,
+            ["d1", "config", "11", "22", "33", "44", "55", "true"],
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn collectors_list_renders_its_seven_columns_from_their_own_fields() {
+        let out = for_method(
+            "collectors.list",
+            &json!({"collectors": [{"name": "c1", "filter": "l>=warn", "level": "tree",
+                                    "domain": "dom", "matched": 7, "snapshots": 2,
+                                    "armed_at": "2026-08-02T03:29:02Z"}]}),
+        )
+        .expect("renders");
+        let (header, row) = header_and_row(&out);
+        assert_eq!(
+            header,
+            [
+                "collector",
+                "filter",
+                "level",
+                "domain",
+                "matched",
+                "snapshots",
+                "armed"
+            ],
+            "{out}"
+        );
+        assert_eq!(
+            row,
+            [
+                "c1",
+                "l>=warn",
+                "tree",
+                "dom",
+                "7",
+                "2",
+                "2026-08-02T03:29:02Z"
+            ],
+            "{out}"
+        );
+    }
 }
