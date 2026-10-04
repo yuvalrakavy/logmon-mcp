@@ -1069,28 +1069,33 @@ Environment variable overrides:
 
 A noisy producer should slow itself down, not take the broker down. Concretely:
 
-- GELF receivers use `try_send` into the pipeline channel — full channel means the entry is dropped at the receiver, not enqueued without bound. A GELF TCP message over 64 KB is dropped at the receiver too, and counted with these.
+- GELF receivers use `try_send` into the pipeline channel — full channel means the entry is dropped at the receiver, not enqueued without bound.
 - GELF UDP sets `SO_RCVBUF` to **8 MB** so a slow consumer has a sizeable OS-side cushion before datagrams start falling on the floor.
 - OTLP gRPC and OTLP HTTP both check channel fill before consuming a payload. At **≥ 80% full**, gRPC returns `UNAVAILABLE` and HTTP returns `429`. The producer is expected to retry with backoff. The protocol-level rejection *is* the backpressure signal — per-source drop counters aren't bumped, because nothing was silently dropped.
 - Per-source drop counts surface in `status.get` under `receiver_drops` (`gelf_udp`, `gelf_tcp`, `otlp_http_logs`, `otlp_http_traces`, `otlp_grpc_logs`, `otlp_grpc_traces`). Healthy operation keeps all six at zero.
+- A GELF TCP message over 64 KB is dropped at the receiver and counted separately, under `gelf_tcp_oversize_dropped` — not a drop in the sense above: the sender's message was too big, the broker was not behind. The connection carries on with the next message.
 - Trace-transport loss surfaces separately under `trace_ingest` (`dropped`, `shed_batches`, `malformed_dropped`) — spans lost before any collector saw them, so non-zero means every span-derived figure is a lower bound. `shed_batches` counts request **bodies** refused with 429/UNAVAILABLE, not spans: the bodies were never parsed, so how many spans they held is unknowable. **`dropped` is not a separate quantity** — it is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, reported again so the three trace figures read as one block, so **adding it to those two double-counts**.
 
 If you're seeing nonzero **drops**, the broker is the bottleneck — bump `buffer_size` /
 `span_buffer_size`, or check whether a runaway producer is genuinely outpacing the consumer.
 That remedy is for channel-full drops only: a `shed_batches` count means the producer was
-told to back off and should retry, and a `malformed_dropped` span was refused for cause (an
-unusable trace id) — no buffer size changes either.
+told to back off and should retry, a `malformed_dropped` span was refused for cause (an
+unusable trace id), and a `gelf_tcp_oversize_dropped` message was too big for the input (the
+sender has to send smaller messages) — no buffer size changes any of them.
 
-**Memory.** The log and span stores — and the 65,536-entry ingest channel in front of them —
-are bounded by record COUNT (`buffer_size`, `span_buffer_size`), not by bytes: what they hold is
-that count times the size of the records that arrive. A GELF message is at most 64 KB on the
-wire on either transport (a UDP datagram's limit; the TCP input drops a longer message, counts
-it in `receiver_drops.gelf_tcp`, and carries on with the next one). In memory a parsed record
-can be much larger than its wire size — a message made of many small fields can take ten times
-as much or more — and OTLP records are bounded only by the OTLP receivers' request-size limits,
-which are larger. So size buffers for the records you actually send, and keep the ingest ports
-off networks you do not trust: they take no authentication, and any sender can make every
-record as large as those limits allow.
+**Memory.** The log and span stores are bounded by record COUNT (`buffer_size`,
+`span_buffer_size`), not by bytes, and so are the two ingest channels in front of each domain's
+stores (logs and spans, 65,536 entries each, whatever the buffer sizes): what they hold is that
+count times the size of the records that arrive. A GELF message is at most 64 KB on the wire on
+either transport (a UDP datagram's limit; the TCP input drops a longer message, counts it in
+`gelf_tcp_oversize_dropped`, and carries on with the next one). In memory a parsed record can be
+much larger than its wire size — a message made of many small fields can take ten times as much
+or more — and OTLP records are bounded only by the request-size limits of the HTTP and gRPC
+libraries the OTLP receivers are built on (their defaults: about 2 MB per HTTP request and 4 MB
+per gRPC message; logmon does not set them), which are larger. So size buffers for the records
+you actually send, and keep the ingest ports off networks you do not trust: they take no
+authentication, any sender can make every record as large as those limits allow, and a sender
+that holds enough connections open can exhaust the broker's file descriptors.
 
 ## Reinstalling after a change
 

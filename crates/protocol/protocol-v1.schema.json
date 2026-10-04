@@ -4473,6 +4473,13 @@
             "otlp_grpc_traces": 0
           }
         },
+        "gelf_tcp_oversize_dropped": {
+          "description": "GELF TCP messages dropped for exceeding the 64 KB size limit — a\nsibling of `receiver_drops`, not a member, for the reason given on\n[`TraceIngestCounts`]: `receiver_drops` means the broker could not keep\nup, and its remedy (a larger buffer) does nothing for a message that is\ntoo big. Non-zero means a sender is sending messages over the limit; the\nconnection carries on with its next message. Additive: an older daemon\nthat omits it deserializes as `0`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "default": 0
+        },
         "trace_ingest": {
           "description": "Spans lost on the OTLP trace transports before any collector saw\nthem — a sibling of `receiver_drops`, not a member (§ doc on\n[`TraceIngestCounts`]). Non-zero means every span-derived number\nelsewhere in this payload (and in `collectors.*`) is a lower bound.",
           "$ref": "#/$defs/TraceIngestCounts",

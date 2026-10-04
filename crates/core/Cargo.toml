@@ -45,6 +45,8 @@ tempfile.workspace = true
 # default `traced_test` keeps only the test crate's own.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
 criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+# `all`: the keepalive getters a test reads the broker's settings back with.
+socket2 = { workspace = true, features = ["all"] }
 
 [[bench]]
 name = "span_ingest"

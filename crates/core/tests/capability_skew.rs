@@ -132,6 +132,35 @@ async fn the_typed_status_struct_drops_no_key_the_daemon_sends() {
     );
 }
 
+/// The other direction: every key the typed struct carries, the daemon sends. A field the
+/// daemon forgot to emit deserializes as its default — `0` drops, an empty list — which reads
+/// exactly like the real answer, so a counter added to the struct and not to `handle_status`
+/// would report "nothing lost" forever. The check above cannot see it: it asks only whether
+/// the struct keeps what the daemon sent.
+#[tokio::test]
+async fn the_daemon_sends_every_key_the_typed_status_struct_carries() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+
+    let raw: Value = client.call("status.get", json!({})).await.unwrap();
+    let typed: StatusGetResult = serde_json::from_value(raw.clone()).unwrap();
+    let round_tripped = serde_json::to_value(&typed).unwrap();
+
+    let sent = raw.as_object().unwrap();
+    let missing: Vec<&String> = round_tripped
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| !sent.contains_key(*k))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "StatusGetResult carries {missing:?}, which the daemon does not send — a \
+         typed caller reads the default as if it were the answer. Emit it in \
+         handle_status."
+    );
+}
+
 /// Every method in the shared table is one this daemon actually dispatches.
 ///
 /// Asserts on the *message*, not the code: every handler failure maps to

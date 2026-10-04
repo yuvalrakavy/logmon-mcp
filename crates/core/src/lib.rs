@@ -10,6 +10,7 @@ pub mod render;
 pub(crate) mod rejection;
 pub mod span;
 pub mod store;
+pub(crate) mod throttle;
 pub mod daemon {
     pub mod domain;
     pub mod domain_lifecycle;

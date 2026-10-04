@@ -1832,6 +1832,7 @@ impl RpcHandler {
                 "otlp_grpc_logs": drops.otlp_grpc_logs,
                 "otlp_grpc_traces": drops.otlp_grpc_traces,
             },
+            "gelf_tcp_oversize_dropped": d.metrics.oversize_dropped(),
             "trace_ingest": {
                 "dropped": trace_ingest.dropped,
                 "shed_batches": trace_ingest.shed_batches,

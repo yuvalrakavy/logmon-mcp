@@ -23,6 +23,11 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
+/// Failed accepts on the broker's client sockets. Throttled and paced, because one that repeats
+/// — out of file descriptors — came straight back on every retry: a spin at full CPU writing
+/// an ERROR line per turn, while every client waited in the backlog.
+static ACCEPT_ERRORS: crate::throttle::Throttle = crate::throttle::Throttle::new();
+
 /// Notification method name for fired triggers. Underscore form matches
 /// `notifications/<name>` rationalization (vs the legacy dot form).
 const TRIGGER_FIRED_METHOD: &str = "trigger_fired";
@@ -768,6 +773,7 @@ async fn run_initialized(
         // after `shutdown_future` resolves, which makes restart-based
         // reconnect testing impossible.
         let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut accept_failures_in_a_row = 0u32;
 
         // Accept loop with override-aware shutdown for graceful termination.
         loop {
@@ -792,6 +798,7 @@ async fn run_initialized(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            accept_failures_in_a_row = 0;
                             let handler = handler.clone();
                             let domains = domains.clone();
                             let sessions = sessions.clone();
@@ -802,7 +809,12 @@ async fn run_initialized(
                             });
                         }
                         Err(e) => {
-                            error!("accept error: {e}");
+                            crate::throttle::pace_after_error(
+                                &ACCEPT_ERRORS,
+                                &mut accept_failures_in_a_row,
+                                |n| error!("accept error ({n} so far): {e}"),
+                            )
+                            .await;
                         }
                     }
                 }
@@ -865,6 +877,7 @@ async fn run_initialized(
         announce_online(_otlp_receiver.is_some(), beacon_target);
 
         let mut connection_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut accept_failures_in_a_row = 0u32;
 
         loop {
             if let Some(p) = accept_paused.as_ref() {
@@ -885,6 +898,7 @@ async fn run_initialized(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
+                            accept_failures_in_a_row = 0;
                             info!(?addr, "new TCP connection");
                             let handler = handler.clone();
                             let domains = domains.clone();
@@ -896,7 +910,12 @@ async fn run_initialized(
                             });
                         }
                         Err(e) => {
-                            error!("accept error: {e}");
+                            crate::throttle::pace_after_error(
+                                &ACCEPT_ERRORS,
+                                &mut accept_failures_in_a_row,
+                                |n| error!("accept error ({n} so far): {e}"),
+                            )
+                            .await;
                         }
                     }
                 }

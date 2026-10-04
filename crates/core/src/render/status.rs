@@ -122,6 +122,17 @@ pub fn render(result: &Value) -> Option<String> {
             lines.push(line);
         }
     }
+    // A line of its own, not a receiver drop: the sender's message was too big, the broker
+    // was not behind, so the drops' remedy (a larger buffer) does nothing for it.
+    if let Some(n) = obj
+        .get("gelf_tcp_oversize_dropped")
+        .and_then(Value::as_u64)
+        .filter(|&n| n > 0)
+    {
+        lines.push(format!(
+            "oversize dropped: gelf_tcp={n} (messages over the 64 KB limit)"
+        ));
+    }
 
     // When each receiver last saw traffic — the answer to "is my app actually
     // sending?", which is the first question behind an empty buffer. Rendered
@@ -169,6 +180,7 @@ pub fn render(result: &Value) -> Option<String> {
         "session",
         "active_filters",
         "receiver_drops",
+        "gelf_tcp_oversize_dropped",
         "trace_ingest",
         "receiver_liveness",
         "broker_tools",
@@ -201,9 +213,27 @@ mod tests {
                         "trigger_count": 2, "filter_count": 0, "queue_size": 0},
             "active_filters": [],
             "receiver_drops": {"gelf_udp": 0, "gelf_tcp": 0},
+            "gelf_tcp_oversize_dropped": 0,
             "trace_ingest": {"dropped": 0, "shed_batches": 0},
             "broker_tools": ["a", "b", "c"],
         })
+    }
+
+    /// Oversize messages get a line of their own — the sender's message was too big, the
+    /// broker was not behind — and, like every loss counter, only when non-zero.
+    #[test]
+    fn oversize_drops_appear_on_their_own_line_only_when_non_zero() {
+        let quiet = render(&reply()).expect("renders");
+        assert!(!quiet.contains("oversize"), "{quiet}");
+
+        let mut lossy = reply();
+        lossy["gelf_tcp_oversize_dropped"] = json!(3);
+        let out = render(&lossy).expect("renders");
+        assert!(
+            out.contains("oversize dropped: gelf_tcp=3 (messages over the 64 KB limit)"),
+            "{out}"
+        );
+        assert!(!out.contains("receiver drops"), "{out}");
     }
 
     /// The rule this method exists to demonstrate: the tool list is noise to the

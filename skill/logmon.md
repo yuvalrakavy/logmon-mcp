@@ -366,7 +366,7 @@ Points worth knowing before you rely on it:
 
 ### Status
 
-- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`gelf_tcp_oversize_dropped`**, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
   It also reports **`broker_version`** and **`broker_tools`** — see below.
 
@@ -393,7 +393,7 @@ Read `broker_version` the first time you call `get_status`, and reach for `broke
 
 **Do not add `trace_ingest.dropped` to the `receiver_drops` trace fields — it IS those fields.** `dropped` is exactly `receiver_drops.otlp_http_traces + otlp_grpc_traces`, the same counters read a second time so the three trace figures read as one block. Summing them double-counts. `shed_batches` and `malformed_dropped` are the genuinely new numbers.
 
-Also: `shed_batches` counts **request bodies**, not spans — the bodies were refused with 429/UNAVAILABLE before being parsed, so how many spans were in them is unknowable. And the standing "bump `buffer_size`" remedy applies only to channel-full drops: a `malformed_dropped` span was refused for cause (an unusable trace id), and no buffer size changes that.
+Also: `shed_batches` counts **request bodies**, not spans — the bodies were refused with 429/UNAVAILABLE before being parsed, so how many spans were in them is unknowable. And the standing "bump `buffer_size`" remedy applies only to channel-full drops: a `malformed_dropped` span was refused for cause (an unusable trace id), and no buffer size changes that. Nor does it change **`gelf_tcp_oversize_dropped`** — GELF TCP messages over the 64 KB limit, dropped because the sender's message was too big, not because the broker was behind: the fix is on the sender's side (smaller messages, or send the big payload some other way).
 
 ### Domains
 
@@ -851,7 +851,7 @@ In order:
 2. Does the application emit telemetry yet? Many projects send GELF only after a feature flag flips. Ask the user to trigger an action that should produce a log.
 3. Is a filter narrowing the buffer? `get_filters` — if filters exist, the buffer only stores matches. Remove them or widen.
 4. Did someone (you, another session) call `clear_logs`? The buffer is shared.
-5. Check `receiver_drops` on `get_status`. Non-zero means the receivers couldn't keep up — the user's app is over-producing; suggest bumping `buffer_size` in `~/.config/logmon/config.json`.
+5. Check `receiver_drops` on `get_status`. Non-zero means the receivers couldn't keep up — the user's app is over-producing; suggest bumping `buffer_size` in `~/.config/logmon/config.json`. A non-zero `gelf_tcp_oversize_dropped` is a different problem: the app sent GELF TCP messages over 64 KB, which no buffer size fixes.
 
 ### "My cursor returned a huge unexpected flood"
 

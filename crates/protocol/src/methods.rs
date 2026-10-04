@@ -2420,6 +2420,15 @@ pub struct StatusGetResult {
     pub store: StoreStats,
     #[serde(default)]
     pub receiver_drops: ReceiverDropCounts,
+    /// GELF TCP messages dropped for exceeding the 64 KB size limit — a
+    /// sibling of `receiver_drops`, not a member, for the reason given on
+    /// [`TraceIngestCounts`]: `receiver_drops` means the broker could not keep
+    /// up, and its remedy (a larger buffer) does nothing for a message that is
+    /// too big. Non-zero means a sender is sending messages over the limit; the
+    /// connection carries on with its next message. Additive: an older daemon
+    /// that omits it deserializes as `0`.
+    #[serde(default)]
+    pub gelf_tcp_oversize_dropped: u64,
     /// Spans lost on the OTLP trace transports before any collector saw
     /// them — a sibling of `receiver_drops`, not a member (§ doc on
     /// [`TraceIngestCounts`]). Non-zero means every span-derived number
