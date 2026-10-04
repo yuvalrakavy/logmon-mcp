@@ -197,12 +197,10 @@ impl Daemon {
 }
 
 impl Drop for Daemon {
-    /// **The SIGKILL here is load-bearing, not merely expedient.** A graceful
-    /// shutdown reaches `send_otel_beacon("OTEL:OFFLINE")`, which multicasts to
-    /// 239.255.77.1:4399 unconditionally — no check that this daemon ever
-    /// started an OTLP receiver. Switching this to SIGTERM would make
-    /// `cargo test` broadcast "collector offline" to every app on the
-    /// developer's machine that uses the tracing-init circuit breaker.
+    /// SIGKILL so a failed assertion cannot leak a process holding the socket. (A
+    /// graceful shutdown would be safe for the host too: it multicasts
+    /// `OTEL:OFFLINE` only from a daemon whose OTLP receiver started, and these
+    /// run with both OTLP ports 0 — they announce nothing.)
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -367,4 +365,52 @@ async fn a_second_daemon_on_the_same_directory_is_refused_while_the_first_lives(
 
     drop(second);
     drop(first);
+}
+
+/// A configured buffer size above the limit stops the broker at startup, and the refusal is
+/// in `daemon.log.<date>` — not only on stderr, which the launchd service sends nowhere, so a
+/// refusal there alone would be a silent restart loop.
+#[test]
+fn an_oversize_configured_buffer_is_refused_and_the_refusal_is_in_the_daemon_log() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("config.json"),
+        r#"{ "buffer_size": 10000001 }"#,
+    )
+    .expect("write config.json");
+    let mut d = Daemon::spawn_unchecked(tmp.path(), "refused.log");
+
+    // Generous for the same reason as `await_ready`: the first exec of a freshly linked
+    // binary is slow on macOS.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(s) = d.child.try_wait().expect("try_wait") {
+            break s;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the broker neither exited nor was refused within 90s; its log:\n{}",
+            d.diagnostics("refused.log")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        !status.success(),
+        "an oversize buffer must stop the broker; its log:\n{}",
+        d.diagnostics("refused.log")
+    );
+
+    // The daemon's OWN log files only — stderr (`refused.log`) carries the error too, and
+    // would satisfy a check that read both.
+    let daemon_log: String = std::fs::read_dir(tmp.path())
+        .expect("read tempdir")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("daemon.log"))
+        .map(|e| std::fs::read_to_string(e.path()).unwrap_or_default())
+        .collect();
+    assert!(
+        daemon_log.contains("refusing to start") && daemon_log.contains("`buffer_size`"),
+        "the refusal must be in daemon.log.<date>; everything the broker wrote:\n{}",
+        d.diagnostics("refused.log")
+    );
 }

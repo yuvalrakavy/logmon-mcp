@@ -22,6 +22,8 @@ async fn the_daemon_refuses_to_start_with_an_oversize_global_buffer() {
         buffer_size: MAX_BUFFER_SIZE + 1,
         ..DaemonConfig::default()
     };
+    // Beacons, if any, to a local socket of this test's own — never the host multicast group.
+    let beacons = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let result = run_with_overrides(
         config,
         DaemonOverrides {
@@ -31,6 +33,7 @@ async fn the_daemon_refuses_to_start_with_an_oversize_global_buffer() {
             shutdown_rx: Some(shutdown_rx),
             accept_paused: None,
             skip_tracing_init: true,
+            beacon_target: beacons.local_addr().ok(),
         },
     )
     .await;
@@ -50,6 +53,14 @@ async fn a_config_domain_with_an_oversize_buffer_is_skipped_and_the_daemon_start
         log_buffer_size: log,
         span_buffer_size: span,
     };
+    // Hold a port (TCP and UDP, as a GELF receiver binds both) so a domain declaring it
+    // fails to start.
+    let held_tcp = std::net::TcpListener::bind("0.0.0.0:0").expect("hold a TCP port");
+    let held = held_tcp.local_addr().unwrap().port();
+    let _held_udp = std::net::UdpSocket::bind(("0.0.0.0", held)).ok();
+    let mut clash = declared("clashed", None, None);
+    clash.gelf_port = Some(held);
+
     let mut config = default_test_config();
     config.domains = vec![
         declared("ok", None, None),
@@ -58,6 +69,9 @@ async fn a_config_domain_with_an_oversize_buffer_is_skipped_and_the_daemon_start
         // An oversize entry does not claim its name: the corrected one after it starts.
         declared("again", Some(MAX_BUFFER_SIZE + 1), None),
         declared("again", None, None),
+        // Nor does one that fails to bind (its GELF port is held below).
+        clash,
+        declared("clashed", None, None),
     ];
 
     let daemon = TestDaemonHandle::spawn_with_config(config).await;
@@ -80,6 +94,21 @@ async fn a_config_domain_with_an_oversize_buffer_is_skipped_and_the_daemon_start
         text.contains("\"again\""),
         "a corrected entry after an oversize one of the same name starts: {text}"
     );
+    let clashed = listed["domains"]
+        .as_array()
+        .expect("a domains array")
+        .iter()
+        .find(|d| d["name"] == "clashed")
+        .unwrap_or_else(|| {
+            panic!("a corrected entry after one that failed to bind starts: {text}")
+        });
+    assert_ne!(
+        clashed["gelf_port"],
+        json!(held),
+        "vacuity: the running `clashed` is the corrected entry, not the one on the held port \
+         (which must have failed to bind): {text}"
+    );
+    drop(held_tcp);
 }
 
 /// A trigger's `pre_window` sizes the pre-trigger buffer, which holds a clone of every

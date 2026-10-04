@@ -31,8 +31,9 @@ pub struct PipelineEvent {
     pub filter_string: String,
     pub matched_entry: LogEntry,
     pub context_before: Vec<LogEntry>,
-    /// The largest `pre_window` among the triggers that fired on this record — the most the
-    /// flush could have stored, not the count it did. Engine-internal; not on the wire.
+    /// The largest `pre_window` among the triggers that fired on this record (0 on the span
+    /// path) — a configured size, not the count the flush stored. Engine-internal; not on the
+    /// wire, and nothing reads it.
     pub pre_trigger_flushed: usize,
     /// The trigger's configured `pre_window`, propagated to the wire payload.
     pub pre_window: u32,

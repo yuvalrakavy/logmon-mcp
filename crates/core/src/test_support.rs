@@ -108,6 +108,20 @@ pub struct TestDaemonHandle {
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     accept_paused: Arc<AtomicBool>,
     join_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Where the daemon sends its OTEL `ONLINE`/`OFFLINE` beacons
+    /// (`DaemonOverrides::beacon_target`): a local socket of the test's own, never the
+    /// host-wide multicast group the live producers listen on. Read with
+    /// [`Self::beacons_received`].
+    beacons: Arc<std::net::UdpSocket>,
+}
+
+/// A local, non-blocking UDP socket for a test daemon's beacons.
+fn beacon_socket() -> Arc<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a beacon socket");
+    socket
+        .set_nonblocking(true)
+        .expect("make the beacon socket non-blocking");
+    Arc::new(socket)
 }
 
 impl TestDaemonHandle {
@@ -146,6 +160,8 @@ impl TestDaemonHandle {
         let accept_paused = Arc::new(AtomicBool::new(false));
         let accept_paused_for_daemon = accept_paused.clone();
         let config_for_daemon = config.clone();
+        let beacons = beacon_socket();
+        let beacon_target = beacons.local_addr().ok();
 
         let join_handle = tokio::spawn(async move {
             let overrides = DaemonOverrides {
@@ -155,6 +171,7 @@ impl TestDaemonHandle {
                 shutdown_rx: Some(shutdown_rx),
                 accept_paused: Some(accept_paused_for_daemon),
                 skip_tracing_init: true,
+                beacon_target,
             };
             if let Err(e) = run_with_overrides(config_for_daemon, overrides).await {
                 eprintln!("test daemon exited with error: {e}");
@@ -176,7 +193,19 @@ impl TestDaemonHandle {
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             accept_paused,
             join_handle: Mutex::new(Some(join_handle)),
+            beacons,
         }
+    }
+
+    /// The OTEL beacons this daemon has sent so far (e.g. `"OTEL:ONLINE\n"`), oldest
+    /// first, drained from its private beacon socket.
+    pub fn beacons_received(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 64];
+        while let Ok((n, _)) = self.beacons.recv_from(&mut buf) {
+            out.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        out
     }
 
     /// Inject a synthetic log entry directly into the pipeline, bypassing
@@ -268,6 +297,7 @@ impl TestDaemonHandle {
         let new_config = new.config.clone();
         let new_log_tx = new.log_tx.clone();
         let new_paused = new.accept_paused.clone();
+        let new_beacons = new.beacons.clone();
         // Drop `new` explicitly — its Drop is a no-op now that shutdown_tx is
         // empty.
         drop(new);
@@ -278,6 +308,7 @@ impl TestDaemonHandle {
         *self.shutdown_tx.lock().await = new_shutdown;
         *self.join_handle.lock().await = new_join;
         self.accept_paused = new_paused;
+        self.beacons = new_beacons;
     }
 
     /// Connect an anonymous client (no session name).
@@ -339,6 +370,8 @@ impl TestDaemonHandle {
         let accept_paused = Arc::new(AtomicBool::new(false));
         let accept_paused_for_daemon = accept_paused.clone();
         let config_for_daemon = config.clone();
+        let beacons = beacon_socket();
+        let beacon_target = beacons.local_addr().ok();
 
         let join_handle = tokio::spawn(async move {
             let overrides = DaemonOverrides {
@@ -348,6 +381,7 @@ impl TestDaemonHandle {
                 shutdown_rx: Some(shutdown_rx),
                 accept_paused: Some(accept_paused_for_daemon),
                 skip_tracing_init: true,
+                beacon_target,
             };
             if let Err(e) = run_with_overrides(config_for_daemon, overrides).await {
                 eprintln!("test daemon (real receivers) exited with error: {e}");
@@ -369,6 +403,7 @@ impl TestDaemonHandle {
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
             accept_paused,
             join_handle: Mutex::new(Some(join_handle)),
+            beacons,
         }
     }
 
