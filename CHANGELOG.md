@@ -135,6 +135,24 @@ What the buffer ADMITS changes with or without filters:
   trigger with a smaller pre-window had drained newer ones, so a later flush could pull in
   records far older than N arrivals.
 
+### Fixed — `pre_window = N` stored N−1 records before the match
+
+A record joined the pre-trigger buffer before its own triggers were evaluated, so when it
+fired it was already in the buffer, and the flush counted it as one of the N. A pre-window
+of N therefore held N−1 records before the match, and `pre_window: 1` ("the record before the
+error") held none. The record now joins the buffer after its triggers run, so a pre-window of
+N stores the N records before the match. At the default 500 the difference is one record.
+
+### Fixed — an oversize configured buffer could abort the broker
+
+`create_domain` refuses a buffer above 10,000,000 records, but the configured
+`buffer_size`/`span_buffer_size` (`config.json`, `--buffer-size`, `--span-buffer-size`) and a
+config-declared domain's own sizes were never checked. A value too large to reserve failed on
+the domain's first record — taking down the whole process, not just that domain. A global size
+above the limit now stops the broker at startup with an error naming the key. A config-declared
+domain with an oversize buffer is skipped with a warning, as any other bad domain entry is, and
+the broker starts.
+
 ### Changed — a trigger notification carries `notify_context` records, not its whole pre-window
 
 A trigger's `context_before` is documented as "at most `notify_context`" records (default 5),

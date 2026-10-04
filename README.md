@@ -1015,7 +1015,7 @@ Defaults:
 }
 ```
 
-`max_domains` caps API-created domains (config/`default` don't count). `stale_after_secs` is the idle threshold above which `list_domains` reports a domain `stale` (`idle_secs` is always reported raw, so tune or ignore this to fit your workload's cadence). `session_ttl_secs` (default `86400` = 24 h) is the session TTL: a *disconnected* named session past it is disposed by a periodic sweep (interval TTL/10, clamped 60 s..1 h) — connected sessions never expire, whatever their age. This keeps per-launch generated names (e.g. `MyProject-Main-<uuid8>`) from accumulating forever.
+`buffer_size` and `span_buffer_size` are capped at 10,000,000 records each, the same limit `create_domain` enforces. A larger global value (from this file or `--buffer-size`/`--span-buffer-size`) stops the broker at startup with an error naming the key; a config-declared domain whose own size is larger is skipped with a warning, like any other bad domain entry. `max_domains` caps API-created domains (config/`default` don't count). `stale_after_secs` is the idle threshold above which `list_domains` reports a domain `stale` (`idle_secs` is always reported raw, so tune or ignore this to fit your workload's cadence). `session_ttl_secs` (default `86400` = 24 h) is the session TTL: a *disconnected* named session past it is disposed by a periodic sweep (interval TTL/10, clamped 60 s..1 h) — connected sessions never expire, whatever their age. This keeps per-launch generated names (e.g. `MyProject-Main-<uuid8>`) from accumulating forever.
 
 **Config-declared domains.** Add a `domains` array to declare durable, isolated domains — each a full broker instance with its own receivers, buffers, and triggers — re-created on every boot:
 

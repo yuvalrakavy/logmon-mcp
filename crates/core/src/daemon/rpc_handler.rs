@@ -649,9 +649,9 @@ impl RpcHandler {
     /// ingest, and `reserve_exact` is INFALLIBLE — an allocation failure aborts
     /// the whole process (every domain, every client), so a client-supplied size
     /// is bounded here. 10M entries is ~100× any realistic per-domain ring and
-    /// still comfortably allocatable. (`default`'s config-supplied sizes never
-    /// come through this path.)
-    const MAX_DOMAIN_BUFFER_SIZE: usize = 10_000_000;
+    /// still comfortably allocatable. The same limit bounds configured sizes,
+    /// checked at startup (`DaemonConfig::validate_buffer_sizes`).
+    const MAX_DOMAIN_BUFFER_SIZE: usize = crate::daemon::persistence::MAX_BUFFER_SIZE;
 
     /// Create (or idempotently ensure) an ephemeral domain. Binds its receivers
     /// synchronously so a port clash is a clean error; refuses once

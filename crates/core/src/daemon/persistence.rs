@@ -178,6 +178,36 @@ fn default_max_domains() -> usize {
     32
 }
 
+/// The largest buffer, in records, any domain may have — log or span, configured or created
+/// over the RPC. A domain's ring reserves its whole capacity at once, inside the one process
+/// that serves every domain and every client, so an absurd size is refused at the boundary
+/// rather than aborting the process on that domain's first record. 10M entries is ~100x any
+/// realistic per-domain ring and still comfortably allocatable.
+pub const MAX_BUFFER_SIZE: usize = 10_000_000;
+
+impl DaemonConfig {
+    /// Refuse a global buffer size above [`MAX_BUFFER_SIZE`] (from `config.json` or a
+    /// command-line flag): the `default` domain is built from it and cannot be skipped, so
+    /// the daemon fails at startup, naming the key, instead of on its first record. A
+    /// config-declared domain whose OWN size is too large is skipped with a warning instead,
+    /// as any other bad domain entry is, and the daemon still starts (`server.rs`, the
+    /// config-domain loop). `domains.create` refuses the same sizes over the RPC.
+    pub fn validate_buffer_sizes(&self) -> anyhow::Result<()> {
+        let check = |what: String, size: usize| -> anyhow::Result<()> {
+            if size > MAX_BUFFER_SIZE {
+                anyhow::bail!(
+                    "{what} = {size} exceeds the maximum of {MAX_BUFFER_SIZE} records; lower it \
+                     in config.json, or in the command-line flag that set it"
+                );
+            }
+            Ok(())
+        };
+        check("`buffer_size`".into(), self.buffer_size)?;
+        check("`span_buffer_size`".into(), self.span_buffer_size)?;
+        Ok(())
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -612,6 +642,32 @@ mod tests {
     fn a_whitespace_only_override_counts_as_blank() {
         let got = config_dir_from(Some("   ".into()), Some("/home/u".into()));
         assert_eq!(got, std::path::PathBuf::from("/home/u/.config/logmon"));
+    }
+
+    /// A configured buffer size above the limit is refused, naming the key — the global
+    /// sizes and a declared domain's own — and the limit itself is accepted.
+    #[test]
+    fn a_configured_buffer_size_above_the_limit_is_refused() {
+        let at_limit = DaemonConfig {
+            buffer_size: MAX_BUFFER_SIZE,
+            span_buffer_size: MAX_BUFFER_SIZE,
+            ..DaemonConfig::default()
+        };
+        assert!(at_limit.validate_buffer_sizes().is_ok());
+
+        let global = DaemonConfig {
+            buffer_size: MAX_BUFFER_SIZE + 1,
+            ..DaemonConfig::default()
+        };
+        let err = global.validate_buffer_sizes().unwrap_err().to_string();
+        assert!(err.contains("`buffer_size`"), "{err}");
+
+        let spans = DaemonConfig {
+            span_buffer_size: MAX_BUFFER_SIZE + 1,
+            ..DaemonConfig::default()
+        };
+        let err = spans.validate_buffer_sizes().unwrap_err().to_string();
+        assert!(err.contains("`span_buffer_size`"), "{err}");
     }
 
     #[test]

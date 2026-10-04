@@ -145,6 +145,10 @@ pub async fn run_with_overrides(
         skip_tracing_init,
     } = overrides;
 
+    // 0. Refuse a buffer size no domain could allocate, before anything binds: it would
+    //    otherwise abort the process on that domain's first record.
+    config.validate_buffer_sizes()?;
+
     // 1. Resolve config dir
     let dir = dir_override.unwrap_or_else(config_dir);
     std::fs::create_dir_all(&dir)?;
@@ -456,6 +460,19 @@ pub async fn run_with_overrides(
         };
         let log_sz = cd.log_buffer_size.unwrap_or(config.buffer_size);
         let span_sz = cd.span_buffer_size.unwrap_or(config.span_buffer_size);
+        // A size no ring could reserve would abort the whole process on this domain's first
+        // record; like any other bad entry, the domain is skipped and the daemon starts.
+        let max = crate::daemon::persistence::MAX_BUFFER_SIZE;
+        if log_sz > max || span_sz > max {
+            warn!(
+                name = %cd.name,
+                log_buffer_size = log_sz,
+                span_buffer_size = span_sz,
+                max,
+                "config domain buffer size exceeds the maximum; skipping"
+            );
+            continue;
+        }
         match spawn_ephemeral_domain(
             id.clone(),
             ports,
