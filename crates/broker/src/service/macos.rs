@@ -121,22 +121,94 @@ pub fn install(scope: Scope) -> Result<()> {
     std::fs::write(&plist_path, rendered)
         .with_context(|| format!("failed to write plist: {}", plist_path.display()))?;
 
-    // bootout existing first (idempotent — safe even if not previously loaded)
+    // bootout existing first (idempotent — safe even if not previously loaded), and wait for it
+    // to finish: see `BOOTOUT_WAIT`.
     let _ = bootout(scope);
+    if !wait_until(BOOTOUT_WAIT, POLL_EVERY, || !loaded(scope)) {
+        eprintln!(
+            "warning: the previous broker is still loaded after {}s; trying to start the new one anyway",
+            BOOTOUT_WAIT.as_secs()
+        );
+    }
 
     let target = scope.bootstrap_target();
     let plist_str = plist_path
         .to_str()
         .with_context(|| format!("plist path is not valid UTF-8: {}", plist_path.display()))?;
-    let status = std::process::Command::new("launchctl")
-        .args(["bootstrap", &target, plist_str])
-        .status()
-        .context("failed to invoke launchctl")?;
-    if !status.success() {
-        bail!("launchctl bootstrap failed (exit {:?})", status.code());
+    let started = retry(BOOTSTRAP_ATTEMPTS, BOOTSTRAP_PAUSE, || {
+        let status = std::process::Command::new("launchctl")
+            .args(["bootstrap", &target, plist_str])
+            .status()
+            .context("failed to invoke launchctl")?;
+        Ok(status.success())
+    })?;
+    if !started {
+        bail!(
+            "launchctl bootstrap failed {BOOTSTRAP_ATTEMPTS} times, so the broker is NOT running. \
+             Start it with: launchctl bootstrap {target} {plist_str}"
+        );
     }
     println!("installed and started: {}", plist_path.display());
     Ok(())
+}
+
+/// How long `install` waits for a `bootout` to finish. launchd's `bootout` returns before a
+/// RUNNING job has exited — it sends SIGTERM, and the broker shuts down gracefully — and until
+/// it has, the label is still loaded and a `bootstrap` of it fails (exit 5, "Input/output
+/// error"). `install` bootstrapped at once, so reinstalling over a running broker — the
+/// documented upgrade step — left the service unloaded and the broker down. Past launchd's
+/// default exit timeout (20 s), after which it kills the job.
+const BOOTOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+/// A bootstrap that still fails after the wait is retried a few times before giving up.
+const BOOTSTRAP_ATTEMPTS: u32 = 5;
+const BOOTSTRAP_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether launchd still has the broker's job loaded.
+fn loaded(scope: Scope) -> bool {
+    let target = scope.bootstrap_target();
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("{target}/{LABEL}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Poll `done` every `every` until it holds or `timeout` has passed. Whether it held.
+fn wait_until(
+    timeout: std::time::Duration,
+    every: std::time::Duration,
+    mut done: impl FnMut() -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if done() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(every);
+    }
+}
+
+/// Run `attempt` up to `attempts` times, `pause` apart, until it reports success. Whether it
+/// did; an `Err` (the command could not be run at all) ends the retries at once.
+fn retry(
+    attempts: u32,
+    pause: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<bool>,
+) -> Result<bool> {
+    for n in 1..=attempts {
+        if attempt()? {
+            return Ok(true);
+        }
+        if n < attempts {
+            std::thread::sleep(pause);
+        }
+    }
+    Ok(false)
 }
 
 pub fn uninstall(scope: Scope) -> Result<()> {
@@ -198,6 +270,56 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// The wait polls until the job has left — however many polls that takes — and reports a
+    /// job that never leaves rather than waiting forever.
+    #[test]
+    fn the_bootout_wait_polls_until_the_job_is_gone_and_is_bounded() {
+        let mut polls = 0;
+        assert!(wait_until(Duration::from_secs(5), Duration::ZERO, || {
+            polls += 1;
+            polls == 3
+        }));
+        assert_eq!(polls, 3, "polled until it held, and not past it");
+
+        let start = std::time::Instant::now();
+        assert!(!wait_until(
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+            || false
+        ));
+        assert!(start.elapsed() < Duration::from_secs(5), "bounded");
+    }
+
+    /// A bootstrap that fails while the old job is still on its way out is retried; one that
+    /// keeps failing is reported after the last attempt; one that cannot run at all stops at once.
+    #[test]
+    fn a_failing_bootstrap_is_retried_a_bounded_number_of_times() {
+        let mut runs = 0;
+        let started = retry(5, Duration::ZERO, || {
+            runs += 1;
+            Ok(runs == 2)
+        });
+        assert!(started.unwrap());
+        assert_eq!(runs, 2, "stopped at the first success");
+
+        let mut runs = 0;
+        assert!(!retry(5, Duration::ZERO, || {
+            runs += 1;
+            Ok(false)
+        })
+        .unwrap());
+        assert_eq!(runs, 5);
+
+        let mut runs = 0;
+        assert!(retry(5, Duration::ZERO, || {
+            runs += 1;
+            anyhow::bail!("launchctl missing")
+        })
+        .is_err());
+        assert_eq!(runs, 1);
+    }
 
     #[test]
     fn the_plist_sends_stderr_to_the_file_it_was_given() {
