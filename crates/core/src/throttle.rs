@@ -73,7 +73,75 @@ pub(crate) async fn pace_after_error(
         log(n);
     }
     if *failures_in_a_row > 1 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(PAUSE).await;
+    }
+}
+
+const PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`pace_after_error`] for an accept loop that is not ours — a server that takes a stream of
+/// accepted connections and retries a failed accept itself (tonic: with no pause, so out of
+/// file descriptors it spun a core). Wrapping the stream paces it from outside: after a
+/// repeated error, the next accept is not attempted until the pause has passed.
+pub(crate) struct PacedAccepts<S> {
+    inner: S,
+    failures_in_a_row: u32,
+    pause: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    throttle: &'static Throttle,
+    what: &'static str,
+}
+
+impl<S> PacedAccepts<S> {
+    pub(crate) fn new(inner: S, throttle: &'static Throttle, what: &'static str) -> Self {
+        Self {
+            inner,
+            failures_in_a_row: 0,
+            pause: None,
+            throttle,
+            what,
+        }
+    }
+}
+
+impl<S, T> tokio_stream::Stream for PacedAccepts<S>
+where
+    S: tokio_stream::Stream<Item = std::io::Result<T>> + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::future::Future;
+        use std::task::Poll;
+        if let Some(pause) = self.pause.as_mut() {
+            if pause.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.pause = None;
+        }
+        let item = match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(item) => item,
+            Poll::Pending => return Poll::Pending,
+        };
+        match &item {
+            Some(Ok(_)) => self.failures_in_a_row = 0,
+            Some(Err(e)) => {
+                self.failures_in_a_row = self.failures_in_a_row.saturating_add(1);
+                if let Some(n) = self.throttle.hit() {
+                    note(format_args!(
+                        "{} accept failed ({n} so far): {e}",
+                        self.what
+                    ));
+                }
+                if self.failures_in_a_row > 1 {
+                    self.pause = Some(Box::pin(tokio::time::sleep(PAUSE)));
+                }
+            }
+            None => {}
+        }
+        Poll::Ready(item)
     }
 }
 
@@ -111,5 +179,35 @@ mod tests {
         assert_eq!(start.elapsed(), std::time::Duration::ZERO);
         pace_after_error(&t, &mut failures, |_| {}).await;
         assert_eq!(start.elapsed(), std::time::Duration::from_millis(100));
+    }
+
+    /// A paced stream of accepts hands every item through, and after a repeated error does not
+    /// ask for the next one until the pause has passed; a success resets the count.
+    #[tokio::test(start_paused = true)]
+    async fn a_paced_accept_stream_pauses_only_after_a_repeated_error() {
+        use tokio_stream::StreamExt;
+        static T: Throttle = Throttle::new();
+        let err = || Err::<u8, _>(std::io::Error::other("emfile"));
+        let mut s = PacedAccepts::new(
+            tokio_stream::iter(vec![err(), Ok(1), err(), err(), Ok(2)]),
+            &T,
+            "test",
+        );
+        let start = tokio::time::Instant::now();
+        let mut seen = Vec::new();
+        while let Some(item) = s.next().await {
+            seen.push((item.is_ok(), start.elapsed()));
+        }
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(
+            seen,
+            vec![
+                (false, ms(0)),
+                (true, ms(0)),
+                (false, ms(0)),  // one error after a success: no pause
+                (false, ms(0)),  // the repeat arms the pause...
+                (true, ms(100)), // ...which the next accept waits out
+            ]
+        );
     }
 }

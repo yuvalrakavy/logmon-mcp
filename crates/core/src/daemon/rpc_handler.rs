@@ -1841,9 +1841,9 @@ impl RpcHandler {
             "current_domain": current_domain,
             "active_filters": active_filters,
             "receiver_liveness": receiver_liveness,
-            // Omitted entirely for a live domain, so nothing changes for the
-            // ordinary case; present, this is what makes every duration above
-            // readable — see `PostmortemStatus`.
+            // `null` for a live domain (sent, not omitted — see the note on
+            // `StatusGetResult::postmortem`); present, this is what makes every
+            // duration above readable — see `PostmortemStatus`.
             "postmortem": d.postmortem.as_ref().map(|pm| {
                 let elapsed = chrono::Utc::now()
                     .signed_duration_since(pm.captured_at)

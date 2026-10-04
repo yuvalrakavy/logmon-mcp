@@ -379,10 +379,16 @@ pub async fn start_grpc_server(
 
     // Keepalive on each accepted connection: an exporter that vanished without closing its
     // long-lived connection held it, and a file descriptor, for the life of the broker.
-    // `Server::tcp_keepalive` does not reach connections handed in through `incoming`.
-    let incoming = tokio_stream::StreamExt::map(
-        tokio_stream::wrappers::TcpListenerStream::new(listener),
-        |accepted| accepted.inspect(crate::receiver::keepalive::keep_alive),
+    // `Server::tcp_keepalive` does not reach connections handed in through `incoming`. And
+    // paced: tonic retries a failed accept with no pause, so out of file descriptors it spun.
+    static ACCEPT_ERRORS: crate::throttle::Throttle = crate::throttle::Throttle::new();
+    let incoming = crate::throttle::PacedAccepts::new(
+        tokio_stream::StreamExt::map(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            |accepted| accepted.inspect(crate::receiver::keepalive::keep_alive),
+        ),
+        &ACCEPT_ERRORS,
+        "OTLP gRPC",
     );
     tonic::transport::Server::builder()
         .add_service(LogsServiceServer::new(logs_svc))

@@ -332,12 +332,20 @@ impl FileLedger {
     /// clone and the map's is the other, and new clones are made only under the map lock held
     /// here. A later write starts a fresh entry, its stamp from the same global sequence.
     ///
-    /// **Called with the path's lock still held.** Released first, a write already waiting on
-    /// it could land — its stamp in this entry — and finish before the count was read, and the
-    /// entry went with its stamp: a stale delete arriving later found a fresh entry at 0 and
-    /// removed a live collector's only file. Holding it here cannot deadlock: nothing waits on
-    /// a path's lock while holding the map's.
-    fn forget_if_unused(&self, path: &std::path::Path, lock: &Arc<Mutex<u64>>) {
+    /// **Called with the path's lock still held** — `held` is the caller's guard on `lock`, so
+    /// the other order does not compile. Released first, a write already waiting on it could
+    /// land — its stamp in this entry — and finish before the count was read, and the entry
+    /// went with its stamp: a stale delete arriving later found a fresh entry at 0 and removed a
+    /// live collector's only file. Holding it here cannot deadlock: nothing waits on a path's
+    /// lock while holding the map's.
+    fn forget_if_unused(
+        &self,
+        path: &std::path::Path,
+        lock: &Arc<Mutex<u64>>,
+        held: &std::sync::MutexGuard<'_, u64>,
+    ) {
+        let _ = held;
+        debug_assert!(lock.try_lock().is_err(), "`held` is not a guard on `lock`");
         let mut paths = self
             .paths
             .lock()
@@ -590,7 +598,7 @@ impl CollectorRegistry {
             // unless it records a write — a stamp a later delete needs — or someone else holds
             // it. Kept, every such write grew the map for the daemon's life.
             if *last == 0 {
-                self.files.forget_if_unused(&path, &lock);
+                self.files.forget_if_unused(&path, &lock, &last);
             }
             return Ok(false);
         };
@@ -648,7 +656,7 @@ impl CollectorRegistry {
         // The path's entry goes with its file — unless another caller holds it, in which case
         // it stays for them (and the map lock keeps anyone new from taking it meanwhile).
         before_forget();
-        self.files.forget_if_unused(&path, &lock);
+        self.files.forget_if_unused(&path, &lock, &last);
         drop(last);
     }
 
@@ -1456,7 +1464,7 @@ mod tests {
             now(),
         )
         .expect("armed");
-        let (id, prepared) = prepared(&r, "c");
+        let (id, prepared) = prepare(&r, "c");
         r.remove(&sid("s"), "c").expect("removed");
         assert!(!path.exists());
         assert_eq!(
@@ -1472,7 +1480,7 @@ mod tests {
     }
 
     /// `(id, prepared file)` of collector `name` as it stands.
-    fn prepared(
+    fn prepare(
         r: &CollectorRegistry,
         name: &str,
     ) -> (u64, crate::collector::persist::PersistedCollector) {
@@ -1500,7 +1508,7 @@ mod tests {
             now(),
         )
         .expect("armed");
-        let (id, stale) = prepared(&r, "c");
+        let (id, stale) = prepare(&r, "c");
         r.remove(&sid("s"), "c").expect("removed");
         r.add(
             &sid("s"),
@@ -1675,7 +1683,7 @@ mod tests {
             now(),
         )
         .expect("armed");
-        let (id, file) = prepared(&r, "c");
+        let (id, file) = prepare(&r, "c");
         let gone = || {
             !r.entries
                 .read()
@@ -1743,7 +1751,7 @@ mod tests {
             now(),
         )
         .expect("armed");
-        let (id, _) = prepared(&r, "c");
+        let (id, _) = prepare(&r, "c");
 
         let (moved, files) = r.move_owner(&sid("s"), &sid("t"));
         assert_eq!(moved, 1);

@@ -124,11 +124,11 @@ pub fn render(result: &Value) -> Option<String> {
     }
     // A line of its own, not a receiver drop: the sender's message was too big, the broker
     // was not behind, so the drops' remedy (a larger buffer) does nothing for it.
-    // Anything but a zero is shown — a value that is not a count too, rather than vanishing
-    // behind its place in `KNOWN`.
+    // Anything but a zero or a `null` is shown — a value that is not a count too, rather than
+    // vanishing behind its place in `KNOWN`. A `null` says nothing, as below.
     if let Some(v) = obj
         .get("gelf_tcp_oversize_dropped")
-        .filter(|v| v.as_u64() != Some(0))
+        .filter(|v| !v.is_null() && v.as_u64() != Some(0))
     {
         lines.push(format!(
             "oversize dropped: gelf_tcp={} (messages over the {} KB limit)",
@@ -171,9 +171,9 @@ pub fn render(result: &Value) -> Option<String> {
     }
 
     // Anything this renderer does not know about. `status.get` has no record
-    // array, so the structural drop rule admits NO omission: a key added to the
-    // result later must show up here rather than vanish from a rendering that
-    // reads as complete.
+    // array, so the structural drop rule admits no omission of a VALUE: a key
+    // added to the result later must show up here rather than vanish from a
+    // rendering that reads as complete. (A `null` is no value, and is left out.)
     const KNOWN: &[&str] = &[
         "broker_version",
         "daemon_uptime_secs",
@@ -240,13 +240,17 @@ mod tests {
         );
         assert!(!out.contains("receiver drops"), "{out}");
 
-        // A value that is not a count is shown as it is, not swallowed.
+        // A value that is not a count is shown as it is, not swallowed — but a `null` says
+        // nothing, as for every other key.
         lossy["gelf_tcp_oversize_dropped"] = json!("unexpected");
         let out = render(&lossy).expect("renders");
         assert!(
             out.contains("oversize dropped: gelf_tcp=unexpected"),
             "{out}"
         );
+        lossy["gelf_tcp_oversize_dropped"] = Value::Null;
+        let out = render(&lossy).expect("renders");
+        assert!(!out.contains("oversize"), "{out}");
     }
 
     /// The rule this method exists to demonstrate: the tool list is noise to the

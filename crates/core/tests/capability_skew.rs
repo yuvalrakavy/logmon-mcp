@@ -133,30 +133,41 @@ async fn the_typed_status_struct_drops_no_key_the_daemon_sends() {
 }
 
 /// The other direction: every key the typed struct carries, the daemon sends — at every level,
-/// since the counters live in nested objects (`receiver_drops`, `trace_ingest`). A field the
-/// daemon forgot to emit deserializes as its default — `0` drops, an empty list — which reads
-/// exactly like the real answer, so a counter added to the struct and not to `handle_status`
-/// would report "nothing lost" forever. The check above cannot see it: it asks only whether
-/// the struct keeps what the daemon sent.
+/// objects and arrays alike, since counters live in nested objects (`receiver_drops`). A
+/// `serde(default)` field the daemon forgot to emit deserializes as its default — `0` drops,
+/// an empty list — which reads exactly like the real answer, so a counter added to the struct
+/// and not to `handle_status` would report "nothing lost" forever. The check above cannot see
+/// it: it asks only whether the struct keeps what the daemon sent. (A field WITHOUT a default
+/// fails louder, at deserialization. A field skipped when `None` — the liveness timestamps — is
+/// outside what this can see: the struct leaves it out of the round trip just as an absent one
+/// would be.)
 #[tokio::test]
 async fn the_daemon_sends_every_key_the_typed_status_struct_carries() {
     let daemon = spawn_test_daemon().await;
     let mut client = daemon.connect_anon().await;
 
     let raw: Value = client.call("status.get", json!({})).await.unwrap();
-    let typed: StatusGetResult = serde_json::from_value(raw.clone()).unwrap();
+    let typed: StatusGetResult = serde_json::from_value(raw.clone())
+        .expect("status.get no longer deserializes into StatusGetResult — a field without a default is missing");
     let round_tripped = serde_json::to_value(&typed).unwrap();
 
     fn missing_keys(typed: &Value, sent: &Value, at: &str, out: &mut Vec<String>) {
-        let (Some(typed), Some(sent)) = (typed.as_object(), sent.as_object()) else {
-            return;
-        };
-        for (k, v) in typed {
-            let path = format!("{at}{k}");
-            match sent.get(k) {
-                None => out.push(path),
-                Some(s) => missing_keys(v, s, &format!("{path}."), out),
+        match (typed, sent) {
+            (Value::Object(typed), Value::Object(sent)) => {
+                for (k, v) in typed {
+                    let path = format!("{at}{k}");
+                    match sent.get(k) {
+                        None => out.push(path),
+                        Some(s) => missing_keys(v, s, &format!("{path}."), out),
+                    }
+                }
             }
+            (Value::Array(typed), Value::Array(sent)) => {
+                for (i, (v, s)) in typed.iter().zip(sent).enumerate() {
+                    missing_keys(v, s, &format!("{at}[{i}]."), out);
+                }
+            }
+            _ => {}
         }
     }
     let mut missing = Vec::new();

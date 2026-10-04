@@ -309,7 +309,8 @@ the wire — the same ceiling as a GELF UDP datagram — and a longer one is dro
 new `status.get` field `gelf_tcp_oversize_dropped`, and skipped to the NUL that ends it in
 bounded memory, so the connection carries on with the next message. That count is deliberately
 not part of `receiver_drops`, which means the broker could not keep up: a larger buffer, the
-remedy for those, does nothing for a message that is too big.
+remedy for those, does nothing for a message that is too big. The rendered `get_status` shows
+it on a line of its own, and no longer ends with `postmortem=null` on a live domain.
 
 The broker also holds connections it can no longer use for less long:
 
@@ -322,15 +323,15 @@ The broker also holds connections it can no longer use for less long:
   re-created domain on the same port nothing until it reconnected. They now close with the
   listener.
 - A failed `accept` that repeats (out of file descriptors) is retried after a pause — on the
-  GELF TCP input and on the broker's own client sockets alike. It was retried at once, spinning
-  a core for as long as it lasted, and on the client sockets writing an ERROR line per turn. A
-  GELF UDP receive error, ignored outright before, is logged and paced the same way.
+  GELF TCP and OTLP gRPC inputs and on the broker's own client sockets alike. It was retried at
+  once, spinning a core for as long as it lasted, and on the client sockets writing an ERROR
+  line per turn. A GELF UDP receive error, ignored outright before, is logged and paced the
+  same way. (The OTLP HTTP input already paused.)
 - The GELF receivers no longer log every malformed message (any sender could fill the disk
   through the log, and a write to a full disk panicked the task that logged — a connection, or
   the TCP accept loop). Each such line is now logged at most once a minute, with a running count,
   and cannot panic. The receivers' backpressure warning keeps the same once-a-minute rate on the
   monotonic clock, so a wall-clock step backwards no longer silences it.
-- The rendered `get_status` no longer ends with `postmortem=null` on a live domain.
 
 Known limit: a host that can reach an ingest port can still hold connections open — the GELF and
 OTLP inputs take no authentication — and enough of them exhaust the broker's file descriptors.

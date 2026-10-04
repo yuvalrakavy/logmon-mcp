@@ -8,7 +8,7 @@
 //! emits a `tracing::warn!` so daemon.log surfaces backpressure visibly.
 //!
 //! A GELF TCP message over the size limit is counted apart from those, in
-//! [`ReceiverMetrics::oversize_dropped`], with a warning slot of its own: there
+//! [`ReceiverMetrics::oversize_dropped`], with a warning throttle of its own: there
 //! the sender's message is too big, the broker is not behind, and the two call
 //! for different remedies.
 
