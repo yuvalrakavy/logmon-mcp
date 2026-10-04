@@ -712,3 +712,48 @@ Kept unchanged.
      bound (`plans/2026-03-27-multi-session.md:1165`), documented in the protocol and the SDK
      README, and quietly became the whole pre-window; nothing pinned it. Same shape as the
      `pre_window` off-by-one the mutation lens found.
+
+## 2026-10-04 the open-issue batch (#21 #23 #24 #25 #27 #28 #29) — nine gate rounds over the fixes
+
+- scope: seven open issues (one T2 — late records reaching cursors — and six T1), then, on the
+  user's "fix them rather than file them", what was found along the way: a collector filename
+  collision, a flaky test, an unexplained test hang. The fixes grew new mechanisms: an atomic
+  session-name claim, a file ledger deciding collector deletes by writes, a case-safe filename
+  encoding with a two-phase migration, request and message caps, a GELF TCP size limit with
+  resync, a log throttle, collector identities, keepalive on every TCP input.
+- time: the issues themselves were a small part. Most of the session was nine review rounds
+  over the fix sets, and rounds 1-7 each found real defects.
+- catches: the first gate ≈ 62 IG (gate-kpi.md). Re-gates 1-7: the worst of each round was
+  usually a defect the PREVIOUS round's fix had introduced (listed in gate-kpi.md). Re-gate 8:
+  no high or medium in production code — lows, two of them my own commit message's claims.
+  Re-gate 9: no high, and its one medium was a test's strength (the forget-order test caught
+  only one shape of its revert), now enforced by the compiler instead. A single-lens review of
+  the last delta found no high or medium; its lows (an assertion weaker than its comment,
+  pacing that counted per-connection errors, wording) were fixed, and review stopped there —
+  severity had fallen round on round to claims about the code rather than the code.
+  - **my own negative controls found one instrument gap no finder had**: removing the new
+    `status.get` field from the daemon failed no test (AA14 GREEN), because capability_skew
+    checked only that the typed struct keeps what the daemon sends — never the reverse. A
+    struct field the daemon forgets reads as 0 drops, indistinguishable from the answer.
+- improve:
+  1. **A fix that needs a NEW mechanism is a design, and these were built under re-gate.** The
+     file ledger alone went through four shapes (liveness, bytes, stamp-at-finish,
+     stamp-at-check) across four rounds. Each new mechanism is new code the next gate finds
+     defects in at the usual rate. When a fix turns out to need a mechanism, stop and give the
+     mechanism the design pass — one architect/reviewer loop costs less than three re-gates,
+     and the re-gates here cost more than twice the first gate.
+  2. **A test that re-implements the function it guards cannot fail.** The stamp-ordering test
+     hand-simulated `write` and passed without the fix; the forget-order test held a clone it
+     never locked and passed in either order; its replacement still missed the natural revert.
+     What worked: a seam in the real function (`write_pausing`, `delete_pausing`) so the test
+     drives real code through the window — and, where possible, making the wrong order a type
+     error (`forget_if_unused` takes the held guard), which no test can match.
+  3. **A counter's meaning is a decision record, and its consumers are where it lives.** I
+     merged a new cause into `receiver_drops` without reading the protocol doc that says "Keep
+     them apart — do not 'fix' this into a merge". Grepping every consumer of a counter
+     (protocol, README, skill, renderer) is the duty-1 check, and it was skipped because the
+     change felt additive.
+  4. **A commit message is a claim, checked like code.** Three findings in rounds 8-9 were my
+     own commit messages ("idle connections used to be harmless", "each fix
+     negative-controlled", "every trace_ingest counter is serde(default)"). Write the controls
+     table first and the sentence from it.
