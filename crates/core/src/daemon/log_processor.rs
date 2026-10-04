@@ -38,9 +38,10 @@ pub fn sync_pre_buffer_size(pipeline: &LogPipeline, sessions: &SessionRegistry) 
     sync_pre_buffer_size_for_domain(pipeline, sessions, &DomainId::default_domain());
 }
 
-/// Process one entry against `domain`: assign seq, buffer it, evaluate the
-/// triggers/filters of the sessions bound to `domain`, and store per the
-/// trigger/post-window/filter rules. Considers ONLY `domain`'s sessions —
+/// Process one entry against `domain`: assign seq, evaluate the triggers of the sessions
+/// bound to `domain` (a firing trigger stores the entry and its pre-window), add the entry to
+/// the pre-trigger buffer — only now, so a trigger's pre-window is the records BEFORE it —
+/// and then store it per the post-window/filter rules. Considers ONLY `domain`'s sessions —
 /// a filter or trigger in another domain can neither suppress storage here nor
 /// fire on this record (spec §2 isolation, §9.1).
 pub fn process_entry_for_domain(
@@ -52,8 +53,8 @@ pub fn process_entry_for_domain(
     // 1. Assign seq
     entry.seq = pipeline.assign_seq();
 
-    // 2. Append to pre-trigger buffer
-    pipeline.pre_buffer_append(entry.clone());
+    // 2. (The pre-trigger buffer takes this entry AFTER its triggers are evaluated — see
+    //    below — so a trigger's pre-window is the N records before the match.)
 
     // 3. Evaluate triggers per session (scoped to this domain)
     let mut any_post_window_active = false;
@@ -169,6 +170,11 @@ pub fn process_entry_for_domain(
             }
         }
     }
+
+    // The entry joins the pre-trigger buffer only now, after its own triggers ran. Appended
+    // before them (as it once was), it sat in the buffer when it fired, and a pre-window of N
+    // flushed the matching record itself as one of the N — N-1 records before the match.
+    pipeline.pre_buffer_append(entry.clone());
 
     // 5. Buffer storage (if entry not already stored by trigger logic)
     if !pipeline.contains_seq(entry.seq) {

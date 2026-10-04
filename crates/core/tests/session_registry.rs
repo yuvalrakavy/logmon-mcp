@@ -279,8 +279,10 @@ fn a_persisted_bookmark_filter_or_trigger_is_not_restored() {
         filter: filter.into(),
         description: None,
     };
+    let mut oversize = trigger("l>=WARN");
+    oversize.pre_window = 10_000_001;
     let persisted = PersistedSession {
-        triggers: vec![trigger("l>=ERROR"), trigger("c>=cur")],
+        triggers: vec![trigger("l>=ERROR"), trigger("c>=cur"), oversize],
         filters: vec![filter("l>=WARN"), filter("b>=mark")],
         client_info: None,
         bookmarks: vec![],

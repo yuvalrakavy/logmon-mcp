@@ -135,6 +135,44 @@ What the buffer ADMITS changes with or without filters:
   trigger with a smaller pre-window had drained newer ones, so a later flush could pull in
   records far older than N arrivals.
 
+### Fixed — `pre_window = N` stored N−1 records before the match
+
+A record joined the pre-trigger buffer before its own triggers were evaluated, so when it
+fired it was already in the buffer, and the flush counted it as one of the N. A pre-window
+of N therefore held N−1 records before the match, and `pre_window: 1` ("the record before the
+error") held none. The record now joins the buffer after its triggers run, so a pre-window of
+N stores the N records before the match. At the default 500 the difference is one record.
+
+### Fixed — an oversize configured buffer could abort the broker
+
+`create_domain` refuses a buffer above 10,000,000 records, but the configured
+`buffer_size`/`span_buffer_size` (`config.json`, `--buffer-size`, `--span-buffer-size`), a
+config-declared domain's own sizes, and a trigger's `pre_window` (which sizes the pre-trigger
+buffer) were never checked. A ring too large to reserve failed on the domain's first record,
+and an oversize `pre_window` grew the pre-trigger buffer record by record to the same end —
+taking down the whole process, not just that domain. Now:
+
+- A global size above the limit stops the broker at startup, with an error naming the key in
+  `daemon.log.<date>`. **A config that set one and happened to work** (the ring is reserved on the
+  first record, which a large machine can satisfy) **now refuses to start** — lower the value.
+- A config-declared domain with an oversize buffer is skipped with a warning, as any other bad
+  domain entry is, and the broker starts.
+- `add_trigger` / `edit_trigger` refuse a `pre_window` above the limit, and a persisted trigger
+  with one is not restored (logged).
+
+### Fixed — brokers that were not serving the host's producers told them the collector was down
+
+On shutdown the broker multicast `OTEL:OFFLINE` to the host unconditionally. tracing-init's
+producers read that as "the collector is down" and open their circuit breaker, dropping spans
+until the next reprobe (30 s by default). The beacon carries no port, so EVERY producer on the
+host acts on it, whichever broker it was talking to. Two ways that went wrong:
+
+- A broker whose OTLP receiver never started (OTLP disabled, or a port clash at boot) had never
+  sent `OTEL:ONLINE`, and its shutdown silenced the producers of the broker that WAS serving
+  them. It now sends `OFFLINE` only if it sent `ONLINE`.
+- logmon's own test suite did the same on test-daemon shutdowns. Test daemons now send their
+  beacons to a socket of the test's own (`DaemonOverrides::beacon_target`), never to the host.
+
 ### Changed — a trigger notification carries `notify_context` records, not its whole pre-window
 
 A trigger's `context_before` is documented as "at most `notify_context`" records (default 5),

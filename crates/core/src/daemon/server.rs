@@ -54,10 +54,13 @@ fn pipeline_event_to_trigger_fired(
 
 /// Send a UDP multicast beacon to notify tracing-init circuit breakers
 /// about OTel collector availability. Best-effort — failures are silently ignored.
-fn send_otel_beacon(message: &str) {
+fn send_otel_beacon(message: &str, target: Option<std::net::SocketAddr>) {
     use std::net::UdpSocket;
     if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        let _ = socket.send_to(message.as_bytes(), "239.255.77.1:4399");
+        let _ = match target {
+            Some(addr) => socket.send_to(message.as_bytes(), addr),
+            None => socket.send_to(message.as_bytes(), "239.255.77.1:4399"),
+        };
     }
 }
 
@@ -122,6 +125,12 @@ pub struct DaemonOverrides {
     /// If `true`, skip installing the daily-rotation tracing subscriber.
     /// Tests own their own subscriber (or none).
     pub skip_tracing_init: bool,
+    /// If `Some`, send the OTEL availability beacons (`ONLINE`/`OFFLINE`) here instead of
+    /// the host-wide multicast group. The beacon carries no port, so every tracing-init
+    /// producer on the host acts on it: a test daemon that multicast `OFFLINE` silenced
+    /// the LIVE broker's producers for the reprobe interval. The test harness points this
+    /// at a socket of its own, which also lets a test read what a daemon announced.
+    pub beacon_target: Option<std::net::SocketAddr>,
 }
 
 /// Run the logmon daemon. This function blocks until the daemon is shut down.
@@ -143,6 +152,7 @@ pub async fn run_with_overrides(
         shutdown_rx,
         accept_paused,
         skip_tracing_init,
+        beacon_target,
     } = overrides;
 
     // 1. Resolve config dir
@@ -167,6 +177,15 @@ pub async fn run_with_overrides(
     };
 
     info!("logmon daemon starting");
+
+    // 2a. Refuse a buffer size no domain could allocate — it would otherwise abort the process
+    //     on that domain's first record. After tracing (which binds nothing) so the refusal
+    //     lands in `daemon.log`: under the launchd service stderr goes nowhere, and the agent
+    //     would restart-loop with no trace of why. Still before anything binds or allocates.
+    if let Err(e) = config.validate_buffer_sizes() {
+        error!("refusing to start: {e:#}");
+        return Err(e);
+    }
 
     // 2b. Stale-pid sweep. If a `daemon.pid` exists from a previous run:
     //     - and that pid is alive, refuse to start (someone else owns the
@@ -344,7 +363,7 @@ pub async fn run_with_overrides(
                         // (see `domain_lifecycle`, which sends none). A producer
                         // targeting a non-default domain uses `create_domain` returning
                         // (its OTLP port pre-binds synchronously) as the readiness signal.
-                        send_otel_beacon("OTEL:ONLINE\n");
+                        send_otel_beacon("OTEL:ONLINE\n", beacon_target);
                         Some(otlp_receiver)
                     }
                     Err(e) => {
@@ -445,7 +464,24 @@ pub async fn run_with_overrides(
             warn!("config domain named 'default' is reserved; skipping");
             continue;
         }
-        if !seen_config_domains.insert(id.clone()) {
+        let log_sz = cd.log_buffer_size.unwrap_or(config.buffer_size);
+        let span_sz = cd.span_buffer_size.unwrap_or(config.span_buffer_size);
+        // A size no ring could reserve would abort the whole process on this domain's first
+        // record; like any other bad entry, the domain is skipped and the daemon starts.
+        let max = crate::daemon::persistence::MAX_BUFFER_SIZE;
+        if log_sz > max || span_sz > max {
+            warn!(
+                name = %cd.name,
+                log_buffer_size = log_sz,
+                span_buffer_size = span_sz,
+                max,
+                "config domain buffer size exceeds the maximum; skipping"
+            );
+            continue;
+        }
+        // A name is claimed only by an entry that STARTS (below), so a skipped entry — too
+        // large, or failed to bind — never blocks a corrected one of the same name later.
+        if seen_config_domains.contains(&id) {
             warn!(name = %cd.name, "duplicate config domain name; skipping");
             continue;
         }
@@ -454,8 +490,6 @@ pub async fn run_with_overrides(
             otlp_grpc: cd.otlp_grpc_port,
             otlp_http: cd.otlp_http_port,
         };
-        let log_sz = cd.log_buffer_size.unwrap_or(config.buffer_size);
-        let span_sz = cd.span_buffer_size.unwrap_or(config.span_buffer_size);
         match spawn_ephemeral_domain(
             id.clone(),
             ports,
@@ -475,6 +509,7 @@ pub async fn run_with_overrides(
                     otlp_http = domain.config.otlp_http_port,
                     "config domain started"
                 );
+                seen_config_domains.insert(id.clone());
                 domains.insert(domain);
             }
             Err(e) => {
@@ -705,8 +740,15 @@ pub async fn run_with_overrides(
         // tasks survive the accept-loop exit).
         connection_tasks.shutdown().await;
 
-        // Send offline beacon before stopping receivers
-        send_otel_beacon("OTEL:OFFLINE\n");
+        // Send the offline beacon before stopping receivers — only if this daemon announced
+        // itself ONLINE, i.e. its OTLP receiver started. The beacon is a host-wide multicast
+        // that opens every tracing-init producer's circuit breaker; a daemon that never
+        // announced (an in-process test daemon on an injected channel, OTLP disabled or
+        // failed to bind) sending it silenced the LIVE broker's producers for the reprobe
+        // interval, every time a test daemon shut down.
+        if _otlp_receiver.is_some() {
+            send_otel_beacon("OTEL:OFFLINE\n", beacon_target);
+        }
 
         // Persist live named-session state (triggers, filters, client_info,
         // bookmarks) before tearing down. Best-effort: failures are logged but
@@ -786,8 +828,15 @@ pub async fn run_with_overrides(
         // disconnects clients.
         connection_tasks.shutdown().await;
 
-        // Send offline beacon before stopping receivers
-        send_otel_beacon("OTEL:OFFLINE\n");
+        // Send the offline beacon before stopping receivers — only if this daemon announced
+        // itself ONLINE, i.e. its OTLP receiver started. The beacon is a host-wide multicast
+        // that opens every tracing-init producer's circuit breaker; a daemon that never
+        // announced (an in-process test daemon on an injected channel, OTLP disabled or
+        // failed to bind) sending it silenced the LIVE broker's producers for the reprobe
+        // interval, every time a test daemon shut down.
+        if _otlp_receiver.is_some() {
+            send_otel_beacon("OTEL:OFFLINE\n", beacon_target);
+        }
 
         // Persist live named-session state (triggers, filters, client_info,
         // bookmarks) before tearing down. Best-effort: failures are logged but

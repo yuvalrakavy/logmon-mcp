@@ -430,6 +430,44 @@ fn a_trigger_stores_its_own_record_with_no_pre_window() {
     );
 }
 
+/// `pre_window = N` stores the N records before the match. The matching record joins the
+/// pre-trigger buffer only after its triggers ran; it used to be in the buffer already, and
+/// was flushed as one of the N, so the pre-window held N-1 records before the match — and a
+/// pre-window of 1 held none.
+#[test]
+fn a_pre_window_of_n_stores_the_n_records_before_the_match() {
+    let pipeline = Arc::new(LogPipeline::new(1000));
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_named("watcher").unwrap();
+    for t in sessions.list_triggers(&sid) {
+        sessions.remove_trigger(&sid, t.id).unwrap();
+    }
+    sessions.add_filter(&sid, "l>=ERROR", None).unwrap();
+    sessions
+        .add_trigger(&sid, "l>=ERROR", 3, 0, 0, None, false)
+        .unwrap();
+    sync_pre_buffer_size(&pipeline, &sessions);
+
+    let mut before = Vec::new();
+    for i in 0..5 {
+        let mut e = make_entry(Level::Info, &format!("kept out {i}"));
+        process_entry(&mut e, &pipeline, &sessions);
+        before.push(e.seq);
+    }
+    assert_eq!(pipeline.store_len(), 0, "vacuity: the filter kept them out");
+    let mut boom = make_entry(Level::Error, "boom");
+    process_entry(&mut boom, &pipeline, &sessions);
+
+    let held: Vec<u64> = pipeline
+        .context_by_seq(boom.seq, 10, 0)
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    let mut want = before[2..].to_vec();
+    want.push(boom.seq);
+    assert_eq!(held, want, "three records before the match, and the match");
+}
+
 #[test]
 fn test_zero_sessions_stores_everything() {
     let pipeline = Arc::new(LogPipeline::new(1000));

@@ -539,11 +539,10 @@ fn a_trigger_flushes_its_traces_older_records_beyond_its_pre_window() {
         json!({ "filter": "m=never-fires", "pre_window": 10, "post_window": 0 }),
     )
     .unwrap();
-    // The pre-buffer already holds the triggering record, so a pre-window of 2 is that
-    // record and the one before it.
+    // A pre-window of 1: the one record just before the match.
     h.call(
         "triggers.add",
-        json!({ "filter": "l>=ERROR", "pre_window": 2, "post_window": 0 }),
+        json!({ "filter": "l>=ERROR", "pre_window": 1, "post_window": 0 }),
     )
     .unwrap();
 

@@ -23,7 +23,7 @@ use super::read::{self, FrontMatter, ParseError, RegistryBlock};
 /// `200000000` asks for tens of gigabytes and aborts the process, taking every
 /// live domain's buffers with it. The front-matter count is a CROSS-CHECK, never
 /// an allocation size — capacity comes from records actually parsed.
-pub const MAX_CASE_RECORDS: usize = 10_000_000;
+pub const MAX_CASE_RECORDS: usize = crate::daemon::persistence::MAX_BUFFER_SIZE;
 
 #[derive(Debug)]
 pub enum LoadError {

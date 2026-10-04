@@ -649,9 +649,11 @@ impl RpcHandler {
     /// ingest, and `reserve_exact` is INFALLIBLE — an allocation failure aborts
     /// the whole process (every domain, every client), so a client-supplied size
     /// is bounded here. 10M entries is ~100× any realistic per-domain ring and
-    /// still comfortably allocatable. (`default`'s config-supplied sizes never
-    /// come through this path.)
-    const MAX_DOMAIN_BUFFER_SIZE: usize = 10_000_000;
+    /// still comfortably allocatable. The same limit bounds the global configured
+    /// sizes (`DaemonConfig::validate_buffer_sizes`, at startup), a config domain's
+    /// own (skipped in the boot loop) and a trigger's `pre_window`
+    /// (`refuse_oversize_pre_window`).
+    const MAX_DOMAIN_BUFFER_SIZE: usize = crate::daemon::persistence::MAX_BUFFER_SIZE;
 
     /// Create (or idempotently ensure) an ephemeral domain. Binds its receivers
     /// synchronously so a port clash is a clean error; refuses once
@@ -1910,6 +1912,7 @@ impl RpcHandler {
         // is honored (only an absent or null value defaults).
         let pre = opt_u32(params, "pre_window")?
             .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_PRE_WINDOW);
+        refuse_oversize_pre_window(pre)?;
         let post = opt_u32(params, "post_window")?
             .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_POST_WINDOW);
         let ctx = opt_u32(params, "notify_context")?
@@ -1935,6 +1938,9 @@ impl RpcHandler {
         let filter = opt_str(params, "filter")?;
         refuse_bookmark_in_edit(filter)?;
         let pre = opt_u32(params, "pre_window")?;
+        if let Some(p) = pre {
+            refuse_oversize_pre_window(p)?;
+        }
         let post = opt_u32(params, "post_window")?;
         let ctx = opt_u32(params, "notify_context")?;
         let desc = opt_str(params, "description")?;
@@ -4322,6 +4328,20 @@ fn refuse_bookmark_in(parsed: &crate::filter::parser::ParsedFilter) -> Result<()
             "bookmarks and cursors (b>=, b<=, c>=) are not allowed in registered filters, triggers or collectors — use them only in query tools"
                 .to_string(),
         );
+    }
+    Ok(())
+}
+
+/// Refuse a `pre_window` above `MAX_BUFFER_SIZE`. The domain's pre-trigger buffer is sized to
+/// its largest pre-window and holds a clone of every record up to it, so an unbounded one
+/// grows until the allocation aborts the whole process — the failure the buffer limit exists
+/// to prevent. (A persisted trigger is checked on restore, `SessionRegistry::restore_named`.)
+fn refuse_oversize_pre_window(pre: u32) -> Result<(), String> {
+    let max = crate::daemon::persistence::MAX_BUFFER_SIZE;
+    if pre as usize > max {
+        return Err(format!(
+            "pre_window {pre} exceeds the maximum of {max} records"
+        ));
     }
     Ok(())
 }
