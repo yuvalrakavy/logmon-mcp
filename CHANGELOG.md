@@ -5,6 +5,15 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Fixed — reinstalling the service over a running broker left it stopped (macOS)
+
+`logmon-broker install-service` unloads the old service and loads the new one. launchd's
+unload returns before a running broker has finished shutting down, and loading the same label
+before then fails ("Bootstrap failed: 5: Input/output error") — so the documented upgrade step,
+run while the broker was up, ended with no broker running. It now waits for the old broker to
+leave (up to 30 s), retries the load a few times, and if it still fails says the broker is not
+running and prints the command that starts it.
+
 ### Added — `load_case` (`cases.load`), reading a case back
 
 A case file becomes a sealed **postmortem domain**, and the whole existing read
