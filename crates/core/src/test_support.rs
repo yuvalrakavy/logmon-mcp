@@ -523,42 +523,52 @@ impl TestClient {
         };
         let req = RpcRequest::new(0, "session.start", serde_json::to_value(&params)?);
         let json = serde_json::to_string(&req)?;
-        writer.write_all(json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
 
         // Read the handshake response synchronously. The daemon may also queue
         // notifications after the response (drained from a previous session);
         // surface them through the notification channel once we hand reading
-        // off to the reader task.
-        let mut early_notifications: Vec<RpcNotification> = Vec::new();
-        let session_start_result: SessionStartResult = loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                anyhow::bail!("daemon closed connection before session.start response");
-            }
-            match parse_daemon_message_from_str(&line)? {
-                DaemonMessage::Response(resp) if resp.id == 0 => {
-                    if let Some(err) = resp.error {
-                        anyhow::bail!("session.start failed: {} ({})", err.message, err.code);
+        // off to the reader task. Bounded like every call: a daemon that never
+        // answers fails the test naming the handshake instead of parking it.
+        let handshake = async {
+            writer.write_all(json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+            let mut early_notifications: Vec<RpcNotification> = Vec::new();
+            let session_start_result: SessionStartResult = loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    anyhow::bail!("daemon closed connection before session.start response");
+                }
+                match parse_daemon_message_from_str(&line)? {
+                    DaemonMessage::Response(resp) if resp.id == 0 => {
+                        if let Some(err) = resp.error {
+                            anyhow::bail!("session.start failed: {} ({})", err.message, err.code);
+                        }
+                        let result = resp.result.ok_or_else(|| {
+                            anyhow::anyhow!("session.start response had no result")
+                        })?;
+                        break serde_json::from_value(result)?;
                     }
-                    let result = resp
-                        .result
-                        .ok_or_else(|| anyhow::anyhow!("session.start response had no result"))?;
-                    break serde_json::from_value(result)?;
+                    DaemonMessage::Response(resp) => {
+                        anyhow::bail!(
+                            "unexpected response id {} before handshake completed",
+                            resp.id
+                        );
+                    }
+                    DaemonMessage::Notification(notif) => {
+                        early_notifications.push(notif);
+                    }
                 }
-                DaemonMessage::Response(resp) => {
-                    anyhow::bail!(
-                        "unexpected response id {} before handshake completed",
-                        resp.id
-                    );
-                }
-                DaemonMessage::Notification(notif) => {
-                    early_notifications.push(notif);
-                }
-            }
+            };
+            Ok((session_start_result, early_notifications))
         };
+        let (session_start_result, early_notifications) =
+            tokio::time::timeout(CALL_TIMEOUT, handshake)
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("session.start: no reply within {CALL_TIMEOUT:?}")
+                })??;
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<RpcResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -656,12 +666,19 @@ impl TestClient {
         let closed = self.closed.clone();
         let result: anyhow::Result<RpcResponse> = async {
             let json = serde_json::to_string(&req)?;
-            let written: std::io::Result<()> = async {
+            // Bounded too: a daemon that stops reading fills the socket, and the write parks.
+            let written: std::io::Result<()> = tokio::time::timeout(CALL_TIMEOUT, async {
                 self.writer.write_all(json.as_bytes()).await?;
                 self.writer.write_all(b"\n").await?;
                 self.writer.flush().await
-            }
-            .await;
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("not written within {CALL_TIMEOUT:?}"),
+                ))
+            });
             if let Err(e) = written {
                 // Named too: the reader may not have seen the connection go yet.
                 let reason = closed.lock().expect("closed lock poisoned").clone();

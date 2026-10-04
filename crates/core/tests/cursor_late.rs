@@ -292,6 +292,15 @@ async fn a_restored_future_cursor_still_excludes_records_below_it() {
         .await
         .unwrap();
     assert_eq!(messages(&r), Vec::<String>::new(), "{r}");
+    // Vacuity: the record IS stored — the cursor is excluding it, not missing it.
+    let r: Value = c
+        .call(
+            "logs.recent",
+            json!({ "filter": "m=early-warn", "count": 50 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages(&r), vec!["early-warn"], "{r}");
 }
 
 /// A cursor restored after a daemon restart still gets the records a trigger stores behind it

@@ -333,6 +333,31 @@ impl BookmarkStore {
         before - map.len()
     }
 
+    /// Move every bookmark of session `old` to session `new`, keeping its position, late mark,
+    /// floor and description. Returns the number moved. A rename that left them behind
+    /// orphaned them under a name the session no longer answers to, and its cursors then
+    /// auto-created at 0 and replayed everything already read. A bookmark `new` already holds
+    /// under the same name is overwritten: the moving session is the live one. `old == new`
+    /// moves nothing.
+    pub fn rename_session(&self, old: &str, new: &str) -> usize {
+        if old == new {
+            return 0;
+        }
+        let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
+        let keys: Vec<String> = map
+            .iter()
+            .filter(|(_, b)| b.session == old)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in &keys {
+            let mut b = map.remove(key).expect("listed under the same lock");
+            b.session = new.to_string();
+            b.qualified_name = format!("{new}/{}", b.name);
+            map.insert(b.qualified_name.clone(), b);
+        }
+        keys.len()
+    }
+
     /// Look up a bookmark by qualified name. Returns the bookmark if it exists.
     pub fn get(&self, qualified_name: &str) -> Option<Bookmark> {
         self.bookmarks

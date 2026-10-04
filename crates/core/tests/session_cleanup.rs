@@ -58,6 +58,12 @@ async fn a_failed_rename_reply_still_disconnects_the_session_by_its_new_name() {
 
     for _ in 0..200 {
         if let Ok(c) = daemon.try_connect_named("renamed", None).await {
+            // Vacuity: a connect served before the daemon handled the rename would create a
+            // fresh `renamed` and pass without the rename ever happening.
+            assert!(
+                !c.session_start_result.is_new,
+                "reached the renamed session, not a new one"
+            );
             c.close().await.unwrap();
             return;
         }

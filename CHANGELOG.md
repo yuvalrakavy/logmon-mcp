@@ -209,20 +209,49 @@ the reply to a `sessions.rename`, after which it disconnects the session by its 
 
 ### Fixed — a new session's triggers did not size the pre-trigger buffer
 
-Connecting a session (or reconnecting a named one) did not re-derive the domain's pre-trigger
-buffer size, so its default triggers' pre-windows were cut to whatever the buffer was already —
-zero after the last session left — until some trigger or filter change resynced it. It is
-re-derived when a session starts.
+Connecting a new session (or a reconnecting named one whose connect-time domain moved its
+binding) did not re-derive the domain's pre-trigger buffer size, so its triggers' pre-windows
+were cut to whatever the buffer was already — zero after the last session left — until some
+trigger or filter change resynced it. It is re-derived when a session starts. (A named session
+that merely reconnects already counted while disconnected, so nothing changed for it.)
 
-### Fixed — two session-lifecycle races
+### Fixed — session lifecycle: disposal, drop, rename and reconnect
 
-- The TTL sweep listed expired sessions and disposed of them a moment later, so a session that
-  reconnected in between was disposed of while live, its bookmarks and collectors with it. It is
-  now disposed of only if still disconnected, decided under the registry's lock.
+- The TTL sweep lists the sessions past their TTL and disposes of them one by one, and it
+  disposed of any that was still disconnected — including one that had reconnected and left
+  again since the listing (a CLI invocation does exactly that), along with the collector or
+  bookmark it had just made. A session is now disposed of only if it is still abandoned —
+  disconnected AND last seen past the TTL — decided under the registry's lock, and the sweep
+  logs a spared session as kept rather than disposed.
+- The sweep and `sessions.drop` cleared the session's bookmarks and collectors AFTER removing it
+  from the registry. Both are keyed by the session's NAME, so a new holder of the name — a
+  rename onto it is a single request — could lose its own to the clear. The clear now runs
+  inside the registry's lock, before any new holder can exist.
 - `sessions.drop` on a CONNECTED session released its collectors (destroying their windows and
-  history) and replied `dropped`, while the session itself was refused and stayed. The registry
-  now decides first — refusing a connected session and removing a disconnected one under its
-  lock — and the collectors are released only when it did not refuse.
+  history) and replied `dropped`, while the session itself was refused and stayed. It is now
+  refused with nothing touched.
+- `sessions.drop` left the session's bookmarks behind, and a later session of the same name
+  inherited them: its cursors resumed from the old positions and `bookmarks.add` refused names it
+  had never used. They are cleared with the session.
+- `sessions.rename` moved the session's collectors but not its bookmarks. Left under the old
+  name, its cursors auto-created at 0 under the new one and replayed everything they had already
+  returned (and an anonymous session's bookmarks stayed in memory until a restart). Bookmarks now
+  move with the session, positions intact.
+- A rename to the session's OWN name deleted every one of its collector files (each was written
+  and then deleted at the same path), so the next restart found no collectors. It moves nothing
+  now.
+- Two `session.start`s for the same disconnected name could both succeed: the claim was a check
+  and then a set, so both passed the check and both connections owned one session. When the
+  first left, the other's live session read as disconnected, open to the TTL sweep and to
+  `sessions.drop`. The claim is now one atomic step; the loser gets "already connected".
+
+### Fixed — a request split around a trigger notification closed the connection
+
+The connection loop races reading the next request against forwarding trigger notifications,
+and each read went into a buffer of its own. When a notification won while a request was only
+partly received — the SDK and the shim write a request and its newline as two writes — the bytes
+already read were dropped, the rest failed to parse, and the broker closed the connection. A
+request now survives the race: what arrived stays buffered until the line completes.
 
 ### Fixed — `get_recent_logs` / `export_logs` could call a record they returned evicted
 

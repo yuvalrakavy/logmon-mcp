@@ -202,12 +202,15 @@ before (seen now) or after (numbered `> S`).
   it. Documented as such, beside `evicted_before_window`, which is an upper bound for the same
   reason.
 - `CursorCommit::commit` compares-and-sets: it moves the cursor only from the position the read
-  started at, and re-inserts a swept cursor only when the SEQ moved. Defensive, not a reachable
-  fix: in the daemon a cursor is read only by its own session, a named session has one
-  connection, and a connection handles one request at a time, so no other read or
-  `bookmarks.add replace` of the same cursor can land between a read and its commit (the
-  re-gate traced every writer). It keeps a future caller that breaks that from moving a cursor
-  backwards.
+  started at, and re-inserts a missing cursor only when the SEQ moved. For a READ or a
+  `bookmarks.add replace` of the same cursor this is defensive: a cursor is read and replaced
+  only through its own session, a named session has one connection (the claim on reconnect is
+  atomic — before the re-gate, two `session.start`s for one name could both succeed), and a
+  connection handles one request at a time. It is NOT unreachable for removals: another session
+  can `bookmarks.remove owner/name` or `bookmarks.clear` that session's bookmarks between a read
+  and its commit, and the commit then re-inserts the cursor at its new position with no
+  description — the same outcome as the sweep race it was written for, and the intent of the
+  read that advanced it.
 - A restored cursor's floor is its restored position, not 0: a `bookmarks.add` with a
   `start_seq` above the counter must keep excluding what lies below it after a restart.
 - The normal walk checks `seq > position` itself, not only through the filter's `CursorSeq`.

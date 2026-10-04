@@ -7,7 +7,7 @@ use crate::daemon::persistence::{
 use crate::daemon::rpc_handler::{DomainPolicy, RpcHandler};
 use crate::daemon::session::{SessionId, SessionRegistry};
 use crate::daemon::span_processor::spawn_span_processor;
-use crate::daemon::transport::{read_request, write_message};
+use crate::daemon::transport::{read_request, write_message, RequestReader};
 use crate::engine::pipeline::{LogPipeline, PipelineEvent};
 use crate::engine::seq_counter::SeqCounter;
 use crate::gelf::message::LogEntry;
@@ -651,9 +651,12 @@ async fn run_initialized(
 
     // 13b. Session TTL sweep (meaningful-session-names spec, 2026-07-17):
     //      a session DISCONNECTED longer than `session_ttl_secs` is disposed —
-    //      its cross-domain bookmarks cleared first, then the registry entry.
-    //      Connected sessions never expire (TTL measures abandonment, not
-    //      lifetime). Keeps unique-per-conversation names from accumulating.
+    //      the registry entry, and under the same lock its bookmarks in every
+    //      domain and its collectors. Re-decided per session at disposal: one
+    //      that reconnected after the listing, or reconnected and left again,
+    //      is no longer abandoned and is left alone. Connected sessions never
+    //      expire (TTL measures abandonment, not lifetime). Keeps
+    //      unique-per-conversation names from accumulating.
     //      Wake: the interval tick. Sleep: `interval.tick().await`.
     {
         let sessions = sessions.clone();
@@ -670,10 +673,17 @@ async fn run_initialized(
             loop {
                 interval.tick().await;
                 for id in sessions.expired_disconnected(ttl) {
-                    let (cleared, collectors) = handler.dispose_expired_session(&id);
-                    info!(session = %id, bookmarks_cleared = cleared,
-                        collectors_released = collectors,
-                        "session TTL sweep: disposed (disconnected past TTL)");
+                    match handler.dispose_expired_session(&id, ttl) {
+                        Some((cleared, collectors)) => {
+                            info!(session = %id, bookmarks_cleared = cleared,
+                                collectors_released = collectors,
+                                "session TTL sweep: disposed (disconnected past TTL)");
+                        }
+                        None => {
+                            info!(session = %id,
+                                "session TTL sweep: kept (active again since it was listed)");
+                        }
+                    }
                 }
             }
         });
@@ -1078,10 +1088,13 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // Tracked so the loop can re-subscribe when the binding changes (§9.4).
     let mut current_domain = connect_domain;
 
-    // 7. Main loop
+    // 7. Main loop. Requests are read through a `RequestReader`: the read races the
+    //    notification branch, and a request half-received when a notification wins must
+    //    survive into the next iteration.
+    let mut requests = RequestReader::default();
     loop {
         tokio::select! {
-            request_result = read_request(&mut reader) => {
+            request_result = requests.next(&mut reader) => {
                 match request_result {
                     Ok(Some(request)) => {
                         let response = handler.handle_async(&session_id, &request).await;
@@ -1197,14 +1210,24 @@ impl Drop for SessionCleanup {
         // connection's panic to that connection; run the cleanup on a thread of its own so a
         // poisoned lock fails that thread, not the daemon.
         // (A plain function on that thread, not another guard: a guard's own `Drop` would run
-        // the cleanup twice, and re-spawn without end if it panicked there.)
+        // the cleanup twice, and re-spawn without end if it panicked there.) Spawned through
+        // `Builder`, which reports a refused thread as an error: `thread::spawn` panics on one,
+        // and that panic, here, would be the abort this branch exists to avoid. A poisoned lock
+        // still fails the cleanup on that thread — this keeps the daemon up, it does not make
+        // the cleanup succeed.
         if std::thread::panicking() {
             let (handler, sessions, session_id) = (
                 self.handler.clone(),
                 self.sessions.clone(),
                 self.session_id.clone(),
             );
-            std::thread::spawn(move || disconnect_session(&handler, &sessions, &session_id));
+            let spawned = std::thread::Builder::new()
+                .name("session-cleanup".into())
+                .spawn(move || disconnect_session(&handler, &sessions, &session_id));
+            if let Err(e) = spawned {
+                error!(session = %self.session_id,
+                    "could not start the cleanup of a panicked connection: {e}");
+            }
             return;
         }
         disconnect_session(&self.handler, &self.sessions, &self.session_id);

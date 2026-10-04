@@ -1205,6 +1205,31 @@ fn a_rename_carries_its_collectors_and_does_not_inherit_a_displaced_session_s() 
     );
 }
 
+/// A rename to the session's own name keeps its collectors on disk. Taken through the owner
+/// move, each collector's file was written and then deleted — the same path both times — so
+/// the next restart found none of them.
+#[test]
+fn a_rename_to_the_session_s_own_name_keeps_its_collector_files() {
+    let d = tempfile::TempDir::new().unwrap();
+    {
+        let h = harness_in(Some(d.path().to_path_buf()));
+        let sid = h.sessions.create_named("perf").unwrap();
+        h.call(
+            &sid,
+            "collectors.add",
+            json!({ "name": "c", "filter": "ALL" }),
+        )
+        .unwrap();
+        h.call(&sid, "sessions.rename", json!({ "name": "perf" }))
+            .expect("a same-name rename");
+    }
+    let h = harness_in(Some(d.path().to_path_buf()));
+    let report = h
+        .collectors
+        .restore(chrono::Utc::now(), |_| Arc::new(ReceiverMetrics::new()));
+    assert_eq!(report.restored.len(), 1, "{:?}", report.restored);
+}
+
 #[test]
 fn a_re_pin_carries_the_metrics_handle_so_ingest_stays_attributable() {
     // The identity check behind ingest attribution is pointer equality on the

@@ -279,7 +279,17 @@ impl SessionRegistry {
                 return Err(SessionError::NotFound(id.to_string()));
             }
             SessionId::Named(_) => {
-                state.connected.store(true, Ordering::Relaxed);
+                // Claimed in ONE step: a load above and a store here let two `session.start`s
+                // for the same name both pass the check (this runs under the READ lock) and
+                // both own the session — and the first to leave then marked the other's live
+                // session disconnected, open to the TTL sweep and `sessions.drop`.
+                if state
+                    .connected
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_err()
+                {
+                    return Err(SessionError::AlreadyConnected(id.to_string()));
+                }
                 state.touch();
             }
         }
@@ -380,36 +390,53 @@ impl SessionRegistry {
         Ok((new_id, displaced_domains))
     }
 
-    /// Dispose a session outright (TTL sweep + rename displacement): removed
-    /// from the registry regardless of kind. The caller is responsible for
-    /// clearing its cross-domain bookmarks first (`touched_domains`).
-    pub fn dispose(&self, id: &SessionId) {
-        self.sessions
-            .write()
-            .expect("sessions lock poisoned")
-            .remove(id);
+    /// Dispose of `id` if it is STILL abandoned — disconnected and last seen more than `ttl`
+    /// ago — deciding under the write lock and running `cleanup` before releasing it. Returns
+    /// whether the session was disposed of.
+    ///
+    /// The TTL sweep lists its candidates first and disposes of them one by one; a session
+    /// that reconnected in the meantime is live, and one that reconnected and left again is no
+    /// longer abandoned (both refresh `last_seen`) — disposing of either took what it had just
+    /// made. `cleanup` runs under the lock because what it clears (bookmarks, collectors) is
+    /// keyed by NAME: after the lock, a new holder of the name could already exist — a rename
+    /// onto it is a single request — and lose its own state to this disposal. It must take
+    /// only leaf locks, never this registry's.
+    pub fn dispose_if_expired(
+        &self,
+        id: &SessionId,
+        ttl: std::time::Duration,
+        cleanup: impl FnOnce(),
+    ) -> bool {
+        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
+        let Some(state) = sessions.get(id) else {
+            return false;
+        };
+        let abandoned = !state.connected.load(Ordering::Relaxed)
+            && state
+                .last_seen
+                .lock()
+                .expect("last_seen lock poisoned")
+                .elapsed()
+                > ttl;
+        if !abandoned {
+            return false;
+        }
+        sessions.remove(id);
+        cleanup();
+        true
     }
 
-    /// Dispose of `id` only if it is (still) disconnected, deciding under the write lock.
-    /// Returns the domains it touched — for clearing its bookmarks, which `touched_domains`
-    /// can no longer answer once it is gone — or `None` if it reconnected (or was already
-    /// gone). The TTL sweep lists candidates and disposes them later; a session that
-    /// reconnected in between used to be disposed while live.
-    pub fn dispose_if_disconnected(&self, id: &SessionId) -> Option<Vec<DomainId>> {
-        let mut sessions = self.sessions.write().expect("sessions lock poisoned");
-        let state = sessions.get(id)?;
-        if state.connected.load(Ordering::Relaxed) {
-            return None;
+    /// Move `id`'s `last_seen` back by `by`, so a test can make a session look abandoned
+    /// without sleeping through a TTL — or race a real one under load.
+    #[cfg(feature = "test-support")]
+    pub fn backdate_last_seen(&self, id: &SessionId, by: std::time::Duration) {
+        let sessions = self.sessions.read().expect("sessions lock poisoned");
+        if let Some(state) = sessions.get(id) {
+            let mut seen = state.last_seen.lock().expect("last_seen lock poisoned");
+            *seen = seen
+                .checked_sub(by)
+                .expect("the monotonic clock reaches back that far");
         }
-        let touched = state
-            .touched_domains
-            .read()
-            .expect("touched_domains lock poisoned")
-            .iter()
-            .cloned()
-            .collect();
-        sessions.remove(id);
-        Some(touched)
     }
 
     /// Sessions that have been DISCONNECTED for longer than `ttl` — the TTL
@@ -540,19 +567,27 @@ impl SessionRegistry {
         }
     }
 
-    pub fn drop_session(&self, name: &str) -> Result<(), SessionError> {
+    /// Drop the disconnected named session `name`, running `cleanup` under the write lock —
+    /// also when no such session exists (`NotFound`), since state keyed by the name can outlive
+    /// it; never when it is connected (`AlreadyConnected`, nothing touched). Under the lock for
+    /// the reason [`Self::dispose_if_expired`] gives: what `cleanup` clears is keyed by NAME,
+    /// and a new holder could otherwise take the name between the removal and the clear.
+    /// `cleanup` must take only leaf locks, never this registry's.
+    pub fn drop_session(&self, name: &str, cleanup: impl FnOnce()) -> Result<(), SessionError> {
         let id = SessionId::Named(name.to_string());
         let mut sessions = self.sessions.write().expect("sessions lock poisoned");
 
-        let state = sessions
-            .get(&id)
-            .ok_or_else(|| SessionError::NotFound(name.to_string()))?;
+        let Some(state) = sessions.get(&id) else {
+            cleanup();
+            return Err(SessionError::NotFound(name.to_string()));
+        };
 
         if state.connected.load(Ordering::Relaxed) {
             return Err(SessionError::AlreadyConnected(name.to_string()));
         }
 
         sessions.remove(&id);
+        cleanup();
         Ok(())
     }
 
@@ -1118,9 +1153,10 @@ impl SessionRegistry {
                 created_at: pb.created_at,
                 description: pb.description.clone(),
                 // Not persisted: the restarted store is empty and its late counter starts
-                // again at 0. The floor is the restored position itself: nothing at or below
-                // it is in the new store, and a bookmark whose explicit `start_seq` was ABOVE
-                // the counter must keep excluding what lies below it, as it did before the
+                // again at 0. The floor is the restored position itself. Ordinarily the new
+                // store's seqs all lie above it, so it excludes nothing; but a bookmark whose
+                // explicit `start_seq` was ABOVE the counter is positioned past records the new
+                // store will hold, and the floor keeps excluding those, as it did before the
                 // restart (see `Bookmark::late_mark` / `Bookmark::floor`).
                 late_mark: 0,
                 floor: pb.seq,

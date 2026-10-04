@@ -87,8 +87,52 @@ fn test_drop_named_session() {
     let registry = SessionRegistry::new();
     let id = registry.create_named("test").unwrap();
     registry.disconnect(&id);
-    registry.drop_session("test").unwrap();
+    let mut cleaned = false;
+    registry.drop_session("test", || cleaned = true).unwrap();
     assert!(registry.get(&id).is_none());
+    assert!(cleaned, "the cleanup ran");
+}
+
+/// A connected session is refused, and its cleanup never runs.
+#[test]
+fn dropping_a_connected_session_runs_no_cleanup() {
+    let registry = SessionRegistry::new();
+    let id = registry.create_named("live").unwrap();
+    let mut cleaned = false;
+    assert!(registry.drop_session("live", || cleaned = true).is_err());
+    assert!(registry.get(&id).is_some());
+    assert!(!cleaned);
+}
+
+/// Two `session.start`s for one disconnected name: exactly one gets the session. The claim
+/// was a load and then a store under a READ lock, so both could pass the load and both own
+/// it. Raced from barrier-released threads, many rounds.
+#[test]
+fn concurrent_reconnects_to_one_name_admit_exactly_one() {
+    use std::sync::{Arc, Barrier};
+    const THREADS: usize = 8;
+    let registry = Arc::new(SessionRegistry::new());
+    let id = registry.create_named("contested").unwrap();
+    for round in 0..500 {
+        registry.disconnect(&id);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let winners: usize = (0..THREADS)
+            .map(|_| {
+                let (registry, barrier, id) = (registry.clone(), barrier.clone(), id.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.reconnect(&id).is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| usize::from(t.join().unwrap()))
+            .sum();
+        assert_eq!(
+            winners, 1,
+            "round {round}: {winners} connections own one session"
+        );
+    }
 }
 
 #[test]
@@ -251,7 +295,7 @@ fn ttl_predicate_spares_connected_and_dispose_removes() {
         "a connected session must NEVER expire: {expired:?}"
     );
 
-    registry.dispose(&dead);
+    assert!(registry.dispose_if_expired(&dead, std::time::Duration::ZERO, || {}));
     let expired = registry.expired_disconnected(std::time::Duration::ZERO);
     assert!(
         expired.is_empty(),

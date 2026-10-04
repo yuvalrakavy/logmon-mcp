@@ -869,6 +869,12 @@ impl CollectorRegistry {
     /// TTL sweep (it iterates the session map) — while still holding their
     /// share of a daemon-wide reservation that only four collectors fit inside.
     pub fn rename_owner(&self, old: &SessionId, new: &SessionId) -> usize {
+        // A rename to the session's own name moves nothing. Taken through the move below, each
+        // collector's file was written and then deleted — the same path both times — so every
+        // collector was gone at the next restart.
+        if old == new {
+            return 0;
+        }
         let files: Vec<_> = {
             let mut g = self.entries.write().expect("registry lock poisoned");
             let mut moved = Vec::new();

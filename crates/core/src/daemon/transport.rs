@@ -32,7 +32,38 @@ pub async fn read_line<R: AsyncBufReadExt + Unpin>(
     Ok(Some(line))
 }
 
-/// Read and parse one `RpcRequest`. Returns `None` on EOF.
+/// Reads newline-delimited requests and can be raced in `select!`: a request only partly
+/// received when another branch wins stays in the reader's buffer, and the next call carries
+/// on from where that one stopped.
+///
+/// [`read_request`] cannot be raced. It reads into a buffer of its own, which the losing
+/// branch drops with whatever had arrived; the rest of the line then failed to parse and the
+/// connection closed. The connection loop races its reads against trigger notifications, and
+/// clients write a request and its newline separately — a trigger firing between them was
+/// enough. This relies on `read_until`'s documented guarantee that what a cancelled call read
+/// is already in the buffer it was given.
+#[derive(Default)]
+pub struct RequestReader {
+    pending: Vec<u8>,
+}
+
+impl RequestReader {
+    /// The next request, or `None` on EOF.
+    pub async fn next<R: AsyncBufReadExt + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> anyhow::Result<Option<RpcRequest>> {
+        let n = reader.read_until(b'\n', &mut self.pending).await?;
+        if n == 0 && self.pending.is_empty() {
+            return Ok(None);
+        }
+        let line = std::mem::take(&mut self.pending);
+        Ok(Some(serde_json::from_slice(&line)?))
+    }
+}
+
+/// Read and parse one `RpcRequest`. Returns `None` on EOF. Not for a `select!` branch — see
+/// [`RequestReader`].
 pub async fn read_request<R: AsyncBufReadExt + Unpin>(
     reader: &mut R,
 ) -> anyhow::Result<Option<RpcRequest>> {
