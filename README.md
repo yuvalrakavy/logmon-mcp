@@ -997,6 +997,39 @@ logmon-mcp --domain nightly --json test-log begin --run-id night-42 --jsonl-path
 logmon-mcp --domain nightly --json test-log close --run-id night-42 --wait-timeout-ms 10000
 ```
 
+The run owner chooses an unused JSONL filename. For a failed execution, these
+commands register the selector and carry the original assertion to the broker.
+Set `domain`, `run`, `id`, `started` and `ended` to your domain, run ID, fresh
+32-hex trace ID and the runner’s RFC 3339 timestamps. Run these between begin and close.
+
+```bash
+logmon-mcp --domain "$domain" --json test-log start --run-id "$run" --execution-id "$id" \
+  --name 'catalog/read' --selector.field trace_id --selector.value "$id" --started-at "$started"
+logmon-mcp --domain "$domain" --json test-log end --run-id "$run" --execution-id "$id" \
+  --name 'catalog/read' --selector.field trace_id --selector.value "$id" --started-at "$started" \
+  --ended-at "$ended" --verdict FAIL --fields '{"message":"expected 3 rows, received 2","failed_test":"read"}'
+```
+
+`begin` accepts repeatable `--collect-distinct` span attributes. Detailed summaries
+use a stable hash of the execution name for `--summary-sample-percent`. Lifecycle
+and case eligibility apply to every execution. The default hard timeout is 600,000 ms,
+overridable with `--test-timeout-ms` on start. After a verdict, batched telemetry
+has a default 10,000 ms grace period, set with `--grace-period-ms` on begin.
+
+The default `--max-failures` is 500. Store uses 50 primary failure slots, 10
+separate rerun slots including passing reruns, and up to 20 slow-pass admissions.
+For slow passes, begin with `--slow-pass opt-out --slow-if 'elapsed > 4 * estimated'`
+or opt individual executions in with a start condition. Captures record ring
+coverage and queue or budget skips. Inspect those fields when interpreting missing
+evidence. Saved ZIPs retain standard case formatting, run provenance and peer context.
+
+A driver recovering unconfirmed ends sends `test-log replay --run-id RUN --events
+'END_JSON'` with one flag per original event, up to 100 per batch. A refusal
+identifies the affected item. Complete replay before close. After a driver crash,
+use `test-log seal --run-id RUN --wait-timeout-ms 1000` on the known abandoned run.
+A new run in its domain receives `run_active` until the previous run closes.
+Recovery by seal requires the daemon that holds the run in memory.
+
 Close reports pending cases if its wait expires. Check both finalization and persistence
 before publishing a report. A completed case path resolves relative to the JSONL file.
 After domain cleanup, read the append-only file with the offline reader:
@@ -1009,7 +1042,19 @@ logmon-test-log compare /runs/41/tests.jsonl CHAIN_NAME /runs/42/tests.jsonl CHA
 
 The reader applies the latest summary revision per execution and joins its case outcome
 and late-telemetry diagnostics. For a stable name with multiple attempts in a run, use
-execution IDs to select the pair for comparison.
+execution IDs to select the pair for comparison. Check file gaps and settlement,
+each execution’s coverage and `sampled_out` state, and post-grace diagnostics.
+
+Run the local transport and fresh-domain reload check from a source checkout:
+
+```bash
+cargo build --locked -p logmon-broker -p logmon-mcp --bins
+python3 scripts/test-nightly-capture.py target.noindex/debug
+```
+
+The transport fixture checks capture and reload. Store’s rollout gate measures its
+actual 16-way DSL workload against the nightly’s 2% elapsed-time budget. A fixture
+pass alone cannot establish the cost of enabling full summaries.
 
 ## Configuration
 

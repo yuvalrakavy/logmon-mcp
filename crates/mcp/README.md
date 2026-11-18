@@ -8,6 +8,10 @@ The `logmon-mcp` binary serves two roles:
 
 Both modes connect to the same broker daemon (`logmon-broker`) over the same Unix domain socket.
 
+The same Cargo package installs `logmon-test-log`, an offline JSONL reader with
+`lookup`, `export` and `compare` commands. See the [nightly test-log guide](../../README.md#nightly-test-logs)
+for reader examples and lifecycle arguments.
+
 ## CLI quick reference
 
 ```
@@ -48,6 +52,8 @@ Global flags:
 | `domains` | `create` / `delete` / `list` / `clear` | Manage isolated domains (each with its own buffers, receivers, triggers). |
 | `cases` | `create` | Freeze a window to disk as one `<stem>.case.zip` — document, both evidence files, machine-readable provenance. `--dir` must be **absolute** (the broker is a service; a relative path resolves against *its* cwd). `--separate` writes loose files, `--uncompressed` stores rather than deflates, `--omit-logdata` / `--omit-spandata` leave that evidence out. |
 | `cases` | `load` | Read one back into a sealed **postmortem** domain, so every read verb answers about it via `--domain`. Nothing arrives on it: collectors, triggers, filters and clears are refused by name, and reads of evidence the capture *omitted* are refused rather than answered emptily. |
+| `test-log` | `begin` / `start` / `end` / `machine-load` | Open the run’s JSONL, register one execution, submit its verdict, or record a machine sample. |
+| `test-log` | `replay` / `close` / `seal` | Replay the original ends in order, query bounded finalization, or explicitly recover an abandoned run by ID. |
 | `status` | (no verb) | Print broker status (incl. `current_domain` + `active_filters`). Reports the broker's version alongside this CLI's. |
 
 Run `logmon-mcp <group> --help` for a group's verbs, and

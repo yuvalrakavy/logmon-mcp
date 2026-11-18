@@ -1,7 +1,7 @@
 ---
 name: logmon
 user_invocable: true
-description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Skip for static log files on disk, historical archives, or projects with no live telemetry pipeline.
+description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Use the offline reader for a nightly test-log JSONL and load_case for a saved logmon case. Skip unrelated static logs and projects without telemetry.
 ---
 
 # Using the log monitor (logmon)
@@ -26,9 +26,30 @@ Reach for it when any of these are true:
 
 Skip it (and say so) when:
 
-- The user is asking about a `.log` file on disk, or an archived log from yesterday — logmon is in-memory and live only.
+- The user supplied an ordinary text log from a different tool. Read that file directly.
 - The broker isn't running and the project doesn't ship telemetry. Don't try to invent log lines.
 - The question is purely about source structure or types — read code, not logs.
+
+## Investigating a nightly failure
+
+Start with the run directory in the morning report. After the original domain expires,
+`logmon-test-log export /path/to/test-log.jsonl` lists its executions. Choose the
+execution ID of the initial failure or its isolated rerun, then run
+`logmon-test-log lookup /path/to/test-log.jsonl EXECUTION_ID`. Read the runner’s
+assertion, failed member, verdict, coverage, and case status. Store summaries cover
+the dependency chain. The entry-point set includes work from all its members.
+
+Resolve `case_path` against the JSONL’s directory. Use `load_case(path=…)` on that
+ZIP and query the returned postmortem domain. Read its overlap list and machine-load
+samples for surrounding activity. For a passing baseline use
+`logmon-test-log compare BEFORE_FILE BEFORE_ID AFTER_FILE AFTER_ID`. Check each side’s
+collection mode, sampling, truncation, late arrivals and journal gaps before interpreting a
+missing span as a behavior change. A timeout capture can predate the runner’s verdict.
+
+A competing `begin_test_log` reports `run_active` and its owner. To recover an abandoned
+run, verify the run ID with the runner’s records, replay outstanding ends, then use
+`seal_test_log` on that ID. A pending close lists outstanding cases; query close again
+within the reporting window. Report both finalization and persistence.
 
 ## Tool selection at a glance
 

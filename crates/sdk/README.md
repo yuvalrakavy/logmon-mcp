@@ -67,6 +67,42 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Reporting a test execution
+
+Use the caller’s existing domain-bound connection for repeated lifecycle requests.
+The runner assigns a fresh execution ID, a stable comparison name and the actual
+selector shared by its logs and spans. On Store the selector field is `trace_id`
+and one execution covers a whole dependency chain. The SDK exports request types
+through `logmon_broker_sdk::test_log` and the following methods on `Broker`.
+
+| Method | Inputs that identify the operation |
+|---|---|
+| `test_log_begin` | Run ID, absolute JSONL path, capture and summary settings |
+| `test_log_start` | Run ID, execution ID, name, selector and original start timestamp |
+| `test_log_end` | Repeat that identity and start timestamp, add end timestamp, verdict and structured failure fields |
+| `test_log_machine_load` | Run ID, host, timestamp and sampler fields |
+| `test_log_replay` | Run ID and up to 100 original end payloads in delivery order |
+| `test_log_close` / `test_log_seal` | Run ID and wait budget in milliseconds |
+
+Set one caller-side deadline around connection acquisition, sending and waiting for a
+start or end reply. The driver distributes `lifecycle_ack_timeout_ms` from the run
+configuration (default 100 ms). A disconnected caller journals its original end
+and continues its test. Concurrent chains share the breaker. After 5 seconds one
+probe checks recovery; failed probes back off to 30 seconds. A definite
+`wrong_run_id` or `no_active_run` refusal disables reporting for that invocation.
+Successful lifecycle acknowledgement can carry degraded JSONL health.
+
+To rerun an execution, use a fresh execution ID and set `rerun_of` on both calls.
+For a recovered delivery, replay the original ID, verdict, times and fields.
+Examine every per-item result. Both `applied` and `already_applied` reconcile the
+journal entry. Keep unresolved items in runner storage. Close the run after replay
+and inspect both `finalization` and `persistence`. The runner owns its verdicts.
+
+For local historical analysis, `test_log_file::TestLogFile::open` loads the JSONL,
+`lookup` retrieves an execution and `journal_status` supplies file-wide gaps,
+sampling and closure status. `compare_summaries` takes any two execution records.
+The bundled [CLI reader](../../README.md#nightly-test-logs) exposes the same operations.
+
 ### Iterating recent traces
 
 ```rust
