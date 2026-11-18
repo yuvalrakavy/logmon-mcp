@@ -1,6 +1,7 @@
 use super::*;
 use crate::daemon::domain::{DomainConfig, DomainId, DomainSource};
 use crate::gelf::message::{Level, LogEntry};
+use std::time::Duration;
 use tempfile::TempDir;
 
 struct Fixture {

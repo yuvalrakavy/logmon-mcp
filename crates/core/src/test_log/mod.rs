@@ -18,7 +18,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct TestLog {

@@ -292,7 +292,13 @@ impl Run {
         Ok(())
     }
     pub fn start(&mut self, d: &Domain, s: TestLogStart) -> Result<Value, String> {
-        if self.entries.contains_key(&s.execution_id) {
+        if let Some(old) = self.entries.get(&s.execution_id) {
+            if old.start.name != s.name
+                || old.start.selector.field != s.selector.field
+                || old.start.selector.value != s.selector.value
+            {
+                return Ok(refused(&s.run_id, "execution_identity_conflict"));
+            }
             return Ok(
                 json!({"status":"already_applied","run_id":s.run_id,"execution_id":s.execution_id}),
             );
@@ -658,12 +664,19 @@ impl Run {
             return;
         }
         self.closing = true;
-        let open: Vec<_> = self
+        let mut open: Vec<_> = self
             .entries
             .iter()
             .filter(|(_, e)| e.end.is_none())
             .map(|(id, _)| id.clone())
             .collect();
+        open.sort_by(|a, b| {
+            self.entries[a]
+                .start
+                .started_at
+                .cmp(&self.entries[b].start.started_at)
+                .then_with(|| a.cmp(b))
+        });
         let reason = if seal {
             "abandoned_run_sealed"
         } else {
