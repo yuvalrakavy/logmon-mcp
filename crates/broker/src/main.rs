@@ -26,6 +26,9 @@ struct Cli {
     /// OTLP HTTP port (0 = disabled)
     #[arg(long)]
     otlp_http_port: Option<u16>,
+    /// Send collector availability beacons to this socket instead of the shared multicast group.
+    #[arg(long)]
+    beacon_target: Option<std::net::SocketAddr>,
     /// Log ring buffer capacity
     #[arg(long)]
     buffer_size: Option<usize>,
@@ -129,7 +132,11 @@ async fn main() -> Result<()> {
             if let Some(s) = cli.span_buffer_size {
                 config.span_buffer_size = s;
             }
-            logmon_broker_core::daemon::server::run_daemon(config).await
+            let overrides = logmon_broker_core::daemon::server::DaemonOverrides {
+                beacon_target: cli.beacon_target,
+                ..Default::default()
+            };
+            logmon_broker_core::daemon::server::run_with_overrides(config, overrides).await
         }
     }
 }

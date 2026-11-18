@@ -56,6 +56,7 @@ address = "127.0.0.1:{gelf}"
 [logging.otel]
 endpoint = "http://127.0.0.1:{otlp}"
 transport = "http"
+beacon_port = {int(broker_env["LOGMON_FIXTURE_BEACON_PORT"])}
 span_queue_size = 16384
 [logging.store_server]
 filter = "warn,store_server=info"

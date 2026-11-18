@@ -28,11 +28,14 @@ def port():
 def broker(binary, root):
     root.mkdir()
     gelf, otlp = port(), port()
-    env = dict(os.environ, LOGMON_CONFIG_DIR=str(root))
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as private_beacon:
+        private_beacon.bind(("127.0.0.1", 0))
+        beacon_port = private_beacon.getsockname()[1]
+    env = dict(os.environ, LOGMON_CONFIG_DIR=str(root), LOGMON_FIXTURE_BEACON_PORT=str(beacon_port))
     with (root / "process.log").open("w") as diagnostics:
         process = subprocess.Popen(
             [binary, "--gelf-port", str(gelf), "--otlp-grpc-port", "0",
-             "--otlp-http-port", str(otlp)], env=env, cwd=root,
+             "--otlp-http-port", str(otlp), "--beacon-target", f"127.0.0.1:{beacon_port}"], env=env, cwd=root,
             stdout=diagnostics, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + 60
