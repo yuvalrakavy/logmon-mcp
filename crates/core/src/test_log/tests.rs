@@ -264,10 +264,9 @@ fn timeout_keeps_unknown_verdict_and_a_later_pass_reuses_capture() {
         rows.iter().filter(|v| v["event"] == "case-ready").count(),
         1
     );
-    assert!(
-        rows.iter()
-            .any(|v| v["event"] == "end-test" && v["verdict"] == "OK")
-    );
+    assert!(rows
+        .iter()
+        .any(|v| v["event"] == "end-test" && v["verdict"] == "OK"));
 }
 
 #[test]

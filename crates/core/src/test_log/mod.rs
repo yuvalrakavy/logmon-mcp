@@ -11,12 +11,12 @@ use chrono::Utc;
 use logmon_broker_protocol::*;
 use run::Run;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
-    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
 };
 use std::time::Instant;
 
@@ -195,21 +195,18 @@ impl TestLog {
         let worker_id = id.clone();
         std::thread::Builder::new()
             .name("test-log-lifecycle".into())
-            .spawn(move || {
-                loop {
-                    let Some(domain) = weak.upgrade() else { break };
-                    let owner = domain.test_log.clone();
-                    let mut guard = owner.state.lock().unwrap();
-                    let Some(run) = guard.run.as_mut().filter(|r| r.config.run_id == worker_id)
-                    else {
-                        break;
-                    };
-                    let now = Instant::now();
-                    run.tick(&domain, now);
-                    let delay = run.next_wake(Instant::now());
-                    drop(domain);
-                    drop(owner.changed.wait_timeout(guard, delay).unwrap());
-                }
+            .spawn(move || loop {
+                let Some(domain) = weak.upgrade() else { break };
+                let owner = domain.test_log.clone();
+                let mut guard = owner.state.lock().unwrap();
+                let Some(run) = guard.run.as_mut().filter(|r| r.config.run_id == worker_id) else {
+                    break;
+                };
+                let now = Instant::now();
+                run.tick(&domain, now);
+                let delay = run.next_wake(Instant::now());
+                drop(domain);
+                drop(owner.changed.wait_timeout(guard, delay).unwrap());
             })
             .map_err(|e| e.to_string())?;
         let health = run.journal.status()["test_log_health"].clone();

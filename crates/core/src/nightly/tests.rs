@@ -180,7 +180,8 @@ fn bounded_schema_and_value_memory_and_generic_backfill_interval() {
         s.start_time = start + Duration::seconds(delta);
         s.end_time = s.start_time;
         s.attributes.insert("group".to_owned(), json!("worker"));
-        s.attributes.insert("huge".to_owned(), json!("X".repeat(65000)));
+        s.attributes
+            .insert("huge".to_owned(), json!("X".repeat(65000)));
         d.span_store.insert(s);
     }
     let mut summary = Summary::new("group", "worker", &["huge".into(), "X".repeat(65000)]);

@@ -1,7 +1,7 @@
 //! One bounded writer per run. A failed partial write is retried from the
 //! previous complete line; readers can use all complete lines in the meantime.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};

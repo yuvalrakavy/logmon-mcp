@@ -6,9 +6,9 @@ use crate::nightly::{CaptureSnapshot, Selector, Summary};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, mpsc};
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 const MAX_SNAPSHOTS: usize = 8;
