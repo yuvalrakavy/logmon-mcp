@@ -60,6 +60,7 @@ pub fn process_span_for_domain(
     // own, so a `use_domain` call by its owning session must not silently stop
     // it (§4.4).
     collectors.ingest_span(domain, span);
+    pipeline.test_log.observe_span(span);
 
     // 3. Evaluate span triggers for each session bound to this domain.
     //

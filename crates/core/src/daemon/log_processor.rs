@@ -211,6 +211,7 @@ pub fn process_entry_for_domain(
             }
         }
     }
+    pipeline.test_log.observe_log(entry);
 }
 
 /// Convenience: process one entry in the `default` domain. Used by

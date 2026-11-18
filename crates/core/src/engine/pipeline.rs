@@ -58,6 +58,7 @@ pub struct FilterInfo {
 /// Shared infrastructure: store + pre-buffer + seq counter.
 /// Per-session logic (triggers, filters, process flow) lives in the daemon.
 pub struct LogPipeline {
+    pub test_log: Arc<crate::test_log::TestLog>,
     store: InMemoryStore,
     pre_buffer: PreTriggerBuffer,
     /// Serializes [`Self::resync_pre_buffer`]'s compute-then-apply.
@@ -155,6 +156,7 @@ impl LogPipeline {
             log.observe(*seq, policy);
         }
         Self {
+            test_log: Arc::default(),
             store: InMemoryStore::from_records(store_capacity, records, lost_below),
             pre_buffer: PreTriggerBuffer::new(0),
             pre_buffer_resync: std::sync::Mutex::new(()),
@@ -172,6 +174,7 @@ impl LogPipeline {
         // `cannot_verify` rather than inheriting this run's policy.
         let epochs = EpochLog::new(seq_counter.current());
         Self {
+            test_log: Arc::default(),
             store: InMemoryStore::new(store_capacity),
             pre_buffer: PreTriggerBuffer::new(0),
             pre_buffer_resync: std::sync::Mutex::new(()),
@@ -352,6 +355,13 @@ impl LogPipeline {
             lost_below: counts.lost_below,
         };
         (counts, stats)
+    }
+
+    pub(crate) fn with_retained<R>(
+        &self,
+        visit: impl FnOnce(crate::store::memory::RetainedRing<'_, LogEntry>) -> R,
+    ) -> R {
+        self.store.with_retained(visit)
     }
 
     pub fn oldest_log_timestamp(&self) -> Option<chrono::DateTime<chrono::Utc>> {

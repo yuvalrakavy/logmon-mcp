@@ -26,6 +26,8 @@ pub struct SpanStore {
 }
 
 struct SpanStoreInner {
+    total_received: u64,
+    latest_evicted_end: Option<chrono::DateTime<chrono::Utc>>,
     /// The held spans in ASCENDING SEQ ORDER, distinct — by construction: `insert` takes its
     /// seq from the shared counter UNDER this ring's write lock and pushes it in the same
     /// critical section, and `from_records` asserts its input. So a seq is found by binary
@@ -51,12 +53,32 @@ impl SpanStore {
             // first insert (see `insert`), so an idle span store holds ~0 buffer.
             inner: RwLock::new(SpanStoreInner {
                 buffer: VecDeque::new(),
+                latest_evicted_end: None,
+                total_received: 0,
                 trace_index: HashMap::new(),
                 capacity,
             }),
             seq_counter,
             lost_below: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Live arrivals since this store was created, including entries since evicted.
+    /// Postmortem records have no recorded arrival and start at zero.
+    pub fn total_received(&self) -> u64 {
+        self.inner.read().unwrap().total_received
+    }
+
+    pub(crate) fn with_retained<R>(
+        &self,
+        visit: impl FnOnce(crate::store::memory::RetainedRing<'_, SpanEntry>) -> R,
+    ) -> R {
+        let inner = self.inner.read().unwrap();
+        visit(crate::store::memory::RetainedRing {
+            records: &inner.buffer,
+            lost_below: self.lost_below(),
+            latest_evicted: inner.latest_evicted_end,
+        })
     }
 
     /// The lowest seq this ring can still speak for — see [`Self::lost_below`].
@@ -95,6 +117,8 @@ impl SpanStore {
         Self {
             inner: RwLock::new(SpanStoreInner {
                 buffer,
+                latest_evicted_end: None,
+                total_received: 0,
                 trace_index,
                 capacity: cap,
             }),
@@ -108,6 +132,7 @@ impl SpanStore {
         // The seq is taken UNDER the write lock, in the same critical section as the push, so
         // the ring is seq-ordered by construction: two inserts can no longer take seqs in one
         // order and push in the other.
+        inner.total_received = inner.total_received.saturating_add(1);
         span.seq = self.seq_counter.next();
         let seq = span.seq;
 
@@ -116,6 +141,7 @@ impl SpanStore {
             // below would otherwise hold one span past a capacity of zero.
             self.lost_below
                 .fetch_max(seq.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+            inner.latest_evicted_end = inner.latest_evicted_end.max(Some(span.end_time));
             return seq;
         }
 
@@ -134,6 +160,7 @@ impl SpanStore {
                     evicted.seq.saturating_add(1),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                inner.latest_evicted_end = inner.latest_evicted_end.max(Some(evicted.end_time));
                 if let Some(seqs) = inner.trace_index.get_mut(&evicted.trace_id) {
                     seqs.retain(|&s| s != evicted.seq);
                     if seqs.is_empty() {
@@ -348,6 +375,7 @@ impl SpanStore {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
+        inner.latest_evicted_end = inner.latest_evicted_end.max(inner.buffer.iter().map(|s| s.end_time).max());
         inner.buffer.clear();
         inner.trace_index.clear();
         n

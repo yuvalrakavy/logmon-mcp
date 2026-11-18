@@ -8,6 +8,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
+pub(crate) struct RetainedRing<'a, T> {
+    pub records: &'a VecDeque<T>,
+    pub lost_below: u64,
+    pub latest_evicted: Option<DateTime<Utc>>,
+}
+
 /// Inner state guarded by a single `RwLock`. Collapsing the three
 /// previously-separate `entries`/`seq_set`/`trace_index` locks into
 /// one structurally prevents lock-ordering bugs (the previous
@@ -16,6 +22,7 @@ use std::time::Duration;
 /// load — see notes/2026-05-05-logmon-broker-rwlock-bug-findings.md).
 /// Mirrors the single-lock pattern in `SpanStore`.
 struct StoreInner {
+    latest_evicted_at: Option<DateTime<Utc>>,
     /// The held records in ASCENDING SEQ ORDER, distinct. An invariant this store
     /// establishes — `append`, `insert_sorted` and `from_records` are its only writers and each
     /// keeps it — and every reader relies on: a position is a position in seq, `front()` and
@@ -137,6 +144,7 @@ impl InMemoryStore {
                 late: BTreeMap::new(),
                 late_by_seq: BTreeMap::new(),
                 late_counter: 0,
+                latest_evicted_at: None,
             }),
             max_capacity: capacity,
             total_stored: AtomicU64::new(0),
@@ -189,6 +197,7 @@ impl InMemoryStore {
                 late: BTreeMap::new(),
                 late_by_seq: BTreeMap::new(),
                 late_counter: 0,
+                latest_evicted_at: None,
             }),
             total_stored: AtomicU64::new(0),
             total_received: AtomicU64::new(0),
@@ -196,6 +205,16 @@ impl InMemoryStore {
             lost_below: AtomicU64::new(lost_below),
             admit_from: AtomicU64::new(0),
         }
+    }
+
+    /// Hold one ring view and its eviction history while the caller reads its records.
+    pub(crate) fn with_retained<R>(&self, visit: impl FnOnce(RetainedRing<'_, LogEntry>) -> R) -> R {
+        let inner = self.inner.read().unwrap();
+        visit(RetainedRing {
+            records: &inner.entries,
+            lost_below: self.lost_below(),
+            latest_evicted: inner.latest_evicted_at,
+        })
     }
 
     /// The lowest seq this store can still speak for — see [`Self::lost_below`].
@@ -261,6 +280,7 @@ impl InMemoryStore {
             self.lost_below
                 .fetch_max(newest.saturating_add(1), Ordering::Relaxed);
         }
+        inner.latest_evicted_at = inner.latest_evicted_at.max(inner.entries.iter().map(|e| e.timestamp).max());
         inner.entries.clear();
         inner.trace_index.clear();
         inner.late.clear();
@@ -290,6 +310,7 @@ impl InMemoryStore {
             // move down and start claiming records it once called lost.
             self.lost_below
                 .fetch_max(evicted.seq.saturating_add(1), Ordering::Relaxed);
+            inner.latest_evicted_at = inner.latest_evicted_at.max(Some(evicted.timestamp));
             inner.unindex(evicted.trace_id, evicted.seq);
         }
     }
@@ -378,6 +399,7 @@ impl InMemoryStore {
         for dropped in merged.by_ref().take(excess) {
             self.lost_below
                 .fetch_max(dropped.seq.saturating_add(1), Ordering::Relaxed);
+            inner.latest_evicted_at = inner.latest_evicted_at.max(Some(dropped.timestamp));
             inner.unindex(dropped.trace_id, dropped.seq);
             dropped_through = Some(dropped.seq);
         }
@@ -874,6 +896,7 @@ impl LogStore for InMemoryStore {
             // below would otherwise hold one record past a capacity of zero).
             self.lost_below
                 .fetch_max(entry.seq.saturating_add(1), Ordering::Relaxed);
+            inner.latest_evicted_at = inner.latest_evicted_at.max(Some(entry.timestamp));
             self.total_stored.fetch_add(1, Ordering::Relaxed);
             return;
         }

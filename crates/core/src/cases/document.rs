@@ -319,7 +319,7 @@ pub fn render(input: &CaseInput) -> Rendered {
 // Front matter — the index surface: fixed-schema, small, grep-able
 // ---------------------------------------------------------------------------
 
-fn front_matter(s: &mut String, i: &CaseInput) {
+pub(crate) fn front_matter(s: &mut String, i: &CaseInput) {
     let (core, missing) = core_coverage(&i.registry);
     let _ = writeln!(s, "---");
     let _ = writeln!(s, "case: {}", i.stem);
