@@ -75,7 +75,14 @@ class IngestRates:
         return result
 
 
-def summary_stats(journal):
+def sampled_name(name, percent):
+    code = 0xcbf29ce484222325
+    for byte in name.encode("utf-8"):
+        code = ((code ^ byte) * 0x100000001b3) & ((1 << 64) - 1)
+    return percent >= 100 or (percent > 0 and float(code) < percent * .01 * float((1 << 64) - 1))
+
+
+def summary_stats(journal, percent=None):
     counts = Counter()
     for line in journal.read_text().splitlines():
         row = json.loads(line)
@@ -84,6 +91,8 @@ def summary_stats(journal):
         if row["event"] != "summary-final":
             continue
         counts[row["summary_status"]] += 1
+        if percent is not None and (row["summary_status"] == "collected") != sampled_name(row["name"], percent):
+            raise RuntimeError(f"incorrect stable-name sampling for {row['name']} at {percent}%")
         if summary := row.get("summary"):
             counts["truncated_attribute_sets"] += sum(
                 bool(v.get("truncated")) for v in summary["distinct_values"].values())
@@ -242,11 +251,15 @@ def timed_arm(bins, source, root, files, label, percent, expected_failures, plan
                 active += delta
                 peak = max(peak, active)
             status = fixture.cli(frontend, env, "status", "get")
+            summaries = summary_stats(journal, percent)
+            finalized = summaries.get("collected", 0) + summaries.get("sampled_out", 0)
+            if finalized != len(end):
+                raise RuntimeError(f"{finalized} final summaries for {len(end)} ended executions")
             return dict(run=label, percent=percent, wall_s=wall, close_s=close_seconds, completed=len(end),
                         batch_wall_s=batch_walls, peak_chains=peak, peak_rss_kib=rss, journal_bytes=journal.stat().st_size,
                         start=ack_stats(starts), end=ack_stats(end),
                         daemon_cpu_s=cpu_after-cpu_before, loadavg_start=load_at_start,
-                        loadavg_end=os.getloadavg(), ingestion=rates.report(), summaries=summary_stats(journal),
+                        loadavg_end=os.getloadavg(), ingestion=rates.report(), summaries=summaries,
                         fail_end=ack_stats(failures),
                         receiver_drops=status["receiver_drops"], trace_ingest=status.get("trace_ingest"),
                         sender_exporter_warnings=exporter_warnings(root/"store-test.log"))
@@ -264,13 +277,17 @@ if __name__ == "__main__":
     parser.add_argument("--records", type=Path, help="new directory for plan, measurements and each arm's files")
     parser.add_argument("--plan-only", action="store_true", help="validate and print the frozen plan without running")
     parser.add_argument("--ack-ms", type=int, default=100, help="lifecycle acknowledgement deadline")
-    parser.add_argument("--single-arm", type=int, choices=(0,100), help="functional rehearsal only")
+    parser.add_argument("--summary-percent", type=float, default=100,
+                        help="compare this stable-name sample percentage against zero (default 100)")
+    parser.add_argument("--single-arm", type=float, help="functional rehearsal at this sampling percentage")
     parser.add_argument("--pairs", type=int, default=3)
     parser.add_argument("--expect-failures", type=int, default=None,
                         help="expected red chains per arm for a representative DSL workload")
     args = parser.parse_args()
     if args.pairs < 1 or args.ack_ms < 1 or (args.expect_failures or 0) < 0:
         parser.error("pairs and ack-ms must be positive and expected failures nonnegative")
+    if not 0 < args.summary_percent <= 100 or (args.single_arm is not None and not 0 <= args.single_arm <= 100):
+        parser.error("summary-percent must be in (0, 100] and single-arm in [0, 100]")
     if args.nightly_run and args.file or not args.nightly_run and (args.batch or args.plan_only):
         parser.error("use --batch/--plan-only with --nightly-run and --file only with a smoke run")
     source = args.store_repo.resolve()
@@ -288,12 +305,12 @@ if __name__ == "__main__":
     expected = args.expect_failures if plan else args.expect_failures or 0
     with tempfile.TemporaryDirectory(prefix="lmbench-frozen-", dir="/tmp") as inputs:
         frozen = Path(inputs) / "inputs"
-        checksums = freeze_inputs(args.bin_dir.resolve(), source, frozen)
+        checksums = freeze_inputs(args.bin_dir.resolve(), source, frozen, full_workspace=bool(plan))
         for pair in range(1 if args.single_arm is not None else args.pairs):
-            percentages = [args.single_arm] if args.single_arm is not None else ([0, 100] if pair % 2 == 0 else [100, 0])
+            percentages = [args.single_arm] if args.single_arm is not None else ([0, args.summary_percent] if pair % 2 == 0 else [args.summary_percent, 0])
             for pct in percentages:
                 with tempfile.TemporaryDirectory(prefix="lmbench-", dir="/tmp") as root:
-                    name = f"p{pair+1}-s{pct}"
+                    name = f"p{pair+1}-s{pct:g}"
                     arm = Path(root)/name
                     try:
                         result = timed_arm(frozen / "logmon", source, arm,
