@@ -208,7 +208,10 @@ impl InMemoryStore {
     }
 
     /// Hold one ring view and its eviction history while the caller reads its records.
-    pub(crate) fn with_retained<R>(&self, visit: impl FnOnce(RetainedRing<'_, LogEntry>) -> R) -> R {
+    pub(crate) fn with_retained<R>(
+        &self,
+        visit: impl FnOnce(RetainedRing<'_, LogEntry>) -> R,
+    ) -> R {
         let inner = self.inner.read().unwrap();
         visit(RetainedRing {
             records: &inner.entries,
@@ -280,7 +283,9 @@ impl InMemoryStore {
             self.lost_below
                 .fetch_max(newest.saturating_add(1), Ordering::Relaxed);
         }
-        inner.latest_evicted_at = inner.latest_evicted_at.max(inner.entries.iter().map(|e| e.timestamp).max());
+        inner.latest_evicted_at = inner
+            .latest_evicted_at
+            .max(inner.entries.iter().map(|e| e.timestamp).max());
         inner.entries.clear();
         inner.trace_index.clear();
         inner.late.clear();
@@ -374,7 +379,10 @@ impl InMemoryStore {
 
         let stored = batch.len() as u64;
         let mut merged: Vec<Arc<LogEntry>> = Vec::with_capacity(tail.len() + batch.len());
-        let (mut t, mut b) = (tail.into_iter().peekable(), batch.into_iter().map(Arc::new).peekable());
+        let (mut t, mut b) = (
+            tail.into_iter().peekable(),
+            batch.into_iter().map(Arc::new).peekable(),
+        );
         loop {
             let take_tail = match (t.peek(), b.peek()) {
                 (Some(x), Some(y)) => x.seq < y.seq,
@@ -936,7 +944,11 @@ impl LogStore for InMemoryStore {
         let start = idx.saturating_sub(before);
         let end = (idx + after + 1).min(inner.entries.len());
 
-        inner.entries.range(start..end).map(|e| e.as_ref().clone()).collect()
+        inner
+            .entries
+            .range(start..end)
+            .map(|e| e.as_ref().clone())
+            .collect()
     }
 
     fn context_by_time(&self, timestamp: DateTime<Utc>, window: Duration) -> Vec<LogEntry> {

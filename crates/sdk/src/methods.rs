@@ -47,7 +47,10 @@ impl Broker {
     }
 
     /// Associate a timestamped machine sample with overlapping executions in the run.
-    pub async fn test_log_machine_load(&self, p: TestLogMachineLoad) -> Result<TestLogAck, BrokerError> {
+    pub async fn test_log_machine_load(
+        &self,
+        p: TestLogMachineLoad,
+    ) -> Result<TestLogAck, BrokerError> {
         self.call_typed("test_log.machine_load", p).await
     }
 
@@ -62,7 +65,10 @@ impl Broker {
     }
 
     /// Reconcile a bounded batch of original end events before closing the run. Returns per-item outcomes.
-    pub async fn test_log_replay(&self, p: TestLogReplay) -> Result<TestLogReplayResult, BrokerError> {
+    pub async fn test_log_replay(
+        &self,
+        p: TestLogReplay,
+    ) -> Result<TestLogReplayResult, BrokerError> {
         self.call_typed("test_log.replay", p).await
     }
 

@@ -588,7 +588,7 @@ impl RpcHandler {
         &self,
         sid: &SessionId,
         request: &RpcRequest,
-    ) -> Result<Value,String> {
+    ) -> Result<Value, String> {
         use std::time::{Duration, Instant};
 
         let began = Instant::now();
@@ -602,10 +602,16 @@ impl RpcHandler {
             // writer to flush the final rows inside the caller's wait budget.
             let flushing = status["test_log_health"] == "healthy"
                 && status["pending_records"].as_u64().unwrap_or(0) > 0;
-            if status["finalization"] != "pending" && !flushing {break;}
-            let delay = wait.saturating_sub(began.elapsed()).min(Duration::from_millis(10));
+            if status["finalization"] != "pending" && !flushing {
+                break;
+            }
+            let delay = wait
+                .saturating_sub(began.elapsed())
+                .min(Duration::from_millis(10));
             tokio::time::sleep(delay).await;
-            let Some(next) = domain.test_log.close_result(id) else {break;};
+            let Some(next) = domain.test_log.close_result(id) else {
+                break;
+            };
             status = next;
         }
         Ok(status)

@@ -321,7 +321,11 @@ impl SpanStore {
         let inner = self.inner.read().unwrap();
         let start = inner.buffer.partition_point(|s| s.seq < from);
         let end = inner.buffer.partition_point(|s| s.seq <= to);
-        let spans = inner.buffer.range(start..end.max(start)).map(|s| s.as_ref().clone()).collect();
+        let spans = inner
+            .buffer
+            .range(start..end.max(start))
+            .map(|s| s.as_ref().clone())
+            .collect();
         (
             spans,
             self.lost_below.load(std::sync::atomic::Ordering::Relaxed),
@@ -336,7 +340,11 @@ impl SpanStore {
             Some(idx) => {
                 let start = idx.saturating_sub(before);
                 let end = (idx + after + 1).min(inner.buffer.len());
-                inner.buffer.range(start..end).map(|s| s.as_ref().clone()).collect()
+                inner
+                    .buffer
+                    .range(start..end)
+                    .map(|s| s.as_ref().clone())
+                    .collect()
             }
             None => vec![],
         }
@@ -375,7 +383,9 @@ impl SpanStore {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        inner.latest_evicted_end = inner.latest_evicted_end.max(inner.buffer.iter().map(|s| s.end_time).max());
+        inner.latest_evicted_end = inner
+            .latest_evicted_end
+            .max(inner.buffer.iter().map(|s| s.end_time).max());
         inner.buffer.clear();
         inner.trace_index.clear();
         n

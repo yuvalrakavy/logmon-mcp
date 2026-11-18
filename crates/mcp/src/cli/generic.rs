@@ -190,8 +190,8 @@ fn coerce(raw: &str, node: Option<&Value>) -> Result<Value, String> {
         // follows the `_`, so a comma in a field name is legal, and guessing
         // there would reject valid input.
         Some("object") => {
-            let obj: Map<String, Value> = serde_json::from_str(raw)
-                .map_err(|e| format!("expected a JSON object: {e}"))?;
+            let obj: Map<String, Value> =
+                serde_json::from_str(raw).map_err(|e| format!("expected a JSON object: {e}"))?;
             Ok(Value::Object(obj))
         }
         Some("array") => {
@@ -1009,11 +1009,24 @@ mod tests {
 
     #[test]
     fn structured_evidence_and_replay_events_remain_objects() {
-        let end = parse("end_test", &["--fields", r#"{"message":"got = 3","line":9}"#]);
+        let end = parse(
+            "end_test",
+            &["--fields", r#"{"message":"got = 3","line":9}"#],
+        );
         assert_eq!(end["fields"]["line"], 9);
-        let replay = parse("replay_end_tests", &["--events", r#"{"execution_id":"a"}"#,
-                                                  "--events", r#"{"execution_id":"b"}"#]);
-        assert_eq!(replay["events"], serde_json::json!([{"execution_id":"a"},{"execution_id":"b"}]));
+        let replay = parse(
+            "replay_end_tests",
+            &[
+                "--events",
+                r#"{"execution_id":"a"}"#,
+                "--events",
+                r#"{"execution_id":"b"}"#,
+            ],
+        );
+        assert_eq!(
+            replay["events"],
+            serde_json::json!([{"execution_id":"a"},{"execution_id":"b"}])
+        );
     }
 
     /// The bug: accumulating only on the SECOND occurrence looks right and is

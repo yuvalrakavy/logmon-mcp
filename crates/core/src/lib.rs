@@ -7,11 +7,11 @@ pub mod gelf;
 pub mod logs;
 pub mod nightly;
 pub mod receiver;
-pub mod render;
 pub(crate) mod rejection;
+pub mod render;
 pub mod span;
-pub mod test_log;
 pub mod store;
+pub mod test_log;
 pub(crate) mod throttle;
 pub mod daemon {
     pub mod domain;
