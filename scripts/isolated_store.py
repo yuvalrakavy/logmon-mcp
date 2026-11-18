@@ -1,6 +1,8 @@
 """Boot disposable Store and MQTT servers, with only private ports and data."""
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
+import os
+import signal
 import json
 import shutil
 import tomllib
@@ -15,17 +17,30 @@ import time
 def child(command, env, cwd, logfile):
     with logfile.open("w") as stream:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=stream, stderr=subprocess.STDOUT)
+                                   stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             yield process
         finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+            stop_process_group(process)
+
+
+def stop_process_group(process):
+    # Store can launch ht_server/renderer children. End the private process group
+    # even if its original leader already exited, without matching host processes.
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
+    try:
+        process.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
 
 
 def wait_ready(process, port, log):

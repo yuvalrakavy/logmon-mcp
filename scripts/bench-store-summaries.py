@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import time
 
-from isolated_store import isolated_store
+from isolated_store import isolated_store, stop_process_group
 
 spec = importlib.util.spec_from_file_location("capture_fixture", Path(__file__).with_name("test-nightly-capture.py"))
 fixture = importlib.util.module_from_spec(spec)
@@ -198,7 +198,7 @@ def timed_arm(bins, source, root, files, label, percent, expected_failures, plan
                                if plan else ["--no-auto-rebake", "--no-template"])
                     proc = subprocess.Popen([runner, "--server", url, "--allow-stale", "--max-parallel-tests",
                                              "16", *options, *batch_files], env=runner_env,
-                                            stdout=log, stderr=subprocess.STDOUT, cwd=cwd)
+                                            stdout=log, stderr=subprocess.STDOUT, cwd=cwd, start_new_session=True)
                     try:
                         while proc.poll() is None:
                             live_rss, _ = process_stats(daemon.pid)
@@ -217,8 +217,7 @@ def timed_arm(bins, source, root, files, label, percent, expected_failures, plan
                                     raise RuntimeError(f"batch {number} exceeded 30 minutes")
                     finally:
                         if proc.poll() is None:
-                            proc.kill()
-                            proc.wait()
+                            stop_process_group(proc)
                     if proc.returncode not in (0, 1):
                         raise RuntimeError((root/"store-test.log").read_text()[-2500:])
                     statuses.append(proc.returncode)
