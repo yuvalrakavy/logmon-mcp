@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use logmon_broker_protocol::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,7 @@ fn loss_counters(d: &Domain) -> [u64; 4] {
 struct Execution {
     start: TestLogStart,
     end: Option<TestLogEnd>,
+    end_fields_hash: u64,
     received: Instant,
     baseline_drops: Option<[u64; 4]>,
     last_seen: DateTime<Utc>,
@@ -50,6 +52,20 @@ struct Execution {
 }
 
 impl Execution {
+    fn matches_identity(
+        &self,
+        name: &str,
+        selector: &TestLogSelector,
+        start: DateTime<Utc>,
+        rerun: Option<&str>,
+    ) -> bool {
+        name == self.start.name
+            && selector.field == self.start.selector.field
+            && selector.value == self.start.selector.value
+            && start == self.start.started_at
+            && rerun == self.start.rerun_of.as_deref()
+    }
+
     fn register_loss(&mut self, d: &Domain) {
         self.coverage["attributable_drops"] = Value::Null;
         self.coverage["domain_loss_during_window"] =
@@ -183,7 +199,12 @@ impl Run {
             _ => return Err("use opt-in, or opt-out with a default slow_if condition".into()),
         }
         let grace = Duration::from_millis(c.grace_period_ms.unwrap_or(10000));
-        if Instant::now().checked_add(grace).is_none() {
+        if Instant::now().checked_add(grace).is_none()
+            || chrono::Duration::from_std(grace)
+                .ok()
+                .and_then(|g| Utc::now().checked_add_signed(g))
+                .is_none()
+        {
             return Err("grace period cannot be represented".into());
         }
         Ok(())
@@ -218,8 +239,13 @@ impl Run {
         data["run_id"] = json!(self.config.run_id);
         self.journal.append(data);
     }
-    fn grace_deadline(&self) -> Instant {
-        Instant::now() + Duration::from_millis(self.config.grace_period_ms.unwrap_or(10000))
+    fn grace_window(&self) -> (Instant, DateTime<Utc>, DateTime<Utc>) {
+        let grace = Duration::from_millis(self.config.grace_period_ms.unwrap_or(10000));
+        let received = Utc::now();
+        let deadline = Instant::now() + grace;
+        let wall_cutoff =
+            received + chrono::Duration::from_std(grace).expect("validated grace duration");
+        (deadline, received, wall_cutoff)
     }
     fn register(
         &mut self,
@@ -278,6 +304,7 @@ impl Run {
                 summary,
                 sampled,
                 end: None,
+                end_fields_hash: 0,
                 decision: None,
                 reason: None,
                 capture_deadline: None,
@@ -293,10 +320,7 @@ impl Run {
     }
     pub fn start(&mut self, d: &Domain, s: TestLogStart) -> Result<Value, String> {
         if let Some(old) = self.entries.get(&s.execution_id) {
-            if old.start.name != s.name
-                || old.start.selector.field != s.selector.field
-                || old.start.selector.value != s.selector.value
-            {
+            if !old.matches_identity(&s.name, &s.selector, s.started_at, s.rerun_of.as_deref()) {
                 return Ok(refused(&s.run_id, "execution_identity_conflict"));
             }
             return Ok(
@@ -341,10 +365,27 @@ impl Run {
         reg: &[RegistryFact],
     ) -> Result<Value, String> {
         let id = e.execution_id.clone();
-        if let Some(old) = self.entries.get(&id).filter(|old| old.end.is_some()) {
-            return Ok(
-                json!({"status":"already_applied","run_id":e.run_id,"execution_id":id,"case_status":old.decision}),
-            );
+        let (deadline, received_at, cutoff) = self.grace_window();
+        // The archive and journal own the potentially large event body after
+        // acknowledgement. A digest lets us detect changed replay evidence.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        e.fields.hash(&mut hasher);
+        let fields_hash = hasher.finish();
+        if let Some(old) = self.entries.get(&id) {
+            if !old.matches_identity(&e.name, &e.selector, e.started_at, e.rerun_of.as_deref()) {
+                return Ok(refused(&e.run_id, "execution_identity_conflict"));
+            }
+            if let Some(accepted) = &old.end {
+                if accepted.ended_at != e.ended_at
+                    || accepted.verdict != e.verdict
+                    || old.end_fields_hash != fields_hash
+                {
+                    return Ok(refused(&e.run_id, "execution_outcome_conflict"));
+                }
+                return Ok(
+                    json!({"status":"already_applied","run_id":e.run_id,"execution_id":id,"case_status":old.decision}),
+                );
+            }
         }
         if self.closing {
             return Ok(refused(&e.run_id, "run_closed"));
@@ -352,14 +393,7 @@ impl Run {
         if e.ended_at < e.started_at {
             return Err("end precedes start".into());
         }
-        if let Some(old) = self.entries.get(&id) {
-            if old.start.name != e.name
-                || old.start.selector.field != e.selector.field
-                || old.start.selector.value != e.selector.value
-            {
-                return Ok(refused(&e.run_id, "execution_identity_conflict"));
-            }
-        } else {
+        if !self.entries.contains_key(&id) {
             self.register(
                 TestLogStart {
                     run_id: e.run_id.clone(),
@@ -376,15 +410,19 @@ impl Run {
                 None,
             )?;
             let ex = self.entries.get_mut(&id).unwrap();
-            if let Some(summary) = &mut ex.summary {
-                let mut coverage = summary.backfill(d, e.started_at, e.ended_at);
-                coverage["collection_mode"] = json!("ring_backfill");
-                coverage["coverage_as_of"] = json!(Utc::now());
-                ex.coverage = coverage;
-            }
+            ex.coverage = match &mut ex.summary {
+                Some(summary) => summary.backfill(d, e.started_at, e.ended_at),
+                None => Summary::backfill_coverage(d, e.started_at, e.ended_at),
+            };
+            ex.coverage["collection_mode"] = json!("ring_backfill");
+            ex.coverage["snapshot_at"] = ex.coverage["coverage_as_of"].clone();
         }
-        let deadline = self.grace_deadline();
         let ex = self.entries.get_mut(&id).unwrap();
+        if ex.coverage["collection_mode"] == "live" {
+            ex.coverage["snapshot_at"] = json!(received_at);
+            ex.coverage["coverage_as_of"] = json!(received_at);
+        }
+        ex.coverage["grace_cutoff"] = json!(cutoff);
         let elapsed = (e.ended_at - ex.start.started_at).num_milliseconds();
         let condition = ex.start.slow_if.as_deref().or_else(|| {
             if self.config.slow_pass.as_deref() == Some("opt-out") {
@@ -406,6 +444,7 @@ impl Run {
             None
         };
         ex.register_loss(d);
+        ex.end_fields_hash = fields_hash;
         ex.end = Some(e.clone());
         ex.deadline = Some(deadline);
         self.active.remove(&id);
@@ -413,6 +452,7 @@ impl Run {
         self.provenance = reg.to_vec();
         if self.entries[&id].decision.is_none() {
             if let Some(reason) = reason {
+                self.entries.get_mut(&id).unwrap().capture_deadline = Some(deadline);
                 self.admit(d, &id, reason, e.ended_at, replay, reg);
             }
         }
@@ -496,6 +536,7 @@ impl Run {
         let start = ex.start.started_at;
         let selector = Selector::new(&ex.start.selector.field, &ex.start.selector.value);
         let snapshot = CaptureSnapshot::new(d, selector, start, end);
+        let snapshot_at = snapshot.captured_at();
         let peers: Vec<_> = self
             .entries
             .iter()
@@ -529,14 +570,17 @@ impl Run {
             "peers": peers,
             "estimated_ms": ex.start.estimated_ms,
             "snapshot_delayed": delayed,
-            "captured_at": Utc::now(),
+            "captured_at": snapshot_at,
+            "grace_cutoff": ex.coverage["grace_cutoff"],
         });
+        self.entries.get_mut(id).unwrap().coverage["case_snapshot_at"] = json!(snapshot_at);
         self.order += 1;
         if is_slow {
             self.slow += 1;
         }
-        let ready = self.grace_deadline();
-        self.entries.get_mut(id).unwrap().capture_deadline = Some(ready);
+        let ready = self.entries[id]
+            .capture_deadline
+            .expect("set by capture caller");
         self.pending.insert(
             id.into(),
             Pending {
@@ -634,8 +678,10 @@ impl Run {
         reg: &[RegistryFact],
         closing: bool,
     ) {
-        let deadline = self.grace_deadline();
+        let (deadline, received_at, cutoff) = self.grace_window();
         let ex = self.entries.get_mut(id).unwrap();
+        ex.coverage["coverage_as_of"] = json!(received_at);
+        ex.coverage["grace_cutoff"] = json!(cutoff);
         ex.register_loss(d);
         ex.forced = closing;
         if !closing {
@@ -647,6 +693,7 @@ impl Run {
             self.grace.insert(id.into());
         }
         if ex.decision.is_none() {
+            ex.capture_deadline = Some(deadline);
             let end = if closing { ex.last_seen } else { Utc::now() };
             self.admit(d, id, reason, end, false, reg);
         }
@@ -767,6 +814,7 @@ impl Run {
         for id in ready {
             let ex = self.entries.get_mut(&id).unwrap();
             ex.register_loss(d);
+            ex.coverage["coverage_as_of"] = ex.coverage["grace_cutoff"].clone();
             ex.coverage["finalized_at"] = json!(Utc::now());
             let data = ex.summary_data();
             ex.summary = None;

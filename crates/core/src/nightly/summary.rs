@@ -228,6 +228,20 @@ impl Summary {
         }
     }
 
+    /// Coverage remains available for sampled-out executions without aggregating
+    /// any records.
+    pub fn backfill_coverage(
+        domain: &crate::daemon::domain::Domain,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Value {
+        domain.pipeline.with_retained(|logs| {
+            domain.span_store.with_retained(|spans| {
+                super::capture::coverage(&logs, &spans, domain.pipeline.current_seq(), start, end)
+            })
+        })
+    }
+
     pub fn backfill(
         &mut self,
         domain: &crate::daemon::domain::Domain,
@@ -240,10 +254,7 @@ impl Summary {
         domain.pipeline.with_retained(|logs| {
             domain.span_store.with_retained(|spans| {
                 for log in logs.records {
-                    if log.seq <= cutoff
-                        && (self.selector.field == "trace_id"
-                            || (start..=end).contains(&log.timestamp))
-                    {
+                    if log.seq <= cutoff && (start..=end).contains(&log.timestamp) {
                         // The domain has one synchronous processor per telemetry
                         // kind. At most its current record can still call our
                         // observer after releasing the ring write lock. Machine
@@ -260,10 +271,7 @@ impl Summary {
                     }
                 }
                 for span in spans.records {
-                    if span.seq <= cutoff
-                        && (self.selector.field == "trace_id"
-                            || (span.start_time <= end && span.end_time >= start))
-                    {
+                    if span.seq <= cutoff && span.start_time <= end && span.end_time >= start {
                         max_span = max_span.max(span.seq);
                         self.observe_span(span);
                     }

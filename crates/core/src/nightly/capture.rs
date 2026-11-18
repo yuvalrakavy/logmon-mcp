@@ -141,6 +141,10 @@ impl CaptureSnapshot {
         }
     }
 
+    pub fn captured_at(&self) -> DateTime<Utc> {
+        self.captured_at
+    }
+
     pub fn coverage(&self) -> Value {
         let mut result = self.ring_coverage.clone();
         result["coverage_as_of"] = json!(self.captured_at);

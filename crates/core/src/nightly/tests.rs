@@ -113,7 +113,7 @@ fn counts_are_selector_scoped_and_backfill_deduplicates_pending_callbacks() {
         "0000000000000000000000000000000a",
         &["kernel.entry_point".to_owned()],
     );
-    let coverage = counts.backfill(&d, s.start_time, s.end_time);
+    let coverage = counts.backfill(&d, event.timestamp, s.end_time);
     // The processor had stored these records when the snapshot took its lock,
     // but its callback on the test-log lock was still waiting.
     counts.observe_log(&event);

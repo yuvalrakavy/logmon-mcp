@@ -285,3 +285,84 @@ fn begin_refuses_to_replace_a_jsonl_file_owned_by_another_run() {
         original
     );
 }
+
+#[test]
+fn close_keeps_receipt_identity_immutable_and_stamps_fixed_coverage_cutoff() {
+    let f = Fixture::new();
+    f.begin("one", 30);
+    let mut evt = f.event("a");
+    f.rpc("start", evt.clone());
+    let mut other = evt.clone();
+    other["rerun_of"] = json!("other");
+    assert_eq!(f.rpc("start", other)["code"], "execution_identity_conflict");
+    evt["ended_at"] = json!(Utc::now());
+    evt["verdict"] = json!("FAIL");
+    evt["fields"] = json!({"message":"original"});
+    assert_eq!(f.rpc("end", evt.clone())["status"], "accepted");
+    f.close("one");
+    for (key, value, code) in [
+        ("name", json!("other"), "execution_identity_conflict"),
+        ("rerun_of", json!("other"), "execution_identity_conflict"),
+        (
+            "started_at",
+            json!(Utc::now()),
+            "execution_identity_conflict",
+        ),
+        ("verdict", json!("OK"), "execution_outcome_conflict"),
+        ("ended_at", json!(Utc::now()), "execution_outcome_conflict"),
+        (
+            "fields",
+            json!({"message":"altered"}),
+            "execution_outcome_conflict",
+        ),
+    ] {
+        let mut changed = evt.clone();
+        changed[key] = value;
+        let result = f.rpc("replay", json!({"run_id":"one","events":[changed]}));
+        assert_eq!(result["results"][0]["code"], code, "{key}");
+    }
+    assert_eq!(f.rpc("end", evt)["status"], "already_applied");
+    let rows = f.rows();
+    let coverage =
+        |event: &str| rows.iter().find(|r| r["event"] == event).unwrap()["coverage"].clone();
+    let initial = coverage("end-test");
+    let final_revision = coverage("summary-final");
+    let time = |v: &Value| chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap()).unwrap();
+    assert_eq!(initial["coverage_as_of"], initial["snapshot_at"]);
+    assert_eq!(
+        initial["case_snapshot_at"],
+        final_revision["case_snapshot_at"]
+    );
+    assert_eq!(initial["grace_cutoff"], final_revision["coverage_as_of"]);
+    assert_eq!(
+        time(&initial["grace_cutoff"]) - time(&initial["snapshot_at"]),
+        chrono::Duration::milliseconds(30)
+    );
+    assert!(time(&final_revision["finalized_at"]) >= time(&final_revision["coverage_as_of"]));
+}
+
+#[test]
+fn sampled_out_missing_start_still_reports_snapshot_and_independent_ring_bounds() {
+    let f = Fixture::new();
+    f.rpc("begin", json!({"run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),"summary_sample_percent":0,"grace_period_ms":5}));
+    let mut e = f.event("a");
+    e["verdict"] = json!("OK");
+    e["ended_at"] = json!(Utc::now());
+    assert_eq!(f.rpc("end", e)["status"], "accepted");
+    f.close("one");
+    let row = f
+        .rows()
+        .into_iter()
+        .find(|r| r["event"] == "summary-final")
+        .unwrap();
+    assert!(row["summary"].is_null());
+    assert_eq!(row["coverage"]["collection_mode"], "ring_backfill");
+    assert_eq!(
+        row["coverage"]["coverage_as_of"],
+        row["coverage"]["grace_cutoff"]
+    );
+    assert!(row["coverage"]["snapshot_at"].is_string());
+    for key in ["log_coverage", "span_coverage"] {
+        assert_eq!(row["coverage"][key]["status"], "retained");
+    }
+}
