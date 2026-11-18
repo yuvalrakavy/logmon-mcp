@@ -4,7 +4,7 @@ use logmon_broker_protocol::*;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as SyncMutex};
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, oneshot, Mutex, Notify};
 
@@ -37,12 +37,25 @@ struct Pending {
     closed: bool,
 }
 
+/// A cancelled caller no longer needs a response slot. This synchronous mutex
+/// only guards the ID map; no I/O happens under it.
+struct ResponseSlot<'a> {
+    id: u64,
+    pending: &'a SyncMutex<Pending>,
+}
+
+impl Drop for ResponseSlot<'_> {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().calls.remove(&self.id);
+    }
+}
+
 /// Owns the writer half of the daemon socket and the pending-response map.
 /// The reader half runs in a background task spawned by [`DaemonBridge::spawn`]
 /// or [`DaemonBridge::start_reader`].
 pub struct DaemonBridge {
-    writer: Mutex<Box<dyn AsyncWrite + Unpin + Send>>,
-    pending: Arc<Mutex<Pending>>,
+    writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    pending: Arc<SyncMutex<Pending>>,
     next_id: AtomicU64,
     notification_tx: broadcast::Sender<Notification>,
     /// Notified when the reader task exits (EOF or transport error). The
@@ -59,7 +72,7 @@ pub struct DaemonBridge {
 /// once the ordering-critical work is done.
 pub struct PendingReader {
     reader: Box<dyn AsyncBufRead + Unpin + Send>,
-    pending: Arc<Mutex<Pending>>,
+    pending: Arc<SyncMutex<Pending>>,
     notification_tx: broadcast::Sender<Notification>,
     disconnect: Arc<Notify>,
 }
@@ -110,12 +123,12 @@ impl DaemonBridge {
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
         let (reader, writer) = tokio::io::split(stream);
-        let pending = Arc::new(Mutex::new(Pending::default()));
+        let pending = Arc::new(SyncMutex::new(Pending::default()));
         let buf_reader = tokio::io::BufReader::new(reader);
         let disconnect = Arc::new(Notify::new());
 
         let bridge = Self {
-            writer: Mutex::new(Box::new(writer)),
+            writer: Arc::new(Mutex::new(Box::new(writer))),
             pending: pending.clone(),
             next_id: AtomicU64::new(1),
             notification_tx: notification_tx.clone(),
@@ -185,20 +198,27 @@ impl DaemonBridge {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = RpcRequest::new(id, method, params);
         let request = if display { request.rendered() } else { request };
+        // Wait without queuing a detached task: at most one write can outlive
+        // its caller if a socket stalls or a lifecycle deadline expires.
+        let mut writer = self.writer.clone().lock_owned().await;
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.pending.lock().unwrap();
             if pending.closed {
                 return Err(BridgeError::Closed);
             }
             pending.calls.insert(id, tx);
         }
-        {
-            let mut writer = self.writer.lock().await;
-            transport::write_message(&mut *writer, &request)
-                .await
-                .map_err(|e| BridgeError::Transport(io::Error::other(e)))?;
-        }
+        let _slot = ResponseSlot {
+            id,
+            pending: &self.pending,
+        };
+        // A deadline can expire in the middle of a multi-write JSON frame.
+        // Finish that frame before releasing the shared connection for reuse.
+        tokio::spawn(async move { transport::write_message(&mut *writer, &request).await })
+            .await
+            .map_err(|e| BridgeError::Transport(io::Error::other(e)))?
+            .map_err(|e| BridgeError::Transport(io::Error::other(e)))?;
         let response = rx.await.map_err(|_| BridgeError::Closed)?;
         match response.error {
             Some(err) => Err(BridgeError::Rpc {
@@ -239,7 +259,7 @@ impl DaemonBridge {
 /// the `disconnect` signal so the reconnect machinery can take over.
 fn spawn_reader_loop(
     mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
-    pending: Arc<Mutex<Pending>>,
+    pending: Arc<SyncMutex<Pending>>,
     notification_tx: broadcast::Sender<Notification>,
     disconnect: Arc<Notify>,
 ) {
@@ -247,7 +267,7 @@ fn spawn_reader_loop(
         loop {
             match transport::read_daemon_message(&mut reader).await {
                 Ok(Some(DaemonMessage::Response(resp))) => {
-                    if let Some(tx) = pending.lock().await.calls.remove(&resp.id) {
+                    if let Some(tx) = pending.lock().unwrap().calls.remove(&resp.id) {
                         let _ = tx.send(resp);
                     }
                 }
@@ -269,7 +289,7 @@ fn spawn_reader_loop(
         // No reply can arrive any more: fail every call still waiting, and refuse new ones —
         // see `Pending`.
         {
-            let mut pending = pending.lock().await;
+            let mut pending = pending.lock().unwrap();
             pending.closed = true;
             pending.calls.clear();
         }
@@ -306,6 +326,50 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn cancelled_call_releases_its_slot_and_finishes_its_frame() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, daemon) = tokio::io::duplex(32);
+        let (tx, _) = broadcast::channel(4);
+        let bridge = Arc::new(DaemonBridge::spawn(client, tx).await.unwrap());
+        let calling = bridge.clone();
+        let first = tokio::spawn(async move {
+            calling
+                .call("test_log.end", serde_json::json!({"data": "x".repeat(512)}))
+                .await
+        });
+        let mut daemon = tokio::io::BufReader::new(daemon);
+        let mut prefix = [0; 1];
+        daemon.read_exact(&mut prefix).await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(bridge.pending.lock().unwrap().calls.is_empty());
+
+        let server = tokio::spawn(async move {
+            let mut first_frame = String::from_utf8(prefix.to_vec()).unwrap();
+            daemon.read_line(&mut first_frame).await.unwrap();
+            let req: RpcRequest = serde_json::from_str(&first_frame).unwrap();
+            assert_eq!(req.method, "test_log.end");
+            let next = transport::read_request(&mut daemon).await.unwrap().unwrap();
+            let reply = serde_json::json!({"jsonrpc":"2.0","id":next.id,"result":"ok"});
+            daemon
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let next = tokio::time::timeout(
+            Duration::from_secs(3),
+            bridge.call("status.get", serde_json::json!({})),
+        )
+        .await
+        .expect("subsequent request can use the connection")
+        .unwrap();
+        assert_eq!(next, "ok");
+        server.await.unwrap();
+    }
 
     /// A daemon that closes the connection without answering — it restarted, or the request's
     /// handler panicked — fails the call in flight, and every later call on that connection,
@@ -364,12 +428,12 @@ mod tests {
 
         // Wait until the reader has given up on the garbage.
         for _ in 0..500 {
-            if bridge.pending.lock().await.closed {
+            if bridge.pending.lock().unwrap().closed {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(bridge.pending.lock().await.closed, "the reader stopped");
+        assert!(bridge.pending.lock().unwrap().closed, "the reader stopped");
 
         let call = tokio::time::timeout(
             Duration::from_secs(10),

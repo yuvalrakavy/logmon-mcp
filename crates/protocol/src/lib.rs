@@ -1,9 +1,11 @@
 pub mod mcp_tools;
 pub mod methods;
 pub mod notifications;
+pub mod test_log;
 
 pub use methods::*;
 pub use notifications::*;
+pub use test_log::*;
 // Deliberately NOT re-exported at the crate root: `mcp_tools` describes one
 // front-end's surface, not the wire protocol, and a future second front-end
 // should have to name it rather than find it among the protocol types.

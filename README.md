@@ -985,6 +985,32 @@ Useful when:
 
 CLI calls are one-shot: no reconnect, fast-fail with a 5-second call timeout, no auto-start of the broker. Run the broker as a service first. **Triggers never fire in CLI mode** — the invocation exits before a matching log can arrive, so use the CLI to *manage* triggers and subscribe to fires over MCP or the SDK. **Collectors do work across invocations**, since CLI mode uses a persistent named session: `collectors add` → run your workload → `collectors get` is the intended shape.
 
+## Nightly test logs
+
+A runner opens one run per domain at an absolute JSONL path in an existing run directory.
+The SDK methods `test_log_start` and `test_log_end` identify each execution by its run ID,
+execution ID, and telemetry selector. Use the same execution ID when retrying a delivery.
+The CLI exposes the same operations under `test-log`:
+
+```bash
+logmon-mcp --domain nightly --json test-log begin --run-id night-42 --jsonl-path /runs/42/tests.jsonl
+logmon-mcp --domain nightly --json test-log close --run-id night-42 --wait-timeout-ms 10000
+```
+
+Close reports pending cases if its wait expires. Check both finalization and persistence
+before publishing a report. A completed case path resolves relative to the JSONL file.
+After domain cleanup, read the append-only file with the offline reader:
+
+```bash
+logmon-test-log lookup /runs/42/tests.jsonl EXECUTION_ID
+logmon-test-log export /runs/42/tests.jsonl
+logmon-test-log compare /runs/41/tests.jsonl CHAIN_NAME /runs/42/tests.jsonl CHAIN_NAME --by-name
+```
+
+The reader applies the latest summary revision per execution and joins its case outcome
+and late-telemetry diagnostics. For a stable name with multiple attempts in a run, use
+execution IDs to select the pair for comparison.
+
 ## Configuration
 
 Config and state live in `~/.config/logmon/` on both macOS and Linux:

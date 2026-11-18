@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 use clap::{Parser, Subcommand};
 use logmon_broker_protocol::*;
@@ -62,6 +62,19 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
         "version": PROTOCOL_VERSION,
         "definitions": {
             // Method param/result structs
+            "TestLogSelector": schema_for!(TestLogSelector),
+            "TestLogBegin": schema_for!(TestLogBegin),
+            "TestLogStart": schema_for!(TestLogStart),
+            "TestLogEnd": schema_for!(TestLogEnd),
+            "TestLogMachineLoad": schema_for!(TestLogMachineLoad),
+            "TestLogClose": schema_for!(TestLogClose),
+            "TestLogSeal": schema_for!(TestLogSeal),
+            "TestLogReplay": schema_for!(TestLogReplay),
+            "TestLogAck": schema_for!(TestLogAck),
+            "TestLogPendingCase": schema_for!(TestLogPendingCase),
+            "TestLogCloseResult": schema_for!(TestLogCloseResult),
+            "TestLogReplayResult": schema_for!(TestLogReplayResult),
+            "TestVerdict": schema_for!(TestVerdict),
             "LogsRecent":            schema_for!(LogsRecent),
             "LogsRecentResult":      schema_for!(LogsRecentResult),
             // logs.fields. The nested row types are listed too: this map is

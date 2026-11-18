@@ -1,0 +1,76 @@
+//! Offline inspection of nightly JSONL after its broker domain is gone.
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use logmon_broker_sdk::test_log_file::{compare_summaries, TestLogFile};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "logmon-test-log",
+    about = "Read one local nightly test-log, or compare two executions"
+)]
+struct Cli {
+    #[command(subcommand)]
+    action: Action,
+}
+
+#[derive(Subcommand)]
+enum Action {
+    /// Read one execution's latest summary, timing and case disposition.
+    Lookup {
+        file: PathBuf,
+        execution: String,
+        /// Select by stable name when there is only one matching attempt.
+        #[arg(long)]
+        by_name: bool,
+    },
+    /// Export the latest revisions for the whole run, with gap and settlement diagnostics.
+    Export { file: PathBuf },
+    /// Compare observed counters, span durations and collected attributes.
+    Compare {
+        before_file: PathBuf,
+        before: String,
+        after_file: PathBuf,
+        after: String,
+        /// Resolve both selectors as stable names instead of execution IDs.
+        #[arg(long)]
+        by_name: bool,
+    },
+}
+
+fn main() -> Result<()> {
+    let value = match Cli::parse().action {
+        Action::Export { file } => serde_json::to_value(TestLogFile::open(&file)?)?,
+        Action::Lookup {
+            file,
+            execution,
+            by_name,
+        } => {
+            let log = TestLogFile::open(&file)?;
+            serde_json::to_value(if by_name {
+                log.lookup_name(&execution)?
+            } else {
+                log.lookup(&execution)?
+            })?
+        }
+        Action::Compare {
+            before_file,
+            before,
+            after_file,
+            after,
+            by_name,
+        } => {
+            let a = TestLogFile::open(&before_file)?;
+            let b = TestLogFile::open(&after_file)?;
+            let (x, y) = if by_name {
+                (a.lookup_name(&before)?, b.lookup_name(&after)?)
+            } else {
+                (a.lookup(&before)?, b.lookup(&after)?)
+            };
+            compare_summaries(x, y)
+        }
+    };
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;
+    println!();
+    Ok(())
+}

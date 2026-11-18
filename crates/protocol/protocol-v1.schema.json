@@ -4,6 +4,726 @@
   "description": "logmon broker JSON-RPC protocol, PROTOCOL_VERSION = 1",
   "version": 1,
   "definitions": {
+    "TestLogSelector": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogSelector",
+      "type": "object",
+      "properties": {
+        "field": {
+          "description": "Field to match on logs and spans, such as trace_id.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Exact selector value identifying this execution.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "value"
+      ]
+    },
+    "TestLogBegin": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogBegin",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Identity of this run, unique across invocations.",
+          "type": "string"
+        },
+        "jsonl_path": {
+          "description": "Absolute JSONL path chosen by the run owner.",
+          "type": "string"
+        },
+        "test_timeout_ms": {
+          "description": "Missing-end deadline in milliseconds, default 600000.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "grace_period_ms": {
+          "description": "Time to collect late telemetry after a verdict, default 10000 ms.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lifecycle_ack_timeout_ms": {
+          "description": "Caller acknowledgement budget for live start/end in milliseconds, default 100.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_failures": {
+          "description": "Number of primary failures eligible for cases, default 500.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_rerun_cases": {
+          "description": "Number of isolated reruns eligible for cases, including passes.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_slow_pass_cases": {
+          "description": "Maximum slow-pass admissions before refusing further slow cases, default 20.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "collect_distinct": {
+          "description": "Span attributes whose distinct values should be retained independently.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "slow_pass": {
+          "description": "Slow-pass policy: opt-in or opt-out.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slow_if": {
+          "description": "Default condition when slow passes are enabled by default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary_sample_percent": {
+          "description": "Stable percentage of chain names selected for detailed summaries (0 to 100).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "run_id",
+        "jsonl_path"
+      ]
+    },
+    "TestLogStart": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogStart",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Identity of the active run.",
+          "type": "string"
+        },
+        "execution_id": {
+          "description": "Identity of this execution; a retry of the same marker reuses it.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Stable fully qualified test or chain name.",
+          "type": "string"
+        },
+        "selector": {
+          "description": "Field/value pair attributing telemetry to this execution.",
+          "$ref": "#/$defs/TestLogSelector"
+        },
+        "started_at": {
+          "description": "Original start timestamp with UTC offset.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "estimated_ms": {
+          "description": "Expected elapsed duration in milliseconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "test_timeout_ms": {
+          "description": "Positive per-execution missing-end deadline overriding the run default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "slow_if": {
+          "description": "Slow-pass condition for this execution, or off to disable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rerun_of": {
+          "description": "Original execution ID if this is an isolated rerun.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "run_id",
+        "execution_id",
+        "name",
+        "selector",
+        "started_at"
+      ],
+      "$defs": {
+        "TestLogSelector": {
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Field to match on logs and spans, such as trace_id.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Exact selector value identifying this execution.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "field",
+            "value"
+          ]
+        }
+      }
+    },
+    "TestLogEnd": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogEnd",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Identity of the active run.",
+          "type": "string"
+        },
+        "execution_id": {
+          "description": "Identity of the execution whose outcome is being reported.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Original stable test or chain name, required for missing-start recovery.",
+          "type": "string"
+        },
+        "selector": {
+          "description": "Original field/value pair used to backfill when start was unobserved.",
+          "$ref": "#/$defs/TestLogSelector"
+        },
+        "started_at": {
+          "description": "Start time from the runner, retained on replay.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "description": "End time from the runner, retained on replay.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "verdict": {
+          "description": "Runner's original execution outcome.",
+          "$ref": "#/$defs/TestVerdict"
+        },
+        "rerun_of": {
+          "description": "Original execution ID for an isolated rerun.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fields": {
+          "description": "Additional evidence; conventional keys include message, failed_test, file and line.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "run_id",
+        "execution_id",
+        "name",
+        "selector",
+        "started_at",
+        "ended_at",
+        "verdict"
+      ],
+      "$defs": {
+        "TestLogSelector": {
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Field to match on logs and spans, such as trace_id.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Exact selector value identifying this execution.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "field",
+            "value"
+          ]
+        },
+        "TestVerdict": {
+          "type": "string",
+          "enum": [
+            "OK",
+            "FAIL",
+            "TIMEOUT",
+            "ABORTED"
+          ]
+        }
+      }
+    },
+    "TestLogMachineLoad": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogMachineLoad",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Identity of the active run.",
+          "type": "string"
+        },
+        "ts": {
+          "description": "Source timestamp for the machine sample.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "host": {
+          "description": "Name of the sampled host.",
+          "type": "string"
+        },
+        "fields": {
+          "description": "Sampler payload, including load or process details.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "run_id",
+        "ts",
+        "host"
+      ]
+    },
+    "TestLogClose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogClose",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Identity of the run to close; repeating close returns the current state.",
+          "type": "string"
+        },
+        "wait_timeout_ms": {
+          "description": "Maximum time in milliseconds to await settled results; zero checks immediately.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "run_id",
+        "wait_timeout_ms"
+      ]
+    },
+    "TestLogSeal": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogSeal",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Exact identity of the abandoned run; a successor cannot be sealed by a stale caller.",
+          "type": "string"
+        },
+        "wait_timeout_ms": {
+          "description": "Maximum milliseconds to wait for finalization.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "run_id"
+      ]
+    },
+    "TestLogReplay": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogReplay",
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "description": "Run to reconcile before closing.",
+          "type": "string"
+        },
+        "events": {
+          "description": "Unconfirmed end events, in order, at most 100 per request.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TestLogEnd"
+          }
+        }
+      },
+      "required": [
+        "run_id",
+        "events"
+      ],
+      "$defs": {
+        "TestLogEnd": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "description": "Identity of the active run.",
+              "type": "string"
+            },
+            "execution_id": {
+              "description": "Identity of the execution whose outcome is being reported.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Original stable test or chain name, required for missing-start recovery.",
+              "type": "string"
+            },
+            "selector": {
+              "description": "Original field/value pair used to backfill when start was unobserved.",
+              "$ref": "#/$defs/TestLogSelector"
+            },
+            "started_at": {
+              "description": "Start time from the runner, retained on replay.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "ended_at": {
+              "description": "End time from the runner, retained on replay.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "verdict": {
+              "description": "Runner's original execution outcome.",
+              "$ref": "#/$defs/TestVerdict"
+            },
+            "rerun_of": {
+              "description": "Original execution ID for an isolated rerun.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fields": {
+              "description": "Additional evidence; conventional keys include message, failed_test, file and line.",
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "run_id",
+            "execution_id",
+            "name",
+            "selector",
+            "started_at",
+            "ended_at",
+            "verdict"
+          ]
+        },
+        "TestLogSelector": {
+          "type": "object",
+          "properties": {
+            "field": {
+              "description": "Field to match on logs and spans, such as trace_id.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Exact selector value identifying this execution.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "field",
+            "value"
+          ]
+        },
+        "TestVerdict": {
+          "type": "string",
+          "enum": [
+            "OK",
+            "FAIL",
+            "TIMEOUT",
+            "ABORTED"
+          ]
+        }
+      }
+    },
+    "TestLogAck": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogAck",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "Daemon decision: accepted, already_applied or refused.",
+          "type": "string"
+        },
+        "code": {
+          "description": "Machine-readable refusal reason, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "Run addressed by this operation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_id": {
+          "description": "Execution addressed by this operation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "case_status": {
+          "description": "Capture admission decision or case state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "test_log_health": {
+          "description": "A degraded writer may accept the lifecycle operation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "additionalProperties": true
+    },
+    "TestLogPendingCase": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogPendingCase",
+      "type": "object",
+      "properties": {
+        "execution_id": {
+          "description": "Execution awaiting case finalization.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Stable name of the test or chain.",
+          "type": "string"
+        },
+        "state": {
+          "description": "Current pending state.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_id",
+        "name",
+        "state"
+      ]
+    },
+    "TestLogCloseResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogCloseResult",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "Operation disposition when supplied; refusals carry a code.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "description": "Machine-readable refusal reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "Run addressed by this request.",
+          "type": "string"
+        },
+        "finalization": {
+          "description": "settled or pending for a successfully initiated close.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "persistence": {
+          "description": "complete, degraded or incomplete, independent of finalization.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending_summaries": {
+          "description": "Number of summaries awaiting finalization.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "pending_cases": {
+          "description": "Cases still awaiting a terminal decision.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TestLogPendingCase"
+          }
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "additionalProperties": true,
+      "$defs": {
+        "TestLogPendingCase": {
+          "type": "object",
+          "properties": {
+            "execution_id": {
+              "description": "Execution awaiting case finalization.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Stable name of the test or chain.",
+              "type": "string"
+            },
+            "state": {
+              "description": "Current pending state.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "execution_id",
+            "name",
+            "state"
+          ]
+        }
+      }
+    },
+    "TestLogReplayResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogReplayResult",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "Disposition for the batch, or refused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "code": {
+          "description": "Machine-readable batch refusal reason.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "results": {
+          "description": "Per-item applied, already_applied or refused decisions in input order.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TestLogAck"
+          },
+          "default": []
+        }
+      },
+      "$defs": {
+        "TestLogAck": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "description": "Daemon decision: accepted, already_applied or refused.",
+              "type": "string"
+            },
+            "code": {
+              "description": "Machine-readable refusal reason, when present.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "description": "Run addressed by this operation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution_id": {
+              "description": "Execution addressed by this operation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "case_status": {
+              "description": "Capture admission decision or case state.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "test_log_health": {
+              "description": "A degraded writer may accept the lifecycle operation.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "additionalProperties": true
+        }
+      }
+    },
+    "TestVerdict": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestVerdict",
+      "type": "string",
+      "enum": [
+        "OK",
+        "FAIL",
+        "TIMEOUT",
+        "ABORTED"
+      ]
+    },
     "LogsRecent": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "LogsRecent",

@@ -9,6 +9,7 @@
 //! `<group>_<verb>` (e.g. `logs.recent` → `logs_recent`).
 
 use crate::{Broker, BrokerError};
+use logmon_broker_protocol::test_log::*;
 use logmon_broker_protocol::{
     BookmarksAdd, BookmarksAddResult, BookmarksClear, BookmarksClearResult, BookmarksList,
     BookmarksListResult, BookmarksRemove, BookmarksRemoveResult, CollectorsAdd,
@@ -30,6 +31,41 @@ use logmon_broker_protocol::{
 };
 
 impl Broker {
+    /// Open the run's JSONL file in the bound domain, or return the existing owner when a different run is active.
+    pub async fn test_log_begin(&self, p: TestLogBegin) -> Result<TestLogAck, BrokerError> {
+        self.call_typed("test_log.begin", p).await
+    }
+
+    /// Register a chain or individual execution and its telemetry selector.
+    pub async fn test_log_start(&self, p: TestLogStart) -> Result<TestLogAck, BrokerError> {
+        self.call_typed("test_log.start", p).await
+    }
+
+    /// Record the original verdict and failure evidence and request capture when policy qualifies.
+    pub async fn test_log_end(&self, p: TestLogEnd) -> Result<TestLogAck, BrokerError> {
+        self.call_typed("test_log.end", p).await
+    }
+
+    /// Associate a timestamped machine sample with overlapping executions in the run.
+    pub async fn test_log_machine_load(&self, p: TestLogMachineLoad) -> Result<TestLogAck, BrokerError> {
+        self.call_typed("test_log.machine_load", p).await
+    }
+
+    /// Stop new starts and wait within the supplied budget for the run's finalization and persistence status.
+    pub async fn test_log_close(&self, p: TestLogClose) -> Result<TestLogCloseResult, BrokerError> {
+        self.call_typed("test_log.close", p).await
+    }
+
+    /// Explicitly close the named abandoned run, preserving incomplete executions and refusing a stale owner.
+    pub async fn test_log_seal(&self, p: TestLogSeal) -> Result<TestLogCloseResult, BrokerError> {
+        self.call_typed("test_log.seal", p).await
+    }
+
+    /// Reconcile a bounded batch of original end events before closing the run. Returns per-item outcomes.
+    pub async fn test_log_replay(&self, p: TestLogReplay) -> Result<TestLogReplayResult, BrokerError> {
+        self.call_typed("test_log.replay", p).await
+    }
+
     // ---- logs.* ----
     pub async fn logs_recent(&self, p: LogsRecent) -> Result<LogsRecentResult, BrokerError> {
         self.call_typed("logs.recent", p).await

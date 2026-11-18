@@ -11,6 +11,8 @@ pub mod filter;
 mod methods;
 mod reconnect;
 pub mod transport;
+pub mod test_log_file;
+pub use logmon_broker_protocol::test_log;
 
 pub use filter::{Filter, FilterBuilder, FilterSpanKind, FilterSpanStatus, Level};
 

@@ -199,6 +199,48 @@ impl Tool {
 /// that file readable when a tool is added.
 pub const TOOLS: &[Tool] = &[
     Tool {
+        name: "begin_test_log",
+        method: "test_log.begin",
+        description: "Open the run's JSONL file in the bound domain, or return the existing owner when a different run is active.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "start_test",
+        method: "test_log.start",
+        description: "Register a chain or individual execution and its telemetry selector.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "end_test",
+        method: "test_log.end",
+        description: "Record the original verdict and failure evidence and request capture when policy qualifies.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "machine_load",
+        method: "test_log.machine_load",
+        description: "Associate a timestamped machine sample with overlapping executions in the run.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "end_test_log",
+        method: "test_log.close",
+        description: "Stop new starts and wait within the supplied budget for the run's finalization and persistence status.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "seal_test_log",
+        method: "test_log.seal",
+        description: "Explicitly close the named abandoned run, preserving incomplete executions and refusing a stale owner.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "replay_end_tests",
+        method: "test_log.replay",
+        description: "Reconcile a bounded batch of original end events before closing the run. Returns per-item outcomes.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "get_status",
         method: "status.get",
         description: "Get current server status including buffer sizes, trigger counts, connection info, and message statistics",
@@ -1106,8 +1148,7 @@ mod tests {
         // stdio and counts what it advertises — NOT a source scan in
         // `mcp/src/server.rs`, which is what this comment used to claim. There
         // is no tool list in the shim to scan: the daemon teaches it.
-        // 50 since `load_case` (cases.load).
-        assert_eq!(TOOLS.len(), 50);
+        assert_eq!(TOOLS.len(), 57);
         for Tool {
             name: tool, method, ..
         } in TOOLS
