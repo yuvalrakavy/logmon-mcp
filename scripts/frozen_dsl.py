@@ -20,13 +20,15 @@ def load_plan(nightly_run, source, only_batches):
             continue
         with log.open() as stream:
             words = shlex.split(stream.readline().strip())
-        if (len(words) < 3 or words[0] != "$" or Path(words[1]).name != "store-test"
-                or "--max-parallel-tests" not in words
-                or words[words.index("--max-parallel-tests") + 1] != "16"):
-            raise ValueError(f"{log}: expected a 16-worker Store DSL batch")
-        files = [word for word in words[2:] if word.startswith("tests/")]
-        if not files or any(".." in Path(f).parts or not (source / f).is_file()
-                            or not (source / f).resolve().is_relative_to(source / "tests") for f in files):
+        # These are the flags the replay supplies explicitly. Refuse unfamiliar
+        # selections (e.g. a future --test filter) instead of running a wider suite.
+        if (len(words) < 10 or words[0] != "$" or Path(words[1]).name != "store-test"
+                or words[2:6] != ["--allow-stale", "--max-parallel-tests", "16", "--results-out"]
+                or words[7:9] != ["-v", "failed"]):
+            raise ValueError(f"{log}: unrecognised Store batch command")
+        files = words[9:]
+        if any(not f.startswith("tests/") or ".." in Path(f).parts or not (source / f).is_file()
+               or not (source / f).resolve().is_relative_to(source / "tests") for f in files):
             raise ValueError(f"{log}: missing or unexpected DSL file")
         plan[number] = files
     if not plan or set(only_batches) - plan.keys():
