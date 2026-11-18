@@ -985,30 +985,57 @@ Useful when:
 
 CLI calls are one-shot: no reconnect, fast-fail with a 5-second call timeout, no auto-start of the broker. Run the broker as a service first. **Triggers never fire in CLI mode** — the invocation exits before a matching log can arrive, so use the CLI to *manage* triggers and subscribe to fires over MCP or the SDK. **Collectors do work across invocations**, since CLI mode uses a persistent named session: `collectors add` → run your workload → `collectors get` is the intended shape.
 
-## Nightly test logs
+<a id="nightly-test-logs"></a>
 
-A runner opens one run per domain at an absolute JSONL path in an existing run directory.
-The SDK methods `test_log_start` and `test_log_end` identify each execution by its run ID,
-execution ID, and telemetry selector. Use the same execution ID when retrying a delivery.
-The CLI exposes the same operations under `test-log`:
+## Test logs for parallel runs
+
+When tests share a service, their logs and spans arrive interleaved. If a CI test
+fails overnight, the broker's live buffers may have rolled over by the time someone
+investigates. A test-log gives the runner a durable JSONL record of each execution.
+A failure can also create a standard case ZIP with the assertion, retained logs and
+spans, overlapping executions, and any machine-load samples from the interval.
+Passing executions provide a baseline: for example, compare how many database
+spans a test emitted in a passing build and a failing one.
+
+**Choose what counts as one execution.** It can be a test function, an integration
+scenario, or a group of dependent steps. Give it a stable name for comparisons
+and a fresh ID for each attempt. The selector tells logmon which telemetry belongs
+to it. Use `trace_id` if your services propagate one trace across the execution.
+If an attempt creates several traces, attach a field such as `test_attempt_id` to
+each log and span and select on that field instead. The runner sends lifecycle
+calls; the application or its telemetry library supplies the selector on records.
+
+**Try the lifecycle from a shell.** This example simulates a failing catalog test
+using the local broker's default domain. Choose an idle domain and an existing
+directory writable by the broker. In a real runner, use the actual trace ID,
+timestamps, verdict and assertion. Applications using MCP or the Rust SDK can
+send the same lifecycle operations.
 
 ```bash
-logmon-mcp --domain nightly --json test-log begin --run-id night-42 --jsonl-path /runs/42/tests.jsonl
-logmon-mcp --domain nightly --json test-log close --run-id night-42 --wait-timeout-ms 10000
+domain=default
+dir=$(mktemp -d)
+id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+run="ci-${id:0:12}"
+control() { logmon-mcp --session "$run" --domain "$domain" --json test-log "$@" ; }
+
+control begin --run-id "$run" --jsonl-path "$dir/tests.jsonl"
+started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+attempt=(--run-id "$run" --execution-id "$id" --name 'catalog/read'
+         --selector.field trace_id --selector.value "$id" --started-at "$started")
+control start "${attempt[@]}"
+
+# Run the test here, propagating the selector through its telemetry.
+control end "${attempt[@]}" --ended-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --verdict FAIL --fields '{"message":"expected 3 rows, received 2"}'
+control close --run-id "$run" --wait-timeout-ms 15000
+logmon-test-log lookup "$dir/tests.jsonl" "$id"
 ```
 
-The run owner chooses an unused JSONL filename. For a failed execution, these
-commands register the selector and carry the original assertion to the broker.
-Set `domain`, `run`, `id`, `started` and `ended` to your domain, run ID, fresh
-32-hex trace ID and the runner’s RFC 3339 timestamps. Run these between begin and close.
-
-```bash
-logmon-mcp --domain "$domain" --json test-log start --run-id "$run" --execution-id "$id" \
-  --name 'catalog/read' --selector.field trace_id --selector.value "$id" --started-at "$started"
-logmon-mcp --domain "$domain" --json test-log end --run-id "$run" --execution-id "$id" \
-  --name 'catalog/read' --selector.field trace_id --selector.value "$id" --started-at "$started" \
-  --ended-at "$ended" --verdict FAIL --fields '{"message":"expected 3 rows, received 2","failed_test":"read"}'
-```
+Use `--verdict OK` for a pass. Even an all-green run produces the JSONL with
+verdicts and timing. By default, detailed summaries include span counts and
+durations by name and log counts by level. An ordinary pass produces no case ZIP.
+A fresh attempt linked with `rerun_of` can preserve a passing rerun as evidence
+for a failure that occurs only under parallel load.
 
 `begin` accepts repeatable `--collect-distinct` span attributes. Detailed summaries
 use a stable hash of the execution name for `--summary-sample-percent`. Lifecycle
@@ -1016,8 +1043,8 @@ and case eligibility apply to every execution. The default hard timeout is 600,0
 overridable with `--test-timeout-ms` on start. After a verdict, batched telemetry
 has a default 10,000 ms grace period, set with `--grace-period-ms` on begin.
 
-The default `--max-failures` is 500. Store uses 50 primary failure slots, 10
-separate rerun slots including passing reruns, and up to 20 slow-pass admissions.
+Set `--max-failures` to the number of initial failures eligible for cases (default 500).
+Use `--max-rerun-cases` and `--max-slow-pass-cases` to budget those captures separately.
 For slow passes, begin with `--slow-pass opt-out --slow-if 'elapsed > 4 * estimated'`
 or opt individual executions in with a start condition. Captures record ring
 coverage and queue or budget skips. Inspect those fields when interpreting missing
@@ -1042,7 +1069,7 @@ After domain cleanup, read the append-only file with the offline reader:
 ```bash
 logmon-test-log lookup /runs/42/tests.jsonl EXECUTION_ID
 logmon-test-log export /runs/42/tests.jsonl
-logmon-test-log compare /runs/41/tests.jsonl CHAIN_NAME /runs/42/tests.jsonl CHAIN_NAME --by-name
+logmon-test-log compare /runs/41/tests.jsonl STABLE_TEST_NAME /runs/42/tests.jsonl STABLE_TEST_NAME --by-name
 ```
 
 The reader applies the latest summary revision per execution and joins its case outcome
@@ -1067,26 +1094,11 @@ python3 scripts/test-nightly-rust.py target.noindex/debug "$TRACING_INIT_CHECKOU
   "$WRAPPER_BIN_DIR/logmon-nextest-wrapper" "$CARGO_TARGET_DIR"
 ```
 
-The transport fixture checks capture and reload. Store’s rollout gate measures its
-actual 16-way DSL workload against the nightly’s 2% elapsed-time budget. A fixture
-pass alone cannot establish the cost of enabling full summaries.
-
-To reproduce a Store nightly selection, supply its run directory and a candidate Store
-checkout with built debug binaries. First inspect the recorded batch order:
-
-```sh
-python3 scripts/bench-store-summaries.py target.noindex/debug "$STORE_CHECKOUT" \
-  --nightly-run "$NIGHTLY_RUN_DIR" --plan-only
-```
-
-For a supervised measurement replace `--plan-only` with `--pairs 3 --records "$NEW_DIRECTORY"`.
-If full summaries exceed the 2% budget, add `--summary-percent P` to compare the
-disabled arm with stable-name sampling at P percent.
-For a rehearsal use `--batch NUMBER --single-arm 100 --records "$NEW_DIRECTORY"`.
-The paired run freezes the binaries and inputs and uses private brokers, Store servers
-and template copies. Compare completed tests, sender discards, receiver drops,
-acknowledgement p99, and DSL wall time for each arm. A representative production
-run may take several hours per arm.
+Before enabling detailed summaries for a large suite, run the same workload
+with `--summary-sample-percent 0` and `100`. Compare elapsed time, completed
+tests, telemetry drops, and start/end acknowledgement latency. If full collection
+costs too much for your CI window, try an intermediate percentage. Sampling by
+stable name keeps the same tests available for comparisons across builds.
 
 ## Configuration
 
@@ -1305,6 +1317,7 @@ usually where a change and its tests belong.
 
 Issues, PRs, and design discussions are welcome. A few ground rules:
 
+- Write feature guides for a reader integrating logmon with their own project. Explain the problem the feature solves and give a runnable example. Keep project-specific runbooks alongside their integration or benchmark tools.
 - Run `scripts/verify.sh` before opening a PR. It is `fmt` + `verify-schema` + `clippy` + the full `--all-features` suite, each exactly once.
 - If your change touches `crates/protocol/src/methods.rs` or `notifications.rs`, regenerate the schema with `cargo xtask verify-schema` and commit the result.
 - A new tool is declared **once**, in `crates/protocol/src/mcp_tools.rs` — name, method, description, and any CLI-only facts. The daemon serves it over `tools.manifest`, and the MCP router and CLI command both fall out of that. There is no client-side list to update.

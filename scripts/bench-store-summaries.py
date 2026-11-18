@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paired pilot using a private broker, Store server, and 16 Store DSL workers."""
+"""Paired pilot using a private broker, Store server, and 16 Store DSL workers. See bench-store-summaries.md for usage."""
 import argparse
 from collections import Counter
 import csv

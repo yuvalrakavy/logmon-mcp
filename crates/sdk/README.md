@@ -4,7 +4,7 @@ Typed Rust client for the logmon broker daemon.
 
 `logmon-broker-sdk` speaks JSON-RPC 2.0 over a Unix domain socket against `logmon-broker`. It exposes a typed method per RPC, a typed `Notification` enum on a broadcast channel, a builder for the broker's filter DSL, and a reconnection state machine that resumes named sessions across daemon restarts.
 
-This guide is the canonical reference for SDK consumers (test harnesses, archival workers, dashboards). The `logmon-mcp` shim is the first SDK consumer; `store-test` is the second. Anything that needs broker access from Rust without going through MCP belongs here.
+This guide is the canonical reference for SDK consumers (test harnesses, archival workers, dashboards). Anything that needs broker access from Rust without going through MCP belongs here.
 
 > **Note on cursor support.** This guide describes the cursor surface from `docs/superpowers/specs/2026-05-01-cursor-bookmarks-design.md`. The cursor implementation lands together with this doc on the `feat/broker-ification` branch; references to `Filter::builder().cursor(...)` and `cursor_advanced_to` reflect the post-implementation state.
 
@@ -71,8 +71,8 @@ async fn main() -> anyhow::Result<()> {
 
 Use the caller’s existing domain-bound connection for repeated lifecycle requests.
 The runner assigns a fresh execution ID, a stable comparison name and the actual
-selector shared by its logs and spans. On Store the selector field is `trace_id`
-and one execution covers a whole dependency chain. The SDK exports request types
+selector shared by its logs and spans. For example, select on `trace_id` for a distributed integration test,
+or on a custom attempt field for a test that starts several independent traces. The SDK exports request types
 through `logmon_broker_sdk::test_log` and the following methods on `Broker`.
 
 | Method | Inputs that identify the operation |
@@ -87,7 +87,7 @@ through `logmon_broker_sdk::test_log` and the following methods on `Broker`.
 Set one caller-side deadline around connection acquisition, sending and waiting for a
 start or end reply. The driver distributes `lifecycle_ack_timeout_ms` from the run
 configuration (default 100 ms). A disconnected caller journals its original end
-and continues its test. Concurrent chains share the breaker. After 5 seconds one
+and continues its test. Share the circuit breaker across concurrent executions in the run. After 5 seconds one
 probe checks recovery; failed probes back off to 30 seconds. A definite
 `wrong_run_id` or `no_active_run` refusal disables reporting for that invocation.
 Successful lifecycle acknowledgement can carry degraded JSONL health.
@@ -101,7 +101,7 @@ and inspect both `finalization` and `persistence`. The runner owns its verdicts.
 For local historical analysis, `test_log_file::TestLogFile::open` loads the JSONL,
 `lookup` retrieves an execution and `journal_status` supplies file-wide gaps,
 sampling and closure status. `compare_summaries` takes any two execution records.
-The bundled [CLI reader](../../README.md#nightly-test-logs) exposes the same operations.
+The bundled [CLI reader](../../README.md#test-logs-for-parallel-runs) exposes the same operations.
 
 ### Iterating recent traces
 

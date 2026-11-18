@@ -1,7 +1,7 @@
 ---
 name: logmon
 user_invocable: true
-description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Use the offline reader for a nightly test-log JSONL and load_case for a saved logmon case. Skip unrelated static logs and projects without telemetry.
+description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Use the offline reader for a runner’s test-log JSONL and load_case for a saved logmon case. Skip unrelated static logs and projects without telemetry.
 ---
 
 # Using the log monitor (logmon)
@@ -30,14 +30,14 @@ Skip it (and say so) when:
 - The broker isn't running and the project doesn't ship telemetry. Don't try to invent log lines.
 - The question is purely about source structure or types — read code, not logs.
 
-## Investigating a nightly failure
+## Investigating a test run
 
-Start with the run directory in the morning report. After the original domain expires,
+Locate the JSONL in the runner’s saved artifacts. An all-green run can be investigated from this file too. After the original domain expires,
 `logmon-test-log export /path/to/test-log.jsonl` lists its executions. Choose the
 execution ID of the initial failure or its isolated rerun, then run
 `logmon-test-log lookup /path/to/test-log.jsonl EXECUTION_ID`. Read the runner’s
-assertion, failed member, verdict, coverage, and case status. Store summaries cover
-the dependency chain. The entry-point set includes work from all its members. For nextest,
+assertion, failed member, verdict, coverage, and case status. Check the unit of execution chosen by the runner. If it groups multiple steps,
+counts and distinct span attribute values cover the entire group. For nextest,
 look up the stable `rust:<binary>::<test>` name and select the individual attempt. Its
 `test_attempt_id` selector includes detached thread and task events from instrumented
 processes. Uninstrumented Rust tests can still have a verdict and captured failure output.

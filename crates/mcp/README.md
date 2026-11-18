@@ -9,7 +9,7 @@ The `logmon-mcp` binary serves two roles:
 Both modes connect to the same broker daemon (`logmon-broker`) over the same Unix domain socket.
 
 The same Cargo package installs `logmon-test-log`, an offline JSONL reader with
-`lookup`, `export` and `compare` commands. See the [nightly test-log guide](../../README.md#nightly-test-logs)
+`lookup`, `export` and `compare` commands. See the [test logs for parallel runs](../../README.md#test-logs-for-parallel-runs)
 for reader examples and lifecycle arguments.
 
 ## CLI quick reference
