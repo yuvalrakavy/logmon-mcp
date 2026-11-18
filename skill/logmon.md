@@ -37,7 +37,10 @@ Start with the run directory in the morning report. After the original domain ex
 execution ID of the initial failure or its isolated rerun, then run
 `logmon-test-log lookup /path/to/test-log.jsonl EXECUTION_ID`. Read the runner’s
 assertion, failed member, verdict, coverage, and case status. Store summaries cover
-the dependency chain. The entry-point set includes work from all its members.
+the dependency chain. The entry-point set includes work from all its members. For nextest,
+look up the stable `rust:<binary>::<test>` name and select the individual attempt. Its
+`test_attempt_id` selector includes detached thread and task events from instrumented
+processes. Uninstrumented Rust tests can still have a verdict and captured failure output.
 
 Resolve `case_path` against the JSONL’s directory. Use `load_case(path=…)` on that
 ZIP and query the returned postmortem domain. Read its overlap list and machine-load

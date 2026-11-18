@@ -1052,6 +1052,16 @@ cargo build --locked -p logmon-broker -p logmon-mcp --bins
 python3 scripts/test-nightly-capture.py target.noindex/debug
 ```
 
+For Rust attempts, use the nextest wrapper and `#[tracing_init::logmon_test]` from tracing-init.
+The wrapper records the process verdict and failure output. The attribute puts the
+`test_attempt_id` selector on structured telemetry. This check exercises both, including
+a spawned Tokio task, an ordinary thread, and a passing rerun of a failed test:
+
+```sh
+python3 scripts/test-nightly-rust.py target.noindex/debug "$TRACING_INIT_CHECKOUT" \
+  "$WRAPPER_BIN_DIR/logmon-nextest-wrapper" "$CARGO_TARGET_DIR"
+```
+
 The transport fixture checks capture and reload. Store’s rollout gate measures its
 actual 16-way DSL workload against the nightly’s 2% elapsed-time budget. A fixture
 pass alone cannot establish the cost of enabling full summaries.
