@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
@@ -83,6 +84,12 @@ def summary_stats(journal):
             counts["executions_over_span_name_limit"] += bool(summary["span_overflow"]["count"])
             counts["omitted_attribute_keys"] += summary["omitted_attribute_keys"]
     return dict(counts)
+
+
+def exporter_warnings(runner_log):
+    pattern = r"telemetry availability — (\S+): (\d+) export failure\(s\), (\d+) batch\(es\) discarded"
+    return {service: {"export_failures": int(failures), "discarded_batches": int(discarded)}
+            for service, failures, discarded in re.findall(pattern, runner_log.read_text())}
 
 
 def timed_arm(bins, source, root, files, label, percent, expected_failures):
@@ -162,7 +169,8 @@ def timed_arm(bins, source, root, files, label, percent, expected_failures):
                         daemon_cpu_s=cpu_after-cpu_before, loadavg_start=load_at_start,
                         loadavg_end=os.getloadavg(), ingestion=rates.report(), summaries=summary_stats(journal),
                         fail_end=ack_stats(failures),
-                        receiver_drops=status["receiver_drops"])
+                        receiver_drops=status["receiver_drops"],
+                        sender_exporter_warnings=exporter_warnings(root/"store-test.log"))
 
 
 if __name__ == "__main__":
