@@ -729,15 +729,19 @@ impl Run {
         delay
     }
 
+    pub fn flush_late_counts(&mut self, now: Instant) {
+        for id in std::mem::take(&mut self.dirty_late) {
+            let e = &self.entries[&id];
+            self.append("late-telemetry-counts",json!({"execution_id":id,"logs":e.late_logs,"spans":e.late_spans,"as_of":Utc::now()}));
+        }
+        self.last_late_flush = now;
+    }
+
     pub fn tick(&mut self, d: &Arc<Domain>, now: Instant) {
         if now.saturating_duration_since(self.last_late_flush) >= Duration::from_secs(1)
             && !self.dirty_late.is_empty()
         {
-            for id in std::mem::take(&mut self.dirty_late) {
-                let e = &self.entries[&id];
-                self.append("late-telemetry-counts",json!({"execution_id":id,"logs":e.late_logs,"spans":e.late_spans,"as_of":Utc::now()}));
-            }
-            self.last_late_flush = now;
+            self.flush_late_counts(now);
         }
         let timeouts: Vec<_> = self
             .active

@@ -1868,6 +1868,7 @@ impl RpcHandler {
             "broker_version": broker_version,
             "broker_tools": broker_tools,
             "receivers": self.receivers_info,
+            "spans_received": d.span_store.total_received(),
             "store": {
                 "total_received": stats.total_received,
                 "total_stored": stats.total_stored,

@@ -12,8 +12,34 @@ use std::time::Duration;
 const MAX_RECORDS: usize = 4096;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// A closed run can still be retrying a failed write when its successor opens.
+/// Account for both queues against the same per-domain allowance.
+#[derive(Default)]
+pub(super) struct QueueBudget {
+    used: Mutex<(usize, usize)>, // records and encoded bytes
+}
+
+impl QueueBudget {
+    fn reserve(&self, bytes: usize) -> bool {
+        let mut used = self.used.lock().unwrap();
+        if used.0 >= MAX_RECORDS || bytes > MAX_BYTES.saturating_sub(used.1) {
+            return false;
+        }
+        used.0 += 1;
+        used.1 += bytes;
+        true
+    }
+
+    fn release(&self, records: usize, bytes: usize) {
+        let mut used = self.used.lock().unwrap();
+        used.0 -= records;
+        used.1 -= bytes;
+    }
+}
+
 #[derive(Default)]
 struct State {
+    budget: Arc<QueueBudget>,
     queue: VecDeque<Arc<[u8]>>,
     bytes: usize,
     lost: u64,
@@ -24,6 +50,12 @@ struct State {
     stopping: bool,
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        self.budget.release(self.queue.len(), self.bytes);
+    }
+}
+
 type Shared = Arc<(Mutex<State>, Condvar)>;
 
 pub(super) struct Journal {
@@ -32,7 +64,7 @@ pub(super) struct Journal {
 }
 
 impl Journal {
-    pub fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path, budget: Arc<QueueBudget>) -> io::Result<Self> {
         if !path.is_absolute() || path.file_name().is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -41,11 +73,13 @@ impl Journal {
         }
         // The nightly owns the run directory. Never overwrite another run.
         let file = OpenOptions::new().create_new(true).write(true).open(path)?;
-        Self::from_file(path, file)
+        Self::from_file(path, file, budget)
     }
 
-    fn from_file(path: &Path, file: File) -> io::Result<Self> {
-        let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
+    fn from_file(path: &Path, file: File, budget: Arc<QueueBudget>) -> io::Result<Self> {
+        let mut state = State::default();
+        state.budget = budget;
+        let shared = Arc::new((Mutex::new(state), Condvar::new()));
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("test-log-writer".into())
@@ -60,7 +94,7 @@ impl Journal {
         let mut bytes = serde_json::to_vec(&record).expect("JSON value serializes");
         bytes.push(b'\n');
         let mut s = self.shared.0.lock().unwrap();
-        if s.queue.len() >= MAX_RECORDS || s.bytes.saturating_add(bytes.len()) > MAX_BYTES {
+        if !s.budget.reserve(bytes.len()) {
             s.lost += 1;
             self.shared.1.notify_one();
             return;
@@ -131,6 +165,7 @@ fn write_loop(mut file: File, shared: Shared) {
                 } else {
                     s.queue.pop_front();
                     s.bytes -= bytes.len();
+                    s.budget.release(1, bytes.len());
                 }
                 s.degraded = false;
             }
@@ -156,10 +191,36 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn successive_unwritable_runs_share_the_domain_byte_budget() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let budget = Arc::new(QueueBudget::default());
+        let open = || {
+            Journal::from_file(
+                temp.path(),
+                File::open(temp.path()).unwrap(),
+                budget.clone(),
+            )
+            .unwrap()
+        };
+        let first = open();
+        let second = open();
+        let row = json!({"event":"end-test"});
+        let bytes = serde_json::to_vec(&row).unwrap().len() + 1;
+        assert!(budget.reserve(MAX_BYTES - bytes));
+        first.append(row.clone());
+        second.append(row.clone());
+        assert_eq!(first.status()["lost_records"], 0);
+        assert_eq!(second.status()["lost_records"], 1);
+        budget.release(1, MAX_BYTES - bytes);
+        second.append(row);
+        assert_eq!(second.status()["lost_records"], 1);
+    }
+
+    #[test]
     fn write_failure_does_not_stall_acks_and_reports_pending_rows() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let file = File::open(temp.path()).unwrap(); // read-only descriptor forces append failure
-        let journal = Journal::from_file(temp.path(), file).unwrap();
+        let journal = Journal::from_file(temp.path(), file, Arc::default()).unwrap();
         journal.append(json!({"event":"end-test"}));
         let limit = Instant::now() + Duration::from_secs(2);
         loop {

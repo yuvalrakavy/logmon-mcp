@@ -25,6 +25,7 @@ pub struct TestLog {
     state: Mutex<State>,
     observing: AtomicBool,
     changed: Condvar,
+    writer_budget: Arc<writer::QueueBudget>,
 }
 
 #[derive(Default)]
@@ -163,7 +164,10 @@ impl TestLog {
             }
         }
         Run::validate_config(&config)?;
-        let journal = match writer::Journal::open(Path::new(&config.jsonl_path)) {
+        let journal = match writer::Journal::open(
+            Path::new(&config.jsonl_path),
+            self.writer_budget.clone(),
+        ) {
             Ok(writer) => writer,
             Err(e) => {
                 return Ok(
@@ -208,7 +212,9 @@ impl TestLog {
                 }
             })
             .map_err(|e| e.to_string())?;
-        if let Some(previous) = state.run.replace(run) {
+        let health = run.journal.status()["test_log_health"].clone();
+        if let Some(mut previous) = state.run.replace(run) {
+            previous.flush_late_counts(Instant::now());
             let result = previous.close_result();
             let pending_writer = (result["pending_records"] != 0).then_some(previous.journal);
             state.closed.insert(
@@ -221,7 +227,7 @@ impl TestLog {
         }
         self.observing.store(true, Ordering::Release);
         self.changed.notify_all();
-        Ok(json!({"status":"accepted","run_id":id,"test_log_health":"healthy"}))
+        Ok(json!({"status":"accepted","run_id":id,"test_log_health":health}))
     }
 
     pub(crate) fn close_result(&self, id: &str) -> Option<Value> {
