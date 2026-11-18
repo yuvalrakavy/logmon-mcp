@@ -47,11 +47,13 @@ fn main() -> Result<()> {
             by_name,
         } => {
             let log = TestLogFile::open(&file)?;
-            serde_json::to_value(if by_name {
+            let mut result = serde_json::to_value(if by_name {
                 log.lookup_name(&execution)?
             } else {
                 log.lookup(&execution)?
-            })?
+            })?;
+            result["test_log_status"] = log.journal_status();
+            result
         }
         Action::Compare {
             before_file,
@@ -67,7 +69,10 @@ fn main() -> Result<()> {
             } else {
                 (a.lookup(&before)?, b.lookup(&after)?)
             };
-            compare_summaries(x, y)
+            let mut result = compare_summaries(x, y);
+            result["before"]["test_log_status"] = a.journal_status();
+            result["after"]["test_log_status"] = b.journal_status();
+            result
         }
     };
     serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;

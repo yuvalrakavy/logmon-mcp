@@ -14,6 +14,10 @@ use std::path::Path;
 pub struct TestLogFile {
     pub run_id: Option<String>,
     pub settled: bool,
+    pub sealed: bool,
+    pub closed_incomplete: bool,
+    pub sampling_algorithm: Option<String>,
+    pub summary_sample_percent: Option<f64>,
     pub reported_lost_records: u64,
     pub partial_last_line: bool,
     pub executions: BTreeMap<String, Map<String, Value>>,
@@ -56,13 +60,36 @@ impl TestLogFile {
                 bail!("multiple run IDs in the same journal");
             }
         }
-        if kind == "run-settled" {
-            self.settled = true;
-        }
-        if kind == "test-log-gap" {
-            self.reported_lost_records = self
-                .reported_lost_records
-                .max(row["lost_records"].as_u64().unwrap_or(0));
+        match kind.as_str() {
+            "begin-test-log" => {
+                self.sampling_algorithm = row
+                    .get("sampling_algorithm")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.summary_sample_percent = Some(
+                    row.get("settings")
+                        .and_then(|v| v.get("summary_sample_percent"))
+                        .and_then(Value::as_f64)
+                        .unwrap_or(100.),
+                );
+            }
+            "end-test-log" | "seal-test-log" => {
+                self.sealed = kind == "seal-test-log";
+                self.closed_incomplete = self.sealed
+                    || row
+                        .get("incomplete")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+            }
+            "run-settled" => self.settled = true,
+            "test-log-gap" => {
+                let lost = row
+                    .get("lost_records")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow!("gap record missing lost_records count"))?;
+                self.reported_lost_records = self.reported_lost_records.max(lost);
+            }
+            _ => {}
         }
         let Some(id) = row.get("execution_id").and_then(Value::as_str) else {
             return Ok(());
@@ -70,6 +97,14 @@ impl TestLogFile {
         let entry = self.executions.entry(id.to_owned()).or_default();
         match kind.as_str() {
             "start-test" | "end-test" | "incomplete" | "summary-final" => {
+                // A timeout case can finish before the authoritative end arrives.
+                // Preserve the independently recorded terminal case outcome.
+                if matches!(
+                    entry.get("case_status").and_then(Value::as_str),
+                    Some("ready" | "error" | "evicted_for_priority")
+                ) {
+                    row.remove("case_status");
+                }
                 entry.extend(row);
                 entry.insert("summary_final".into(), Value::Bool(kind == "summary-final"));
             }
@@ -94,6 +129,14 @@ impl TestLogFile {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Include file-level diagnostics when presenting a single execution or a comparison.
+    pub fn journal_status(&self) -> Value {
+        json!({"run_id":self.run_id,"settled":self.settled,"sealed":self.sealed,
+            "closed_incomplete":self.closed_incomplete, "reported_lost_records":self.reported_lost_records,
+            "partial_last_line":self.partial_last_line, "sampling_algorithm":self.sampling_algorithm,
+            "summary_sample_percent":self.summary_sample_percent})
     }
 
     pub fn lookup(&self, execution_id: &str) -> Result<&Map<String, Value>> {
@@ -138,6 +181,7 @@ fn context(row: &Map<String, Value>) -> Map<String, Value> {
         "summary_final",
         "closure_incomplete",
         "late_telemetry_observed",
+        "late_telemetry_counts",
     ] {
         if let Some(v) = row.get(key) {
             out.insert(key.to_owned(), v.clone());
@@ -222,6 +266,34 @@ mod tests {
         assert_eq!(row["summary"]["log_levels"]["ERROR"], 2);
         assert_eq!(row["case_path"], "cases/a.zip");
         assert!(report.settled && report.partial_last_line);
+    }
+
+    #[test]
+    fn late_end_cannot_reopen_a_finished_timeout_case() {
+        let rows = [
+            json!({"event":"case-ready","execution_id":"e","case_status":"ready","case_path":"cases/e.zip"}),
+            json!({"event":"end-test","execution_id":"e","case_status":"pending","verdict":"OK"}),
+        ].map(|v|v.to_string()).join("\n");
+        let report = TestLogFile::read(rows.as_bytes()).unwrap();
+        let entry = report.lookup("e").unwrap();
+        assert_eq!(entry["case_status"], "ready");
+        assert_eq!(entry["verdict"], "OK");
+    }
+
+    #[test]
+    fn sealed_or_gapped_run_remains_visible_after_settlement() {
+        let rows = [
+            json!({"event":"begin-test-log","settings":{"summary_sample_percent":25.},"sampling_algorithm":"fnv1a64-v1"}),
+            json!({"event":"seal-test-log","incomplete":true}),
+            json!({"event":"test-log-gap","lost_records":3}),
+            json!({"event":"run-settled"}),
+        ].map(|row|row.to_string()).join("\n");
+        let summary = TestLogFile::read(rows.as_bytes()).unwrap().journal_status();
+        assert_eq!(summary["reported_lost_records"], 3);
+        assert_eq!(summary["settled"], true);
+        assert_eq!(summary["closed_incomplete"], true);
+        assert_eq!(summary["summary_sample_percent"], 25.);
+        assert!(TestLogFile::read(br#"{"event":"test-log-gap"}"#.as_slice()).is_err());
     }
 
     #[test]
