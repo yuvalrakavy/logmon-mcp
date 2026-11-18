@@ -107,7 +107,7 @@ def timed_arm(bins, source, root, files, label, percent, expected_failures):
                 path = cwd / "pilot.tests"
                 path.write_text("".join('test "pilot_%d" tags "fast smoke harness" expect_errors {\n'
                     '    run script { store.query("/"); 42 } { assert result == 42 }\n}\n' % i for i in range(32)))
-                files = [path]
+                files = [path.name]  # stable chain names across disposable run directories
             control("begin", jsonl_path=journal, grace_period_ms=1000, collect_distinct=["kernel.entry_point"],
                     summary_sample_percent=percent)
             rates = IngestRates(fixture.cli(frontend, env, "status", "get"))
