@@ -84,30 +84,34 @@ def sampled_name(name, percent):
 
 def summary_stats(journal, percent=None):
     counts = Counter()
-    for line in journal.read_text().splitlines():
-        row = json.loads(line)
-        if row["event"] in ("case-ready", "case-error", "late-telemetry", "test-log-gap"):
-            counts[row["event"]] += 1
-        if row["event"] != "summary-final":
-            continue
-        counts[row["summary_status"]] += 1
-        if percent is not None and (row["summary_status"] == "collected") != sampled_name(row["name"], percent):
-            raise RuntimeError(f"incorrect stable-name sampling for {row['name']} at {percent}%")
-        if summary := row.get("summary"):
-            counts["truncated_attribute_sets"] += sum(
-                bool(v.get("truncated")) for v in summary["distinct_values"].values())
-            counts["executions_over_span_name_limit"] += bool(summary["span_overflow"]["count"])
-            counts["omitted_attribute_keys"] += summary["omitted_attribute_keys"]
+    with journal.open() as source:
+        for line in source:
+            row = json.loads(line)
+            if row["event"] in ("case-ready", "case-error", "late-telemetry", "test-log-gap"):
+                counts[row["event"]] += 1
+            if row["event"] != "summary-final":
+                continue
+            counts[row["summary_status"]] += 1
+            if percent is not None and (row["summary_status"] == "collected") != sampled_name(row["name"], percent):
+                raise RuntimeError(f"incorrect stable-name sampling for {row['name']} at {percent}%")
+            if summary := row.get("summary"):
+                counts["truncated_attribute_sets"] += sum(
+                    bool(v.get("truncated")) for v in summary["distinct_values"].values())
+                counts["executions_over_span_name_limit"] += bool(summary["span_overflow"]["count"])
+                counts["omitted_attribute_keys"] += summary["omitted_attribute_keys"]
     return dict(counts)
 
 
 def exporter_warnings(runner_log):
     pattern = r"telemetry availability — (\S+): (\d+) export failure\(s\), (\d+) batch\(es\) discarded"
     totals = {}
-    for service, failures, discarded in re.findall(pattern, runner_log.read_text()):
-        count = totals.setdefault(service, {"export_failures": 0, "discarded_batches": 0})
-        count["export_failures"] += int(failures)
-        count["discarded_batches"] += int(discarded)
+    with runner_log.open(errors="replace") as stream:
+        for line in stream:
+            if match := re.search(pattern, line):
+                service, failures, discarded = match.groups()
+                count = totals.setdefault(service, {"export_failures": 0, "discarded_batches": 0})
+                count["export_failures"] += int(failures)
+                count["discarded_batches"] += int(discarded)
     return totals
 
 
