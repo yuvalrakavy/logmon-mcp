@@ -2435,6 +2435,9 @@ pub struct StatusGetResult {
     /// elsewhere in this payload (and in `collectors.*`) is a lower bound.
     #[serde(default)]
     pub trace_ingest: TraceIngestCounts,
+    /// Span entries received by the current domain, including entries since evicted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spans_received: Option<u64>,
     /// The domain the calling session is currently bound to (§7). Additive:
     /// an older daemon that omits it deserializes as `""`.
     #[serde(default)]

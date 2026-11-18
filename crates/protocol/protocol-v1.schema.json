@@ -5209,6 +5209,15 @@
             "malformed_dropped": 0
           }
         },
+        "spans_received": {
+          "description": "Span entries received by the current domain, including entries since evicted.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "current_domain": {
           "description": "The domain the calling session is currently bound to (§7). Additive:\nan older daemon that omits it deserializes as `\"\"`.",
           "type": "string",
