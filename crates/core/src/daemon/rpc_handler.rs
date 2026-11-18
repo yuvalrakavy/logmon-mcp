@@ -495,6 +495,7 @@ impl RpcHandler {
     /// Handle an RPC request for a given session.
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         let result = match request.method.as_str() {
+            name if name.starts_with("test_log.") => self.handle_test_log(session_id, name, &request.params),
             "logs.recent" => self.handle_logs_recent(session_id, &request.params),
             "logs.fields" => self.handle_logs_fields(session_id, &request.params),
             "logs.profile" => self.handle_logs_profile(session_id, &request.params),
@@ -567,6 +568,49 @@ impl RpcHandler {
         }
     }
 
+    fn handle_test_log(
+        &self,
+        sid: &SessionId,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, String> {
+        self.require_live(sid, method)?;
+        let domain = self.resolve_domain(sid)?;
+        let provenance = match method {
+            "test_log.end" | "test_log.replay" | "test_log.close" | "test_log.seal"
+            | "test_log.begin" => self.case_registry_copy(sid, Utc::now()).0,
+            _ => Vec::new(),
+        };
+        domain.test_log.rpc(&domain, method, params, provenance)
+    }
+
+    async fn handle_test_log_close(
+        &self,
+        sid: &SessionId,
+        request: &RpcRequest,
+    ) -> Result<Value,String> {
+        use std::time::{Duration, Instant};
+
+        let began = Instant::now();
+        let params = &request.params;
+        let wait = Duration::from_millis(params["wait_timeout_ms"].as_u64().unwrap_or(0));
+        let id = params["run_id"].as_str().unwrap_or("");
+        let domain = self.resolve_domain(sid)?;
+        let mut status = self.handle_test_log(sid, &request.method, params)?;
+        while status["status"] != "refused" && began.elapsed() < wait {
+            // Even after summaries/cases settle, allow an otherwise healthy
+            // writer to flush the final rows inside the caller's wait budget.
+            let flushing = status["test_log_health"] == "healthy"
+                && status["pending_records"].as_u64().unwrap_or(0) > 0;
+            if status["finalization"] != "pending" && !flushing {break;}
+            let delay = wait.saturating_sub(began.elapsed()).min(Duration::from_millis(10));
+            tokio::time::sleep(delay).await;
+            let Some(next) = domain.test_log.close_result(id) else {break;};
+            status = next;
+        }
+        Ok(status)
+    }
+
     /// Add `_display` when the caller asked for it and this method has a
     /// renderer. The one place presentation enters a reply.
     ///
@@ -602,6 +646,12 @@ impl RpcHandler {
     /// here; every other method — including the synchronous `domains.delete` /
     /// `domains.list` — delegates to the synchronous [`Self::handle`].
     pub async fn handle_async(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
+        if matches!(request.method.as_str(), "test_log.close" | "test_log.seal") {
+            return match self.handle_test_log_close(session_id, request).await {
+                Ok(value) => RpcResponse::success(request.id, value),
+                Err(error) => RpcResponse::error(request.id, -32601, &error),
+            };
+        }
         if request.method == "cases.load" {
             // Async for the same reason `domains.create` is: it creates a domain,
             // and `create_lock` is a `tokio::sync::Mutex`. Without it two loads

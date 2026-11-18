@@ -122,6 +122,7 @@ pub struct DomainConfig {
 pub struct Domain {
     pub config: DomainConfig,
     pub pipeline: Arc<LogPipeline>,
+    pub test_log: Arc<crate::test_log::TestLog>,
     pub span_store: Arc<SpanStore>,
     pub bookmarks: Arc<BookmarkStore>,
     pub metrics: Arc<ReceiverMetrics>,
@@ -187,6 +188,7 @@ impl Domain {
     ) -> Self {
         Self {
             config,
+            test_log: pipeline.test_log.clone(),
             pipeline,
             span_store,
             bookmarks,
