@@ -1075,6 +1075,8 @@ python3 scripts/bench-store-summaries.py target.noindex/debug "$STORE_CHECKOUT" 
 ```
 
 For a supervised measurement replace `--plan-only` with `--pairs 3 --records "$NEW_DIRECTORY"`.
+If full summaries exceed the 2% budget, add `--summary-percent P` to compare the
+disabled arm with stable-name sampling at P percent.
 For a rehearsal use `--batch NUMBER --single-arm 100 --records "$NEW_DIRECTORY"`.
 The paired run freezes the binaries and inputs and uses private brokers, Store servers
 and template copies. Compare completed tests, sender discards, receiver drops,
