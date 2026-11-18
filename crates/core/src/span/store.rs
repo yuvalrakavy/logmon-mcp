@@ -33,7 +33,7 @@ struct SpanStoreInner {
     /// critical section, and `from_records` asserts its input. So a seq is found by binary
     /// search and `front()`/`back()` are the lowest and highest (the log store's invariant,
     /// for the same reasons).
-    buffer: VecDeque<SpanEntry>,
+    buffer: VecDeque<Arc<SpanEntry>>,
     /// Each trace's held seqs, ascending.
     trace_index: HashMap<u128, Vec<u64>>,
     capacity: usize,
@@ -111,7 +111,7 @@ impl SpanStore {
         let mut trace_index: HashMap<u128, Vec<u64>> = HashMap::new();
         for s in spans {
             trace_index.entry(s.trace_id).or_default().push(s.seq);
-            buffer.push_back(s);
+            buffer.push_back(Arc::new(s));
         }
         let cap = capacity.max(buffer.len());
         Self {
@@ -175,7 +175,7 @@ impl SpanStore {
             .entry(span.trace_id)
             .or_default()
             .push(span.seq);
-        inner.buffer.push_back(span);
+        inner.buffer.push_back(Arc::new(span));
         seq
     }
 
@@ -197,7 +197,7 @@ impl SpanStore {
             .iter()
             .filter(|s| s.duration_ms >= min_duration_ms)
             .filter(|s| filter.is_none_or(|f| matches_span(f, s)))
-            .cloned()
+            .map(|s| s.as_ref().clone())
             .collect();
         matching.sort_by(|a, b| {
             b.duration_ms
@@ -321,7 +321,7 @@ impl SpanStore {
         let inner = self.inner.read().unwrap();
         let start = inner.buffer.partition_point(|s| s.seq < from);
         let end = inner.buffer.partition_point(|s| s.seq <= to);
-        let spans = inner.buffer.range(start..end.max(start)).cloned().collect();
+        let spans = inner.buffer.range(start..end.max(start)).map(|s| s.as_ref().clone()).collect();
         (
             spans,
             self.lost_below.load(std::sync::atomic::Ordering::Relaxed),
@@ -336,7 +336,7 @@ impl SpanStore {
             Some(idx) => {
                 let start = idx.saturating_sub(before);
                 let end = (idx + after + 1).min(inner.buffer.len());
-                inner.buffer.range(start..end).cloned().collect()
+                inner.buffer.range(start..end).map(|s| s.as_ref().clone()).collect()
             }
             None => vec![],
         }
@@ -417,7 +417,7 @@ fn trace_spans(inner: &SpanStoreInner, trace_id: u128) -> Vec<&SpanEntry> {
     };
     let mut spans: Vec<&SpanEntry> = seqs
         .iter()
-        .filter_map(|&seq| inner.buffer.get(inner.position(seq)?))
+        .filter_map(|&seq| inner.buffer.get(inner.position(seq)?).map(Arc::as_ref))
         .collect();
     spans.sort_by_key(|s| s.start_time);
     spans
@@ -525,6 +525,7 @@ mod trace_lookup_tests {
             .buffer
             .iter()
             .filter(|s| s.trace_id == trace_id)
+            .map(Arc::as_ref)
             .collect();
         spans.sort_by_key(|s| s.start_time);
         spans.into_iter().map(|s| s.seq).collect()

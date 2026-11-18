@@ -1021,7 +1021,12 @@ separate rerun slots including passing reruns, and up to 20 slow-pass admissions
 For slow passes, begin with `--slow-pass opt-out --slow-if 'elapsed > 4 * estimated'`
 or opt individual executions in with a start condition. Captures record ring
 coverage and queue or budget skips. Inspect those fields when interpreting missing
-evidence. Saved ZIPs retain standard case formatting, run provenance and peer context.
+evidence. In each domain, admitted snapshots share a 128 MiB retention budget. A
+record referenced by several cases is charged once, with a small index charge per
+case. The snapshots keep their records through ring rollover. If a new snapshot
+would exceed the aggregate budget, end returns `skipped_capture_budget`. A ZIP
+worker streams the retained rows directly into a standard case with provenance
+and peer context.
 
 A driver recovering unconfirmed ends sends `test-log replay --run-id RUN --events
 'END_JSON'` with one flag per original event, up to 100 per batch. A refusal

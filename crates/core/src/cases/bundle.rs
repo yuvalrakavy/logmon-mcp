@@ -110,6 +110,25 @@ pub fn pack<W: Write + Seek>(
     entries: &[(String, Vec<u8>)],
     compressed: bool,
 ) -> Result<u64, BundleError> {
+    pack_stream(
+        out,
+        stem,
+        entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
+        compressed,
+        |writer, bytes| Ok(writer.write_all(bytes)?),
+    )
+}
+
+/// Write each entry straight into the standard ZIP. Nightly snapshots can share
+/// most of their records: serializing a full JSONL vector per worker would
+/// recreate the very burst of allocations that shared retention avoids.
+pub(crate) fn pack_stream<'a, W: Write + Seek, T>(
+    out: W,
+    stem: &str,
+    entries: impl IntoIterator<Item = (&'a str, T)>,
+    compressed: bool,
+    mut write_entry: impl FnMut(&mut dyn Write, T) -> Result<(), BundleError>,
+) -> Result<u64, BundleError> {
     let allowed = permitted(stem);
     let mut zw = zip::ZipWriter::new(out);
     // Stored is a real choice, not a debug flag: it keeps `unzip -p` cheap for
@@ -123,12 +142,12 @@ pub fn pack<W: Write + Seek>(
     let opts: zip::write::FileOptions<'_, ()> =
         zip::write::FileOptions::default().compression_method(method);
 
-    for (name, bytes) in entries {
-        if !allowed.contains(name) {
-            return Err(BundleError::ForeignEntry(name.clone()));
+    for (name, data) in entries {
+        if !allowed.iter().any(|n| n == name) {
+            return Err(BundleError::ForeignEntry(name.to_owned()));
         }
-        zw.start_file(name.as_str(), opts)?;
-        zw.write_all(bytes)?;
+        zw.start_file(name, opts)?;
+        write_entry(&mut zw, data)?;
     }
     let mut w = zw.finish()?;
     w.flush()?;

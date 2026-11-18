@@ -22,6 +22,7 @@ use std::time::Instant;
 
 #[derive(Default)]
 pub struct TestLog {
+    pub(crate) capture_pool: Arc<Mutex<crate::nightly::CapturePool>>,
     state: Mutex<State>,
     observing: AtomicBool,
     changed: Condvar,

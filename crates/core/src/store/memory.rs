@@ -5,11 +5,11 @@ use crate::store::traits::{LogStore, StoreStats};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 pub(crate) struct RetainedRing<'a, T> {
-    pub records: &'a VecDeque<T>,
+    pub records: &'a VecDeque<Arc<T>>,
     pub lost_below: u64,
     pub latest_evicted: Option<DateTime<Utc>>,
 }
@@ -32,7 +32,7 @@ struct StoreInner {
     /// record that fired it, then the older records of its pre-window
     /// (`daemon/log_processor.rs`). Every reader that took a position for a seq was then
     /// wrong across that stretch — see the seq-ordered ring spec.
-    entries: VecDeque<LogEntry>,
+    entries: VecDeque<Arc<LogEntry>>,
     /// Each trace's held seqs, ascending.
     trace_index: HashMap<u128, Vec<u64>>,
     /// The held records that were stored LATE — below a seq this ring already held, which only
@@ -187,7 +187,7 @@ impl InMemoryStore {
             if let Some(tid) = e.trace_id {
                 trace_index.entry(tid).or_default().push(e.seq);
             }
-            entries.push_back(e);
+            entries.push_back(Arc::new(e));
         }
         Self {
             max_capacity: capacity.max(entries.len()),
@@ -244,7 +244,7 @@ impl InMemoryStore {
         let records = inner
             .entries
             .range(start..end.max(start))
-            .cloned()
+            .map(|e| e.as_ref().clone())
             .collect();
         (records, self.lost_below.load(Ordering::Relaxed))
     }
@@ -357,7 +357,7 @@ impl InMemoryStore {
 
         // The held records above the batch's lowest seq come off, to be merged back.
         let split = inner.entries.partition_point(|e| e.seq < batch[0].seq);
-        let tail: Vec<LogEntry> = inner.entries.drain(split..).collect();
+        let tail: Vec<Arc<LogEntry>> = inner.entries.drain(split..).collect();
         let moved = tail.len();
 
         // Each trace's list takes the batch's seqs for it in ONE merge, not a sorted insert
@@ -373,8 +373,8 @@ impl InMemoryStore {
         }
 
         let stored = batch.len() as u64;
-        let mut merged: Vec<LogEntry> = Vec::with_capacity(tail.len() + batch.len());
-        let (mut t, mut b) = (tail.into_iter().peekable(), batch.into_iter().peekable());
+        let mut merged: Vec<Arc<LogEntry>> = Vec::with_capacity(tail.len() + batch.len());
+        let (mut t, mut b) = (tail.into_iter().peekable(), batch.into_iter().map(Arc::new).peekable());
         loop {
             let take_tail = match (t.peek(), b.peek()) {
                 (Some(x), Some(y)) => x.seq < y.seq,
@@ -463,7 +463,7 @@ impl InMemoryStore {
                         continue;
                     }
                 }
-                result.push(entry.clone());
+                result.push(entry.as_ref().clone());
                 if result.len() >= count {
                     break;
                 }
@@ -477,7 +477,7 @@ impl InMemoryStore {
                         continue;
                     }
                 }
-                result.push(entry.clone());
+                result.push(entry.as_ref().clone());
                 if result.len() >= count {
                     break;
                 }
@@ -553,7 +553,7 @@ impl InMemoryStore {
                     continue;
                 }
                 entries.push((
-                    e.clone(),
+                    e.as_ref().clone(),
                     Some(LateTag {
                         number,
                         held_through: held,
@@ -577,7 +577,7 @@ impl InMemoryStore {
                 if e.seq <= pos.seq || filter.is_some_and(|f| !matches_entry(f, e)) {
                     continue;
                 }
-                entries.push((e.clone(), None));
+                entries.push((e.as_ref().clone(), None));
                 if entries.len() >= count {
                     break;
                 }
@@ -630,14 +630,14 @@ impl InMemoryStore {
                     continue;
                 }
                 entries.push((
-                    e.clone(),
+                    e.as_ref().clone(),
                     Some(LateTag {
                         number,
                         held_through: 0,
                     }),
                 ));
             } else if filter.is_none_or(|f| matches_entry(f, e)) {
-                entries.push((e.clone(), None));
+                entries.push((e.as_ref().clone(), None));
             }
         }
         CursorRead {
@@ -911,7 +911,7 @@ impl LogStore for InMemoryStore {
             // The newest seq, so the list stays ascending.
             inner.trace_index.entry(tid).or_default().push(entry.seq);
         }
-        inner.entries.push_back(entry);
+        inner.entries.push_back(Arc::new(entry));
         self.total_stored.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -936,7 +936,7 @@ impl LogStore for InMemoryStore {
         let start = idx.saturating_sub(before);
         let end = (idx + after + 1).min(inner.entries.len());
 
-        inner.entries.range(start..end).cloned().collect()
+        inner.entries.range(start..end).map(|e| e.as_ref().clone()).collect()
     }
 
     fn context_by_time(&self, timestamp: DateTime<Utc>, window: Duration) -> Vec<LogEntry> {
@@ -953,7 +953,7 @@ impl LogStore for InMemoryStore {
                     .unwrap_or(i64::MAX);
                 diff <= window_ns
             })
-            .cloned()
+            .map(|e| e.as_ref().clone())
             .collect()
     }
 
@@ -975,7 +975,7 @@ impl LogStore for InMemoryStore {
         };
         seqs.iter()
             .filter_map(|&seq| inner.entries.get(inner.position(seq)?))
-            .cloned()
+            .map(|e| e.as_ref().clone())
             .collect()
     }
 

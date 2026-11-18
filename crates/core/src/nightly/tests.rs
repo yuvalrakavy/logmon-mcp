@@ -139,10 +139,11 @@ fn oversized_record_fails_explicitly_without_copying_it() {
     let mut snap = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
     let mut log = LogEntry::synthetic(Level::Info, "");
     log.trace_id = Some(10);
-    log.message = "x".repeat(17 * 1024 * 1024);
+    d.test_log.capture_pool.lock().unwrap().set_available(1024);
+    log.message = "x".repeat(2048);
     snap.observe_log(&log);
     assert!(snap.is_over_budget());
-    assert_eq!(snap.resident_bytes(), 0);
+    assert_eq!(d.test_log.capture_pool.lock().unwrap().available(), 1024);
     let dir = tempfile::tempdir().unwrap();
     assert!(snap.write(dir.path(), &json!({}), vec![]).is_err());
     assert_eq!(dir.path().read_dir().unwrap().count(), 0);
@@ -194,4 +195,56 @@ fn bounded_schema_and_value_memory_and_generic_backfill_interval() {
     assert_eq!(d.span_store.total_received(), 3);
     d.span_store.clear();
     assert_eq!(d.span_store.total_received(), 3);
+}
+
+#[test]
+fn eight_overlapping_large_snapshots_round_trip_after_both_rings_roll() {
+    let d = domain();
+    let now = Utc::now();
+    let original_budget = d.test_log.capture_pool.lock().unwrap().available();
+    // Each case covers more than 16 MiB. Eight deep copies would also exceed
+    // the entire 128 MiB pool before any case had reached its worker.
+    for i in 0..18 {
+        let mut entry = LogEntry::synthetic(Level::Info, &format!("shared row {i}"));
+        entry.full_message = Some("z".repeat(1024 * 1024));
+        entry.seq = d.pipeline.assign_seq();
+        entry.timestamp = now;
+        d.pipeline.append_to_store(entry);
+    }
+    let mut event = span();
+    event.start_time = now;
+    event.end_time = now;
+    d.span_store.insert(event);
+    let create = || CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
+    let first = create();
+    let after_first = d.test_log.capture_pool.lock().unwrap().available();
+    let mut cases = vec![first];
+    cases.extend((1..8).map(|_| create()));
+    let after_eight = d.test_log.capture_pool.lock().unwrap().available();
+    assert!(original_budget - after_first > 16 * 1024 * 1024);
+    assert!(after_first - after_eight < 32 * 1024);
+    d.pipeline.clear_logs();
+    d.span_store.clear();
+    let dir = tempfile::tempdir().unwrap();
+    for case in cases {
+        assert!(!case.is_over_budget());
+        let path = case
+            .write(
+                dir.path(),
+                &json!({"name":"burst","reason":"failure"}),
+                vec![],
+            )
+            .unwrap();
+        let loaded = cases::load::load(&path).unwrap();
+        let logs = loaded.logs.unwrap();
+        assert_eq!(logs.len(), 19);
+        assert!(logs[..18]
+            .iter()
+            .all(|l| l.full_message.as_ref().unwrap().len() == 1024 * 1024));
+        assert_eq!(loaded.spans.unwrap().len(), 1);
+    }
+    assert_eq!(
+        d.test_log.capture_pool.lock().unwrap().available(),
+        original_budget
+    );
 }

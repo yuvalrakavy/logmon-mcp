@@ -536,6 +536,10 @@ impl Run {
         let start = ex.start.started_at;
         let selector = Selector::new(&ex.start.selector.field, &ex.start.selector.value);
         let snapshot = CaptureSnapshot::new(d, selector, start, end);
+        if snapshot.is_over_budget() {
+            self.entries.get_mut(id).unwrap().decision = Some("skipped_capture_budget".into());
+            return;
+        }
         let snapshot_at = snapshot.captured_at();
         let peers: Vec<_> = self
             .entries

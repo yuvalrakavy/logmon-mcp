@@ -366,3 +366,42 @@ fn sampled_out_missing_start_still_reports_snapshot_and_independent_ring_bounds(
         assert_eq!(row["coverage"][key]["status"], "retained");
     }
 }
+
+#[test]
+fn aggregate_capture_budget_refuses_new_snapshot_without_losing_accepted_case() {
+    let f = Fixture::new();
+    f.domain
+        .test_log
+        .capture_pool
+        .lock()
+        .unwrap()
+        .set_available(8192);
+    f.begin("one", 0);
+    let mut a = f.event("a");
+    f.rpc("start", a.clone());
+    f.log(1, "red A");
+    a["verdict"] = json!("FAIL");
+    a["ended_at"] = json!(Utc::now());
+    assert_eq!(f.rpc("end", a)["case_status"], "pending");
+    let mut b = f.event("b");
+    f.rpc("start", b.clone());
+    f.log(2, &"big B".repeat(2048));
+    b["verdict"] = json!("FAIL");
+    b["ended_at"] = json!(Utc::now());
+    assert_eq!(f.rpc("end", b)["case_status"], "skipped_capture_budget");
+    f.close("one");
+    let cases: Vec<_> = f
+        .rows()
+        .into_iter()
+        .filter(|r| r["event"] == "case-ready")
+        .collect();
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0]["execution_id"], "a");
+    let path = f.dir.path().join(cases[0]["case_path"].as_str().unwrap());
+    assert!(crate::cases::load::load(&path)
+        .unwrap()
+        .logs
+        .unwrap()
+        .iter()
+        .any(|r| r.message == "red A"));
+}

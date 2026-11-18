@@ -10,8 +10,78 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+// One aggregate evidence budget per domain, including per-case indexes. Records
+// used by several pending or writing cases are charged once until their last
+// snapshot releases them; the ordinary bounded rings may meanwhile roll over.
+const CAPTURE_POOL_BYTES: usize = 128 * 1024 * 1024;
+const INDEX_BYTES: usize = 96;
+
+pub(crate) struct CapturePool {
+    available: usize,
+    logs: HashMap<u64, Pinned<LogEntry>>,
+    spans: HashMap<u64, Pinned<SpanEntry>>,
+}
+impl Default for CapturePool {
+    fn default() -> Self {
+        Self {
+            available: CAPTURE_POOL_BYTES,
+            logs: HashMap::new(),
+            spans: HashMap::new(),
+        }
+    }
+}
+#[cfg(test)]
+impl CapturePool {
+    pub(crate) fn set_available(&mut self, bytes: usize) {
+        self.available = bytes;
+    }
+    pub(super) fn available(&self) -> usize {
+        self.available
+    }
+}
+struct Pinned<T> {
+    record: Arc<T>,
+    bytes: usize,
+    users: usize,
+}
+fn pin<T>(
+    records: &mut HashMap<u64, Pinned<T>>,
+    available: &mut usize,
+    seq: u64,
+    bytes: impl FnOnce() -> usize,
+    record: impl FnOnce() -> Arc<T>,
+) -> Option<Arc<T>> {
+    if let Some(pin) = records.get_mut(&seq) {
+        *available = available.checked_sub(INDEX_BYTES)?;
+        pin.users += 1;
+        return Some(pin.record.clone());
+    }
+    let bytes = bytes();
+    *available = available.checked_sub(bytes.checked_add(INDEX_BYTES)?)?;
+    let record = record();
+    records.insert(
+        seq,
+        Pinned {
+            record: record.clone(),
+            bytes,
+            users: 1,
+        },
+    );
+    Some(record)
+}
+fn unpin<T>(records: &mut HashMap<u64, Pinned<T>>, seq: u64) -> usize {
+    let Some(pin) = records.get_mut(&seq) else {
+        return 0;
+    };
+    pin.users -= 1;
+    if pin.users == 0 {
+        INDEX_BYTES + records.remove(&seq).expect("present").bytes
+    } else {
+        INDEX_BYTES
+    }
+}
 
 pub struct CaptureSnapshot {
     domain: String,
@@ -21,13 +91,13 @@ pub struct CaptureSnapshot {
     captured_at: DateTime<Utc>,
     // A unique sequence for the end-test meta-record included in the archive.
     anchor_seq: u64,
-    logs: BTreeMap<u64, LogEntry>,
-    spans: BTreeMap<u64, SpanEntry>,
+    logs: BTreeMap<u64, Arc<LogEntry>>,
+    spans: BTreeMap<u64, Arc<SpanEntry>>,
     log_floor: u64,
     span_floor: u64,
     domain_drops: Value,
     ring_coverage: Value,
-    bytes: usize,
+    pool: Arc<Mutex<CapturePool>>,
     over_budget: bool,
 }
 
@@ -50,6 +120,18 @@ pub(super) fn coverage(
     };
     json!({"log_coverage":ring(logs.lost_below, logs.latest_evicted),
         "span_coverage":ring(spans.lost_below, spans.latest_evicted),"coverage_as_of":Utc::now()})
+}
+
+impl Drop for CaptureSnapshot {
+    fn drop(&mut self) {
+        let mut pool = self.pool.lock().unwrap();
+        for seq in self.logs.keys() {
+            pool.available += unpin(&mut pool.logs, *seq);
+        }
+        for seq in self.spans.keys() {
+            pool.available += unpin(&mut pool.spans, *seq);
+        }
+    }
 }
 
 impl CaptureSnapshot {
@@ -76,7 +158,7 @@ impl CaptureSnapshot {
             domain_drops: json!({"gelf_udp":drops.gelf_udp,"gelf_tcp":drops.gelf_tcp,
                 "otlp_http_logs":drops.otlp_http_logs,"otlp_http_traces":drops.otlp_http_traces,
                 "otlp_grpc_logs":drops.otlp_grpc_logs,"otlp_grpc_traces":drops.otlp_grpc_traces}),
-            bytes: 0,
+            pool: domain.test_log.capture_pool.clone(),
             over_budget: false,
         };
         // Always lock logs before spans. Both stores remain fixed while the verdict
@@ -87,12 +169,12 @@ impl CaptureSnapshot {
                 snapshot.span_floor = spans.lost_below;
                 for log in logs.records {
                     if log.seq < anchor_seq {
-                        snapshot.observe_log(log);
+                        snapshot.pin_log(log, || log.clone());
                     }
                 }
                 for span in spans.records {
                     if span.seq < anchor_seq {
-                        snapshot.observe_span(span);
+                        snapshot.pin_span(span, || span.clone());
                     }
                 }
                 snapshot.ring_coverage = coverage(&logs, &spans, anchor_seq, start, end);
@@ -101,46 +183,57 @@ impl CaptureSnapshot {
         snapshot
     }
 
-    fn reserve(&mut self, bytes: usize) -> bool {
-        if bytes > MAX_SNAPSHOT_BYTES.saturating_sub(self.bytes) {
-            self.over_budget = true;
-            return false;
-        }
-        self.bytes += bytes;
-        true
-    }
-
-    #[cfg(test)]
-    pub fn resident_bytes(&self) -> usize {
-        self.bytes
-    }
     pub fn is_over_budget(&self) -> bool {
         self.over_budget
     }
 
     pub fn observe_log(&mut self, log: &LogEntry) {
-        if self.over_budget || self.logs.contains_key(&log.seq) {
+        self.pin_log(log, || Arc::new(log.clone()));
+    }
+    fn pin_log(&mut self, log: &LogEntry, get: impl FnOnce() -> Arc<LogEntry>) {
+        if self.over_budget
+            || self.logs.contains_key(&log.seq)
+            || !(self.selector.matches_log(log) || (self.start..=self.end).contains(&log.timestamp))
+        {
             return;
         }
-        if (self.selector.matches_log(log) || (self.start..=self.end).contains(&log.timestamp))
-            && self.reserve(log_bytes(log))
-        {
-            self.logs.insert(log.seq, log.clone());
+        let mut pool = self.pool.lock().unwrap();
+        let CapturePool {
+            logs, available, ..
+        } = &mut *pool;
+        match pin(logs, available, log.seq, || log_bytes(log), get) {
+            Some(record) => {
+                self.logs.insert(log.seq, record);
+            }
+            None => {
+                self.over_budget = true;
+            }
         }
     }
-
     pub fn observe_span(&mut self, span: &SpanEntry) {
-        if self.over_budget || self.spans.contains_key(&span.seq) {
+        self.pin_span(span, || Arc::new(span.clone()));
+    }
+    fn pin_span(&mut self, span: &SpanEntry, get: impl FnOnce() -> Arc<SpanEntry>) {
+        if self.over_budget
+            || self.spans.contains_key(&span.seq)
+            || !(self.selector.matches_span(span)
+                || (span.start_time <= self.end && span.end_time >= self.start))
+        {
             return;
         }
-        if (self.selector.matches_span(span)
-            || (span.start_time <= self.end && span.end_time >= self.start))
-            && self.reserve(span_bytes(span))
-        {
-            self.spans.insert(span.seq, span.clone());
+        let mut pool = self.pool.lock().unwrap();
+        let CapturePool {
+            spans, available, ..
+        } = &mut *pool;
+        match pin(spans, available, span.seq, || span_bytes(span), get) {
+            Some(record) => {
+                self.spans.insert(span.seq, record);
+            }
+            None => {
+                self.over_budget = true;
+            }
         }
     }
-
     pub fn captured_at(&self) -> DateTime<Utc> {
         self.captured_at
     }
@@ -343,7 +436,7 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
         registry: Vec<doc::RegistryFact>,
     ) -> Result<PathBuf, String> {
         if self.over_budget {
-            return Err("capture exceeded per-snapshot byte allowance".into());
+            return Err("domain capture pool byte budget exhausted".into());
         }
         if self.logs.len() + self.spans.len() + 1 > cases::load::MAX_CASE_RECORDS {
             return Err("capture exceeds the standard case reader's record limit".into());
@@ -388,7 +481,7 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
             marker
                 .additional_fields
                 .insert("coverage".into(), self.coverage());
-            self.logs.insert(marker.seq, marker);
+            self.logs.insert(marker.seq, Arc::new(marker));
             let first = self
                 .logs
                 .keys()
@@ -408,22 +501,6 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
                 .max()
                 .unwrap_or(self.anchor_seq);
             let names = cases::file_names(&file.stem);
-            let mut logs = Vec::new();
-            let mut spans = Vec::new();
-            cases::write_jsonl(
-                &mut logs,
-                Path::new(&names[1]),
-                "logdata",
-                self.logs.values(),
-            )
-            .map_err(|e| e.to_string())?;
-            cases::write_jsonl(
-                &mut spans,
-                Path::new(&names[2]),
-                "spandata",
-                self.spans.values(),
-            )
-            .map_err(|e| e.to_string())?;
             let input = doc::CaseInput {
                 stem: file.stem.clone(),
                 captured_at: self.captured_at,
@@ -475,17 +552,45 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
             let mut body = String::new();
             doc::front_matter(&mut body, &input);
             self.render_summary(&mut body, &test_name, reason, headline, metadata);
-            let entries = vec![
-                (names[0].clone(), body.into_bytes()),
-                (names[1].clone(), logs),
-                (names[2].clone(), spans),
-                (
-                    cases::bundle::registry_entry_name(&file.stem),
-                    doc::registry_json(&input.registry),
-                ),
+            let registry_name = cases::bundle::registry_entry_name(&file.stem);
+            let entries = [
+                names[0].as_str(),
+                names[1].as_str(),
+                names[2].as_str(),
+                registry_name.as_str(),
             ];
-            cases::bundle::pack(file.file, &file.stem, &entries, true)
-                .map_err(|e| e.to_string())?;
+            cases::bundle::pack_stream(
+                file.file,
+                &file.stem,
+                entries.into_iter().enumerate().map(|(i, n)| (n, i)),
+                true,
+                |zip, i| {
+                    match i {
+                        0 => zip.write_all(body.as_bytes())?,
+                        1 => {
+                            cases::write_jsonl(
+                                zip,
+                                Path::new(&names[1]),
+                                "logdata",
+                                self.logs.values().map(Arc::as_ref),
+                            )
+                            .map_err(std::io::Error::other)?;
+                        }
+                        2 => {
+                            cases::write_jsonl(
+                                zip,
+                                Path::new(&names[2]),
+                                "spandata",
+                                self.spans.values().map(Arc::as_ref),
+                            )
+                            .map_err(std::io::Error::other)?;
+                        }
+                        _ => zip.write_all(&doc::registry_json(&input.registry))?,
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|e| e.to_string())?;
             Ok(path.clone())
         })();
         if result.is_err() {
