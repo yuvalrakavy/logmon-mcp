@@ -161,7 +161,7 @@ fn unconfirmed_start_backfills_without_double_counting_or_spending_an_extra_case
     let path = f.dir.path().join("one.jsonl");
     f.rpc(
         "begin",
-        json!({"run_id":"one","jsonl_path":path,"max_failures":0,"grace_period_ms":0}),
+        json!({"run_id":"one","jsonl_path":path,"max_failures":0,"grace_period_ms":0,"summary_sample_percent":0}),
     );
     let mut a = f.event("a");
     f.log(1, "already stored");
@@ -404,4 +404,202 @@ fn aggregate_capture_budget_refuses_new_snapshot_without_losing_accepted_case() 
         .unwrap()
         .iter()
         .any(|r| r.message == "red A"));
+}
+
+#[test]
+fn zero_sampling_keeps_failure_and_green_rerun_and_expanded_focus_evidence() {
+    let f = Fixture::new();
+    f.rpc("begin",json!({"run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),
+        "grace_period_ms":0,"summary_sample_percent":0,"expanded_cases":true,"display_timezone":"Asia/Jerusalem",
+        "fields":{"/Build/commit":"abc","/Build/profile":"release","/Action":"test","extra":{"version":3}}}));
+    let mut peer = f.event("a");
+    f.rpc("start", peer.clone());
+    f.log(1, "earlier peer work");
+    let mut red = f.event("b");
+    f.rpc("start", red.clone());
+    f.log(2, "target");
+    red["ended_at"] = json!(Utc::now());
+    red["verdict"] = json!("FAIL");
+    red["fields"] = json!({"failed_test":"member","member_runtime_ms":3});
+    f.rpc("end", red);
+    peer["ended_at"] = json!(Utc::now());
+    peer["verdict"] = json!("OK");
+    f.rpc("end", peer);
+    let mut rerun = f.event("c");
+    rerun["selector"]["value"] = json!(format!("{:032x}", 3));
+    rerun["rerun_of"] = json!("b");
+    f.rpc("start", rerun.clone());
+    f.log(3, "clean");
+    rerun["ended_at"] = json!(Utc::now());
+    rerun["verdict"] = json!("OK");
+    f.rpc("end", rerun);
+    f.close("one");
+    let rows = f.rows();
+    let summary = |id: &str| {
+        rows.iter()
+            .find(|r| r["event"] == "summary-final" && r["execution_id"] == id)
+            .unwrap()
+    };
+    assert!(summary("a")["summary"].is_null());
+    assert_eq!(summary("b")["coverage"]["collection_mode"], "ring_backfill");
+    assert_eq!(summary("b")["member_runtime_ms"], 3);
+    assert_eq!(summary("c")["coverage"]["collection_mode"], "live");
+    for id in ["b", "c"] {
+        assert_eq!(summary(id)["summary"]["log_levels"]["INFO"], 1);
+    }
+    let rel = rows
+        .iter()
+        .find(|r| r["event"] == "case-ready" && r["execution_id"] == "b")
+        .unwrap()["case_path"]
+        .as_str()
+        .unwrap();
+    let stem = format!("member--{:032x}", 2);
+    assert_eq!(rel, format!("cases/{stem}/{stem}.md"));
+    let path = f.dir.path().join(rel);
+    let md = std::fs::read_to_string(&path).unwrap();
+    assert!(md.contains("earlier peer work") && md.contains("Asia/Jerusalem"));
+    let mut case = crate::cases::load::load(&path).unwrap();
+    assert_eq!(case.registry.as_ref().unwrap().facts.len(), 3);
+    let logs = case.logs.as_ref().unwrap();
+    assert!(logs.iter().any(|l| l.message == "earlier peer work"));
+    assert!(logs.iter().any(|l| l
+        .additional_fields
+        .get("case_context")
+        .is_some_and(|v| v["run_fields"]["extra"]["version"] == 3)));
+    case.select_scope("focus", None).unwrap();
+    assert!(case
+        .logs
+        .as_ref()
+        .unwrap()
+        .iter()
+        .all(|e| e.trace_id == Some(2)));
+}
+
+#[test]
+fn deadline_group_indexes_distinct_foci_and_late_ok_supersedes_incomplete() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let mut tests = [f.event("a"), f.event("b")];
+    for e in &mut tests {
+        e["test_timeout_ms"] = json!(10);
+        f.rpc("start", e.clone());
+    }
+    f.log(1, "original A");
+    f.log(2, "original B");
+    let limit = Instant::now() + Duration::from_secs(2);
+    while f
+        .rows()
+        .iter()
+        .filter(|r| r["event"] == "incomplete")
+        .count()
+        < 2
+    {
+        assert!(Instant::now() < limit);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for mut e in tests {
+        e["ended_at"] = json!(Utc::now());
+        e["verdict"] = json!("OK");
+        f.rpc("end", e);
+    }
+    // Advance the maintenance clock past the first group's fixed window.
+    // A subsequent crossing must create an independently loadable case.
+    f.domain
+        .test_log
+        .state
+        .lock()
+        .unwrap()
+        .run
+        .as_mut()
+        .unwrap()
+        .tick(&f.domain, Instant::now() + Duration::from_secs(61));
+    let mut third = f.event("c");
+    third["selector"]["value"] = json!(format!("{:032x}", 3));
+    third["test_timeout_ms"] = json!(2);
+    f.rpc("start", third.clone());
+    let limit = Instant::now() + Duration::from_secs(2);
+    while !f
+        .rows()
+        .iter()
+        .any(|r| r["event"] == "incomplete" && r["execution_id"] == "c")
+    {
+        assert!(Instant::now() < limit);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    third["ended_at"] = json!(Utc::now());
+    third["verdict"] = json!("OK");
+    f.rpc("end", third);
+    f.close("one");
+    let rows = f.rows();
+    let path = |id: &str| {
+        rows.iter()
+            .find(|r| r["event"] == "case-ready" && r["execution_id"] == id)
+            .unwrap()["case_path"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(path("a"), path("b"));
+    assert_ne!(path("a"), path("c"));
+    for r in rows.iter().filter(|r| r["event"] == "summary-final") {
+        assert_eq!(r["verdict"], "OK");
+        assert_eq!(r["closure_incomplete"], false);
+        assert_eq!(r["supersedes_incomplete"], true);
+    }
+    let mut case = crate::cases::load::load(&f.dir.path().join(path("a"))).unwrap();
+    assert_eq!(case.front.focus_traces.len(), 2);
+    assert!(case.select_scope("focus", None).is_err());
+    case.select_scope("focus", Some("2")).unwrap();
+    assert!(case.logs.unwrap().iter().any(|e| e.message == "original B"));
+}
+
+#[test]
+fn bounded_rings_grow_only_for_evidence_in_active_and_grace_windows() {
+    let f = Fixture::new();
+    let logs = &f.domain.pipeline.store;
+    let spans = &f.domain.span_store;
+    logs.resize_with(Some(2), Some(4), || spans.resize(Some(2), Some(6)));
+    let span = || {
+        let at = Utc::now();
+        let span = serde_json::from_value(json!({"seq":0,"trace_id":"00000000000000000000000000000001","span_id":"0000000000000001","parent_span_id":null,"start_time":at,"end_time":at,"duration_ms":0,"name":"work","kind":"internal","service_name":"worker","status":{"type":"ok"},"attributes":{},"events":[]})).unwrap();
+        spans.insert(span);
+    };
+    for _ in 0..5 {
+        f.log(2, "before");
+        span();
+    }
+    assert_eq!(
+        (logs.ring_info().0.current, spans.ring_info().0.current),
+        (2, 2)
+    );
+    f.begin("one", 120);
+    let mut event = f.event("a");
+    f.rpc("start", event.clone());
+    for _ in 0..2 {
+        f.log(2, "peer");
+        span();
+    }
+    assert_eq!(
+        (logs.ring_info().0.current, spans.ring_info().0.current),
+        (2, 2)
+    );
+    f.log(2, "peer");
+    assert_eq!(
+        (logs.ring_info().0.current, spans.ring_info().0.current),
+        (4, 2)
+    );
+    event["ended_at"] = json!(Utc::now());
+    event["verdict"] = json!("OK");
+    f.rpc("end", event);
+    span();
+    assert_eq!(spans.ring_info().0.current, 4);
+    for _ in 0..8 {
+        f.log(2, "peer");
+    }
+    assert_eq!(logs.ring_info().0.current, 4);
+    assert!(f.domain.pipeline.lost_below() > 0);
+    f.close("one");
+    for _ in 0..10 {
+        span();
+    }
+    assert_eq!(spans.ring_info().0.current, 4);
 }

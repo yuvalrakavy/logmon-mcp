@@ -29,6 +29,15 @@ pub struct TestLogBegin {
     pub run_id: String,
     /// Absolute JSONL path chosen by the run owner.
     pub jsonl_path: String,
+    /// Run-scoped provenance copied into each case.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, Value>,
+    /// Write loose case files in a per-execution directory.
+    #[serde(default)]
+    pub expanded_cases: bool,
+    /// IANA timezone for human-readable reports (UTC by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_timezone: Option<String>,
     /// Missing-end deadline in milliseconds, default 600000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_timeout_ms: Option<u64>,

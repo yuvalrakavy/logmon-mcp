@@ -12,6 +12,8 @@ pub struct SpanStoreStats {
 }
 
 pub struct SpanStore {
+    pub(crate) capture_pool:
+        std::sync::OnceLock<std::sync::Weak<std::sync::Mutex<crate::nightly::CapturePool>>>,
     inner: RwLock<SpanStoreInner>,
     seq_counter: Arc<SeqCounter>,
     /// The lowest seq this ring can still speak for: spans below it were held
@@ -36,7 +38,8 @@ struct SpanStoreInner {
     buffer: VecDeque<Arc<SpanEntry>>,
     /// Each trace's held seqs, ascending.
     trace_index: HashMap<u128, Vec<u64>>,
-    capacity: usize,
+    capacity: crate::store::capacity::RingCapacity,
+    record_bytes: usize,
 }
 
 impl SpanStoreInner {
@@ -51,12 +54,14 @@ impl SpanStore {
         Self {
             // Lazy allocation (§6): start empty and reserve the full ring on the
             // first insert (see `insert`), so an idle span store holds ~0 buffer.
+            capture_pool: Default::default(),
             inner: RwLock::new(SpanStoreInner {
                 buffer: VecDeque::new(),
                 latest_evicted_end: None,
                 total_received: 0,
                 trace_index: HashMap::new(),
-                capacity,
+                capacity: crate::store::capacity::RingCapacity::fixed(capacity),
+                record_bytes: 0,
             }),
             seq_counter,
             lost_below: std::sync::atomic::AtomicU64::new(0),
@@ -115,15 +120,66 @@ impl SpanStore {
         }
         let cap = capacity.max(buffer.len());
         Self {
+            capture_pool: Default::default(),
             inner: RwLock::new(SpanStoreInner {
+                record_bytes: buffer.iter().map(|s| crate::nightly::span_bytes(s)).sum(),
                 buffer,
                 latest_evicted_end: None,
                 total_received: 0,
                 trace_index,
-                capacity: cap,
+                capacity: crate::store::capacity::RingCapacity::fixed(cap),
             }),
             seq_counter,
             lost_below: std::sync::atomic::AtomicU64::new(lost_below),
+        }
+    }
+
+    pub(crate) fn ring_info(&self) -> (crate::store::capacity::RingCapacity, usize, usize) {
+        let ring = self.inner.read().unwrap();
+        let indexes = ring.buffer.capacity() * size_of::<Arc<SpanEntry>>()
+            + ring.buffer.len() * size_of::<u64>()
+            + ring.trace_index.capacity() * 48;
+        (ring.capacity, ring.record_bytes, indexes)
+    }
+
+    pub(crate) fn protect_since(&self, since: Option<chrono::DateTime<chrono::Utc>>) {
+        self.inner.write().unwrap().capacity.protected_since = since;
+    }
+
+    pub(crate) fn resize(&self, initial: Option<usize>, maximum: Option<usize>) -> usize {
+        let mut ring = self.inner.write().unwrap();
+        ring.capacity.configure(initial, maximum);
+        let capacity = ring.capacity.current;
+        let removed = ring.buffer.len().saturating_sub(capacity);
+        for _ in 0..removed {
+            self.evict_front(&mut ring);
+        }
+        ring.buffer.shrink_to(capacity);
+        removed
+    }
+
+    fn evict_front(&self, inner: &mut SpanStoreInner) {
+        if let Some(evicted) = inner.buffer.pop_front() {
+            if Arc::strong_count(&evicted) > 1 {
+                if let Some(pool) = self.capture_pool.get().and_then(|p| p.upgrade()) {
+                    pool.lock().unwrap().evict_span(evicted.seq);
+                }
+            }
+            inner.record_bytes -= crate::nightly::span_bytes(&evicted);
+            // The one place a span actually leaves, recorded under the same
+            // write guard that removes it. `fetch_max`: eviction takes the lowest seq, so
+            // this never lowers the floor, and could not even if that broke.
+            self.lost_below.fetch_max(
+                evicted.seq.saturating_add(1),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            inner.latest_evicted_end = inner.latest_evicted_end.max(Some(evicted.end_time));
+            if let Some(seqs) = inner.trace_index.get_mut(&evicted.trace_id) {
+                seqs.retain(|&s| s != evicted.seq);
+                if seqs.is_empty() {
+                    inner.trace_index.remove(&evicted.trace_id);
+                }
+            }
         }
     }
 
@@ -136,7 +192,11 @@ impl SpanStore {
         span.seq = self.seq_counter.next();
         let seq = span.seq;
 
-        if inner.capacity == 0 {
+        if inner.buffer.len() >= inner.capacity.current {
+            let candidate = inner.buffer.front().map_or(span.end_time, |s| s.end_time);
+            inner.capacity.grow_for(candidate);
+        }
+        if inner.capacity.current == 0 {
             // A ring of no spans stores and evicts at once, as the log ring does: the push
             // below would otherwise hold one span past a capacity of zero.
             self.lost_below
@@ -147,27 +207,12 @@ impl SpanStore {
 
         // Lazy allocation (§6): reserve the full ring ONCE, on the first insert.
         if inner.buffer.capacity() == 0 {
-            let cap = inner.capacity;
+            let cap = inner.capacity.current;
             inner.buffer.reserve_exact(cap);
         }
 
-        if inner.buffer.len() >= inner.capacity {
-            if let Some(evicted) = inner.buffer.pop_front() {
-                // The one place a span actually leaves, recorded under the same
-                // write guard that removes it. `fetch_max`: eviction takes the lowest seq, so
-                // this never lowers the floor, and could not even if that broke.
-                self.lost_below.fetch_max(
-                    evicted.seq.saturating_add(1),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                inner.latest_evicted_end = inner.latest_evicted_end.max(Some(evicted.end_time));
-                if let Some(seqs) = inner.trace_index.get_mut(&evicted.trace_id) {
-                    seqs.retain(|&s| s != evicted.seq);
-                    if seqs.is_empty() {
-                        inner.trace_index.remove(&evicted.trace_id);
-                    }
-                }
-            }
+        if inner.buffer.len() >= inner.capacity.current {
+            self.evict_front(&mut inner);
         }
 
         inner
@@ -175,6 +220,7 @@ impl SpanStore {
             .entry(span.trace_id)
             .or_default()
             .push(span.seq);
+        inner.record_bytes += crate::nightly::span_bytes(&span);
         inner.buffer.push_back(Arc::new(span));
         seq
     }
@@ -386,6 +432,13 @@ impl SpanStore {
         inner.latest_evicted_end = inner
             .latest_evicted_end
             .max(inner.buffer.iter().map(|s| s.end_time).max());
+        if let Some(pool) = self.capture_pool.get().and_then(|p| p.upgrade()) {
+            let mut pool = pool.lock().unwrap();
+            for record in &inner.buffer {
+                pool.evict_span(record.seq);
+            }
+        }
+        inner.record_bytes = 0;
         inner.buffer.clear();
         inner.trace_index.clear();
         n

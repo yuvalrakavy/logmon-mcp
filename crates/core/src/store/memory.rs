@@ -22,6 +22,8 @@ pub(crate) struct RetainedRing<'a, T> {
 /// load — see notes/2026-05-05-logmon-broker-rwlock-bug-findings.md).
 /// Mirrors the single-lock pattern in `SpanStore`.
 struct StoreInner {
+    capacity: crate::store::capacity::RingCapacity,
+    record_bytes: usize,
     latest_evicted_at: Option<DateTime<Utc>>,
     /// The held records in ASCENDING SEQ ORDER, distinct. An invariant this store
     /// establishes — `append`, `insert_sorted` and `from_records` are its only writers and each
@@ -108,8 +110,10 @@ fn merge_ascending(list: &mut Vec<u64>, add: &[u64]) {
 }
 
 pub struct InMemoryStore {
+    pub(crate) capture_pool:
+        std::sync::OnceLock<std::sync::Weak<std::sync::Mutex<crate::nightly::CapturePool>>>,
     inner: RwLock<StoreInner>,
-    max_capacity: usize,
+
     total_stored: AtomicU64,
     total_received: AtomicU64,
     malformed_count: AtomicU64,
@@ -133,12 +137,46 @@ pub struct InMemoryStore {
 }
 
 impl InMemoryStore {
+    pub(crate) fn ring_info(&self) -> (crate::store::capacity::RingCapacity, usize, usize) {
+        let ring = self.inner.read().unwrap();
+        let indexes = ring.entries.capacity() * size_of::<Arc<LogEntry>>()
+            + ring.entries.len() * size_of::<u64>()
+            + ring.trace_index.capacity() * 48
+            + ring.late.len() * 96;
+        (ring.capacity, ring.record_bytes, indexes)
+    }
+
+    pub(crate) fn protect_since(&self, since: Option<DateTime<Utc>>) {
+        self.inner.write().unwrap().capacity.protected_since = since;
+    }
+
+    /// Hold the log ring while applying the span edit, in snapshot lock order.
+    pub(crate) fn resize_with<T>(
+        &self,
+        initial: Option<usize>,
+        maximum: Option<usize>,
+        finish: impl FnOnce() -> T,
+    ) -> (usize, T) {
+        let mut ring = self.inner.write().unwrap();
+        ring.capacity.configure(initial, maximum);
+        let capacity = ring.capacity.current;
+        let removed = ring.entries.len().saturating_sub(capacity);
+        for _ in 0..removed {
+            self.evict_front(&mut ring);
+        }
+        ring.entries.shrink_to(capacity);
+        (removed, finish())
+    }
+
     pub fn new(capacity: usize) -> Self {
         Self {
             // Lazy allocation (§6): start empty and reserve the full ring on the
             // first append (see `append`), so an idle store holds ~0 buffer
             // memory — matters when many domains are created but stay idle.
+            capture_pool: Default::default(),
             inner: RwLock::new(StoreInner {
+                capacity: crate::store::capacity::RingCapacity::fixed(capacity),
+                record_bytes: 0,
                 entries: VecDeque::new(),
                 trace_index: HashMap::new(),
                 late: BTreeMap::new(),
@@ -146,7 +184,7 @@ impl InMemoryStore {
                 late_counter: 0,
                 latest_evicted_at: None,
             }),
-            max_capacity: capacity,
+
             total_stored: AtomicU64::new(0),
             total_received: AtomicU64::new(0),
             malformed_count: AtomicU64::new(0),
@@ -190,8 +228,10 @@ impl InMemoryStore {
             entries.push_back(Arc::new(e));
         }
         Self {
-            max_capacity: capacity.max(entries.len()),
+            capture_pool: Default::default(),
             inner: RwLock::new(StoreInner {
+                capacity: crate::store::capacity::RingCapacity::fixed(capacity.max(entries.len())),
+                record_bytes: entries.iter().map(|e| crate::nightly::log_bytes(e)).sum(),
                 entries,
                 trace_index,
                 late: BTreeMap::new(),
@@ -286,6 +326,13 @@ impl InMemoryStore {
         inner.latest_evicted_at = inner
             .latest_evicted_at
             .max(inner.entries.iter().map(|e| e.timestamp).max());
+        if let Some(pool) = self.capture_pool.get().and_then(|p| p.upgrade()) {
+            let mut pool = pool.lock().unwrap();
+            for record in &inner.entries {
+                pool.evict_log(record.seq);
+            }
+        }
+        inner.record_bytes = 0;
         inner.entries.clear();
         inner.trace_index.clear();
         inner.late.clear();
@@ -310,6 +357,12 @@ impl InMemoryStore {
     /// Evict the lowest held record: the floor rises past it and its trace forgets it.
     fn evict_front(&self, inner: &mut StoreInner) {
         if let Some(evicted) = inner.entries.pop_front() {
+            if Arc::strong_count(&evicted) > 1 {
+                if let Some(pool) = self.capture_pool.get().and_then(|p| p.upgrade()) {
+                    pool.lock().unwrap().evict_log(evicted.seq);
+                }
+            }
+            inner.record_bytes -= crate::nightly::log_bytes(&evicted);
             // The floor is raised with `fetch_max`: eviction takes the lowest seq, so this
             // never lowers it — and if that invariant ever broke, the floor would still not
             // move down and start claiming records it once called lost.
@@ -324,7 +377,7 @@ impl InMemoryStore {
     /// holds no buffer, and `pop_front` never shrinks capacity.
     fn reserve_ring(&self, inner: &mut StoreInner) {
         if inner.entries.capacity() == 0 {
-            inner.entries.reserve_exact(self.max_capacity);
+            inner.entries.reserve_exact(inner.capacity.current);
         }
     }
 
@@ -377,6 +430,7 @@ impl InMemoryStore {
             merge_ascending(inner.trace_index.entry(tid).or_default(), &seqs);
         }
 
+        inner.record_bytes += batch.iter().map(crate::nightly::log_bytes).sum::<usize>();
         let stored = batch.len() as u64;
         let mut merged: Vec<Arc<LogEntry>> = Vec::with_capacity(tail.len() + batch.len());
         let (mut t, mut b) = (
@@ -396,20 +450,29 @@ impl InMemoryStore {
         // Capacity BEFORE pushing back: past the one-time `reserve_exact` the deque would
         // reallocate, and never give the memory back. The lowest records leave first — the
         // front of the ring, then the lowest of the merged run — each as an eviction.
-        let mut excess = (inner.entries.len() + merged.len()).saturating_sub(self.max_capacity);
-        while excess > 0 && !inner.entries.is_empty() {
-            self.evict_front(inner);
-            excess -= 1;
-        }
-        let mut merged = merged.into_iter();
-        // `merged` is ascending, so the dropped are exactly the seqs up to the last one dropped.
-        let mut dropped_through: Option<u64> = None;
-        for dropped in merged.by_ref().take(excess) {
-            self.lost_below
-                .fetch_max(dropped.seq.saturating_add(1), Ordering::Relaxed);
-            inner.latest_evicted_at = inner.latest_evicted_at.max(Some(dropped.timestamp));
-            inner.unindex(dropped.trace_id, dropped.seq);
-            dropped_through = Some(dropped.seq);
+        let mut merged = merged.into_iter().peekable();
+        let mut dropped_through = None;
+        while inner.entries.len() + merged.len() > inner.capacity.current {
+            let next = inner.entries.front().or_else(|| merged.peek()).unwrap();
+            if inner.capacity.grow_for(next.timestamp) {
+                continue;
+            }
+            if inner.entries.front().is_some() {
+                self.evict_front(inner);
+            } else {
+                let dropped = merged.next().unwrap();
+                self.lost_below
+                    .fetch_max(dropped.seq.saturating_add(1), Ordering::Relaxed);
+                inner.latest_evicted_at = inner.latest_evicted_at.max(Some(dropped.timestamp));
+                if Arc::strong_count(&dropped) > 1 {
+                    if let Some(pool) = self.capture_pool.get().and_then(|p| p.upgrade()) {
+                        pool.lock().unwrap().evict_log(dropped.seq);
+                    }
+                }
+                inner.record_bytes -= crate::nightly::log_bytes(&dropped);
+                inner.unindex(dropped.trace_id, dropped.seq);
+                dropped_through = Some(dropped.seq);
+            }
         }
         inner.entries.extend(merged);
         for seq in late_seqs {
@@ -898,7 +961,14 @@ impl LogStore for InMemoryStore {
         if entry.seq < self.refuse_below() {
             return;
         }
-        if self.max_capacity == 0 {
+        if inner.entries.len() >= inner.capacity.current {
+            let candidate = inner
+                .entries
+                .front()
+                .map_or(entry.timestamp, |e| e.timestamp);
+            inner.capacity.grow_for(candidate);
+        }
+        if inner.capacity.current == 0 {
             // A ring of no records stores and evicts at once, as the merge does with the run
             // it has no room for — so both write paths agree that it holds nothing (the push
             // below would otherwise hold one record past a capacity of zero).
@@ -910,7 +980,7 @@ impl LogStore for InMemoryStore {
         }
 
         self.reserve_ring(&mut inner);
-        if inner.entries.len() >= self.max_capacity {
+        if inner.entries.len() >= inner.capacity.current {
             // The one place a record leaves in the normal path, under the same write guard
             // that removes it, so the floor and the removal cannot be observed out of step.
             self.evict_front(&mut inner);
@@ -919,6 +989,7 @@ impl LogStore for InMemoryStore {
             // The newest seq, so the list stays ascending.
             inner.trace_index.entry(tid).or_default().push(entry.seq);
         }
+        inner.record_bytes += crate::nightly::log_bytes(&entry);
         inner.entries.push_back(Arc::new(entry));
         self.total_stored.fetch_add(1, Ordering::Relaxed);
     }
@@ -1093,7 +1164,11 @@ mod full_walk_tests {
         use crate::filter::parser::parse_filter;
         let store = InMemoryStore::new(1_000);
         for i in 0..100 {
-            let lvl = if i % 10 == 0 { Level::Error } else { Level::Info };
+            let lvl = if i % 10 == 0 {
+                Level::Error
+            } else {
+                Level::Info
+            };
             let mut e = LogEntry::synthetic(lvl, "m");
             e.seq = i + 1;
             store.append(e);
@@ -1103,7 +1178,10 @@ mod full_walk_tests {
         let mut visited = 0usize;
         let counts = store.for_each_matching(Some(&f), |_| visited += 1);
 
-        assert_eq!(counts.scanned, 100, "the filter narrows matches, not the walk");
+        assert_eq!(
+            counts.scanned, 100,
+            "the filter narrows matches, not the walk"
+        );
         assert_eq!(counts.matched, 10, "one in ten");
         assert_eq!(visited, 10, "the visitor sees matches only");
     }

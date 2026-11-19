@@ -258,6 +258,12 @@ impl Broker {
     ) -> Result<DomainsDeleteResult, BrokerError> {
         self.call_typed("domains.delete", p).await
     }
+    pub async fn domains_resize(
+        &self,
+        p: logmon_broker_protocol::DomainsResize,
+    ) -> Result<logmon_broker_protocol::DomainsResizeResult, BrokerError> {
+        self.call_typed("domains.resize", p).await
+    }
     pub async fn domains_list(&self, p: DomainsList) -> Result<DomainsListResult, BrokerError> {
         self.call_typed("domains.list", p).await
     }

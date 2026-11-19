@@ -415,6 +415,7 @@ impl Cur {
 /// contract the loader reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontMatter {
+    pub focus_traces: Vec<u128>,
     pub case: String,
     pub logmon_format: u32,
     pub captured_at: DateTime<Utc>,
@@ -768,7 +769,20 @@ pub fn parse_front_matter(doc: &str) -> Result<FrontMatter, ParseError> {
         other => return Err(ParseError::BadVerdict(other.to_string())),
     };
 
+    let mut focus_traces = Vec::new();
+    if let Some(v) = top.get("focus_trace_ids") {
+        for id in as_text(v, "focus_trace_ids")?.split(',') {
+            focus_traces.push(
+                u128::from_str_radix(id, 16).map_err(|_| ParseError::WrongType {
+                    key: "focus_trace_ids",
+                    wanted: "hexadecimal trace IDs",
+                    got: id.into(),
+                })?,
+            );
+        }
+    }
     Ok(FrontMatter {
+        focus_traces,
         case: as_text(take(&top, "case")?, "case")?,
         logmon_format,
         captured_at: as_time(take(&top, "captured_at")?, "captured_at")?,

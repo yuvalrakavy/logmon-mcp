@@ -98,6 +98,14 @@ Examine every per-item result. Both `applied` and `already_applied` reconcile th
 journal entry. Keep unresolved items in runner storage. Close the run after replay
 and inspect both `finalization` and `persistence`. The runner owns its verdicts.
 
+Set `fields` on begin to attach shared provenance once, for example a build commit,
+profile and action. `display_timezone` selects the display zone for human-readable
+case times. Set `expanded_cases` when your run will be published as a single
+archive. A case-ready event then points to the case Markdown beside its evidence
+files. A runner that knows both active work time and wall time can include
+`fields.member_runtime_ms` on end to compare active work with its estimate.
+Keep the original chain start and end times so the deadline includes waits.
+
 For local historical analysis, `test_log_file::TestLogFile::open` loads the JSONL,
 `lookup` retrieves an execution and `journal_status` supplies file-wide gaps,
 sampling and closure status. `compare_summaries` takes any two execution records.
@@ -265,6 +273,7 @@ Every JSON-RPC method has a typed `Broker::*` method. Param and result types com
 | `sessions_drop` | `SessionsDrop` | `SessionsDropResult` |
 | `status_get` | `StatusGet` | `StatusGetResult` |
 | `domains_create` | `DomainsCreate` | `DomainsCreateResult` |
+| `domains_resize` | `DomainsResize` | `DomainsResizeResult` |
 | `domains_delete` | `DomainsDelete` | `DomainsDeleteResult` |
 | `domains_list` | `DomainsList` | `DomainsListResult` |
 | `domains_use` | `DomainsUse` | `DomainsUseResult` |

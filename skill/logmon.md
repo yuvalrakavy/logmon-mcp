@@ -42,8 +42,7 @@ look up the stable `rust:<binary>::<test>` name and select the individual attemp
 `test_attempt_id` selector includes detached thread and task events from instrumented
 processes. Uninstrumented Rust tests can still have a verdict and captured failure output.
 
-Resolve `case_path` against the JSONL’s directory. Use `load_case(path=…)` on that
-ZIP and query the returned postmortem domain. Read its overlap list and machine-load
+For an archived run, extract the outer ZIP once. Open `summary.md`, find the execution in `failed-test-log.jsonl`, and resolve its relative `case_path` beside `full-test-log.jsonl`. Pass the absolute path of the expanded case Markdown to `load_case`. For a standalone case, pass the case ZIP directly. Query the returned postmortem domain. Read its overlap list and machine-load
 samples for surrounding activity. For a passing baseline use
 `logmon-test-log compare BEFORE_FILE BEFORE_ID AFTER_FILE AFTER_ID`. Check each side’s
 collection mode, sampling, truncation, late arrivals and journal gaps before interpreting a
@@ -599,7 +598,9 @@ get_trace(trace_id="peer-id", include_logs=false)
 get_recent_logs(filter="l>=WARN", count=20)
 ```
 
-Current brokers load the captured window. Focus it at query time with the selector above. On a broker whose `load_case` schema advertises `scope`, `all` is the default for inspecting peers and untagged activity; use `focus` for target-only analysis when the archive declares a focus trace. Older archives can start later than the earliest peer, so check the saved window before interpreting a missing event.
+To inspect only the selected execution, call `load_case(path=…, scope="focus", domain="case-focus")`. A shared deadline case lists every execution and focus ID. Pass its `focus_trace_id` when several are declared. To test a concurrency hypothesis, load the same document again with `scope="all", domain="case-window"`. This default view includes the earliest direct peer and untagged records through capture. Older cases support the full load and can have a shorter window. Inspect the saved coverage before interpreting a missing event.
+
+Compare the failure with its linked isolated rerun even when routine summary sampling was disabled. In `metric_coverage`, inspect log counts and span counts/durations separately for each attempt. An observed lower bound or unknown coverage limits the conclusions you can draw from the numeric difference. A deadline case followed by an OK verdict records a deadline crossing in a completed execution.
 
 **The things that bite:**
 

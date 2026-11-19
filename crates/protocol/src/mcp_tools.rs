@@ -547,7 +547,13 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "create_domain",
         method: "domains.create",
-        description: "Create (or idempotently ensure) an isolated domain — a full broker instance with its own log/span buffers, receivers, and triggers. Omitted ports are auto-allocated; a port of 0 disables that receiver. Ephemeral (gone on daemon restart).",
+        description: "Create (or idempotently ensure) an isolated domain — a full broker instance with its own log/span buffers, receivers, and triggers. Omitted ports are auto-allocated; a port of 0 disables that receiver. Use persist to restore listeners and sizes after restart.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "resize_domain",
+        method: "domains.resize",
+        description: "Resize one or both rings in place, keeping the newest records. Supply the domain name and the sizes to change.",
         cli: Cli::PLAIN,
     },
     Tool {
@@ -1148,7 +1154,7 @@ mod tests {
         // stdio and counts what it advertises — NOT a source scan in
         // `mcp/src/server.rs`, which is what this comment used to claim. There
         // is no tool list in the shim to scan: the daemon teaches it.
-        assert_eq!(TOOLS.len(), 57);
+        assert_eq!(TOOLS.len(), 58);
         for Tool {
             name: tool, method, ..
         } in TOOLS

@@ -63,14 +63,30 @@ fn domain_to_info(d: &Domain, stale_after_secs: u64) -> DomainInfo {
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
         (now.saturating_sub(n).max(0) / 1_000_000_000) as u64
     });
+    let (logs, logs_bytes, log_indexes) = d.pipeline.store.ring_info();
+    let (spans, spans_bytes, span_indexes) = d.span_store.ring_info();
+    let pending_capture_bytes = d.test_log.capture_pool.lock().unwrap().exclusive_bytes();
+    let indexes_bytes = log_indexes + span_indexes;
     DomainInfo {
+        memory: DomainMemory {
+            logs_bytes,
+            spans_bytes,
+            indexes_bytes,
+            pending_capture_bytes,
+        },
+        estimated_memory_bytes: logs_bytes + spans_bytes + indexes_bytes + pending_capture_bytes,
+        outcome: None,
+        initial_log_buffer_size: logs.initial,
+        initial_span_buffer_size: spans.initial,
+        max_log_buffer_size: logs.maximum,
+        max_span_buffer_size: spans.maximum,
         name: d.config.name.to_string(),
         gelf_port: d.config.gelf_port,
         otlp_grpc_port: d.config.otlp_grpc_port,
         otlp_http_port: d.config.otlp_http_port,
         source: d.config.source.as_str().to_string(),
-        log_buffer_size: d.config.log_buffer_size,
-        span_buffer_size: d.config.span_buffer_size,
+        log_buffer_size: logs.current,
+        span_buffer_size: spans.current,
         log_count: d.pipeline.store_len(),
         span_count: d.span_store.len(),
         oldest_seq: d.pipeline.oldest_log_seq(),
@@ -96,6 +112,7 @@ fn port_matches(existing: u16, requested: Option<u16>) -> bool {
 fn ensure_idempotent(
     existing: &Domain,
     requested: &DomainPortSpec,
+    sizing: &DomainsCreate,
     stale_after_secs: u64,
 ) -> Result<Value, String> {
     // **Before the port comparison, because it would pass.** A postmortem domain
@@ -116,13 +133,42 @@ fn ensure_idempotent(
         && port_matches(existing.config.otlp_grpc_port, requested.otlp_grpc)
         && port_matches(existing.config.otlp_http_port, requested.otlp_http);
     if matches {
-        serde_json::to_value(domain_to_info(existing, stale_after_secs)).map_err(|e| e.to_string())
+        let mut info = domain_to_info(existing, stale_after_secs);
+        if sizing
+            .log_buffer_size
+            .is_some_and(|n| n != info.initial_log_buffer_size)
+            || sizing
+                .span_buffer_size
+                .is_some_and(|n| n != info.initial_span_buffer_size)
+            || sizing
+                .max_log_buffer_size
+                .is_some_and(|n| Some(n) != info.max_log_buffer_size)
+            || sizing
+                .max_span_buffer_size
+                .is_some_and(|n| Some(n) != info.max_span_buffer_size)
+        {
+            return Err(format!("capacity_mismatch: {} has logs {} (maximum {:?}), spans {} (maximum {:?}); requested logs {:?} (maximum {:?}), spans {:?} (maximum {:?})", sizing.name, info.initial_log_buffer_size, info.max_log_buffer_size, info.initial_span_buffer_size, info.max_span_buffer_size, sizing.log_buffer_size, sizing.max_log_buffer_size, sizing.span_buffer_size, sizing.max_span_buffer_size));
+        }
+        if sizing.persist && existing.config.source == DomainSource::Ephemeral {
+            return Err(format!("domain {} exists as ephemeral", sizing.name));
+        }
+        info.outcome = Some("already_exists".into());
+        serde_json::to_value(info).map_err(|e| e.to_string())
     } else {
         Err(format!(
             "domain \"{}\" already exists with different ports",
             existing.id()
         ))
     }
+}
+
+fn validate_sizes(initial: usize, maximum: Option<usize>) -> Result<(), String> {
+    if initial > RpcHandler::MAX_DOMAIN_BUFFER_SIZE
+        || maximum.is_some_and(|cap| cap < initial || cap > RpcHandler::MAX_DOMAIN_BUFFER_SIZE)
+    {
+        return Err(format!("initial capacity {initial} and maximum {maximum:?} must satisfy initial <= maximum <= {}",RpcHandler::MAX_DOMAIN_BUFFER_SIZE));
+    }
+    Ok(())
 }
 
 pub struct RpcHandler {
@@ -138,6 +184,7 @@ pub struct RpcHandler {
     /// a test harness can build a handler without a config dir; when absent the
     /// `domain_data.*` methods say so rather than pretending an empty registry.
     domain_data: Option<Arc<crate::domain_data::DomainDataStore>>,
+    definitions: Option<super::domain_definitions::DomainDefinitions>,
     start_time: std::time::Instant,
     receivers_info: Vec<String>,
     domain_policy: DomainPolicy,
@@ -166,11 +213,31 @@ impl RpcHandler {
             sessions,
             collectors,
             domain_data: None,
+            definitions: None,
             start_time: std::time::Instant::now(),
             receivers_info,
             domain_policy,
             create_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    pub(crate) fn with_definitions(mut self, dir: &std::path::Path) -> Self {
+        self.definitions = Some(super::domain_definitions::DomainDefinitions::new(dir));
+        self
+    }
+
+    pub(crate) async fn restore_definitions(&self) -> anyhow::Result<()> {
+        let Some(store) = &self.definitions else {
+            return Ok(());
+        };
+        for def in store.load()? {
+            let name = def.name.clone();
+            let ports = (def.gelf_port, def.otlp_grpc_port, def.otlp_http_port);
+            if let Err(error) = self.create_domain(def, true).await {
+                tracing::warn!(%name, ?ports, %error, "persistent domain could not be restored");
+            }
+        }
+        Ok(())
     }
 
     /// Attach the provenance registry.
@@ -217,7 +284,9 @@ impl RpcHandler {
         use crate::cases::load;
 
         let raw = req_str(params, "path")?;
-        let case = load::load(std::path::Path::new(raw)).map_err(|e| e.to_string())?;
+        let mut case = load::load(std::path::Path::new(raw)).map_err(|e| e.to_string())?;
+        let scope = opt_str(params, "scope")?.unwrap_or("all");
+        case.select_scope(scope, opt_str(params, "focus_trace_id")?)?;
 
         // The name defaults to the case's own stem, so a reader who does not
         // care never invents one and two cases never collide by accident.
@@ -227,6 +296,16 @@ impl RpcHandler {
         let id = DomainId::new(&wanted).map_err(|e| e.to_string())?;
 
         let _guard = self.create_lock.lock().await;
+        if self
+            .definitions
+            .as_ref()
+            .map(|s| s.contains(&id))
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(false)
+        {
+            return Err(format!("domain {id} has a persistent listener definition; choose another name for this case"));
+        }
         if let Some(existing) = self.domains.get(&id) {
             let holds = match &existing.postmortem {
                 Some(pm) => format!("holds the case `{}`", pm.case),
@@ -257,6 +336,8 @@ impl RpcHandler {
         let reply = json!({
             "domain": domain.config.name.to_string(),
             "case": case.stem,
+            "scope": scope,
+            "focus_trace_ids": case.front.focus_traces.iter().map(|id|format!("{id:032x}")).collect::<Vec<_>>(),
             "captured_at": case.front.captured_at.to_rfc3339(),
             // Through serde, NOT `{:?}`. `Debug` ignores the enum's
             // `rename_all = "snake_case"`, so `CannotVerify` went on the wire as
@@ -527,6 +608,7 @@ impl RpcHandler {
                     .to_string(),
             ),
             "domains.delete" => self.handle_domains_delete(&request.params),
+            "domains.resize" => self.handle_domains_resize(&request.params),
             "domains.list" => self.handle_domains_list(),
             "domains.use" => self.handle_domains_use(session_id, &request.params),
             "sessions.rename" => self.handle_sessions_rename(session_id, &request.params),
@@ -669,6 +751,10 @@ impl RpcHandler {
                 Err(msg) => RpcResponse::error(request.id, -32601, &msg),
             };
         }
+        if matches!(request.method.as_str(), "domains.delete" | "domains.resize") {
+            let _guard = self.create_lock.lock().await;
+            return self.handle(session_id, request);
+        }
         if request.method == "domains.create" {
             return match self.handle_domains_create(&request.params).await {
                 // Through the same step as the sync path: `domains.create` has
@@ -676,7 +762,15 @@ impl RpcHandler {
                 // exit that silently could not render would be a trap for
                 // whoever adds one.
                 Ok(value) => RpcResponse::success(request.id, Self::maybe_render(request, value)),
-                Err(msg) => RpcResponse::error(request.id, -32601, &msg),
+                Err(msg) => RpcResponse::error(
+                    request.id,
+                    if msg.starts_with("capacity_mismatch:") {
+                        -32032
+                    } else {
+                        -32601
+                    },
+                    &msg,
+                ),
             };
         }
         self.handle(session_id, request)
@@ -729,13 +823,10 @@ impl RpcHandler {
         let req: DomainsCreate = serde_json::from_value(params.clone())
             .map_err(|e| format!("invalid domains.create params: {e}"))?;
 
-        if req.persist {
-            return Err(
-                "persistent domains are not yet supported — create with persist=false (ephemeral)"
-                    .into(),
-            );
-        }
+        self.create_domain(req, false).await
+    }
 
+    async fn create_domain(&self, req: DomainsCreate, restoring: bool) -> Result<Value, String> {
         let id = DomainId::new(&req.name).map_err(|e| e.to_string())?;
         let requested = DomainPortSpec {
             gelf: req.gelf_port,
@@ -774,7 +865,15 @@ impl RpcHandler {
         // Idempotent ensure: an existing domain with matching (or unspecified)
         // ports is a no-op; conflicting ports are an error.
         if let Some(existing) = self.domains.get(&id) {
-            return ensure_idempotent(&existing, &requested, self.domain_policy.stale_after_secs);
+            if restoring {
+                return Err(format!("persistent domain name {id} already in use"));
+            }
+            return ensure_idempotent(
+                &existing,
+                &requested,
+                &req,
+                self.domain_policy.stale_after_secs,
+            );
         }
 
         // `max_domains` caps API-created (non-`config`) domains; `config` +
@@ -785,7 +884,7 @@ impl RpcHandler {
             .iter()
             .filter(|d| d.config.source != DomainSource::Config)
             .count();
-        if api_created >= self.domain_policy.max_domains {
+        if !restoring && api_created >= self.domain_policy.max_domains {
             return Err(format!(
                 "max_domains ({}) reached — delete a domain before creating another",
                 self.domain_policy.max_domains
@@ -815,21 +914,129 @@ impl RpcHandler {
             ));
         }
 
+        validate_sizes(log_buffer_size, req.max_log_buffer_size)?;
+        validate_sizes(span_buffer_size, req.max_span_buffer_size)?;
+        if !restoring
+            && self
+                .definitions
+                .as_ref()
+                .map(|s| s.contains(&id))
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(false)
+        {
+            return Err(format!("a persistent definition exists for {id} whose listeners could not start; inspect broker diagnostics or delete the definition"));
+        }
+        if req.persist && self.definitions.is_none() {
+            return Err("persistent domain storage unavailable".into());
+        }
+
         let domain = spawn_ephemeral_domain(
-            id,
+            id.clone(),
             requested,
             log_buffer_size,
             span_buffer_size,
             self.sessions.clone(),
             self.collectors.clone(),
-            DomainSource::Ephemeral,
+            if req.persist {
+                DomainSource::Persistent
+            } else {
+                DomainSource::Ephemeral
+            },
         )
         .await
         .map_err(|e| format!("could not create domain: {e}"))?;
 
-        let info = domain_to_info(&domain, self.domain_policy.stale_after_secs);
+        domain
+            .pipeline
+            .store
+            .resize_with(Some(log_buffer_size), req.max_log_buffer_size, || {
+                domain
+                    .span_store
+                    .resize(Some(span_buffer_size), req.max_span_buffer_size)
+            });
+        let mut info = domain_to_info(&domain, self.domain_policy.stale_after_secs);
+        if req.persist && !restoring {
+            self.save_definition(
+                &domain,
+                log_buffer_size,
+                req.max_log_buffer_size,
+                span_buffer_size,
+                req.max_span_buffer_size,
+            )?;
+        }
+        info.outcome = Some("created".into());
         self.domains.insert(domain);
         serde_json::to_value(info).map_err(|e| e.to_string())
+    }
+
+    fn save_definition(
+        &self,
+        domain: &Domain,
+        logs: usize,
+        max_logs: Option<usize>,
+        spans: usize,
+        max_spans: Option<usize>,
+    ) -> Result<(), String> {
+        let config = &domain.config;
+        let definition = DomainsCreate {
+            name: config.name.to_string(),
+            gelf_port: Some(config.gelf_port),
+            otlp_grpc_port: Some(config.otlp_grpc_port),
+            otlp_http_port: Some(config.otlp_http_port),
+            log_buffer_size: Some(logs),
+            span_buffer_size: Some(spans),
+            max_log_buffer_size: max_logs,
+            max_span_buffer_size: max_spans,
+            persist: true,
+        };
+        self.definitions
+            .as_ref()
+            .ok_or("persistent domain storage unavailable")?
+            .save(&config.name, &definition)
+            .map_err(|e| format!("could not save domain {}: {e}", config.name))
+    }
+
+    fn handle_domains_resize(&self, params: &Value) -> Result<Value, String> {
+        let req: DomainsResize =
+            serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+        let id = DomainId::new(&req.name).map_err(|e| e.to_string())?;
+        let domain = self
+            .domains
+            .get(&id)
+            .ok_or_else(|| format!("domain {id} does not exist"))?;
+        if domain.is_postmortem() {
+            return Err(format!("domain {id} holds a loaded case"));
+        }
+        let before = domain_to_info(&domain, self.domain_policy.stale_after_secs);
+        let logs = req
+            .log_buffer_size
+            .unwrap_or(before.initial_log_buffer_size);
+        let spans = req
+            .span_buffer_size
+            .unwrap_or(before.initial_span_buffer_size);
+        let max_logs = req.max_log_buffer_size.or(before.max_log_buffer_size);
+        let max_spans = req.max_span_buffer_size.or(before.max_span_buffer_size);
+        validate_sizes(logs, max_logs)?;
+        validate_sizes(spans, max_spans)?;
+        if domain.config.source == DomainSource::Persistent {
+            self.save_definition(&domain, logs, max_logs, spans, max_spans)?;
+        }
+        let (logs_evicted, spans_evicted) =
+            domain
+                .pipeline
+                .store
+                .resize_with(req.log_buffer_size, max_logs, || {
+                    domain.span_store.resize(req.span_buffer_size, max_spans)
+                });
+        let after = domain_to_info(&domain, self.domain_policy.stale_after_secs);
+        serde_json::to_value(DomainsResizeResult {
+            before,
+            after,
+            logs_evicted,
+            spans_evicted,
+        })
+        .map_err(|e| e.to_string())
     }
 
     /// Delete an ephemeral (or persistent) domain. Refuses `config`-declared
@@ -841,21 +1048,34 @@ impl RpcHandler {
             .map_err(|e| format!("invalid domains.delete params: {e}"))?;
         let id = DomainId::new(&req.name).map_err(|e| e.to_string())?;
 
-        let existing = self
-            .domains
-            .get(&id)
-            .ok_or_else(|| format!("domain \"{id}\" does not exist"))?;
-        if existing.config.source == DomainSource::Config {
+        let existing = self.domains.get(&id);
+        if existing
+            .as_ref()
+            .is_some_and(|d| d.config.source == DomainSource::Config)
+        {
             return Err(format!(
                 "cannot delete config-declared domain \"{id}\" — edit config.json"
             ));
         }
-        drop(existing);
-        self.domains.remove(&id);
-
+        let saved = self
+            .definitions
+            .as_ref()
+            .map(|s| s.delete(&id))
+            .transpose()
+            .map_err(|e| format!("cannot delete persistent definition for {id}: {e}"))?
+            .unwrap_or(false);
+        let memory = existing
+            .as_ref()
+            .map(|d| domain_to_info(d, self.domain_policy.stale_after_secs).estimated_memory_bytes);
+        let deleted = self.domains.remove(&id).is_some() || saved;
+        if !deleted && !req.if_exists {
+            return Err(format!("domain \"{id}\" does not exist"));
+        }
         serde_json::to_value(DomainsDeleteResult {
             name: req.name,
-            deleted: true,
+            deleted,
+            outcome: if deleted { "deleted" } else { "already_absent" }.into(),
+            estimated_memory_bytes: memory,
         })
         .map_err(|e| e.to_string())
     }
@@ -1257,9 +1477,15 @@ impl RpcHandler {
     fn handle_domains_clear(&self, session_id: &SessionId) -> Result<Value, String> {
         self.require_live(session_id, "clear_domain")?;
         let d = self.resolve_domain(session_id)?;
+        let estimated_memory_bytes_before =
+            domain_to_info(&d, self.domain_policy.stale_after_secs).estimated_memory_bytes;
         let logs_cleared = d.pipeline.clear_logs();
         let spans_cleared = d.span_store.clear();
+        let estimated_memory_bytes_after =
+            domain_to_info(&d, self.domain_policy.stale_after_secs).estimated_memory_bytes;
         serde_json::to_value(DomainsClearResult {
+            estimated_memory_bytes_before,
+            estimated_memory_bytes_after,
             logs_cleared,
             spans_cleared,
         })
@@ -2442,6 +2668,10 @@ impl RpcHandler {
             );
         }
 
+        let focus = opt_str(params, "focus_trace_id")?
+            .map(|id| u128::from_str_radix(id, 16))
+            .transpose()
+            .map_err(|_| "invalid focus_trace_id")?;
         let before = window_count(params, "before")?;
         let after = window_count(params, "after")?;
         let clamped = before.clamped || after.clamped;
@@ -2500,15 +2730,57 @@ impl RpcHandler {
         above.truncate(after.value);
         let from = below.last().copied().unwrap_or(anchor.seq);
         let to = above.last().copied().unwrap_or(anchor.seq);
-
-        // The logs the window contains, and the log floor, read TOGETHER under
-        // one lock once the window is cut. `log_ctx` only cut it: the stores
-        // were read separately, so a log stored after `log_ctx` (and below a
-        // span the span scan saw) is inside `[from, to]` without being in
-        // `log_ctx`, and a log in `log_ctx` may since have been evicted. Read
-        // apart, the file and the floor could describe different instants —
-        // and the floor would call a record gone that the file holds.
-        let (logs, log_lost_below) = d.pipeline.logs_in_range_with_floor(from, to);
+        let (logs, log_lost_below, spans, span_lost_below, peer_traces, from, to) =
+            if let Some(focus) = focus {
+                d.pipeline.with_retained(|logs| {
+                    d.span_store.with_retained(|spans| {
+                        let mut intervals = crate::cases::focus::Intervals::default();
+                        for e in logs.records {
+                            if let Some(trace) = e.trace_id {
+                                intervals.observe(trace, e.timestamp, e.timestamp);
+                            }
+                        }
+                        for s in spans.records {
+                            intervals.observe(s.trace_id, s.start_time, s.end_time);
+                        }
+                        let (start, peers) = intervals
+                            .overlapping(focus)
+                            .ok_or("focus_trace_id has no retained records")?;
+                        let selected_logs: Vec<_> = logs
+                            .records
+                            .iter()
+                            .filter(|e| e.seq == anchor.seq || e.timestamp >= start)
+                            .map(|e| e.as_ref().clone())
+                            .collect();
+                        let selected_spans: Vec<_> = spans
+                            .records
+                            .iter()
+                            .filter(|s| s.end_time >= start)
+                            .map(|s| s.as_ref().clone())
+                            .collect();
+                        let (from, to) = selected_logs
+                            .iter()
+                            .map(|e| e.seq)
+                            .chain(selected_spans.iter().map(|s| s.seq))
+                            .fold((anchor.seq, anchor.seq), |(a, b), seq| {
+                                (a.min(seq), b.max(seq))
+                            });
+                        Ok::<_, String>((
+                            selected_logs,
+                            logs.lost_below,
+                            selected_spans,
+                            spans.lost_below,
+                            peers,
+                            from,
+                            to,
+                        ))
+                    })
+                })?
+            } else {
+                let (logs, log_floor) = d.pipeline.logs_in_range_with_floor(from, to);
+                let (spans, span_floor) = d.span_store.range_with_floor(from, to);
+                (logs, log_floor, spans, span_floor, Vec::new(), from, to)
+            };
         if logs.binary_search_by_key(&anchor.seq, |e| e.seq).is_err() {
             return Err(format!(
                 "the anchor entry at seq {} was evicted while the capture was being taken",
@@ -2516,11 +2788,6 @@ impl RpcHandler {
             ));
         }
 
-        // Spans over the SAME resolved range, so the two files describe one
-        // interval by construction rather than by two window parameters that
-        // could disagree — with the span floor read in the same lock, as the
-        // log floor is.
-        let (spans, span_lost_below) = d.span_store.range_with_floor(from, to);
         // Bounded by the window, twice over: the span floor can sit far above `to`
         // (unlike the log floor, which the held anchor bounds), and spans gone above
         // the window are not spans gone from it; and a seq a held log occupies was
@@ -2548,8 +2815,16 @@ impl RpcHandler {
         // log floor ever raised it flipped `complete` to `evicted`. The residual
         // the cut leaves is smaller: a record a trigger flushes in between can be
         // in the file of a window the document calls short of it.
-        let short_before = before.value.saturating_sub(below.len());
-        let short_after = after.value.saturating_sub(above.len());
+        let short_before = if focus.is_some() {
+            0
+        } else {
+            before.value.saturating_sub(below.len())
+        };
+        let short_after = if focus.is_some() {
+            0
+        } else {
+            after.value.saturating_sub(above.len())
+        };
         // The window was cut at the bottom AND records really have left: the
         // shortfall is eviction rather than an empty past.
         //
@@ -2647,6 +2922,7 @@ impl RpcHandler {
 
         let anchor_seq = anchor.seq;
         let input = doc::CaseInput {
+            focus_traces: focus.into_iter().collect(),
             stem: files.stem.clone(),
             captured_at,
             domain: domain_name.clone(),
@@ -2730,7 +3006,18 @@ impl RpcHandler {
                     spans.iter(),
                 )?)
             };
-            let rendered = doc::render(&input);
+            let mut rendered = doc::render(&input);
+            if focus.is_some() {
+                crate::cases::focus::render(
+                    &mut rendered.body,
+                    &input,
+                    &peer_traces,
+                    chrono_tz::UTC,
+                    logs.iter().filter(|_| !omit_logdata),
+                    spans.iter().filter(|_| !omit_spandata),
+
+                );
+            }
             let doc_bytes = rendered.body.as_bytes().to_vec();
             let registry_bytes = doc::registry_json(&input.registry);
 

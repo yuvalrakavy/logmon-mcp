@@ -752,3 +752,178 @@ async fn create_rejects_equal_otlp_ports() {
         .expect("both-disabled OTLP is fine");
     assert_eq!(ok.name, "y");
 }
+
+#[tokio::test]
+async fn capacity_mismatch_resize_preserves_newest_and_cleanup_is_idempotent() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let info: DomainInfo = client.call("domains.create", json!({"name":"sizing","log_buffer_size":4,"max_log_buffer_size":8,"span_buffer_size":4})).await.unwrap();
+    let mismatch = client
+        .call::<DomainInfo>(
+            "domains.create",
+            json!({"name":"sizing","log_buffer_size":3}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        mismatch.to_string().contains("capacity_mismatch"),
+        "{mismatch}"
+    );
+    for i in 0..4 {
+        send_gelf(info.gelf_port, &format!("record {i}")).await;
+    }
+    assert_eq!(wait_log_count(&mut client, "sizing", 4).await, 4);
+    let invalid = client.call::<serde_json::Value>("domains.resize",json!({"name":"sizing","log_buffer_size":1,"span_buffer_size":5,"max_span_buffer_size":3})).await;
+    assert!(invalid.is_err());
+    assert_eq!(
+        get_domain(&mut client, "sizing").await.unwrap().log_count,
+        4
+    );
+    let request = json!({"name":"sizing","log_buffer_size":2});
+    let result: serde_json::Value = client
+        .call("domains.resize", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(result["logs_evicted"], 2);
+    assert_eq!(
+        result["before"]["newest_seq"],
+        result["after"]["newest_seq"]
+    );
+    assert!(result["after"]["oldest_seq"].as_u64() > result["before"]["oldest_seq"].as_u64());
+    assert!(
+        result["after"]["estimated_memory_bytes"].as_u64()
+            < result["before"]["estimated_memory_bytes"].as_u64()
+    );
+    let retry: serde_json::Value = client.call("domains.resize", request).await.unwrap();
+    assert_eq!(retry["logs_evicted"], 0);
+    client
+        .call::<serde_json::Value>("domains.use", json!({"name":"sizing"}))
+        .await
+        .unwrap();
+    let cleared: DomainsClearResult = client.call("domains.clear", json!({})).await.unwrap();
+    assert_eq!(cleared.logs_cleared, 2);
+    assert!(cleared.estimated_memory_bytes_before > cleared.estimated_memory_bytes_after);
+    let delete = json!({"name":"sizing","if_exists":true});
+    let first: DomainsDeleteResult = client.call("domains.delete", delete.clone()).await.unwrap();
+    assert!(first.deleted && first.estimated_memory_bytes.is_some());
+    let again: DomainsDeleteResult = client.call("domains.delete", delete).await.unwrap();
+    assert_eq!(again.outcome, "already_absent");
+    assert_eq!(again.estimated_memory_bytes, None);
+}
+
+#[tokio::test]
+async fn persisted_resized_domain_restores_exact_listeners_and_empty_rings() {
+    let mut daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let info: DomainInfo = client
+        .call(
+            "domains.create",
+            json!({"name":"lane","persist":true,"log_buffer_size":3,"max_log_buffer_size":9}),
+        )
+        .await
+        .unwrap();
+    client
+        .call::<DomainInfo>("domains.create", json!({"name":"ephemeral"}))
+        .await
+        .unwrap();
+    send_gelf(info.gelf_port, "before restart").await;
+    assert_eq!(wait_log_count(&mut client, "lane", 1).await, 1);
+    client
+        .call::<serde_json::Value>("domains.resize", json!({"name":"lane","log_buffer_size":6}))
+        .await
+        .unwrap();
+    drop(client);
+    daemon.restart().await;
+    let mut client = daemon.connect_anon().await;
+    assert!(get_domain(&mut client, "ephemeral").await.is_none());
+    let restored = get_domain(&mut client, "lane").await.unwrap();
+    assert_eq!(
+        (
+            restored.gelf_port,
+            restored.otlp_grpc_port,
+            restored.otlp_http_port
+        ),
+        (info.gelf_port, info.otlp_grpc_port, info.otlp_http_port)
+    );
+    assert_eq!(restored.source, "persistent");
+    assert_eq!(
+        (
+            restored.log_count,
+            restored.initial_log_buffer_size,
+            restored.max_log_buffer_size
+        ),
+        (0, 6, Some(9))
+    );
+    send_gelf(restored.gelf_port, "after restart").await;
+    assert_eq!(wait_log_count(&mut client, "lane", 1).await, 1);
+    client
+        .call::<DomainsDeleteResult>("domains.delete", json!({"name":"lane"}))
+        .await
+        .unwrap();
+    drop(client);
+    daemon.restart().await;
+    assert!(get_domain(&mut daemon.connect_anon().await, "lane")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn ensure_after_growth_and_resize_during_ingest_keep_the_receiver_live() {
+    let daemon = spawn_test_daemon().await;
+    let mut client = daemon.connect_anon().await;
+    let config = json!({"name":"burst","log_buffer_size":2,"max_log_buffer_size":8});
+    let domain: DomainInfo = client.call("domains.create", config.clone()).await.unwrap();
+    client
+        .call::<serde_json::Value>("domains.use", json!({"name":"burst"}))
+        .await
+        .unwrap();
+    let begin = json!({"run_id":"growth","jsonl_path": daemon.tempdir.path().join("growth.jsonl"), "grace_period_ms":0});
+    client
+        .call::<serde_json::Value>("test_log.begin", begin)
+        .await
+        .unwrap();
+    let event = json!({"run_id":"growth","execution_id":"exec","name":"work","started_at":chrono::Utc::now(),"selector":{"field":"trace_id","value":"1"}});
+    client
+        .call::<serde_json::Value>("test_log.start", event)
+        .await
+        .unwrap();
+    for i in 0..5 {
+        send_gelf(domain.gelf_port, &format!("before {i}")).await;
+    }
+    assert_eq!(wait_log_count(&mut client, "burst", 5).await, 5);
+    let ensured: DomainInfo = client.call("domains.create", config).await.unwrap();
+    assert_eq!(
+        (ensured.initial_log_buffer_size, ensured.log_buffer_size),
+        (2, 8)
+    );
+    assert_eq!(ensured.gelf_port, domain.gelf_port);
+    // Raising only a ceiling preserves a grown ring.
+    let updated: serde_json::Value = client
+        .call(
+            "domains.resize",
+            json!({"name":"burst","max_log_buffer_size":10}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["logs_evicted"], 0);
+    assert_eq!(updated["after"]["log_buffer_size"], 8);
+    let sender = tokio::spawn(async move {
+        for i in 0..30 {
+            send_gelf(domain.gelf_port, &format!("during {i}")).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    let shrink: serde_json::Value = client
+        .call(
+            "domains.resize",
+            json!({"name":"burst","log_buffer_size":3,"max_log_buffer_size":3}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shrink["after"]["log_buffer_size"], 3);
+    sender.await.unwrap();
+    let after = get_domain(&mut client, "burst").await.unwrap();
+    assert_eq!((after.log_count, after.log_buffer_size), (3, 3));
+    assert!(after.newest_seq > ensured.newest_seq);
+    assert_eq!(after.gelf_port, ensured.gelf_port);
+}

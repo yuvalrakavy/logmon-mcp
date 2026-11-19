@@ -1787,3 +1787,29 @@ fn the_prefix_falls_back_through_the_registry_to_the_domain() {
         .unwrap()
         .starts_with("checkout-hang-"));
 }
+
+#[test]
+fn manual_focus_selects_direct_peers_and_the_complete_retained_window() {
+    let h = harness();
+    h.feed(Level::Info, "outside");
+    h.feed_traced(Level::Info, "early peer", Some(2));
+    let anchor = h.feed_traced(Level::Info, "focus start", Some(1));
+    h.feed(Level::Info, "untagged");
+    h.feed_traced(Level::Info, "peer overlap", Some(2));
+    h.feed_traced(Level::Info, "focus end", Some(1));
+    let r = bundled(&h, json!({"anchor":{"seq":anchor},"focus_trace_id":"1"}));
+    let path = std::path::Path::new(r["paths"][0].as_str().unwrap());
+    let mut loaded = logmon_broker_core::cases::load::load(path).unwrap();
+    let msgs: Vec<_> = loaded
+        .logs
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect();
+    assert!(
+        msgs.contains(&"early peer") && msgs.contains(&"untagged") && !msgs.contains(&"outside")
+    );
+    loaded.select_scope("focus", None).unwrap();
+    assert_eq!(loaded.logs.unwrap().len(), 2);
+}

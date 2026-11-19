@@ -66,7 +66,10 @@ async fn domains_typed_lifecycle_round_trip() {
 
     // delete.
     let deleted = broker
-        .domains_delete(DomainsDelete { name: "t3".into() })
+        .domains_delete(DomainsDelete {
+            name: "t3".into(),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert!(deleted.deleted);

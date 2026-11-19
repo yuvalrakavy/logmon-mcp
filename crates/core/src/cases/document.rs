@@ -203,6 +203,7 @@ pub struct CollectorLine {
 /// Everything the renderer needs, gathered by the caller.
 #[derive(Debug, Clone)]
 pub struct CaseInput {
+    pub focus_traces: Vec<u128>,
     pub stem: String,
     pub captured_at: DateTime<Utc>,
     pub domain: String,
@@ -323,6 +324,15 @@ pub(crate) fn front_matter(s: &mut String, i: &CaseInput) {
     let (core, missing) = core_coverage(&i.registry);
     let _ = writeln!(s, "---");
     let _ = writeln!(s, "case: {}", i.stem);
+    if !i.focus_traces.is_empty() {
+        let ids = i
+            .focus_traces
+            .iter()
+            .map(|id| format!("{id:032x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = writeln!(s, "focus_trace_ids: {}", yaml_str(&ids));
+    }
     let _ = writeln!(s, "logmon_format: {FORMAT_VERSION}");
     let _ = writeln!(s, "captured_at: {}", yaml_str(&i.captured_at.to_rfc3339()));
     let _ = writeln!(s, "domain: {}", yaml_str(&i.domain));

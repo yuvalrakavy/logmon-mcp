@@ -120,6 +120,33 @@ pub struct LoadedCase {
 }
 
 impl LoadedCase {
+    pub fn select_scope(&mut self, scope: &str, requested: Option<&str>) -> Result<(), String> {
+        if scope == "all" && requested.is_none() {
+            return Ok(());
+        }
+        if scope != "focus" {
+            return Err(
+                "choose scope all, or use scope focus to select a declared focus trace".into(),
+            );
+        }
+        let focus = match (requested, self.front.focus_traces.as_slice()) {
+            (Some(id), ids) => u128::from_str_radix(id, 16)
+                .ok()
+                .filter(|id| ids.contains(id))
+                .ok_or("requested trace is not a declared focus of this case")?,
+            (None, [id]) => *id,
+            (None, []) => return Err("case has no declared focus trace".into()),
+            (None, _) => return Err("shared case requires focus_trace_id for scope focus".into()),
+        };
+        if let Some(logs) = self.logs.as_mut() {
+            logs.retain(|e| e.trace_id == Some(focus));
+        }
+        if let Some(spans) = self.spans.as_mut() {
+            spans.retain(|e| e.trace_id == focus);
+        }
+        Ok(())
+    }
+
     /// The window's lower bound, which is also `lost_below` and one above the
     /// epoch origin.
     pub fn from_seq(&self) -> u64 {

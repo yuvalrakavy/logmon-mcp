@@ -120,6 +120,9 @@ impl TestLogFile {
             }
             "late-telemetry" | "late-telemetry-counts" => {
                 entry.insert("late_telemetry_observed".into(), Value::Bool(true));
+                if let Some(stream) = row.get("kind").and_then(Value::as_str) {
+                    entry.insert("first_late_kind".into(), stream.into());
+                }
                 if kind == "late-telemetry-counts" {
                     entry.insert("late_telemetry_counts".into(), json!({
                         "logs":row.get("logs"), "spans":row.get("spans"), "as_of":row.get("as_of")
@@ -176,6 +179,8 @@ fn context(row: &Map<String, Value>) -> Map<String, Value> {
         "name",
         "verdict",
         "elapsed_ms",
+        "member_runtime_ms",
+        "rerun_of",
         "coverage",
         "summary_status",
         "summary_final",
@@ -193,6 +198,46 @@ fn context(row: &Map<String, Value>) -> Map<String, Value> {
     out
 }
 
+// A live summary survives raw ring eviction. Domain-wide ingest losses are
+// ambiguous for any one execution, so treat the affected stream as unknown.
+fn counter_coverage(row: &Map<String, Value>, kind: &str) -> &'static str {
+    let c = row.get("coverage").unwrap_or(&Value::Null);
+    let status = c[format!("{kind}_coverage")]["status"].as_str();
+    if status == Some("evicted") {
+        return "observed_lower_bound";
+    }
+    let drops = &c["domain_loss_during_window"];
+    let keys: &[&str] = if kind == "log" {
+        &["logs_dropped"]
+    } else {
+        &["spans_dropped", "malformed_spans", "shed_trace_batches"]
+    };
+    let late = row.get("late_telemetry_observed") == Some(&Value::Bool(true))
+        && row
+            .get("late_telemetry_counts")
+            .and_then(|counts| counts[if kind == "log" { "logs" } else { "spans" }].as_u64())
+            .map_or_else(
+                || {
+                    row.get("first_late_kind")
+                        .and_then(Value::as_str)
+                        .is_none_or(|stream| stream == kind)
+                },
+                |count| count > 0,
+            );
+    if status == Some("unknown")
+        || row.get("closure_incomplete") == Some(&Value::Bool(true))
+        || late
+        || keys.iter().any(|k| drops[*k].as_u64().unwrap_or(0) > 0)
+    {
+        return "unknown";
+    }
+    if status == Some("retained") || c["collection_mode"] == "live" {
+        "observed"
+    } else {
+        "unknown"
+    }
+}
+
 /// Changes are differences between observed counters. Coverage from both
 /// source summaries accompanies them; incomplete and sampled-out executions
 /// can never establish the absence of a span or attribute.
@@ -206,6 +251,10 @@ pub fn compare_summaries(before: &Map<String, Value>, after: &Map<String, Value>
         return result;
     };
     result["comparable"] = true.into();
+    for (kind, label) in [("log", "log_counts"), ("span", "span_counts_and_durations")] {
+        result["metric_coverage"][label] =
+            json!({"before":counter_coverage(before,kind),"after":counter_coverage(after,kind)});
+    }
     let mut spans = Map::new();
     for key in either_keys(&a["spans"], &b["spans"]) {
         let old = &a["spans"][key];
@@ -214,6 +263,27 @@ pub fn compare_summaries(before: &Map<String, Value>, after: &Map<String, Value>
             spans.insert(key.clone(), json!({"before":old,"after":new,
                 "count_change":count_diff(&old["count"], &new["count"]),
                 "duration_change_ms":new["total_duration_ms"].as_f64().unwrap_or(0.0)-old["total_duration_ms"].as_f64().unwrap_or(0.0)}));
+        }
+    }
+    if counter_coverage(before, "span") == "observed"
+        && counter_coverage(after, "span") == "observed"
+    {
+        for v in spans.values_mut() {
+            if (v["before"].is_null() && a["span_overflow"]["count"].as_u64().unwrap_or(0) > 0)
+                || (v["after"].is_null() && b["span_overflow"]["count"].as_u64().unwrap_or(0) > 0)
+            {
+                v["name_coverage"] = "unknown_truncated".into();
+                continue;
+            }
+            if let Some(percent) = percent_change(&v["before"]["count"], &v["after"]["count"]) {
+                v["count_change_percent"] = percent.into();
+            }
+            if let Some(percent) = percent_change(
+                &v["before"]["total_duration_ms"],
+                &v["after"]["total_duration_ms"],
+            ) {
+                v["duration_change_percent"] = percent.into();
+            }
         }
     }
     result["span_changes"] = spans.into();
@@ -227,6 +297,14 @@ pub fn compare_summaries(before: &Map<String, Value>, after: &Map<String, Value>
             );
         }
     }
+    if counter_coverage(before, "log") == "observed" && counter_coverage(after, "log") == "observed"
+    {
+        for v in levels.values_mut() {
+            if let Some(percent) = percent_change(&v["before"], &v["after"]) {
+                v["count_change_percent"] = percent.into();
+            }
+        }
+    }
     result["log_level_changes"] = levels.into();
     let mut attrs = Map::new();
     for key in either_keys(&a["distinct_values"], &b["distinct_values"]) {
@@ -237,6 +315,11 @@ pub fn compare_summaries(before: &Map<String, Value>, after: &Map<String, Value>
     }
     result["attribute_changes"] = attrs.into();
     result
+}
+
+fn percent_change(before: &Value, after: &Value) -> Option<f64> {
+    let old = before.as_f64()?;
+    (old > 0.).then(|| (after.as_f64().unwrap_or(0.) / old - 1.) * 100.)
 }
 
 fn count_diff(before: &Value, after: &Value) -> Value {
@@ -252,6 +335,24 @@ fn count_diff(before: &Value, after: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn partial_spans_do_not_hide_comparable_log_counts() {
+        let a = json!({"summary":{"spans":{"read":{"count":4,"total_duration_ms":10.0}},"log_levels":{"WARN":2}},"coverage":{"collection_mode":"ring_backfill","log_coverage":{"status":"retained"},"span_coverage":{"status":"evicted"}}});
+        let b = json!({"summary":{"spans":{"read":{"count":6,"total_duration_ms":30.0}},"log_levels":{"WARN":3}},"coverage":{"collection_mode":"live"}});
+        let diff = compare_summaries(a.as_object().unwrap(), b.as_object().unwrap());
+        assert_eq!(
+            diff["metric_coverage"]["span_counts_and_durations"]["before"],
+            "observed_lower_bound"
+        );
+        assert!(diff["span_changes"]["read"]
+            .get("count_change_percent")
+            .is_none());
+        assert_eq!(
+            diff["log_level_changes"]["WARN"]["count_change_percent"],
+            50.0
+        );
+    }
+
     #[test]
     fn final_revision_keeps_the_verdict_case_and_failure_message() {
         let rows=concat!(

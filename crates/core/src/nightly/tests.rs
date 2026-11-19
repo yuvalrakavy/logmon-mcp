@@ -248,3 +248,39 @@ fn eight_overlapping_large_snapshots_round_trip_after_both_rings_roll() {
         original_budget
     );
 }
+
+#[test]
+fn pending_capture_memory_counts_shared_records_once_after_resize_and_clear() {
+    let d = domain();
+    let now = Utc::now();
+    let mut log = LogEntry::synthetic(Level::Info, &"r".repeat(4096));
+    log.trace_id = Some(10);
+    log.seq = d.pipeline.assign_seq();
+    let log_bytes = super::log_bytes(&log);
+    let span = span();
+    let span_bytes = super::span_bytes(&span);
+    d.pipeline.append_to_store(log);
+    d.span_store.insert(span);
+    let snap = || {
+        CaptureSnapshot::new(
+            &d,
+            Selector::new("trace_id", "a"),
+            now - Duration::seconds(1),
+            now + Duration::seconds(1),
+        )
+    };
+    let first = snap();
+    let second = snap();
+    let pending = || d.test_log.capture_pool.lock().unwrap().exclusive_bytes();
+    let indexes = pending();
+    assert!(indexes < log_bytes);
+    assert_eq!(d.pipeline.store.ring_info().1, log_bytes);
+    d.pipeline.store.resize_with(Some(0), None, || {});
+    assert_eq!(pending(), indexes + log_bytes);
+    d.span_store.clear();
+    assert_eq!(pending(), indexes + log_bytes + span_bytes);
+    drop(first);
+    assert_eq!(pending(), indexes / 2 + log_bytes + span_bytes);
+    drop(second);
+    assert_eq!(pending(), 0);
+}

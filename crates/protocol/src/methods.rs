@@ -2499,6 +2499,37 @@ pub struct PostmortemStatus {
 // domains.*
 // =============================================================================
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainMemory {
+    pub logs_bytes: usize,
+    pub spans_bytes: usize,
+    pub indexes_bytes: usize,
+    pub pending_capture_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DomainsResize {
+    /// Name of the live domain to resize.
+    pub name: String,
+    /// Initial log capacity in records. Omit to preserve the configured initial capacity.
+    pub log_buffer_size: Option<usize>,
+    /// Initial span capacity in records. Omit to preserve the configured initial capacity.
+    pub span_buffer_size: Option<usize>,
+    /// New ceiling for log ring growth during executions. Omit to preserve the ceiling.
+    pub max_log_buffer_size: Option<usize>,
+    /// New ceiling for span ring growth during executions. Omit to preserve the ceiling.
+    pub max_span_buffer_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DomainsResizeResult {
+    pub before: DomainInfo,
+    pub after: DomainInfo,
+    pub logs_evicted: usize,
+    pub spans_evicted: usize,
+}
+
 /// A single domain as reported by `domains.list` and `domains.create`.
 ///
 /// A port value of `0` means that receiver is disabled for the domain. The
@@ -2515,6 +2546,20 @@ pub struct DomainInfo {
     pub source: String,
     pub log_buffer_size: usize,
     pub span_buffer_size: usize,
+    #[serde(default)]
+    pub initial_log_buffer_size: usize,
+    #[serde(default)]
+    pub initial_span_buffer_size: usize,
+    #[serde(default)]
+    pub max_log_buffer_size: Option<usize>,
+    #[serde(default)]
+    pub max_span_buffer_size: Option<usize>,
+    #[serde(default)]
+    pub estimated_memory_bytes: usize,
+    #[serde(default)]
+    pub memory: DomainMemory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
     pub log_count: usize,
     pub span_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2568,9 +2613,13 @@ pub struct DomainsCreate {
     /// Span ring capacity (default: the daemon's configured size).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_buffer_size: Option<usize>,
-    /// `false` (default) → ephemeral (gone on restart). `true` → durable
-    /// (re-created at boot). Durable domains are a later stage; Wave 2 accepts
-    /// only ephemeral creation.
+    /// Optional log ring ceiling while an active execution needs its oldest evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_log_buffer_size: Option<usize>,
+    /// Optional span ring ceiling while an active execution needs its oldest evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_span_buffer_size: Option<usize>,
+    /// Persist listener ports and configured sizes for broker restart.
     #[serde(default)]
     pub persist: bool,
 }
@@ -2585,12 +2634,19 @@ pub struct DomainsDelete {
     /// Name of the domain to delete. Refuses config-declared domains (incl.
     /// 'default').
     pub name: String,
+    /// Succeed if the broker confirms that this domain is already absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DomainsDeleteResult {
     pub name: String,
     pub deleted: bool,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub estimated_memory_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -2658,6 +2714,10 @@ pub struct DomainsClearResult {
     pub logs_cleared: usize,
     /// Number of spans disposed from the bound domain.
     pub spans_cleared: usize,
+    #[serde(default)]
+    pub estimated_memory_bytes_before: usize,
+    #[serde(default)]
+    pub estimated_memory_bytes_after: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -2843,6 +2903,12 @@ pub struct CaseAnchor {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CasesLoad {
+    /// Load the complete saved window (all, default) or only the focus trace (focus).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Member focus trace to load from a shared deadline case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_trace_id: Option<String>,
     /// Absolute path to a `.case.zip` or to the case document.
     ///
     /// **Absolute for the same reason `cases.create`'s `dir` is**: the broker
@@ -2867,6 +2933,9 @@ pub struct CasesLoad {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CasesCreate {
+    /// Optional focus trace whose overlapping work is included in the saved evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_trace_id: Option<String>,
     /// Why this capture exists. Required: a manual case that cannot say why it
     /// was taken has no provenance, and unlike a watch there is no filter
     /// standing in for one.

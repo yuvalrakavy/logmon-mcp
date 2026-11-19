@@ -775,6 +775,10 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
     };
     let reply = match sent {
         Ok(r) => r,
+        Err(e @ logmon_broker_sdk::BrokerError::Method { code: -32032, .. }) => {
+            format::error(&e.to_string(), json);
+            return 3;
+        }
         Err(e) => {
             format::error(&e.to_string(), json);
             return 1;

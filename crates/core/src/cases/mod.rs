@@ -36,6 +36,7 @@
 
 pub mod bundle;
 pub mod document;
+pub(crate) mod focus;
 pub mod load;
 pub mod naming;
 pub mod read;

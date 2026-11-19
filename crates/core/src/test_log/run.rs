@@ -34,6 +34,7 @@ struct Execution {
     start: TestLogStart,
     end: Option<TestLogEnd>,
     end_fields_hash: u64,
+    member_runtime_ms: Option<u64>,
     received: Instant,
     baseline_drops: Option<[u64; 4]>,
     last_seen: DateTime<Utc>,
@@ -84,11 +85,11 @@ impl Execution {
           "selector":self.start.selector,"started_at":self.start.started_at,
           "ended_at":self.end.as_ref().map(|e|e.ended_at),"verdict":self.end.as_ref().map(|e|e.verdict),
           "elapsed_ms":self.end.as_ref().map(|e|(e.ended_at-self.start.started_at).num_milliseconds()),
-          "estimated_ms":self.start.estimated_ms,"test_timeout_ms":self.timeout_ms,
+          "member_runtime_ms": self.member_runtime_ms,"deadline_crossed":self.timed_out,"supersedes_incomplete":self.timed_out && self.end.is_some(),"estimated_ms":self.start.estimated_ms,"test_timeout_ms":self.timeout_ms,
           "case_reason":self.reason,"slow_if":self.start.slow_if,
           "summary_status":if self.sampled{"collected"}else{"sampled_out"},
           "summary":self.summary.as_ref().map(Summary::json),"coverage":self.coverage,
-          "closure_incomplete":self.forced || self.timed_out,"rerun_of":self.start.rerun_of})
+          "closure_incomplete":self.forced || (self.timed_out && self.end.is_none()),"rerun_of":self.start.rerun_of})
     }
 }
 
@@ -99,11 +100,57 @@ struct Pending {
     order: u64,
     metadata: Value,
     registry: Vec<RegistryFact>,
+    group_until: Option<Instant>,
+    members: Vec<(String, Instant, Value, CaptureSnapshot)>,
+}
+
+impl Pending {
+    fn ready_at(&self, closing: bool) -> Instant {
+        let grace = self.members.iter().fold(self.ready, |at, m| at.max(m.1));
+        if closing {
+            grace
+        } else {
+            self.group_until.unwrap_or(grace).max(grace)
+        }
+    }
+    fn write(mut self, dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        if self.group_until.is_some() {
+            let mut first = self.metadata.clone();
+            first["coverage"] = self.snapshot.coverage();
+            let mut group = vec![first];
+            let mut peers = self.metadata["peers"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for (_, _, mut meta, snap) in self.members {
+                meta["coverage"] = snap.coverage();
+                for peer in meta["peers"].as_array().into_iter().flatten() {
+                    if !peers
+                        .iter()
+                        .any(|p| p["execution_id"] == peer["execution_id"])
+                    {
+                        peers.push(peer.clone());
+                    }
+                }
+                self.snapshot.merge(snap);
+                group.push(meta);
+            }
+            peers.retain(|peer| {
+                !group
+                    .iter()
+                    .any(|m| m["execution_id"] == peer["execution_id"])
+            });
+            self.metadata["peers"] = json!(peers);
+            self.metadata["deadline_members"] = json!(group);
+        }
+        self.snapshot.write(dir, &self.metadata, self.registry)
+    }
 }
 
 pub(super) struct Run {
     pub config: TestLogBegin,
     pub journal: Arc<Journal>,
+    began_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub closing: bool,
     close_written: bool,
@@ -114,6 +161,7 @@ pub(super) struct Run {
     grace: HashSet<String>,
     pending: HashMap<String, Pending>,
     writing: HashSet<String>,
+    writing_members: HashMap<String, Vec<String>>,
     dirty_late: HashSet<String>,
     last_late_flush: Instant,
     primary: u64,
@@ -138,6 +186,7 @@ fn sampled(name: &str, percent: f64) -> bool {
     (hash as f64) < percent * 0.01 * (u64::MAX as f64)
 }
 
+#[derive(Clone, Copy)]
 enum Slow {
     Off,
     Estimate(f64),
@@ -181,7 +230,25 @@ impl Slow {
 }
 
 impl Run {
+    pub(super) fn update_ring_protection(&self, domain: &Domain) {
+        let since = self
+            .active
+            .iter()
+            .chain(&self.grace)
+            .filter_map(|id| self.entries.get(id))
+            .filter(|e| e.decision.as_deref() != Some("pending"))
+            .filter(|e| e.deadline.is_none_or(|at| at > Instant::now()) || e.end.is_none())
+            .map(|e| e.start.started_at)
+            .min();
+        domain.pipeline.store.protect_since(since);
+        domain.span_store.protect_since(since);
+    }
+
     pub fn validate_config(c: &TestLogBegin) -> Result<(), String> {
+        if let Some(zone) = &c.display_timezone {
+            zone.parse::<chrono_tz::Tz>()
+                .map_err(|_| format!("invalid IANA time zone {zone}"))?;
+        }
         if c.test_timeout_ms == Some(0) || c.lifecycle_ack_timeout_ms == Some(0) {
             return Err("timeouts must be positive".into());
         }
@@ -211,10 +278,12 @@ impl Run {
     }
     pub fn new(config: TestLogBegin, journal: Journal, provenance: Vec<RegistryFact>) -> Self {
         let (tx, rx) = mpsc::channel();
+        let began_at = Utc::now();
         Self {
             config,
             journal: Arc::new(journal),
-            last_activity: Utc::now(),
+            began_at,
+            last_activity: began_at,
             closing: false,
             close_written: false,
             entries: HashMap::new(),
@@ -223,6 +292,7 @@ impl Run {
             grace: HashSet::new(),
             pending: HashMap::new(),
             writing: HashSet::new(),
+            writing_members: HashMap::new(),
             primary: 0,
             dirty_late: HashSet::new(),
             last_late_flush: Instant::now(),
@@ -266,7 +336,8 @@ impl Run {
         if let Some(cond) = &s.slow_if {
             Slow::parse(cond)?;
         }
-        let sampled = sampled(&s.name, self.config.summary_sample_percent.unwrap_or(100.));
+        let sampled = s.rerun_of.is_some()
+            || sampled(&s.name, self.config.summary_sample_percent.unwrap_or(100.));
         let summary = sampled.then(|| {
             Summary::new(
                 &s.selector.field,
@@ -305,6 +376,7 @@ impl Run {
                 sampled,
                 end: None,
                 end_fields_hash: 0,
+                member_runtime_ms: None,
                 decision: None,
                 reason: None,
                 capture_deadline: None,
@@ -409,7 +481,18 @@ impl Run {
                 "ring_backfill",
                 None,
             )?;
-            let ex = self.entries.get_mut(&id).unwrap();
+        }
+        let ex = self.entries.get_mut(&id).unwrap();
+        let promote = !ex.sampled && e.verdict != TestVerdict::Ok;
+        if promote {
+            ex.summary = Some(Summary::new(
+                &e.selector.field,
+                &e.selector.value,
+                &self.config.collect_distinct,
+            ));
+            ex.sampled = true;
+        }
+        if promote || ex.coverage["collection_mode"] == "ring_backfill" {
             ex.coverage = match &mut ex.summary {
                 Some(summary) => summary.backfill(d, e.started_at, e.ended_at),
                 None => Summary::backfill_coverage(d, e.started_at, e.ended_at),
@@ -423,6 +506,7 @@ impl Run {
             ex.coverage["coverage_as_of"] = json!(received_at);
         }
         ex.coverage["grace_cutoff"] = json!(cutoff);
+        ex.member_runtime_ms = e.fields.get("member_runtime_ms").and_then(Value::as_u64);
         let elapsed = (e.ended_at - ex.start.started_at).num_milliseconds();
         let condition = ex.start.slow_if.as_deref().or_else(|| {
             if self.config.slow_pass.as_deref() == Some("opt-out") {
@@ -437,7 +521,17 @@ impl Run {
             Some("failure")
         } else if condition
             .and_then(|c| Slow::parse(c).ok())
-            .is_some_and(|s| s.matches(elapsed, ex.start.estimated_ms))
+            .is_some_and(|s| {
+                s.matches(
+                    match s {
+                        Slow::Estimate(_) => ex
+                            .member_runtime_ms
+                            .map_or(elapsed, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+                        _ => elapsed,
+                    },
+                    ex.start.estimated_ms,
+                )
+            })
         {
             Some("slow_pass")
         } else {
@@ -511,7 +605,16 @@ impl Run {
             self.entries.get_mut(id).unwrap().decision = Some(skip.into());
             return;
         }
-        if self.pending.len() + self.writing.len() >= MAX_SNAPSHOTS {
+        let now = Instant::now();
+        let group = if reason == "end_test_missing_at_deadline" {
+            self.pending
+                .iter()
+                .find(|(_, p)| p.group_until.is_some_and(|cutoff| now < cutoff))
+                .map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        if group.is_none() && self.pending.len() + self.writing.len() >= MAX_SNAPSHOTS {
             let displace = (!is_slow)
                 .then(|| {
                     self.pending
@@ -535,13 +638,7 @@ impl Run {
         let ex = &self.entries[id];
         let start = ex.start.started_at;
         let selector = Selector::new(&ex.start.selector.field, &ex.start.selector.value);
-        let snapshot = CaptureSnapshot::new(d, selector, start, end);
-        if snapshot.is_over_budget() {
-            self.entries.get_mut(id).unwrap().decision = Some("skipped_capture_budget".into());
-            return;
-        }
-        let snapshot_at = snapshot.captured_at();
-        let peers: Vec<_> = self
+        let mut overlaps: Vec<_> = self
             .entries
             .iter()
             .filter(|(peer_id, peer)| {
@@ -549,6 +646,13 @@ impl Run {
                     && peer.start.started_at <= end
                     && peer.end.as_ref().is_none_or(|e| e.ended_at >= start)
             })
+            .collect();
+        overlaps.sort_unstable_by_key(|(peer_id, peer)| (peer.start.started_at, *peer_id));
+        let window_start = overlaps
+            .first()
+            .map_or(start, |(_, peer)| start.min(peer.start.started_at));
+        let peers: Vec<_> = overlaps
+            .into_iter()
             .map(|(peer_id, peer)| {
                 json!({
                     "execution_id": peer_id,
@@ -560,12 +664,22 @@ impl Run {
                 })
             })
             .collect();
+        let snapshot = CaptureSnapshot::for_execution(d, selector, window_start, end);
+        if snapshot.is_over_budget() {
+            self.entries.get_mut(id).unwrap().decision = Some("skipped_capture_budget".into());
+            return;
+        }
+        let snapshot_at = snapshot.captured_at();
         let metadata = json!({
             "run_id": self.config.run_id,
             "domain": d.id().as_str(),
             "execution_id": id,
             "name": ex.start.name,
             "reason": reason,
+            "run_fields": self.config.fields,
+            "display_timezone": self.config.display_timezone,
+            "expanded_cases": self.config.expanded_cases,
+            "window_start":window_start,
             "selector": ex.start.selector,
             "started_at": start,
             "ended_at": ex.end.as_ref().map(|e|e.ended_at),
@@ -585,15 +699,44 @@ impl Run {
         let ready = self.entries[id]
             .capture_deadline
             .expect("set by capture caller");
+        if let Some(group) = group {
+            self.pending.get_mut(&group).unwrap().members.push((
+                id.into(),
+                ready,
+                metadata,
+                snapshot,
+            ));
+            self.entries.get_mut(id).unwrap().decision = Some("pending".into());
+            return;
+        }
         self.pending.insert(
             id.into(),
             Pending {
                 snapshot,
+                group_until: (reason == "end_test_missing_at_deadline")
+                    .then(|| now + Duration::from_secs(60)),
+                members: Vec::new(),
                 ready,
                 reason,
                 order: self.order,
                 metadata,
-                registry: reg.to_vec(),
+                registry: {
+                    let mut registry = reg.to_vec();
+                    for path in ["/Build/commit", "/Build/profile", "/Action"] {
+                        if let Some(value) = self.config.fields.get(path).and_then(Value::as_str) {
+                            registry.retain(|fact| fact.path != path);
+                            registry.push(RegistryFact {
+                                path: path.into(),
+                                value: value.into(),
+                                created_at: self.began_at,
+                                validated_at: self.began_at,
+                                ttl_secs: None,
+                                expired: None,
+                            });
+                        }
+                    }
+                    registry
+                },
             },
         );
         self.entries.get_mut(id).unwrap().decision = Some("pending".into());
@@ -601,8 +744,15 @@ impl Run {
 
     pub fn observe_log(&mut self, log: &LogEntry) {
         let now = Instant::now();
-        for p in self.pending.values_mut().filter(|p| now < p.ready) {
-            p.snapshot.observe_log(log);
+        for p in self.pending.values_mut() {
+            if now < p.ready {
+                p.snapshot.observe_log(log);
+            }
+            for (_, deadline, _, snapshot) in &mut p.members {
+                if now < *deadline {
+                    snapshot.observe_log(log);
+                }
+            }
         }
         let ids: Vec<_> = self
             .index
@@ -638,8 +788,15 @@ impl Run {
     }
     pub fn observe_span(&mut self, span: &SpanEntry) {
         let now = Instant::now();
-        for p in self.pending.values_mut().filter(|p| now < p.ready) {
-            p.snapshot.observe_span(span);
+        for p in self.pending.values_mut() {
+            if now < p.ready {
+                p.snapshot.observe_span(span);
+            }
+            for (_, deadline, _, snapshot) in &mut p.members {
+                if now < *deadline {
+                    snapshot.observe_span(span);
+                }
+            }
         }
         let ids: Vec<_> = self
             .index
@@ -768,7 +925,11 @@ impl Run {
         }
         if self.writing.len() < MAX_WRITERS {
             for capture in self.pending.values() {
-                delay = delay.min(capture.ready.saturating_duration_since(now));
+                delay = delay.min(
+                    capture
+                        .ready_at(self.closing)
+                        .saturating_duration_since(now),
+                );
             }
         }
         if !self.dirty_late.is_empty() {
@@ -827,7 +988,9 @@ impl Run {
         }
         while let Ok((id, result)) = self.finished_rx.try_recv() {
             self.writing.remove(&id);
-            match result{
+            let member_ids = self.writing_members.remove(&id).unwrap_or_default();
+            for id in std::iter::once(id).chain(member_ids) {
+                match &result{
                 Ok(path)=>{
                     match path.strip_prefix(self.journal.path.parent().unwrap()) {
                         Ok(relative)=>self.append("case-ready",json!({"execution_id":id,"case_status":"ready","case_path":relative})),
@@ -836,35 +999,38 @@ impl Run {
                 }
                 Err(error)=>self.append("case-error",json!({"execution_id":id,"case_status":"error","message":error})),
             }
+            }
         }
         while self.writing.len() < MAX_WRITERS {
             let candidate = self
                 .pending
                 .iter()
-                .filter(|(_, p)| p.ready <= now)
+                .filter(|(_, p)| p.ready_at(self.closing) <= now)
                 .min_by_key(|(_, p)| (p.reason == "slow_pass", p.order))
                 .map(|(id, _)| id.clone());
             let Some(id) = candidate else { break };
             let p = self.pending.remove(&id).unwrap();
             let tx = self.finished_tx.clone();
             let key = id.clone();
+            let members: Vec<_> = p.members.iter().map(|m| m.0.clone()).collect();
             let dir = self.journal.path.parent().unwrap().join("cases");
             match std::thread::Builder::new()
                 .name("test-case-writer".into())
                 .spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        p.snapshot.write(&dir, &p.metadata, p.registry)
-                    }))
-                    .unwrap_or_else(|_| Err("case writer panicked".into()));
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.write(&dir)))
+                            .unwrap_or_else(|_| Err("case writer panicked".into()));
                     let _ = tx.send((key, result));
                 }) {
                 Ok(_) => {
+                    self.writing_members.insert(id.clone(), members);
                     self.writing.insert(id);
                 }
-                Err(e) => self.append(
-                    "case-error",
-                    json!({"execution_id":id,"case_status":"error","message":e.to_string()}),
-                ),
+                Err(e) => {
+                    for id in std::iter::once(id).chain(members) {
+                        self.append("case-error",json!({"execution_id":id,"case_status":"error","message":e.to_string()}));
+                    }
+                }
             }
         }
         if self.closing
@@ -894,13 +1060,19 @@ impl Run {
         let now = Instant::now();
         let mut pending = Vec::with_capacity(self.pending.len() + self.writing.len());
         for (id, capture) in &self.pending {
-            pending.push(json!({
-                "execution_id": id,
-                "name": self.entries[id].start.name,
-                "state": if capture.ready > now {"in_grace"} else {"queued"},
-            }));
+            for id in std::iter::once(id).chain(capture.members.iter().map(|m| &m.0)) {
+                pending.push(json!({
+                    "execution_id": id,
+                    "name": self.entries[id].start.name,
+                    "state": if capture.ready > now {"in_grace"} else {"queued"},
+                }));
+            }
         }
-        for id in &self.writing {
+        for id in self
+            .writing
+            .iter()
+            .chain(self.writing_members.values().flatten())
+        {
             pending.push(json!({
                 "execution_id": id,
                 "name": self.entries[id].start.name,

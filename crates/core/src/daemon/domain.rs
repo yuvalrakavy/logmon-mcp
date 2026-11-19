@@ -108,6 +108,7 @@ pub struct DomainConfig {
     pub otlp_grpc_port: u16,
     /// OTLP HTTP port (`0` = disabled).
     pub otlp_http_port: u16,
+    /// Initial construction values. Runtime sizing is owned by each ring.
     pub log_buffer_size: usize,
     pub span_buffer_size: usize,
     pub source: DomainSource,
@@ -186,6 +187,9 @@ impl Domain {
         bookmarks: Arc<BookmarkStore>,
         metrics: Arc<ReceiverMetrics>,
     ) -> Self {
+        let pool = Arc::downgrade(&pipeline.test_log.capture_pool);
+        let _ = pipeline.store.capture_pool.set(pool.clone());
+        let _ = span_store.capture_pool.set(pool);
         Self {
             config,
             test_log: pipeline.test_log.clone(),

@@ -98,7 +98,9 @@ def scenario(binaries, root):
             return cli(frontend, env, "test-log", action, run_id="fixture", **kw)
 
         control("begin", jsonl_path=journal, grace_period_ms=1500,
-                collect_distinct=["kernel.entry_point"], max_failures=1, max_rerun_cases=1)
+                collect_distinct=["kernel.entry_point"], max_failures=1, max_rerun_cases=1,
+                summary_sample_percent=0, expanded_cases="true", display_timezone="Asia/Jerusalem",
+                fields={"/Build/commit": "abc123", "/Build/profile": "release", "/Action": "test"})
         def start(name, number, **kw):
             trace = f"{number:032x}"
             identity = dict(execution_id=str(number), name=name, started_at=utc(),
@@ -107,6 +109,7 @@ def scenario(binaries, root):
             return identity, trace
 
         peer, other_trace = start("peer", 1)
+        log(gelf, "peer-before-chain", other_trace)
         chain, trace = start("chain", 2)
         started = time.time_ns()
         log(gelf, "peer-context", other_trace)
@@ -116,7 +119,7 @@ def scenario(binaries, root):
         ended = time.time_ns()
         span(otlp, trace, 1, started, ended)
         control("end", **chain, ended_at=utc(), verdict="FAIL",
-                fields={"failed_test": "member", "message": "expected fixture assertion"})
+                fields={"failed_test": "member", "message": "expected fixture assertion", "member_runtime_ms": 5})
         span(otlp, trace, 2, started, ended)
         control("end", **peer, ended_at=utc(), verdict="OK")
         rerun, _ = start("chain", 3, rerun_of="2")
@@ -133,18 +136,35 @@ def scenario(binaries, root):
     assert summaries["3"]["rerun_of"] == "2"
     cases = {r["execution_id"]: r["case_path"] for r in rows if r["event"] == "case-ready"}
     assert set(cases) == {"2", "3"}, cases
+    assert summaries["1"]["summary_status"] == "sampled_out"
+    assert summaries["2"]["member_runtime_ms"] == 5
+    assert summaries["3"]["summary_status"] == "collected"
+    archive = root / "fixture.zip"
+    subprocess.run([binaries / "logmon-test-log", "archive", journal, archive], check=True)
+    extracted = root / "extracted"
+    with zipfile.ZipFile(archive) as published:
+        assert published.testzip() is None
+        assert not any(name.endswith(".zip") for name in published.namelist())
+        published.extractall(extracted)
+    result = subprocess.run([binaries / "logmon-test-log", "compare",
+                             extracted / "full-test-log.jsonl", "2",
+                             extracted / "full-test-log.jsonl", "3"],
+                            check=True, text=True, capture_output=True)
+    assert "test.kernel" in result.stdout
     with broker(daemon, root / "postmortem") as (env, *_):
         for execution, relative in cases.items():
             assert not Path(relative).is_absolute() and ".." not in Path(relative).parts
-            case = journal.parent / relative
-            cli(frontend, env, "cases", "load", path=case)
+            case = extracted / relative
+            full = cli(frontend, env, "cases", "load", path=case, domain="all-" + execution)
             if execution == "2":
-                with zipfile.ZipFile(case) as archive:
-                    evidence = "\n".join(archive.read(f).decode() for f in archive.namelist())
-                for token in ("peer-context", "chain-evidence", "untagged-context", "expected fixture assertion",
-                              "Machine samples (1)", "fixture-entry"):
+                focus = cli(frontend, env, "cases", "load", path=case, domain="focus", scope="focus")
+                assert focus["logs"] < full["logs"], (focus, full)
+                evidence = "\n".join(f.read_text() for f in case.parent.iterdir())
+                for token in ("peer-before-chain", "peer-context", "chain-evidence", "untagged-context",
+                              "expected fixture assertion", "Machine samples (1)", "fixture-entry",
+                              "Asia/Jerusalem", "abc123"):
                     assert token in evidence, token
-    print("live capture passed: grace-period span, peer and machine evidence, passing rerun, portable reload")
+    print("live capture passed: zero-sampled failure and rerun, portable archive, focused and full reload")
 
 
 def store_scenario(binaries, source, root):

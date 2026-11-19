@@ -28,6 +28,7 @@ fn fact(path: &str, value: &str, validated: &str) -> RegistryFact {
 /// against this.
 fn base() -> CaseInput {
     CaseInput {
+        focus_traces: vec![],
         stem: "checkout-hang-260731-141530".into(),
         captured_at: t("2026-07-31T14:15:30Z"),
         domain: "t3".into(),

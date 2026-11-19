@@ -36,6 +36,23 @@
           "description": "Absolute JSONL path chosen by the run owner.",
           "type": "string"
         },
+        "fields": {
+          "description": "Run-scoped provenance copied into each case.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "expanded_cases": {
+          "description": "Write loose case files in a per-execution directory.",
+          "type": "boolean",
+          "default": false
+        },
+        "display_timezone": {
+          "description": "IANA timezone for human-readable reports (UTC by default).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "test_timeout_ms": {
           "description": "Missing-end deadline in milliseconds, default 600000.",
           "type": [
@@ -4474,6 +4491,13 @@
       "title": "CasesCreate",
       "type": "object",
       "properties": {
+        "focus_trace_id": {
+          "description": "Optional focus trace whose overlapping work is included in the saved evidence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reason": {
           "description": "Why this capture exists. Required: a manual case that cannot say why it\nwas taken has no provenance, and unlike a watch there is no filter\nstanding in for one.",
           "type": "string"
@@ -4779,6 +4803,20 @@
       "description": "`cases.load` — a case file back into a sealed postmortem domain.",
       "type": "object",
       "properties": {
+        "scope": {
+          "description": "Load the complete saved window (all, default) or only the focus trace (focus).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focus_trace_id": {
+          "description": "Member focus trace to load from a shared deadline case.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "path": {
           "description": "Absolute path to a `.case.zip` or to the case document.\n\n**Absolute for the same reason `cases.create`'s `dir` is**: the broker\nruns as a service, so a relative path resolves against *its* working\ndirectory rather than yours. The evidence files are then found beside the\ndocument — or inside the bundle — and their names are checked against the\ncase's own stem, because the daemon opens them and a pointer read out of\na file that arrived from another machine must not be able to name a path.",
           "type": "string"
@@ -5675,6 +5713,57 @@
           "format": "uint",
           "minimum": 0
         },
+        "initial_log_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "initial_span_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "max_log_buffer_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "max_span_buffer_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "estimated_memory_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "memory": {
+          "$ref": "#/$defs/DomainMemory",
+          "default": {
+            "logs_bytes": 0,
+            "spans_bytes": 0,
+            "indexes_bytes": 0,
+            "pending_capture_bytes": 0
+          }
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "log_count": {
           "type": "integer",
           "format": "uint",
@@ -5749,49 +5838,52 @@
         "span_buffer_size",
         "log_count",
         "span_count"
-      ]
+      ],
+      "$defs": {
+        "DomainMemory": {
+          "type": "object",
+          "properties": {
+            "logs_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "spans_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "indexes_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "pending_capture_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "logs_bytes",
+            "spans_bytes",
+            "indexes_bytes",
+            "pending_capture_bytes"
+          ]
+        }
+      }
     },
-    "DomainsCreate": {
+    "DomainsResize": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "DomainsCreate",
+      "title": "DomainsResize",
       "type": "object",
       "properties": {
         "name": {
-          "description": "Domain name — the isolation key.",
+          "description": "Name of the live domain to resize.",
           "type": "string"
         },
-        "gelf_port": {
-          "description": "GELF UDP+TCP port. Omitted → auto-allocate; `0` → disable GELF for this\ndomain; otherwise bind exactly this port (error if held by another domain).",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint16",
-          "minimum": 0,
-          "maximum": 65535
-        },
-        "otlp_grpc_port": {
-          "description": "OTLP gRPC port. Omitted → auto-allocate; 0 → disable.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint16",
-          "minimum": 0,
-          "maximum": 65535
-        },
-        "otlp_http_port": {
-          "description": "OTLP HTTP port. Omitted → auto-allocate; 0 → disable.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint16",
-          "minimum": 0,
-          "maximum": 65535
-        },
         "log_buffer_size": {
-          "description": "Log ring capacity (default: the daemon's configured size).",
+          "description": "Initial log capacity in records. Omit to preserve the configured initial capacity.",
           "type": [
             "integer",
             "null"
@@ -5800,7 +5892,7 @@
           "minimum": 0
         },
         "span_buffer_size": {
-          "description": "Span ring capacity (default: the daemon's configured size).",
+          "description": "Initial span capacity in records. Omit to preserve the configured initial capacity.",
           "type": [
             "integer",
             "null"
@@ -5808,69 +5900,57 @@
           "format": "uint",
           "minimum": 0
         },
-        "persist": {
-          "description": "`false` (default) → ephemeral (gone on restart). `true` → durable\n(re-created at boot). Durable domains are a later stage; Wave 2 accepts\nonly ephemeral creation.",
-          "type": "boolean",
-          "default": false
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name"
-      ]
-    },
-    "DomainsDelete": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "DomainsDelete",
-      "type": "object",
-      "properties": {
-        "name": {
-          "description": "Name of the domain to delete. Refuses config-declared domains (incl.\n'default').",
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "name"
-      ]
-    },
-    "DomainsDeleteResult": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "DomainsDeleteResult",
-      "type": "object",
-      "properties": {
-        "name": {
-          "type": "string"
+        "max_log_buffer_size": {
+          "description": "New ceiling for log ring growth during executions. Omit to preserve the ceiling.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         },
-        "deleted": {
-          "type": "boolean"
+        "max_span_buffer_size": {
+          "description": "New ceiling for span ring growth during executions. Omit to preserve the ceiling.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       },
+      "additionalProperties": false,
       "required": [
-        "name",
-        "deleted"
+        "name"
       ]
     },
-    "DomainsList": {
+    "DomainsResizeResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "DomainsList",
-      "type": "object",
-      "additionalProperties": false
-    },
-    "DomainsListResult": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "DomainsListResult",
+      "title": "DomainsResizeResult",
       "type": "object",
       "properties": {
-        "domains": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/DomainInfo"
-          }
+        "before": {
+          "$ref": "#/$defs/DomainInfo"
+        },
+        "after": {
+          "$ref": "#/$defs/DomainInfo"
+        },
+        "logs_evicted": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "spans_evicted": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
         }
       },
       "required": [
-        "domains"
+        "before",
+        "after",
+        "logs_evicted",
+        "spans_evicted"
       ],
       "$defs": {
         "DomainInfo": {
@@ -5911,6 +5991,57 @@
               "type": "integer",
               "format": "uint",
               "minimum": 0
+            },
+            "initial_log_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
+            "initial_span_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
+            "max_log_buffer_size": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0,
+              "default": null
+            },
+            "max_span_buffer_size": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0,
+              "default": null
+            },
+            "estimated_memory_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
+            "memory": {
+              "$ref": "#/$defs/DomainMemory",
+              "default": {
+                "logs_bytes": 0,
+                "spans_bytes": 0,
+                "indexes_bytes": 0,
+                "pending_capture_bytes": 0
+              }
+            },
+            "outcome": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "log_count": {
               "type": "integer",
@@ -5987,6 +6118,393 @@
             "log_count",
             "span_count"
           ]
+        },
+        "DomainMemory": {
+          "type": "object",
+          "properties": {
+            "logs_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "spans_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "indexes_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "pending_capture_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "logs_bytes",
+            "spans_bytes",
+            "indexes_bytes",
+            "pending_capture_bytes"
+          ]
+        }
+      }
+    },
+    "DomainsCreate": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsCreate",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Domain name — the isolation key.",
+          "type": "string"
+        },
+        "gelf_port": {
+          "description": "GELF UDP+TCP port. Omitted → auto-allocate; `0` → disable GELF for this\ndomain; otherwise bind exactly this port (error if held by another domain).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_grpc_port": {
+          "description": "OTLP gRPC port. Omitted → auto-allocate; 0 → disable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "otlp_http_port": {
+          "description": "OTLP HTTP port. Omitted → auto-allocate; 0 → disable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "log_buffer_size": {
+          "description": "Log ring capacity (default: the daemon's configured size).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "span_buffer_size": {
+          "description": "Span ring capacity (default: the daemon's configured size).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_log_buffer_size": {
+          "description": "Optional log ring ceiling while an active execution needs its oldest evidence.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "max_span_buffer_size": {
+          "description": "Optional span ring ceiling while an active execution needs its oldest evidence.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "persist": {
+          "description": "Persist listener ports and configured sizes for broker restart.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "DomainsDelete": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsDelete",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Name of the domain to delete. Refuses config-declared domains (incl.\n'default').",
+          "type": "string"
+        },
+        "if_exists": {
+          "description": "Succeed if the broker confirms that this domain is already absent.",
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "DomainsDeleteResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsDeleteResult",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "type": "string",
+          "default": ""
+        },
+        "estimated_memory_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        }
+      },
+      "required": [
+        "name",
+        "deleted"
+      ]
+    },
+    "DomainsList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsList",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "DomainsListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "DomainsListResult",
+      "type": "object",
+      "properties": {
+        "domains": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DomainInfo"
+          }
+        }
+      },
+      "required": [
+        "domains"
+      ],
+      "$defs": {
+        "DomainInfo": {
+          "description": "A single domain as reported by `domains.list` and `domains.create`.\n\nA port value of `0` means that receiver is disabled for the domain. The\ncount/seq fields reflect the domain's live buffers; the `last_*_received_at` /\n`idle_secs` / `stale` liveness fields answer \"is this domain actually\nreceiving?\" (`status.get.receiver_liveness` gives the per-listener drill-down).",
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "gelf_port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "otlp_grpc_port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "otlp_http_port": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "source": {
+              "description": "`\"config\"` | `\"persistent\"` | `\"ephemeral\"`.",
+              "type": "string"
+            },
+            "log_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "span_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "initial_log_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
+            "initial_span_buffer_size": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
+            "max_log_buffer_size": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0,
+              "default": null
+            },
+            "max_span_buffer_size": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint",
+              "minimum": 0,
+              "default": null
+            },
+            "estimated_memory_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0,
+              "default": 0
+            },
+            "memory": {
+              "$ref": "#/$defs/DomainMemory",
+              "default": {
+                "logs_bytes": 0,
+                "spans_bytes": 0,
+                "indexes_bytes": 0,
+                "pending_capture_bytes": 0
+              }
+            },
+            "outcome": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "log_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "span_count": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "oldest_seq": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "newest_seq": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "bound_sessions": {
+              "description": "Sessions currently bound to this domain (connected first, disconnected\nsuffixed). DERIVED from the session registry — never caller-supplied —\nso with meaningful session names, `domains.list` answers \"which\nconversation is using which domain\" authoritatively. Populated by\n`domains.list`; empty elsewhere.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "last_log_received_at": {
+              "description": "Wall-clock of the last log ingested into this domain (across any listener),\nor `None` if none ever arrived. A `None` here is the \"nothing is shipping\nto this domain — did I misconfigure the port?\" signal. (Consumer #2.)",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "last_span_received_at": {
+              "description": "Wall-clock of the last span ingested into this domain, or `None`.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "idle_secs": {
+              "description": "Seconds since the most recent log OR span ingest; `None` if neither ever\narrived.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "stale": {
+              "description": "`true` when the domain HAS received before but has been idle longer than\nthe broker's `stale_after_secs` (config, default 60s). A never-received\ndomain is `false` — distinguish it via `last_*_received_at == None`.",
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "name",
+            "gelf_port",
+            "otlp_grpc_port",
+            "otlp_http_port",
+            "source",
+            "log_buffer_size",
+            "span_buffer_size",
+            "log_count",
+            "span_count"
+          ]
+        },
+        "DomainMemory": {
+          "type": "object",
+          "properties": {
+            "logs_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "spans_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "indexes_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "pending_capture_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "logs_bytes",
+            "spans_bytes",
+            "indexes_bytes",
+            "pending_capture_bytes"
+          ]
         }
       }
     },
@@ -6027,6 +6545,18 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "estimated_memory_bytes_before": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "estimated_memory_bytes_after": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
         }
       },
       "required": [
@@ -6141,6 +6671,57 @@
           "format": "uint",
           "minimum": 0
         },
+        "initial_log_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "initial_span_buffer_size": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "max_log_buffer_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "max_span_buffer_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0,
+          "default": null
+        },
+        "estimated_memory_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0,
+          "default": 0
+        },
+        "memory": {
+          "$ref": "#/$defs/DomainMemory",
+          "default": {
+            "logs_bytes": 0,
+            "spans_bytes": 0,
+            "indexes_bytes": 0,
+            "pending_capture_bytes": 0
+          }
+        },
+        "outcome": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "log_count": {
           "type": "integer",
           "format": "uint",
@@ -6222,7 +6803,40 @@
         "span_buffer_size",
         "log_count",
         "span_count"
-      ]
+      ],
+      "$defs": {
+        "DomainMemory": {
+          "type": "object",
+          "properties": {
+            "logs_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "spans_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "indexes_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "pending_capture_bytes": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "logs_bytes",
+            "spans_bytes",
+            "indexes_bytes",
+            "pending_capture_bytes"
+          ]
+        }
+      }
     },
     "ToolsManifest": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

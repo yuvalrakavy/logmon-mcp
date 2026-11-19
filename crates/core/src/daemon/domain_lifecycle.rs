@@ -1,5 +1,5 @@
 //! Runtime domain lifecycle — bind a `domains.create`d domain's receivers and
-//! spawn its processors (Wave 2 stage 2.2b, ephemeral domains only).
+//! spawn its processors.
 //!
 //! The keystone `default` domain is fed by the daemon-level receivers built in
 //! [`crate::daemon::server::run_with_overrides`]; this module builds the SAME

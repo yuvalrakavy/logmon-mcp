@@ -52,7 +52,14 @@ const LISTS: &[(&str, &str, &[Col], &str)] = &[
             ("name", "name"),
             ("src", "source"),
             ("logs", "log_count"),
+            ("log_init", "initial_log_buffer_size"),
+            ("log_cap", "log_buffer_size"),
+            ("log_max", "max_log_buffer_size"),
             ("spans", "span_count"),
+            ("span_init", "initial_span_buffer_size"),
+            ("span_cap", "span_buffer_size"),
+            ("span_max", "max_span_buffer_size"),
+            ("bytes", "estimated_memory_bytes"),
             ("oldest", "oldest_seq"),
             ("newest", "newest_seq"),
             ("idle_s", "idle_secs"),
@@ -601,23 +608,42 @@ mod tests {
     /// Every value is distinct, so a column wired to the wrong key shows up as
     /// a value under the wrong header — not only a dropped column.
     #[test]
-    fn domains_list_renders_its_eight_columns_from_their_own_fields() {
+    fn domains_list_renders_capacities_and_occupancies_from_their_own_fields() {
         let out = for_method(
             "domains.list",
             &json!({"domains": [{"name": "d1", "source": "config", "log_count": 11,
-                                 "span_count": 22, "oldest_seq": 33, "newest_seq": 44,
+                                 "initial_log_buffer_size":12,"log_buffer_size":13,"max_log_buffer_size":14,"span_count":22,"initial_span_buffer_size":23,"span_buffer_size":24,"max_span_buffer_size":25,"estimated_memory_bytes":88,"oldest_seq": 33, "newest_seq": 44,
                                  "idle_secs": 55, "stale": true}]}),
         )
         .expect("renders");
         let (header, row) = header_and_row(&out);
         assert_eq!(
             header,
-            ["name", "src", "logs", "spans", "oldest", "newest", "idle_s", "stale"],
+            [
+                "name",
+                "src",
+                "logs",
+                "log_init",
+                "log_cap",
+                "log_max",
+                "spans",
+                "span_init",
+                "span_cap",
+                "span_max",
+                "bytes",
+                "oldest",
+                "newest",
+                "idle_s",
+                "stale"
+            ],
             "{out}"
         );
         assert_eq!(
             row,
-            ["d1", "config", "11", "22", "33", "44", "55", "true"],
+            [
+                "d1", "config", "11", "12", "13", "14", "22", "23", "24", "25", "88", "33", "44",
+                "55", "true"
+            ],
             "{out}"
         );
     }

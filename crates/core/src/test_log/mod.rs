@@ -136,6 +136,7 @@ impl TestLog {
             }
             _ => return Err(format!("unknown method: {method}")),
         };
+        run.update_ring_protection(d);
         result["test_log_health"] = run.journal.status()["test_log_health"].clone();
         self.changed.notify_all();
         Ok(result)
@@ -205,6 +206,7 @@ impl TestLog {
                 };
                 let now = Instant::now();
                 run.tick(&domain, now);
+                run.update_ring_protection(&domain);
                 let delay = run.next_wake(Instant::now());
                 drop(domain);
                 drop(owner.changed.wait_timeout(guard, delay).unwrap());

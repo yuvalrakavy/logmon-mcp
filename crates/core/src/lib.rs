@@ -15,6 +15,7 @@ pub mod test_log;
 pub(crate) mod throttle;
 pub mod daemon {
     pub mod domain;
+    pub(crate) mod domain_definitions;
     pub mod domain_lifecycle;
     pub mod log_processor;
     pub mod persistence;

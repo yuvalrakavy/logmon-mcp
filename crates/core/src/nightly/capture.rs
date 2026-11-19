@@ -20,6 +20,7 @@ const INDEX_BYTES: usize = 96;
 
 pub(crate) struct CapturePool {
     available: usize,
+    shared_bytes: usize,
     logs: HashMap<u64, Pinned<LogEntry>>,
     spans: HashMap<u64, Pinned<SpanEntry>>,
 }
@@ -27,8 +28,28 @@ impl Default for CapturePool {
     fn default() -> Self {
         Self {
             available: CAPTURE_POOL_BYTES,
+            shared_bytes: 0,
             logs: HashMap::new(),
             spans: HashMap::new(),
+        }
+    }
+}
+impl CapturePool {
+    pub(crate) fn exclusive_bytes(&self) -> usize {
+        CAPTURE_POOL_BYTES
+            .saturating_sub(self.available)
+            .saturating_sub(self.shared_bytes)
+    }
+    pub(crate) fn evict_log(&mut self, seq: u64) {
+        if let Some(record) = self.logs.get_mut(&seq).filter(|r| r.shared) {
+            self.shared_bytes -= record.bytes;
+            record.shared = false;
+        }
+    }
+    pub(crate) fn evict_span(&mut self, seq: u64) {
+        if let Some(record) = self.spans.get_mut(&seq).filter(|r| r.shared) {
+            self.shared_bytes -= record.bytes;
+            record.shared = false;
         }
     }
 }
@@ -45,11 +66,14 @@ struct Pinned<T> {
     record: Arc<T>,
     bytes: usize,
     users: usize,
+    shared: bool,
 }
 fn pin<T>(
     records: &mut HashMap<u64, Pinned<T>>,
     available: &mut usize,
     seq: u64,
+    shared: bool,
+    shared_bytes: &mut usize,
     bytes: impl FnOnce() -> usize,
     record: impl FnOnce() -> Arc<T>,
 ) -> Option<Arc<T>> {
@@ -61,22 +85,29 @@ fn pin<T>(
     let bytes = bytes();
     *available = available.checked_sub(bytes.checked_add(INDEX_BYTES)?)?;
     let record = record();
+    if shared {
+        *shared_bytes += bytes;
+    }
     records.insert(
         seq,
         Pinned {
             record: record.clone(),
             bytes,
             users: 1,
+            shared,
         },
     );
     Some(record)
 }
-fn unpin<T>(records: &mut HashMap<u64, Pinned<T>>, seq: u64) -> usize {
+fn unpin<T>(records: &mut HashMap<u64, Pinned<T>>, seq: u64, shared_bytes: &mut usize) -> usize {
     let Some(pin) = records.get_mut(&seq) else {
         return 0;
     };
     pin.users -= 1;
     if pin.users == 0 {
+        if pin.shared {
+            *shared_bytes -= pin.bytes;
+        }
         INDEX_BYTES + records.remove(&seq).expect("present").bytes
     } else {
         INDEX_BYTES
@@ -125,13 +156,33 @@ pub(super) fn coverage(
 impl Drop for CaptureSnapshot {
     fn drop(&mut self) {
         let mut pool = self.pool.lock().unwrap();
+        let CapturePool {
+            logs,
+            spans,
+            available,
+            shared_bytes,
+        } = &mut *pool;
         for seq in self.logs.keys() {
-            pool.available += unpin(&mut pool.logs, *seq);
+            *available += unpin(logs, *seq, shared_bytes);
         }
         for seq in self.spans.keys() {
-            pool.available += unpin(&mut pool.spans, *seq);
+            *available += unpin(spans, *seq, shared_bytes);
         }
     }
+}
+
+struct CaseClaim(PathBuf);
+impl Drop for CaseClaim {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn zone(metadata: &Value) -> chrono_tz::Tz {
+    metadata["display_timezone"]
+        .as_str()
+        .and_then(|name| name.parse().ok())
+        .unwrap_or(chrono_tz::UTC)
 }
 
 impl CaptureSnapshot {
@@ -169,12 +220,12 @@ impl CaptureSnapshot {
                 snapshot.span_floor = spans.lost_below;
                 for log in logs.records {
                     if log.seq < anchor_seq {
-                        snapshot.pin_log(log, || log.clone());
+                        snapshot.pin_log(log, true, || log.clone());
                     }
                 }
                 for span in spans.records {
                     if span.seq < anchor_seq {
-                        snapshot.pin_span(span, || span.clone());
+                        snapshot.pin_span(span, true, || span.clone());
                     }
                 }
                 snapshot.ring_coverage = coverage(&logs, &spans, anchor_seq, start, end);
@@ -183,14 +234,52 @@ impl CaptureSnapshot {
         snapshot
     }
 
+    /// Preserve the domain through the broker cutoff, including activity
+    /// between the runner verdict and its delivery. Subsequent grace arrivals
+    /// qualify by selector or by their original execution window.
+    pub fn for_execution(
+        domain: &Domain,
+        selector: Selector,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Self {
+        let mut snapshot = Self::new(domain, selector, start, end.max(Utc::now()));
+        snapshot.end = end;
+        snapshot
+    }
+
+    /// Transfer owned pool references into one shared artifact. Duplicate pins
+    /// remain with the consumed snapshot and are released by its Drop.
+    pub fn merge(&mut self, mut other: Self) {
+        other.logs.retain(|seq, log| match self.logs.entry(*seq) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(log.clone());
+                false
+            }
+            _ => true,
+        });
+        other
+            .spans
+            .retain(|seq, span| match self.spans.entry(*seq) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(span.clone());
+                    false
+                }
+                _ => true,
+            });
+        self.over_budget |= other.over_budget;
+        self.start = self.start.min(other.start);
+        self.end = self.end.max(other.end);
+    }
+
     pub fn is_over_budget(&self) -> bool {
         self.over_budget
     }
 
     pub fn observe_log(&mut self, log: &LogEntry) {
-        self.pin_log(log, || Arc::new(log.clone()));
+        self.pin_log(log, false, || Arc::new(log.clone()));
     }
-    fn pin_log(&mut self, log: &LogEntry, get: impl FnOnce() -> Arc<LogEntry>) {
+    fn pin_log(&mut self, log: &LogEntry, shared: bool, get: impl FnOnce() -> Arc<LogEntry>) {
         if self.over_budget
             || self.logs.contains_key(&log.seq)
             || !(self.selector.matches_log(log) || (self.start..=self.end).contains(&log.timestamp))
@@ -199,9 +288,20 @@ impl CaptureSnapshot {
         }
         let mut pool = self.pool.lock().unwrap();
         let CapturePool {
-            logs, available, ..
+            logs,
+            available,
+            shared_bytes,
+            ..
         } = &mut *pool;
-        match pin(logs, available, log.seq, || log_bytes(log), get) {
+        match pin(
+            logs,
+            available,
+            log.seq,
+            shared,
+            shared_bytes,
+            || log_bytes(log),
+            get,
+        ) {
             Some(record) => {
                 self.logs.insert(log.seq, record);
             }
@@ -211,9 +311,9 @@ impl CaptureSnapshot {
         }
     }
     pub fn observe_span(&mut self, span: &SpanEntry) {
-        self.pin_span(span, || Arc::new(span.clone()));
+        self.pin_span(span, false, || Arc::new(span.clone()));
     }
-    fn pin_span(&mut self, span: &SpanEntry, get: impl FnOnce() -> Arc<SpanEntry>) {
+    fn pin_span(&mut self, span: &SpanEntry, shared: bool, get: impl FnOnce() -> Arc<SpanEntry>) {
         if self.over_budget
             || self.spans.contains_key(&span.seq)
             || !(self.selector.matches_span(span)
@@ -223,9 +323,20 @@ impl CaptureSnapshot {
         }
         let mut pool = self.pool.lock().unwrap();
         let CapturePool {
-            spans, available, ..
+            spans,
+            available,
+            shared_bytes,
+            ..
         } = &mut *pool;
-        match pin(spans, available, span.seq, || span_bytes(span), get) {
+        match pin(
+            spans,
+            available,
+            span.seq,
+            shared,
+            shared_bytes,
+            || span_bytes(span),
+            get,
+        ) {
             Some(record) => {
                 self.spans.insert(span.seq, record);
             }
@@ -240,6 +351,11 @@ impl CaptureSnapshot {
 
     pub fn coverage(&self) -> Value {
         let mut result = self.ring_coverage.clone();
+        result["requested_window_start"] = json!(self.start);
+        // Bounds describe the actual timestamps present in each saved raw stream.
+        result["earliest_retained_log_time"] = json!(self.logs.values().map(|e| e.timestamp).min());
+        result["earliest_retained_span_start"] =
+            json!(self.spans.values().map(|s| s.start_time).min());
         result["coverage_as_of"] = json!(self.captured_at);
         result["receiver_drops_domain_lifetime"] = self.domain_drops.clone();
         result["over_budget"] = json!(self.over_budget);
@@ -282,14 +398,27 @@ impl CaptureSnapshot {
             flatten(reason)
         )
         .unwrap();
-        let end_time = meta.get("ended_at").and_then(Value::as_str);
+        let zone = zone(meta);
+        let display = |v: &Value| {
+            serde_json::from_value::<DateTime<Utc>>(v.clone())
+                .ok()
+                .map(|t| t.with_timezone(&zone).to_rfc3339())
+        };
+        writeln!(
+            body,
+            "Report timezone: {zone}. Capture in UTC: {}.\n",
+            self.captured_at.to_rfc3339()
+        )
+        .unwrap();
+        let end_time = display(&meta["ended_at"]);
         writeln!(
             body,
             "Started at {}. End: {}. Captured at {}.
 ",
-            self.start.to_rfc3339(),
-            end_time.unwrap_or("unknown"),
-            self.captured_at.to_rfc3339()
+            display(&meta["started_at"])
+                .unwrap_or_else(|| self.start.with_timezone(&zone).to_rfc3339()),
+            end_time.as_deref().unwrap_or("unknown"),
+            self.captured_at.with_timezone(&zone).to_rfc3339()
         )
         .unwrap();
         if end_time.is_some() {
@@ -298,11 +427,20 @@ impl CaptureSnapshot {
                 .and_then(Value::as_u64)
                 .map(|v| format!("{v} ms"))
                 .unwrap_or_else(|| "unknown".into());
+            let runtime = meta
+                .pointer("/end/fields/member_runtime_ms")
+                .and_then(Value::as_u64);
             writeln!(
                 body,
-                "Elapsed: {} ms. Estimate: {}.
+                "Chain wall duration: {} ms. {} Estimate: {}.
 ",
-                (self.end - self.start).num_milliseconds(),
+                (self.end
+                    - serde_json::from_value::<DateTime<Utc>>(meta["started_at"].clone())
+                        .unwrap_or(self.start))
+                .num_milliseconds(),
+                runtime
+                    .map(|v| format!("Measured member runtime: {v} ms (estimate basis)."))
+                    .unwrap_or_default(),
                 estimate
             )
             .unwrap();
@@ -363,8 +501,8 @@ impl CaptureSnapshot {
                     value(&peer["name"]),
                     value(&peer["execution_id"]),
                     value(&peer["selector"]["value"]),
-                    value(&peer["started_at"]),
-                    cell(ended)
+                    display(&peer["started_at"]).unwrap_or_else(|| "unknown".into()),
+                    display(&peer["ended_at"]).unwrap_or_else(|| cell(ended))
                 )
                 .unwrap();
             }
@@ -384,7 +522,7 @@ impl CaptureSnapshot {
                     body,
                     "Latest retained sample from {} at {}:\n\n    {}\n",
                     sample.host,
-                    sample.timestamp,
+                    sample.timestamp.with_timezone(&zone).to_rfc3339(),
                     fields.to_string().chars().take(1000).collect::<String>()
                 )
                 .unwrap();
@@ -446,10 +584,64 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
             .and_then(Value::as_str)
             .unwrap_or(&self.selector.value)
             .to_owned();
-        let prefix = cases::resolve_prefix(Some(&test_name), None, &self.domain);
-        let file =
-            cases::claim_bundle(case_dir, &prefix, self.captured_at).map_err(|e| e.to_string())?;
-        let path = file.path.clone();
+        let prefix = cases::resolve_prefix(
+            metadata
+                .pointer("/end/fields/failed_test")
+                .and_then(Value::as_str)
+                .or(Some(&test_name)),
+            None,
+            &self.domain,
+        );
+        let suffix = if self.selector.field == "trace_id" {
+            u128::from_str_radix(&self.selector.value, 16)
+                .ok()
+                .map(|id| format!("{id:032x}"))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| {
+            cases::resolve_prefix(
+                metadata["execution_id"].as_str(),
+                None,
+                &self.selector.value,
+            )
+        });
+        let group = metadata["deadline_members"].as_array();
+        let prefix = if group.is_some() {
+            "deadline-group"
+        } else {
+            &prefix
+        };
+        let expanded = metadata["expanded_cases"] == true;
+        std::fs::create_dir_all(case_dir).map_err(|e| e.to_string())?;
+        let mut stem = format!("{prefix}--{suffix}");
+        let (path, _claim) = loop {
+            let path = if expanded {
+                case_dir.join(&stem)
+            } else {
+                case_dir.join(cases::bundle::bundle_name(&stem))
+            };
+            let claim = case_dir.join(format!(".{stem}.claim"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&claim)
+            {
+                Ok(_) => {
+                    let claim = CaseClaim(claim);
+                    if !path.try_exists().map_err(|e| e.to_string())? {
+                        break (path, claim);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            stem = format!("{prefix}-{}--{suffix}", cases::roll_id());
+        };
+        let stage = case_dir.join(format!(".pending-{}", uuid::Uuid::new_v4()));
+        if expanded {
+            std::fs::create_dir(&stage).map_err(|e| e.to_string())?;
+        }
         let result = (|| {
             let reason = metadata
                 .get("reason")
@@ -500,9 +692,27 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
                 .copied()
                 .max()
                 .unwrap_or(self.anchor_seq);
-            let names = cases::file_names(&file.stem);
+            let names = cases::file_names(&stem);
             let input = doc::CaseInput {
-                stem: file.stem.clone(),
+                focus_traces: if let Some(members) = group {
+                    members
+                        .iter()
+                        .filter_map(|m| {
+                            (m["selector"]["field"] == "trace_id")
+                                .then(|| m["selector"]["value"].as_str())
+                                .flatten()
+                        })
+                        .filter_map(|id| u128::from_str_radix(id, 16).ok())
+                        .collect()
+                } else if self.selector.field == "trace_id" {
+                    u128::from_str_radix(&self.selector.value, 16)
+                        .ok()
+                        .into_iter()
+                        .collect()
+                } else {
+                    vec![]
+                },
+                stem: stem.clone(),
                 captured_at: self.captured_at,
                 domain: self.domain.clone(),
                 incarnation: metadata
@@ -552,19 +762,49 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
             let mut body = String::new();
             doc::front_matter(&mut body, &input);
             self.render_summary(&mut body, &test_name, reason, headline, metadata);
-            let registry_name = cases::bundle::registry_entry_name(&file.stem);
+            if let Some(members) = group {
+                use std::fmt::Write;
+                body.push_str("\n## Deadline crossings\n\n| Execution | Name | Focus | Crossing |\n|---|---|---|---|\n");
+                for m in members {
+                    let field =
+                        |v: &Value| crate::render::escape::cell(v.as_str().unwrap_or("unknown"));
+                    writeln!(
+                        body,
+                        "| {} | {} | {} | {} |",
+                        field(&m["execution_id"]),
+                        field(&m["name"]),
+                        field(&m["selector"]["value"]),
+                        field(&m["captured_at"])
+                    )
+                    .unwrap();
+                }
+            }
+            if !input.focus_traces.is_empty() {
+                let peers: Vec<_> = metadata["peers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["selector"]["field"] == "trace_id")
+                    .filter_map(|p| u128::from_str_radix(p["selector"]["value"].as_str()?, 16).ok())
+                    .collect();
+                cases::focus::render(
+                    &mut body,
+                    &input,
+                    &peers,
+                    zone(metadata),
+                    self.logs.values().map(Arc::as_ref),
+                    self.spans.values().map(Arc::as_ref),
+                );
+            }
+            let registry_name = cases::bundle::registry_entry_name(&stem);
             let entries = [
                 names[0].as_str(),
                 names[1].as_str(),
                 names[2].as_str(),
                 registry_name.as_str(),
             ];
-            cases::bundle::pack_stream(
-                file.file,
-                &file.stem,
-                entries.into_iter().enumerate().map(|(i, n)| (n, i)),
-                true,
-                |zip, i| {
+            let write_entry =
+                |zip: &mut dyn std::io::Write, i| -> Result<(), cases::bundle::BundleError> {
                     match i {
                         0 => zip.write_all(body.as_bytes())?,
                         1 => {
@@ -588,13 +828,38 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
                         _ => zip.write_all(&doc::registry_json(&input.registry))?,
                     }
                     Ok(())
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(path.clone())
+                };
+            if expanded {
+                for (i, name) in entries.iter().enumerate() {
+                    let mut file =
+                        std::fs::File::create(stage.join(name)).map_err(|e| e.to_string())?;
+                    write_entry(&mut file, i).map_err(|e| e.to_string())?;
+                }
+                std::fs::rename(&stage, &path).map_err(|e| e.to_string())?;
+                Ok(path.join(&names[0]))
+            } else {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stage)
+                    .map_err(|e| e.to_string())?;
+                cases::bundle::pack_stream(
+                    file,
+                    &stem,
+                    entries.into_iter().enumerate().map(|(i, n)| (n, i)),
+                    true,
+                    write_entry,
+                )
+                .map_err(|e| e.to_string())?;
+                std::fs::rename(&stage, &path).map_err(|e| e.to_string())?;
+                Ok(path.clone())
+            }
         })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(path);
+        if expanded && result.is_err() {
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+        if !expanded {
+            let _ = std::fs::remove_file(&stage);
         }
         result
     }
@@ -622,7 +887,7 @@ fn value_bytes(v: &Value) -> usize {
         _ => 64,
     }
 }
-fn log_bytes(log: &LogEntry) -> usize {
+pub(crate) fn log_bytes(log: &LogEntry) -> usize {
     128 + size_of::<LogEntry>()
         + log.message.len()
         + log.host.len()
@@ -636,7 +901,7 @@ fn log_bytes(log: &LogEntry) -> usize {
             .sum::<usize>()
         + attributes_bytes(&log.additional_fields)
 }
-fn span_bytes(span: &SpanEntry) -> usize {
+pub(crate) fn span_bytes(span: &SpanEntry) -> usize {
     128 + size_of::<SpanEntry>()
         + span.name.len()
         + span.service_name.len()

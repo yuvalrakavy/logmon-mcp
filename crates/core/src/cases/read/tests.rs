@@ -160,6 +160,7 @@ fn an_escape_the_emitter_never_produces_is_refused() {
 
 fn hostile_input() -> CaseInput {
     CaseInput {
+        focus_traces: vec![],
         stem: "checkout-hang-260731-141530".into(),
         captured_at: t("2026-07-31T14:15:30Z"),
         domain: "t3".into(),

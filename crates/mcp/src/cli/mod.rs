@@ -183,7 +183,7 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
     let skip_bind = argv.first().map(String::as_str) == Some("domains")
         && matches!(
             argv.get(1).map(String::as_str),
-            Some("create") | Some("delete") | Some("list")
+            Some("create") | Some("resize") | Some("delete") | Some("list")
         );
     if !skip_bind {
         let target = globals.domain.unwrap_or_else(|| "default".to_string());

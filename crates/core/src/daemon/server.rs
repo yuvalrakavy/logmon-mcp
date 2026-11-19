@@ -521,8 +521,7 @@ async fn run_initialized(
     //      never persists). Each binds its own receivers. A `default`-named entry,
     //      a duplicate, an invalid name, or a bind failure (port clash) is SKIPPED
     //      with a WARN so one bad entry can't take the daemon down; bound ports are
-    //      logged. (Per-domain seq/bookmark durability + `persist=true` are §17
-    //      deferred work.)
+    //      logged. API-persisted definitions are restored separately below.
     let mut seen_config_domains: std::collections::HashSet<DomainId> =
         std::collections::HashSet::new();
     for cd in &config.domains {
@@ -612,11 +611,14 @@ async fn run_initialized(
         //       lazily per domain on first use — the skill recommends one domain
         //       per test run, so opening eagerly would leave a permanent file for
         //       every run that never recorded anything.
+        .with_definitions(&dir)
         .with_domain_data(Arc::new(crate::domain_data::DomainDataStore::new(
             dir.clone(),
             env!("CARGO_PKG_VERSION").to_string(),
         ))),
     );
+
+    handler.restore_definitions().await?;
 
     // 13a2. Restore collectors (§10). Deliberately AFTER the domain registry
     //       exists, so a restored collector can be handed the metrics of the
@@ -697,7 +699,9 @@ async fn run_initialized(
     //      Wake: the interval tick. Sleep: `interval.tick().await`.
     {
         let sessions = sessions.clone();
-        let handler = handler.clone();
+        // A sleeping maintenance task must not keep a stopped broker and its
+        // listener ports alive when the same runtime restarts it.
+        let handler = Arc::downgrade(&handler);
         let ttl = std::time::Duration::from_secs(config.session_ttl_secs.max(1));
         tokio::spawn(async move {
             // Sweep at TTL/10, clamped to [60s, 1h] — timely without churn.
@@ -709,6 +713,9 @@ async fn run_initialized(
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
+                let Some(handler) = handler.upgrade() else {
+                    break;
+                };
                 for id in sessions.expired_disconnected(ttl) {
                     use crate::daemon::rpc_handler::ExpiredDisposal;
                     match handler.dispose_expired_session(&id, ttl) {

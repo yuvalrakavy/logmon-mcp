@@ -723,7 +723,7 @@ const READ_ONLY: &[&str] = &[
     "document_collectors",
     // Lifecycle: creating or deleting a DIFFERENT domain is not an operation on
     // this one, and delete is the honest way to discard a case.
-    "create_domain", "delete_domain", "drop_session", "rename_session",
+    "create_domain", "resize_domain", "delete_domain", "drop_session", "rename_session",
     "get_domain_data_registry",
 ];
 

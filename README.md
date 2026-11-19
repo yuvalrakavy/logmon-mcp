@@ -1077,6 +1077,26 @@ and late-telemetry diagnostics. For a stable name with multiple attempts in a ru
 execution IDs to select the pair for comparison. Check file gaps and settlement,
 each execution’s coverage and `sampled_out` state, and post-grace diagnostics.
 
+Use the offline report to locate an exceptional execution across a parallel test run.
+The summary reports failures and isolated reruns together with their elapsed times,
+case links, machine load and the health of the evidence. A deadline crossing remains
+visible when a later verdict confirms a pass.
+
+```bash
+logmon-test-log summary /runs/42/tests.jsonl
+logmon-test-log archive /runs/42/tests.jsonl /runs/42.zip
+unzip /runs/42.zip -d /tmp/run-42
+```
+
+Open `summary.md` in the extracted directory. Follow the [focused case investigation guide](docs/focused-cases.md) to inspect one execution or the surrounding activity with the MCP tools. `full-test-log.jsonl` contains the
+journal and `failed-test-log.jsonl` contains records for exceptional executions and
+run-level gaps. Each case under `cases/` is expanded with its evidence next to its
+Markdown report. Older standard case ZIPs are expanded during packaging and their
+journal links are adjusted to the extracted paths. An all-green run still produces
+both journals and the cases directory. Use `summary` for provisional results and
+publish the archive after the runner confirms settlement and persistence. Pass
+`--unresolved-ends N` when the runner has unreconciled verdicts.
+
 Run the local transport and fresh-domain reload check from a source checkout:
 
 ```bash
@@ -1101,6 +1121,8 @@ costs too much for your CI window, try an intermediate percentage. Sampling by
 stable name keeps the same tests available for comparisons across builds.
 
 ## Configuration
+
+For parallel producers, size the log and span rings independently. Optional maxima let a ring grow when eviction would cut into an active test or its grace period. Inspect current capacities and estimated memory before increasing a domain’s limits. See the [domain capacity and lifetime guide](docs/domain-capacity.md) for creation, resize, cleanup and restart examples.
 
 Config and state live in `~/.config/logmon/` on both macOS and Linux:
 

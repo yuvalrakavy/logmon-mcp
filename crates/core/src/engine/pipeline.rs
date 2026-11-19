@@ -59,7 +59,7 @@ pub struct FilterInfo {
 /// Per-session logic (triggers, filters, process flow) lives in the daemon.
 pub struct LogPipeline {
     pub test_log: Arc<crate::test_log::TestLog>,
-    store: InMemoryStore,
+    pub(crate) store: InMemoryStore,
     pre_buffer: PreTriggerBuffer,
     /// Serializes [`Self::resync_pre_buffer`]'s compute-then-apply.
     pre_buffer_resync: std::sync::Mutex<()>,

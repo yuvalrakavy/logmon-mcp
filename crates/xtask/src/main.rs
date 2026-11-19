@@ -160,6 +160,8 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             // domains.* (DomainsCreateResult is an alias of DomainInfo; DomainsUseResult is
             // its own struct and is listed below — the old comment said otherwise)
             "DomainInfo":            schema_for!(DomainInfo),
+            "DomainsResize":schema_for!(DomainsResize),
+            "DomainsResizeResult":schema_for!(DomainsResizeResult),
             "DomainsCreate":         schema_for!(DomainsCreate),
             "DomainsDelete":         schema_for!(DomainsDelete),
             "DomainsDeleteResult":   schema_for!(DomainsDeleteResult),

@@ -2,8 +2,8 @@
 //! separately preserve the source records needed to investigate a verdict.
 mod capture;
 mod summary;
-pub(crate) use capture::CapturePool;
 pub use capture::CaptureSnapshot;
+pub(crate) use capture::{log_bytes, span_bytes, CapturePool};
 pub use summary::{Selector, Summary};
 
 #[cfg(test)]
