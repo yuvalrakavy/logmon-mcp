@@ -23,6 +23,809 @@
         "value"
       ]
     },
+    "TestLogStatus": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogStatus",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "description": "Existing domain to inspect. Defaults to the caller's bound domain.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "description": "Read this retained run, including a closed or sealed run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TestLogStatusResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogStatusResult",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TestLogQueryErrorResult"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "const": 1
+            },
+            "domain": {
+              "type": "string"
+            },
+            "test_log": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TestLogRunDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "domain",
+            "test_log"
+          ]
+        }
+      ],
+      "$defs": {
+        "TestLogQueryErrorResult": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "const": 1
+            },
+            "error": {
+              "$ref": "#/$defs/TestLogQueryError"
+            }
+          },
+          "required": [
+            "schema_version",
+            "error"
+          ]
+        },
+        "TestLogQueryError": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "domain": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ]
+        },
+        "TestLogRunDetail": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "began_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "last_event_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "last_completion_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "elapsed_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "jsonl_path": {
+              "type": "string"
+            },
+            "fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "executions": {
+              "$ref": "#/$defs/TestLogExecutionCounts"
+            },
+            "longest_in_flight": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TestLogRunningExecution"
+              }
+            },
+            "recent_failures_truncated": {
+              "type": "boolean"
+            },
+            "recent_failures": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TestLogRecentFailure"
+              }
+            },
+            "cases": {
+              "$ref": "#/$defs/TestLogDetailedCases"
+            },
+            "summaries": {
+              "$ref": "#/$defs/TestLogSummaryCounts"
+            },
+            "replayed_ends": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "journal": {
+              "$ref": "#/$defs/TestLogJournalHealth"
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "began_at",
+            "last_event_at",
+            "elapsed_ms",
+            "jsonl_path",
+            "fields",
+            "executions",
+            "longest_in_flight",
+            "recent_failures_truncated",
+            "recent_failures",
+            "cases",
+            "summaries",
+            "replayed_ends",
+            "journal"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
+          ]
+        },
+        "TestLogExecutionCounts": {
+          "type": "object",
+          "properties": {
+            "planned": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "started": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ended": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "by_verdict": {
+              "$ref": "#/$defs/TestLogVerdictCounts"
+            }
+          },
+          "required": [
+            "planned",
+            "started",
+            "ended",
+            "in_flight",
+            "by_verdict"
+          ]
+        },
+        "TestLogVerdictCounts": {
+          "type": "object",
+          "properties": {
+            "OK": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "FAIL": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "TIMEOUT": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ABORTED": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "NO_VERDICT": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "OK",
+            "FAIL",
+            "TIMEOUT",
+            "ABORTED",
+            "NO_VERDICT"
+          ]
+        },
+        "TestLogRunningExecution": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "execution_id": {
+              "type": "string"
+            },
+            "trace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "started_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "elapsed_ms": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "deadline_overdue_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "name",
+            "execution_id",
+            "trace_id",
+            "started_at",
+            "elapsed_ms",
+            "deadline_overdue_ms"
+          ]
+        },
+        "TestLogRecentFailure": {
+          "type": "object",
+          "properties": {
+            "execution_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "failed_test": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verdict": {
+              "type": "string"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ended_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "case_status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "case_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rerun_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "case_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "execution_id",
+            "name",
+            "verdict",
+            "ended_at"
+          ]
+        },
+        "TestLogDetailedCases": {
+          "type": "object",
+          "properties": {
+            "requested": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ready_executions": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "distinct_cases_written": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "pending": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "skipped": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "refused_by_max_failures": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "max_failures": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "files": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TestLogCaseFile"
+              }
+            }
+          },
+          "required": [
+            "requested",
+            "ready_executions",
+            "distinct_cases_written",
+            "pending",
+            "failed",
+            "skipped",
+            "refused_by_max_failures",
+            "max_failures",
+            "files"
+          ]
+        },
+        "TestLogCaseFile": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "execution_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "path",
+            "execution_ids"
+          ]
+        },
+        "TestLogSummaryCounts": {
+          "type": "object",
+          "properties": {
+            "final": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "pending": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "final",
+            "pending"
+          ]
+        },
+        "TestLogJournalHealth": {
+          "type": "object",
+          "properties": {
+            "write_error": true
+          },
+          "required": [
+            "write_error"
+          ]
+        }
+      }
+    },
+    "TestLogList": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogList",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "description": "Existing domain to inspect. Defaults to the caller's bound domain.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TestLogListResult": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "TestLogListResult",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TestLogQueryErrorResult"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "const": 1
+            },
+            "domain": {
+              "type": "string"
+            },
+            "runs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TestLogRunSummary"
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "domain",
+            "runs"
+          ]
+        }
+      ],
+      "$defs": {
+        "TestLogQueryErrorResult": {
+          "type": "object",
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0,
+              "const": 1
+            },
+            "error": {
+              "$ref": "#/$defs/TestLogQueryError"
+            }
+          },
+          "required": [
+            "schema_version",
+            "error"
+          ]
+        },
+        "TestLogQueryError": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "domain": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "run_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ]
+        },
+        "TestLogRunSummary": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "began_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "last_event_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "last_completion_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "fields": {
+              "type": "object",
+              "additionalProperties": true
+            },
+            "executions": {
+              "$ref": "#/$defs/TestLogExecutionCounts"
+            },
+            "cases": {
+              "$ref": "#/$defs/TestLogCaseCounts"
+            },
+            "summaries": {
+              "$ref": "#/$defs/TestLogSummaryCounts"
+            },
+            "replayed_ends": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "began_at",
+            "last_event_at",
+            "fields",
+            "executions",
+            "cases",
+            "summaries",
+            "replayed_ends"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
+          ]
+        },
+        "TestLogExecutionCounts": {
+          "type": "object",
+          "properties": {
+            "planned": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "started": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ended": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "by_verdict": {
+              "$ref": "#/$defs/TestLogVerdictCounts"
+            }
+          },
+          "required": [
+            "planned",
+            "started",
+            "ended",
+            "in_flight",
+            "by_verdict"
+          ]
+        },
+        "TestLogVerdictCounts": {
+          "type": "object",
+          "properties": {
+            "OK": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "FAIL": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "TIMEOUT": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ABORTED": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "NO_VERDICT": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "OK",
+            "FAIL",
+            "TIMEOUT",
+            "ABORTED",
+            "NO_VERDICT"
+          ]
+        },
+        "TestLogCaseCounts": {
+          "type": "object",
+          "properties": {
+            "requested": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ready_executions": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "distinct_cases_written": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "pending": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "skipped": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "refused_by_max_failures": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "max_failures": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "requested",
+            "ready_executions",
+            "distinct_cases_written",
+            "pending",
+            "failed",
+            "skipped",
+            "refused_by_max_failures",
+            "max_failures"
+          ]
+        },
+        "TestLogSummaryCounts": {
+          "type": "object",
+          "properties": {
+            "final": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "pending": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "final",
+            "pending"
+          ]
+        }
+      }
+    },
     "TestLogBegin": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TestLogBegin",
@@ -31,6 +834,15 @@
         "run_id": {
           "description": "Identity of this run, unique across invocations.",
           "type": "string"
+        },
+        "planned_executions": {
+          "description": "Original number of planned executions. Zero is an explicitly empty plan.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         },
         "jsonl_path": {
           "description": "Absolute JSONL path chosen by the run owner.",
@@ -5183,6 +5995,27 @@
       "title": "StatusGetResult",
       "type": "object",
       "properties": {
+        "test_log_schema_version": {
+          "description": "Missing on brokers predating test-log discovery.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "test_log": {
+          "description": "Current open or closing run. Null for an idle domain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestLogLane"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "session": {
           "anyOf": [
             {
@@ -5293,6 +6126,36 @@
         "store"
       ],
       "$defs": {
+        "TestLogLane": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "in_flight"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
+          ]
+        },
         "SessionInfo": {
           "description": "One entry in a `sessions.list` or `status.get` response.",
           "type": "object",
@@ -5678,6 +6541,27 @@
       "description": "A single domain as reported by `domains.list` and `domains.create`.\n\nA port value of `0` means that receiver is disabled for the domain. The\ncount/seq fields reflect the domain's live buffers; the `last_*_received_at` /\n`idle_secs` / `stale` liveness fields answer \"is this domain actually\nreceiving?\" (`status.get.receiver_liveness` gives the per-listener drill-down).",
       "type": "object",
       "properties": {
+        "test_log_schema_version": {
+          "description": "Missing on brokers predating test-log discovery.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "test_log": {
+          "description": "Current open or closing run. Null for an idle domain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestLogLane"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "name": {
           "type": "string"
         },
@@ -5840,6 +6724,36 @@
         "span_count"
       ],
       "$defs": {
+        "TestLogLane": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "in_flight"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
+          ]
+        },
         "DomainMemory": {
           "type": "object",
           "properties": {
@@ -5957,6 +6871,27 @@
           "description": "A single domain as reported by `domains.list` and `domains.create`.\n\nA port value of `0` means that receiver is disabled for the domain. The\ncount/seq fields reflect the domain's live buffers; the `last_*_received_at` /\n`idle_secs` / `stale` liveness fields answer \"is this domain actually\nreceiving?\" (`status.get.receiver_liveness` gives the per-listener drill-down).",
           "type": "object",
           "properties": {
+            "test_log_schema_version": {
+              "description": "Missing on brokers predating test-log discovery.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "test_log": {
+              "description": "Current open or closing run. Null for an idle domain.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TestLogLane"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "name": {
               "type": "string"
             },
@@ -6117,6 +7052,36 @@
             "span_buffer_size",
             "log_count",
             "span_count"
+          ]
+        },
+        "TestLogLane": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "in_flight"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
           ]
         },
         "DomainMemory": {
@@ -6313,6 +7278,27 @@
           "description": "A single domain as reported by `domains.list` and `domains.create`.\n\nA port value of `0` means that receiver is disabled for the domain. The\ncount/seq fields reflect the domain's live buffers; the `last_*_received_at` /\n`idle_secs` / `stale` liveness fields answer \"is this domain actually\nreceiving?\" (`status.get.receiver_liveness` gives the per-listener drill-down).",
           "type": "object",
           "properties": {
+            "test_log_schema_version": {
+              "description": "Missing on brokers predating test-log discovery.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "test_log": {
+              "description": "Current open or closing run. Null for an idle domain.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TestLogLane"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
             "name": {
               "type": "string"
             },
@@ -6473,6 +7459,36 @@
             "span_buffer_size",
             "log_count",
             "span_count"
+          ]
+        },
+        "TestLogLane": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "in_flight"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
           ]
         },
         "DomainMemory": {
@@ -6636,6 +7652,27 @@
       "description": "`domains.use` returns the now-bound domain (same shape as a `domains.list`\nentry), plus a warning when the bind REPLACED a different non-default\nbinding.",
       "type": "object",
       "properties": {
+        "test_log_schema_version": {
+          "description": "Missing on brokers predating test-log discovery.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "test_log": {
+          "description": "Current open or closing run. Null for an idle domain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestLogLane"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "name": {
           "type": "string"
         },
@@ -6805,6 +7842,36 @@
         "span_count"
       ],
       "$defs": {
+        "TestLogLane": {
+          "type": "object",
+          "properties": {
+            "run_id": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/TestLogRunState"
+            },
+            "in_flight": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "run_id",
+            "state",
+            "in_flight"
+          ]
+        },
+        "TestLogRunState": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closing",
+            "closed",
+            "sealed"
+          ]
+        },
         "DomainMemory": {
           "type": "object",
           "properties": {

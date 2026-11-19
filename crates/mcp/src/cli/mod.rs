@@ -1,9 +1,8 @@
 //! CLI mode for `logmon-mcp`. Routed when argv carries anything but flags.
 //!
-//! **There are no per-command modules.** Every command is built from the
-//! daemon's `tools.manifest` at runtime by [`generic`], so this file's whole
-//! job is to separate the flags that belong to *this process* from the ones
-//! that belong to the tool, open a connection, and hand over.
+//! Commands use the daemon's manifest and the parser in [`generic`]. The
+//! progress polling path also needs the shipped query schema so it can report
+//! a failed connection before any daemon is available to describe the tool.
 //!
 //! ## Where a global flag stops being global
 //!
@@ -139,9 +138,31 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
         return 1;
     }
 
-    let session_name = globals.session.clone().unwrap_or_else(|| "cli".to_string());
+    if !globals.help
+        && argv
+            .first()
+            .is_some_and(|v| v.eq_ignore_ascii_case("test-log"))
+    {
+        let method = match argv.get(1).map(|v| v.to_ascii_lowercase()).as_deref() {
+            Some("status") => Some("test_log.status"),
+            Some("list") => Some("test_log.list"),
+            _ => None,
+        };
+        if let Some(method) = method {
+            return dispatch_progress(&globals, method, &argv[2..]).await;
+        }
+    }
 
-    let broker = match connect::connect_cli(&session_name, &argv).await {
+    // A status-page read of a particular lane must not rebind another caller's
+    // persistent session between its own domains.use and its subsequent RPC.
+    let lane_status = globals.domain.is_some()
+        && argv
+            .first()
+            .is_some_and(|a| a.eq_ignore_ascii_case("status"))
+        && (argv.len() == 1 || argv.get(1).is_some_and(|a| a.eq_ignore_ascii_case("get")));
+    let session_name = (!lane_status).then(|| globals.session.as_deref().unwrap_or("cli"));
+
+    let broker = match connect::connect_cli(session_name, &argv).await {
         Ok(b) => b,
         Err(e) => {
             format::error(&e.to_string(), json);
@@ -174,8 +195,7 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
     // Registry-management verbs skip the bind, because binding to a domain you
     // are about to create cannot succeed.
     //
-    // **This IS a hand-kept list, and it is the last piece of logmon knowledge
-    // in this file.** An earlier comment here claimed the opposite while
+    // **This is a hand-kept list.** An earlier comment here claimed the opposite while
     // sitting directly above the literals. It cannot be derived today: nothing
     // in the manifest says which verbs are domain-agnostic. The honest fix is a
     // manifest hint (`cli.domain_agnostic`), which belongs with the daemon work
@@ -197,6 +217,63 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
     }
 
     generic::dispatch(&broker, &argv, json).await
+}
+
+/// Polling passes the domain in the RPC. Binding the shared named CLI session
+/// would race two concurrent lane reads. Parse these two commands with the
+/// shipped schema so a cold connection failure can still identify the request.
+async fn dispatch_progress(globals: &Globals, method: &str, args: &[String]) -> i32 {
+    use crate::progress;
+    use logmon_broker_protocol::mcp_tools;
+    use logmon_broker_sdk::Broker;
+    use serde_json::Value;
+
+    let entries = mcp_tools::manifest();
+    let Some(entry) = entries.iter().find(|e| e.method == method) else {
+        format::error(
+            "This build does not support test-log progress queries",
+            globals.json,
+        );
+        return 1;
+    };
+    let mut args = args.to_vec();
+    if let Some(domain) = &globals.domain {
+        args.extend(["--domain".to_string(), domain.clone()]);
+    }
+    let mut params = match generic::build_params(&args, entry) {
+        Ok(p) => p,
+        Err(e) => {
+            format::error(&e, globals.json);
+            return 1;
+        }
+    };
+    params
+        .entry("domain")
+        .or_insert_with(|| Value::from("default"));
+    let params = Value::Object(params);
+    let connect = Broker::connect()
+        .reconnect_max_attempts(0)
+        .call_timeout(progress::QUERY_TIMEOUT)
+        .open();
+    let reply = match tokio::time::timeout(progress::QUERY_TIMEOUT, connect).await {
+        Ok(Ok(broker)) => progress::query(&broker, method, params).await,
+        Ok(Err(e)) => progress::error(&params, "broker_unreachable", e),
+        Err(_) => progress::error(
+            &params,
+            "broker_unreachable",
+            "Broker connection timed out.",
+        ),
+    };
+    let failed = reply.get("error").is_some();
+    if !globals.json && failed {
+        eprintln!(
+            "{}",
+            reply["error"]["message"].as_str().unwrap_or("Broker error")
+        );
+    } else {
+        format::print_json(&reply);
+    }
+    i32::from(failed)
 }
 
 #[cfg(test)]

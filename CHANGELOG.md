@@ -5,6 +5,10 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Added — read-only progress for parallel test runs
+
+Query a domain’s current run, active executions, verdicts, cases and recent runs using the CLI or MCP. Domain listings expose a compact active-run projection. Runners can supply a planned execution count at begin. See the [progress API](docs/test-log-progress.md).
+
 ### Fixed — an SDK call hung forever when the broker closed the connection mid-call
 
 The SDK (and so the MCP shim and the CLI) waited for a reply that could no longer come when the

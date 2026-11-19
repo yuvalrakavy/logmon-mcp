@@ -1,5 +1,6 @@
 //! Run ownership, execution lifecycle and capture admission for a single domain.
 
+mod progress;
 mod run;
 mod writer;
 
@@ -23,6 +24,7 @@ use std::time::Instant;
 #[derive(Default)]
 pub struct TestLog {
     pub(crate) capture_pool: Arc<Mutex<crate::nightly::CapturePool>>,
+    history: Arc<progress::History>,
     state: Mutex<State>,
     observing: AtomicBool,
     changed: Condvar,
@@ -34,6 +36,25 @@ struct State {
     run: Option<Run>,
     // Old close receipts are small; full evidence and summaries live in the run file.
     closed: HashMap<String, ClosedRun>,
+    // Eviction only removes query history. Keep retrying already accepted writes.
+    draining: Vec<Arc<writer::Journal>>,
+}
+
+impl State {
+    fn prune_settled(&mut self, history: &progress::History) {
+        self.draining.retain(|w| w.status()["pending_records"] != 0);
+        self.closed.retain(|id, receipt| {
+            if history.retains(id) {
+                return true;
+            }
+            if let Some(writer) = receipt.pending_writer.take() {
+                if writer.status()["pending_records"] != 0 {
+                    self.draining.push(writer);
+                }
+            }
+            false
+        });
+    }
 }
 
 struct ClosedRun {
@@ -63,6 +84,16 @@ fn refused(id: &str, code: &str) -> Value {
 }
 
 impl TestLog {
+    pub fn status(&self, domain: &str, run_id: Option<&str>) -> Value {
+        self.history.status(domain, run_id)
+    }
+    pub fn list(&self, domain: &str) -> Value {
+        self.history.list(domain)
+    }
+    pub fn projection(&self) -> Option<TestLogLane> {
+        self.history.projection()
+    }
+
     pub(crate) fn rpc(
         &self,
         d: &Arc<Domain>,
@@ -187,7 +218,7 @@ impl TestLog {
             }
         }
         let id = config.run_id.clone();
-        let mut run = Run::new(config, journal, provenance);
+        let mut run = Run::new(config, journal, provenance, self.history.clone());
         run.append(
             "begin-test-log",
             json!({"settings":run.config,"sampling_algorithm":"fnv1a64-v1"}),
@@ -205,13 +236,19 @@ impl TestLog {
                     break;
                 };
                 let now = Instant::now();
+                let was_settled = run.is_settled();
                 run.tick(&domain, now);
                 run.update_ring_protection(&domain);
                 let delay = run.next_wake(Instant::now());
+                let settled = run.is_settled();
+                if settled && !was_settled || !guard.draining.is_empty() {
+                    guard.prune_settled(&owner.history);
+                }
                 drop(domain);
                 drop(owner.changed.wait_timeout(guard, delay).unwrap());
             })
             .map_err(|e| e.to_string())?;
+        run.progress.publish_begin();
         let health = run.journal.status()["test_log_health"].clone();
         if let Some(mut previous) = state.run.replace(run) {
             previous.flush_late_counts(Instant::now());

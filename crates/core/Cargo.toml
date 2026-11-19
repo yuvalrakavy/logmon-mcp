@@ -8,6 +8,7 @@ license.workspace = true
 test-support = ["dep:tempfile"]
 
 [dependencies]
+arc-swap = "1.9"
 logmon-broker-protocol = { path = "../protocol" }
 tokio.workspace = true
 tokio-stream.workspace = true

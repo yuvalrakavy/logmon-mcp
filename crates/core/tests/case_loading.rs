@@ -710,6 +710,8 @@ fn a_live_domain_is_never_refused_for_evidence() {
 /// *different* domain — creating, deleting, or loading another case is not an
 /// operation on this one, and delete is the only honest way to discard a case.
 const READ_ONLY: &[&str] = &[
+    "test_log_status",
+    "test_log_list",
     "load_case",
     // The reader's own navigation, placed today with today's clock.
     "clear_bookmarks",

@@ -4,6 +4,7 @@ use rmcp::ServiceExt;
 mod auto_start;
 mod cli;
 mod notifications;
+mod progress;
 mod server;
 
 /// Argument parsing is **not** done with clap.

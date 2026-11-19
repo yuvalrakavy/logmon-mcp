@@ -1,11 +1,13 @@
 //! One bounded writer per run. A failed partial write is retried from the
 //! previous complete line; readers can use all complete lines in the meantime.
 
+use arc_swap::ArcSwapOption;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -56,7 +58,18 @@ impl Drop for State {
     }
 }
 
-type Shared = Arc<(Mutex<State>, Condvar)>;
+#[derive(Default)]
+pub(super) struct Health {
+    error: ArcSwapOption<String>,
+    lost: AtomicU64,
+}
+impl Health {
+    pub fn json(&self) -> Value {
+        let error = self.error.load_full();
+        json!({"write_error":error.as_deref(),"lost_records":self.lost.load(Ordering::Acquire)})
+    }
+}
+type Shared = Arc<(Mutex<State>, Condvar, Arc<Health>)>;
 
 pub(super) struct Journal {
     pub path: PathBuf,
@@ -79,7 +92,7 @@ impl Journal {
     fn from_file(path: &Path, file: File, budget: Arc<QueueBudget>) -> io::Result<Self> {
         let mut state = State::default();
         state.budget = budget;
-        let shared = Arc::new((Mutex::new(state), Condvar::new()));
+        let shared = Arc::new((Mutex::new(state), Condvar::new(), Arc::<Health>::default()));
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("test-log-writer".into())
@@ -96,12 +109,17 @@ impl Journal {
         let mut s = self.shared.0.lock().unwrap();
         if !s.budget.reserve(bytes.len()) {
             s.lost += 1;
+            self.shared.2.lost.store(s.lost, Ordering::Release);
             self.shared.1.notify_one();
             return;
         }
         s.bytes += bytes.len();
         s.queue.push_back(bytes.into());
         self.shared.1.notify_one();
+    }
+
+    pub fn progress_health(&self) -> Arc<Health> {
+        self.shared.2.clone()
     }
 
     pub fn status(&self) -> Value {
@@ -174,6 +192,7 @@ fn write_loop(mut file: File, shared: Shared) {
                 s.degraded = true;
                 let msg = err.to_string();
                 s.first_error.get_or_insert_with(|| msg.clone());
+                shared.2.error.store(Some(Arc::new(msg.clone())));
                 s.last_error = Some(msg);
                 if s.stopping {
                     return;
@@ -214,6 +233,34 @@ mod tests {
         budget.release(1, MAX_BYTES - bytes);
         second.append(row);
         assert_eq!(second.status()["lost_records"], 1);
+    }
+
+    #[test]
+    fn query_history_eviction_keeps_pending_rows_and_independent_health() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let file = File::open(temp.path()).unwrap();
+        let journal = Arc::new(Journal::from_file(temp.path(), file, Arc::default()).unwrap());
+        journal.append(json!({"event":"run-settled"}));
+        let health = journal.progress_health();
+        let mut state = super::super::State::default();
+        state.closed.insert(
+            "old".into(),
+            super::super::ClosedRun {
+                result: Value::Null,
+                pending_writer: Some(journal.clone()),
+            },
+        );
+        state.prune_settled(&super::super::progress::History::default());
+        assert!(!state.closed.contains_key("old"));
+        assert!(Arc::ptr_eq(&state.draining[0], &journal));
+        let limit = Instant::now() + Duration::from_secs(2);
+        while health.json()["write_error"].is_null() {
+            assert!(Instant::now() < limit);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let queue = journal.shared.0.lock().unwrap();
+        assert_eq!(queue.queue.len(), 1);
+        assert!(health.json()["write_error"].is_string());
     }
 
     #[test]

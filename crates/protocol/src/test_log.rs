@@ -27,6 +27,9 @@ pub struct TestLogSelector {
 pub struct TestLogBegin {
     /// Identity of this run, unique across invocations.
     pub run_id: String,
+    /// Original number of planned executions. Zero is an explicitly empty plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_executions: Option<u64>,
     /// Absolute JSONL path chosen by the run owner.
     pub jsonl_path: String,
     /// Run-scoped provenance copied into each case.

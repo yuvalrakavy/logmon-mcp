@@ -29,8 +29,22 @@ use logmon_broker_protocol::{
     TriggersEdit, TriggersEditResult, TriggersList, TriggersListResult, TriggersRemove,
     TriggersRemoveResult,
 };
+use logmon_broker_protocol::{TestLogList, TestLogListResult, TestLogStatus, TestLogStatusResult};
 
 impl Broker {
+    /// Read progress for the active or a specifically named retained run.
+    pub async fn test_log_status(
+        &self,
+        p: TestLogStatus,
+    ) -> Result<TestLogStatusResult, BrokerError> {
+        self.call_typed("test_log.status", p).await
+    }
+
+    /// List retained runs in an existing domain, newest first.
+    pub async fn test_log_list(&self, p: TestLogList) -> Result<TestLogListResult, BrokerError> {
+        self.call_typed("test_log.list", p).await
+    }
+
     /// Open the run's JSONL file in the bound domain, or return the existing owner when a different run is active.
     pub async fn test_log_begin(&self, p: TestLogBegin) -> Result<TestLogAck, BrokerError> {
         self.call_typed("test_log.begin", p).await

@@ -255,10 +255,18 @@ fn timeout_keeps_unknown_verdict_and_a_later_pass_reuses_capture() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
+    let v = f.domain.test_log.status("tests", None)["test_log"].clone();
+    assert_eq!(v["executions"]["by_verdict"]["NO_VERDICT"], 1);
+    assert_eq!(v["executions"]["in_flight"], 0);
+    assert_eq!(v["summaries"]["pending"], 1);
     a["verdict"] = json!("OK");
     a["ended_at"] = json!(Utc::now());
     f.rpc("end", a);
     f.close("one");
+    let v = f.domain.test_log.status("tests", Some("one"))["test_log"].clone();
+    assert_eq!(v["executions"]["ended"], 1);
+    assert_eq!(v["executions"]["by_verdict"]["NO_VERDICT"], 0);
+    assert_eq!(v["executions"]["by_verdict"]["OK"], 1);
     let rows = f.rows();
     assert_eq!(
         rows.iter().filter(|v| v["event"] == "case-ready").count(),
@@ -462,10 +470,11 @@ fn zero_sampling_keeps_failure_and_green_rerun_and_expanded_focus_evidence() {
     assert_eq!(case.registry.as_ref().unwrap().facts.len(), 3);
     let logs = case.logs.as_ref().unwrap();
     assert!(logs.iter().any(|l| l.message == "earlier peer work"));
-    assert!(logs.iter().any(|l| l
-        .additional_fields
-        .get("case_context")
-        .is_some_and(|v| v["run_fields"]["extra"]["version"] == 3)));
+    assert!(logs.iter().any(|l| {
+        l.additional_fields
+            .get("case_context")
+            .is_some_and(|v| v["run_fields"]["extra"]["version"] == 3)
+    }));
     case.select_scope("focus", None).unwrap();
     assert!(case
         .logs
@@ -530,6 +539,10 @@ fn deadline_group_indexes_distinct_foci_and_late_ok_supersedes_incomplete() {
     third["verdict"] = json!("OK");
     f.rpc("end", third);
     f.close("one");
+    let v = f.domain.test_log.status("tests", Some("one"))["test_log"].clone();
+    assert_eq!(v["cases"]["ready_executions"], 3);
+    assert_eq!(v["cases"]["distinct_cases_written"], 2);
+    assert_eq!(v["cases"]["files"].as_array().unwrap().len(), 2);
     let rows = f.rows();
     let path = |id: &str| {
         rows.iter()
@@ -602,4 +615,81 @@ fn bounded_rings_grow_only_for_evidence_in_active_and_grace_windows() {
         span();
     }
     assert_eq!(spans.ring_info().0.current, 4);
+}
+
+#[test]
+fn progress_counts_reconstruction_replay_caps_and_history_without_writer_lock() {
+    let f = Fixture::new();
+    let log = &f.domain.test_log;
+    assert!(log.status("lane", None)["test_log"].is_null());
+    assert_eq!(log.list("lane")["runs"], json!([]));
+    f.rpc(
+        "begin",
+        json!({"run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),"planned_executions":24,
+        "fields":{"/Action":"merge-check"},"max_failures":0,"grace_period_ms":1}),
+    );
+    for i in 0..24 {
+        let mut e = f.event(&i.to_string());
+        if i % 2 == 0 {
+            f.rpc("start", e.clone());
+        }
+        e["ended_at"] = json!(Utc::now());
+        e["verdict"] = json!("FAIL");
+        e["fields"] = json!({"message":"assertion","rerun_command":"rerun"});
+        let batch = json!({"run_id":"one","events":[e.clone(),e]});
+        let result = f.rpc("replay", batch);
+        assert_eq!(result["results"][1]["status"], "already_applied");
+    }
+    // Reading remains possible while the lifecycle mutex is held, as during a slow capture.
+    let locked = log.state.lock().unwrap();
+    let v = log.status("lane", None)["test_log"].clone();
+    let _: logmon_broker_protocol::TestLogRunDetail = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(
+        v["executions"],
+        json!({"planned":24,"started":24,"ended":24,"in_flight":0,
+        "by_verdict":{"OK":0,"FAIL":24,"TIMEOUT":0,"ABORTED":0,"NO_VERDICT":0}})
+    );
+    assert_eq!(v["replayed_ends"], 24);
+    assert_eq!(v["cases"]["skipped"], 24);
+    assert_eq!(v["cases"]["refused_by_max_failures"], 24);
+    assert_eq!(v["recent_failures"].as_array().unwrap().len(), 20);
+    assert_eq!(v["recent_failures"][0]["execution_id"], "23");
+    assert_eq!(
+        v["recent_failures"][0]["case_reason"],
+        "skipped_failure_limit"
+    );
+    assert_eq!(v["recent_failures_truncated"], true);
+    assert_eq!(log.list("lane")["runs"][0]["cases"].get("files"), None);
+    assert_eq!(log.projection().unwrap().in_flight, 0);
+    drop(locked);
+    f.close("one");
+    assert!(log.status("lane", None)["test_log"].is_null());
+    let settled = f
+        .rows()
+        .into_iter()
+        .find(|r| r["event"] == "run-settled")
+        .unwrap();
+    let v = log.status("lane", Some("one"))["test_log"].clone();
+    assert_eq!(settled["aggregates"]["executions"], v["executions"]);
+    assert_eq!(v["summaries"], json!({"pending":0,"final":24}));
+    assert_eq!(v["state"], "closed");
+    for i in 0..9 {
+        let id = format!("run-{i}");
+        f.begin(&id, 0);
+        f.close(&id);
+    }
+    f.begin("successor", 0);
+    assert_eq!(log.list("lane")["runs"].as_array().unwrap().len(), 11);
+    f.rpc("seal", json!({"run_id":"successor","wait_timeout_ms":0}));
+    f.close("successor");
+    assert_eq!(log.list("lane")["runs"].as_array().unwrap().len(), 10);
+    assert_eq!(
+        log.status("lane", Some("one"))["error"]["code"],
+        "run_not_found"
+    );
+    assert_eq!(
+        log.status("lane", Some("successor"))["test_log"]["state"],
+        "sealed"
+    );
+    assert!(f.dir.path().join("one.jsonl").exists());
 }

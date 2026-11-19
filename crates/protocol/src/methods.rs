@@ -2398,6 +2398,12 @@ pub struct TraceIngestCounts {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct StatusGetResult {
+    /// Missing on brokers predating test-log discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_log_schema_version: Option<u32>,
+    /// Current open or closing run. Null for an idle domain.
+    #[serde(default)]
+    pub test_log: Option<crate::TestLogLane>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionInfo>,
     pub daemon_uptime_secs: u64,
@@ -2538,6 +2544,12 @@ pub struct DomainsResizeResult {
 /// receiving?" (`status.get.receiver_liveness` gives the per-listener drill-down).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DomainInfo {
+    /// Missing on brokers predating test-log discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_log_schema_version: Option<u32>,
+    /// Current open or closing run. Null for an idle domain.
+    #[serde(default)]
+    pub test_log: Option<crate::TestLogLane>,
     pub name: String,
     pub gelf_port: u16,
     pub otlp_grpc_port: u16,

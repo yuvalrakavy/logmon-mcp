@@ -18,7 +18,7 @@ use std::time::Duration;
 /// This used to map a clap enum to a group name, which meant a new command
 /// needed a new arm here. The path is now derived from the command the user
 /// typed, so there is nothing to keep in step.
-pub async fn connect_cli(session: &str, argv: &[String]) -> Result<Broker> {
+pub async fn connect_cli(session: Option<&str>, argv: &[String]) -> Result<Broker> {
     let path: Vec<&str> = argv
         .iter()
         .take_while(|a| !a.starts_with('-'))
@@ -32,9 +32,11 @@ pub async fn connect_cli(session: &str, argv: &[String]) -> Result<Broker> {
         "argv": path,
     });
 
-    Broker::connect()
-        .session_name(session)
-        .client_info(client_info)
+    let mut builder = Broker::connect().client_info(client_info);
+    if let Some(session) = session {
+        builder = builder.session_name(session);
+    }
+    builder
         .reconnect_max_attempts(0)
         .call_timeout(Duration::from_secs(5))
         .open()

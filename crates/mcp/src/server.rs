@@ -1,20 +1,10 @@
 //! The MCP surface, built from the daemon's manifest rather than from knowledge
 //! of it.
 //!
-//! **No tool name, parameter struct or result shape appears in this file.**
-//! There were 45 `#[rmcp::tool]` attributes and 37 parameter structs here; they
-//! described a surface the daemon already describes, and every tool added to
-//! the broker had to be re-declared here before an agent could reach it. The
-//! router is now assembled at startup from `tools.manifest`, so a daemon that
-//! gains a tool gains an MCP tool, with no reinstall of this binary.
-//!
-//! The two "client-side" exceptions went with them. `export_logs` writes a file
-//! because a daemon resolves a relative path against its own working directory
-//! — but *which* parameter names that file is a fact the manifest states, so
-//! the generic forwarder can honour it without knowing the tool. And the
-//! version-skew note existed only because this binary kept its own tool list to
-//! compare against; with no list, there is nothing to skew, and the concept
-//! disappears rather than needing a home.
+//! The daemon declares tool names and argument schemas. Most responses are
+//! rendered for human readers. The test-log progress methods also implement
+//! a versioned structured result and client-side transport error contract.
+//! Domain discovery exposes both its rendered text and structured payload.
 
 use logmon_broker_protocol::mcp_tools::ManifestEntry;
 use logmon_broker_sdk::Broker;
@@ -75,6 +65,9 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
     }
 
     let method = entry.method.clone();
+    if crate::progress::is_query(&method) {
+        schema.insert("required".into(), serde_json::json!(["domain"]));
+    }
     let hints = entry.cli.clone();
 
     // The argument names this tool accepts, taken from the schema AFTER the
@@ -97,12 +90,16 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
             .unwrap_or_default(),
     );
 
+    let mut tool = Tool::new(
+        entry.name.clone(),
+        entry.description.clone(),
+        std::sync::Arc::new(schema),
+    );
+    if crate::progress::is_query(&method) {
+        tool = tool.with_annotations(ToolAnnotations::new().read_only(true));
+    }
     Some(ToolRoute::new_dyn(
-        Tool::new(
-            entry.name.clone(),
-            entry.description.clone(),
-            std::sync::Arc::new(schema),
-        ),
+        tool,
         move |ctx: ToolCallContext<'_, GelfMcpServer>| {
             let method = method.clone();
             let hints = hints.clone();
@@ -166,6 +163,23 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                 // dead zone, not an untested behaviour. Said here so the next
                 // reader does not go looking for the test that would prove it.
                 let params = serde_json::Value::Object(args);
+                if crate::progress::is_query(&method) {
+                    if params["domain"]
+                        .as_str()
+                        .is_none_or(|s| s.trim().is_empty())
+                    {
+                        return Err(rmcp::ErrorData::invalid_params(
+                            "domain must name an existing domain",
+                            None,
+                        ));
+                    }
+                    let reply = crate::progress::query(&ctx.service.broker, &method, params).await;
+                    return Ok(if reply.get("error").is_some() {
+                        CallToolResult::structured_error(reply)
+                    } else {
+                        CallToolResult::structured(reply)
+                    });
+                }
                 // `-` is the stdout spelling and `files_to_write` treats it as
                 // "no file", so it must mean "no path" here too — otherwise the
                 // rendering is suppressed for a reply that is about to be
@@ -224,7 +238,15 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                         None => serde_json::to_string_pretty(&result)
                             .unwrap_or_else(|e| format!("unserialisable reply: {e}")),
                     };
-                    return Ok(CallToolResult::success(vec![Content::text(text)]));
+                    let mut response = CallToolResult::success(vec![Content::text(text)]);
+                    if matches!(method.as_str(), "domains.list" | "status.get") {
+                        let mut structured = result;
+                        if let Some(fields) = structured.as_object_mut() {
+                            fields.remove("_display");
+                        }
+                        response.structured_content = Some(structured);
+                    }
+                    return Ok(response);
                 }
 
                 let mut wrote = Vec::new();

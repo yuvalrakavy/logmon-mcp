@@ -199,6 +199,18 @@ impl Tool {
 /// that file readable when a tool is added.
 pub const TOOLS: &[Tool] = &[
     Tool {
+        name: "test_log_status",
+        method: "test_log.status",
+        description: "Read the current test-log or a retained run by ID in an existing domain.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
+        name: "test_log_list",
+        method: "test_log.list",
+        description: "List the current and retained test-log runs in an existing domain, newest start first.",
+        cli: Cli::PLAIN,
+    },
+    Tool {
         name: "begin_test_log",
         method: "test_log.begin",
         description: "Open the run's JSONL file in the bound domain, or return the existing owner when a different run is active.",
@@ -1154,7 +1166,7 @@ mod tests {
         // stdio and counts what it advertises — NOT a source scan in
         // `mcp/src/server.rs`, which is what this comment used to claim. There
         // is no tool list in the shim to scan: the daemon teaches it.
-        assert_eq!(TOOLS.len(), 58);
+        assert_eq!(TOOLS.len(), 60);
         for Tool {
             name: tool, method, ..
         } in TOOLS

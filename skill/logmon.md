@@ -33,7 +33,7 @@ Skip it (and say so) when:
 ## Investigating a test run
 
 Locate the JSONL in the runner’s saved artifacts. An all-green run can be investigated from this file too. After the original domain expires,
-`logmon-test-log export /path/to/test-log.jsonl` lists its executions. Choose the
+For live progress, use `test_log_status` on the domain. Report the oldest running execution, recent failed assertions and case paths as they become available. A null current run means the lane is idle. Use `test_log_list` and an explicit run ID for a recently finished run. Treat an unavailable broker as unknown. For durable history, `logmon-test-log export /path/to/test-log.jsonl` lists its executions. Choose the
 execution ID of the initial failure or its isolated rerun, then run
 `logmon-test-log lookup /path/to/test-log.jsonl EXECUTION_ID`. Read the runner’s
 assertion, failed member, verdict, coverage, and case status. Check the unit of execution chosen by the runner. If it groups multiple steps,

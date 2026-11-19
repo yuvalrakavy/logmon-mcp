@@ -548,3 +548,88 @@ async fn a_document_and_its_companion_both_land_on_disk() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn progress_queries_return_structured_success_and_errors_without_rebinding() {
+    with_mcp(|mcp, _| {
+        let tools = mcp.request("tools/list", json!({}));
+        for name in ["test_log_status", "test_log_list"] {
+            let tool = tools["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap();
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        }
+        let call = |mcp: &mut Mcp, name: &str, args: Value| {
+            mcp.request("tools/call", json!({"name":name,"arguments":args}))["result"].clone()
+        };
+        let idle = call(mcp, "test_log_status", json!({"domain":"default"}));
+        assert_ne!(idle["isError"], true);
+        assert_eq!(
+            idle["structuredContent"],
+            json!({"schema_version":1,"domain":"default","test_log":null})
+        );
+        let list = call(mcp, "test_log_list", json!({"domain":"default"}));
+        assert_eq!(list["structuredContent"]["runs"], json!([]));
+        for (domain, code) in [("gone", "unknown_domain"), ("default", "run_not_found")] {
+            let result = call(
+                mcp,
+                "test_log_status",
+                json!({"domain":domain,"run_id":"missing"}),
+            );
+            assert_eq!(result["isError"], true);
+            let error = &result["structuredContent"];
+            assert_eq!(error["schema_version"], 1);
+            assert_eq!(error["error"]["code"], code);
+            assert_eq!(error["error"]["domain"], domain);
+            assert_eq!(error["error"]["run_id"], "missing");
+        }
+        let status = call(mcp, "get_status", json!({}));
+        assert_eq!(status["structuredContent"]["test_log_schema_version"], 1);
+        assert!(status["structuredContent"]
+            .get("test_log")
+            .unwrap()
+            .is_null());
+    })
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn progress_query_after_socket_disconnect_returns_structured_broker_unreachable() {
+    let (daemon, _) = spawn_with_cli().await;
+    let upstream = daemon.socket_path.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proxy.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let (kill, stop) = tokio::sync::oneshot::channel::<()>();
+    let proxy = tokio::spawn(async move {
+        let (mut downstream, _) = listener.accept().await.unwrap();
+        let mut upstream = tokio::net::UnixStream::connect(upstream).await.unwrap();
+        tokio::select! {
+            _ = stop => (),
+            _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => (),
+        }
+    });
+    let mut mcp = tokio::task::spawn_blocking(move || Mcp::start(&path, dir.path()))
+        .await
+        .unwrap();
+    kill.send(()).unwrap();
+    proxy.await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        let response = mcp.request(
+            "tools/call",
+            json!({"name":"test_log_status","arguments":{"domain":"t5","run_id":"lost"}}),
+        );
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let error = &response["result"]["structuredContent"];
+        assert_eq!(error["error"]["code"], "broker_unreachable");
+        assert_eq!(error["error"]["domain"], "t5");
+        assert_eq!(error["error"]["run_id"], "lost");
+        assert_eq!(error["schema_version"], 1);
+    })
+    .await
+    .unwrap();
+}

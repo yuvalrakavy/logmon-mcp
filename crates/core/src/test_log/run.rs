@@ -148,6 +148,7 @@ impl Pending {
 }
 
 pub(super) struct Run {
+    pub(super) progress: super::progress::Progress,
     pub config: TestLogBegin,
     pub journal: Arc<Journal>,
     began_at: DateTime<Utc>,
@@ -276,12 +277,19 @@ impl Run {
         }
         Ok(())
     }
-    pub fn new(config: TestLogBegin, journal: Journal, provenance: Vec<RegistryFact>) -> Self {
+    pub fn new(
+        config: TestLogBegin,
+        journal: Journal,
+        provenance: Vec<RegistryFact>,
+        history: Arc<super::progress::History>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let began_at = Utc::now();
+        let journal = Arc::new(journal);
         Self {
+            progress: super::progress::Progress::new(&config, began_at, journal.clone(), history),
             config,
-            journal: Arc::new(journal),
+            journal,
             began_at,
             last_activity: began_at,
             closing: false,
@@ -305,6 +313,7 @@ impl Run {
         }
     }
     pub fn append(&self, event: &str, mut data: Value) {
+        self.progress.apply(event, &mut data);
         data["event"] = json!(event);
         data["run_id"] = json!(self.config.run_id);
         self.journal.append(data);
@@ -1045,6 +1054,10 @@ impl Run {
                 json!({"at":Utc::now(),"executions":self.entries.len()}),
             );
         }
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.close_written
     }
 
     pub fn close_result(&self) -> Value {

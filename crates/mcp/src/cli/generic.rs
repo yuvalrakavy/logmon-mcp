@@ -158,6 +158,10 @@ fn coerce(raw: &str, node: Option<&Value>) -> Result<Value, String> {
     match ty.as_deref() {
         // `integer` and `number` are NOT interchangeable: an integer sent as
         // f64 renders `3.0`, and a daemon reading it as u64 refuses that.
+        Some("integer") if node.is_some_and(|n| n["format"] == "uint64") => raw
+            .parse::<u64>()
+            .map(Value::from)
+            .map_err(|_| format!("`{raw}` is not a nonnegative whole number")),
         Some("integer") => raw
             .parse::<i64>()
             .map(|n| serde_json::json!(n))

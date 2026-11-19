@@ -63,6 +63,10 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
         "definitions": {
             // Method param/result structs
             "TestLogSelector": schema_for!(TestLogSelector),
+            "TestLogStatus": schema_for!(TestLogStatus),
+            "TestLogStatusResult": schema_for!(TestLogStatusResult),
+            "TestLogList": schema_for!(TestLogList),
+            "TestLogListResult": schema_for!(TestLogListResult),
             "TestLogBegin": schema_for!(TestLogBegin),
             "TestLogStart": schema_for!(TestLogStart),
             "TestLogEnd": schema_for!(TestLogEnd),

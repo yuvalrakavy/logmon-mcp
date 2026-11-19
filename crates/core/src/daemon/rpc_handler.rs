@@ -68,6 +68,8 @@ fn domain_to_info(d: &Domain, stale_after_secs: u64) -> DomainInfo {
     let pending_capture_bytes = d.test_log.capture_pool.lock().unwrap().exclusive_bytes();
     let indexes_bytes = log_indexes + span_indexes;
     DomainInfo {
+        test_log_schema_version: Some(TEST_LOG_SCHEMA_VERSION),
+        test_log: d.test_log.projection(),
         memory: DomainMemory {
             logs_bytes,
             spans_bytes,
@@ -576,6 +578,7 @@ impl RpcHandler {
     /// Handle an RPC request for a given session.
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         let result = match request.method.as_str() {
+            "test_log.status" | "test_log.list" => self.handle_test_log_query(session_id, &request.method, &request.params),
             name if name.starts_with("test_log.") => self.handle_test_log(session_id, name, &request.params),
             "logs.recent" => self.handle_logs_recent(session_id, &request.params),
             "logs.fields" => self.handle_logs_fields(session_id, &request.params),
@@ -648,6 +651,45 @@ impl RpcHandler {
             Ok(value) => RpcResponse::success(request.id, Self::maybe_render(request, value)),
             Err(msg) => RpcResponse::error(request.id, -32601, &msg),
         }
+    }
+
+    fn handle_test_log_query(
+        &self,
+        sid: &SessionId,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, String> {
+        let (target, run_id) = if method == "test_log.status" {
+            let query: TestLogStatus =
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            (query.domain, query.run_id)
+        } else {
+            let query: TestLogList =
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            (query.domain, None)
+        };
+        let target = target.unwrap_or_else(|| self.sessions.domain_of(sid).to_string());
+        // Look up in the existing registry, including postmortem domains. A
+        // poll never rebinds this session or creates a missing target.
+        let domain = DomainId::new(&target)
+            .ok()
+            .and_then(|id| self.domains.get(&id));
+        let Some(domain) = domain else {
+            return Ok(json!(TestLogQueryErrorResult {
+                schema_version: TEST_LOG_SCHEMA_VERSION,
+                error: TestLogQueryError {
+                    code: "unknown_domain".into(),
+                    message: format!("Domain {target} does not exist."),
+                    domain: Some(target),
+                    run_id
+                }
+            }));
+        };
+        Ok(if method == "test_log.status" {
+            domain.test_log.status(&target, run_id.as_deref())
+        } else {
+            domain.test_log.list(&target)
+        })
     }
 
     fn handle_test_log(
@@ -2122,6 +2164,8 @@ impl RpcHandler {
                 "malformed_dropped": trace_ingest.malformed,
             },
             "current_domain": current_domain,
+            "test_log_schema_version": TEST_LOG_SCHEMA_VERSION,
+            "test_log": d.test_log.projection(),
             "active_filters": active_filters,
             "receiver_liveness": receiver_liveness,
             // `null` for a live domain (sent, not omitted — see the note on

@@ -1005,6 +1005,8 @@ If an attempt creates several traces, attach a field such as `test_attempt_id` t
 each log and span and select on that field instead. The runner sends lifecycle
 calls; the application or its telemetry library supplies the selector on records.
 
+**Watch a run.** Use `logmon-mcp --json --domain ci test-log status` to see in-flight executions, verdicts, recent failures and ready cases. Use `test-log list` to find a recently settled run, then pass its ID to `status --run-id ID`. MCP clients can call `test_log_status` and `test_log_list` directly. See the [progress API guide](docs/test-log-progress.md) for idle lanes, retention and dashboard polling.
+
 **Try the lifecycle from a shell.** This example simulates a failing catalog test
 using the local broker's default domain. Choose an idle domain and an existing
 directory writable by the broker. In a real runner, use the actual trace ID,
