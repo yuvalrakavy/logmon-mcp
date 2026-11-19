@@ -693,3 +693,45 @@ fn progress_counts_reconstruction_replay_caps_and_history_without_writer_lock() 
     );
     assert!(f.dir.path().join("one.jsonl").exists());
 }
+
+#[test]
+fn progress_lists_oldest_three_and_freezes_at_settlement() {
+    let f = Fixture::new();
+    f.rpc(
+        "begin",
+        json!({"run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),
+      "planned_executions":0,"grace_period_ms":100}),
+    );
+    let base = Utc::now() - chrono::Duration::seconds(15);
+    for i in [2, 0, 3, 1] {
+        let mut e = f.event(&format!("test-{i}"));
+        e["started_at"] = json!(base + chrono::Duration::seconds(i));
+        e["selector"] = json!({"field":"worker","value":format!("worker-{i}")});
+        f.rpc("start", e);
+    }
+    let log = &f.domain.test_log;
+    let detail = log.status("tests", None)["test_log"].clone();
+    assert_eq!(detail["executions"]["planned"], 0);
+    assert!(detail["last_completion_at"].is_null());
+    assert_eq!(detail["executions"]["in_flight"], 4);
+    let oldest = detail["longest_in_flight"].as_array().unwrap();
+    let ids: Vec<_> = oldest
+        .iter()
+        .map(|x| x["execution_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["test-0", "test-1", "test-2"]);
+    assert!(oldest
+        .iter()
+        .all(|x| x["trace_id"].is_null() && x["deadline_overdue_ms"] == 0));
+    f.rpc("seal", json!({"run_id":"one","wait_timeout_ms":0}));
+    assert_eq!(log.projection().unwrap().state, TestLogRunState::Closing);
+    f.close("one");
+    let detail = log.status("tests", Some("one"))["test_log"].clone();
+    assert_eq!(detail["executions"]["by_verdict"]["NO_VERDICT"], 4);
+    assert_eq!(detail["longest_in_flight"], json!([]));
+    std::thread::sleep(Duration::from_millis(3));
+    assert_eq!(
+        detail["elapsed_ms"],
+        log.status("tests", Some("one"))["test_log"]["elapsed_ms"]
+    );
+}
