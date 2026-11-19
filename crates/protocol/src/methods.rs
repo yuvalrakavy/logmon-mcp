@@ -2444,7 +2444,10 @@ pub struct StatusGetResult {
     /// Span entries received by the current domain, including entries since evicted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spans_received: Option<u64>,
-    /// The domain the calling session is currently bound to (§7). Additive:
+    /// Domain that supplied the status. Older brokers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Effective domain for this status query (§7). Additive:
     /// an older daemon that omits it deserializes as `""`.
     #[serde(default)]
     pub current_domain: String,

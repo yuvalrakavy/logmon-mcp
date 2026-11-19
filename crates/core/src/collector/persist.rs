@@ -156,6 +156,8 @@ impl PersistedExact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
     pub label: String,
     pub description: Option<String>,
     pub meta: serde_json::Value,
@@ -277,6 +279,7 @@ fn level_from_str(s: &str) -> Result<Level, String> {
 impl PersistedSnapshot {
     pub fn of(s: &StoredSnapshot) -> Self {
         Self {
+            domain: s.domain.clone(),
             label: s.label.clone(),
             description: s.description.clone(),
             meta: s.meta.clone(),
@@ -321,6 +324,7 @@ impl PersistedSnapshot {
             _ => None,
         };
         Ok(StoredSnapshot {
+            domain: self.domain.clone(),
             label: self.label.clone(),
             description: self.description.clone(),
             meta: self.meta.clone(),

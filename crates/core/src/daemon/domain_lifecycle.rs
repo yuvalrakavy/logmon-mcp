@@ -99,6 +99,8 @@ pub async fn spawn_ephemeral_domain(
     let mut domain = Domain::new_with_metrics(config, 0, metrics);
 
     // --- Domain-scoped processors (serve only sessions bound to `id`, §9.1) ---
+    // Restored named watches may already be armed before the first connection.
+    super::log_processor::sync_pre_buffer_size_for_domain(&domain.pipeline, &sessions, &id);
     let log_processor = spawn_log_processor(
         log_rx,
         domain.pipeline.clone(),

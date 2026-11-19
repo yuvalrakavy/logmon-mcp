@@ -633,3 +633,90 @@ async fn progress_query_after_socket_disconnect_returns_structured_broker_unreac
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn shared_stdio_routes_interleaved_reads_without_rebinding() {
+    with_mcp(|mcp, scratch| {
+        let read = |mcp: &mut Mcp, tool: &str, args: Value| {
+            let response = mcp.request("tools/call", json!({"name":tool,"arguments":args}));
+            assert!(response.get("error").is_none() && response["result"]["isError"] != true, "{response}");
+            response["result"].clone()
+        };
+        for domain in ["alpha", "beta"] {
+            read(mcp, "create_domain", json!({"name":domain, "otlp_grpc_port":0, "otlp_http_port":0}));
+            read(mcp, "use_domain", json!({"name":domain}));
+            read(mcp, "update_domain_data", json!({"entries":[{"path":"/Build/commit","value":domain}]}));
+        }
+
+        let domains = read(mcp, "list_domains", json!({}));
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for lane in domains["structuredContent"]["domains"].as_array().unwrap() {
+            let name = lane["name"].as_str().unwrap();
+            if ["alpha", "beta"].contains(&name) {
+                let log = json!({"version":"1.1","host":"probe","level":6,"short_message":name});
+                sock.send_to(log.to_string().as_bytes(), ("127.0.0.1", lane["gelf_port"].as_u64().unwrap() as u16)).unwrap();
+            }
+        }
+        for _ in 0..100 {
+            let domains = read(mcp, "list_domains", json!({}));
+            if domains["structuredContent"]["domains"].as_array().unwrap().iter()
+                .filter(|lane| lane["name"] == "alpha" || lane["name"] == "beta").all(|lane| lane["log_count"] == 1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Two conversations multiplex one initialized shim and one broker session.
+        for binding in ["alpha", "beta", "alpha", "beta"] {
+            read(mcp, "use_domain", json!({"name":binding}));
+            let explicit = read(mcp, "get_domain_data", json!({"domain":"alpha","scope":"conv-a"}));
+            assert_eq!(explicit["structuredContent"]["domain"], "alpha");
+            assert_eq!(explicit["structuredContent"]["keys"][0]["value"], "alpha");
+            let implicit = read(mcp, "get_domain_data", json!({}));
+            assert_eq!(implicit["structuredContent"]["domain"], binding);
+            assert_eq!(implicit["structuredContent"]["keys"][0]["value"], binding);
+        }
+        // Interleave outstanding requests rather than waiting for each bind before sending the next read.
+        let first = mcp.next_id;
+        for i in 0..24 {
+            let id = first + i;
+            let (tool, args) = if i % 2 == 0 {
+                ("use_domain", json!({"name":if i % 4 == 0 {"alpha"} else {"beta"}}))
+            } else {
+                ("get_recent_logs", json!({"domain":if i % 4 == 1 {"beta"} else {"alpha"},"count":10}))
+            };
+            mcp.send(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":args}}));
+        }
+        mcp.next_id += 24;
+        let mut replies = std::collections::HashSet::new();
+        while replies.len() < 24 {
+            let mut line = String::new();
+            assert_ne!(mcp.out.read_line(&mut line).unwrap(), 0);
+            let reply: Value = serde_json::from_str(&line).unwrap();
+            let Some(id) = reply["id"].as_u64() else { continue; };
+            assert!((first..first+24).contains(&id) && replies.insert(id), "{reply}");
+            assert!(reply.get("error").is_none() && reply["result"]["isError"] != true, "{reply}");
+            if (id-first) % 2 == 1 {
+                let result = &reply["result"]["structuredContent"];
+                let expected = if (id-first) % 4 == 1 { "beta" } else { "alpha" };
+                assert_eq!(result["domain"], expected);
+                assert_eq!(result["logs"].as_array().unwrap().len(), 1);
+                assert_eq!(result["logs"][0]["message"], expected, "{result}");
+            }
+        }
+        for (scope, count) in [("first", 1), ("first", 0), ("second", 1)] {
+            let logs = read(mcp, "get_recent_logs", json!({"domain":"alpha", "scope":scope, "filter":"c>=last"}));
+            assert_eq!(logs["structuredContent"]["count"], count, "{logs}");
+        }
+        let missing = mcp.call("get_domain_data", json!({"domain":"not-a-lane"})).unwrap_err();
+        assert!(missing.contains("not-a-lane"), "{missing}");
+        let export = read(mcp, "export_logs", json!({"domain":"alpha","path":scratch.join("export.json")}));
+        assert_eq!(export["structuredContent"]["domain"], "alpha", "{export}");
+        assert!(scratch.join("export.json").is_file());
+        for (scope, bookmark) in [("one", "private-one"), ("two", "private-two")] {
+            read(mcp, "add_bookmark", json!({"domain":"beta","scope":scope,"name":bookmark}));
+        }
+        let scoped = read(mcp, "list_bookmarks", json!({"domain":"beta","scope":"one"}));
+        assert!(scoped["structuredContent"].to_string().contains("private-one"), "{scoped}");
+        assert!(!scoped["structuredContent"].to_string().contains("private-two"), "{scoped}");
+    }).await;
+}

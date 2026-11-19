@@ -10,6 +10,20 @@ logmon is a local broker daemon that collects structured logs (GELF over UDP+TCP
 
 Use logmon when the user wants to know **what the running program actually did**. Source-level reasoning isn't enough for those questions — open the broker first, then go back to the code.
 
+## Querying a known domain
+
+Pass `domain` on every supported MCP call when you know the target, including the follow-up that opens a trace, exports evidence or creates a case. Verify the returned `domain` before drawing a conclusion from an empty result. Use `use_domain` as a convenience on a single-conversation connection. A desktop host can share one shim across conversations.
+
+Choose a stable, caller-specific `scope` for named cursors and bookmarks. Use the same scope for the bookmark and every read that references it. Another conversation can use the same bare cursor name independently. Match trigger notifications to the domain and scope used to arm them.
+
+Collectors have a session-wide name and a pinned domain. When reading a saved collector snapshot, pass the domain where it was captured, even if the live collector has since moved. Older snapshots without a recorded domain are available through the legacy lookup by name.
+
+```
+add_bookmark(domain="staging", scope="checkout-42", name="before")
+get_recent_logs(domain="staging", scope="checkout-42", filter="b>=before, l>=ERROR")
+get_recent_logs(domain="staging", scope="checkout-42", filter="c>=poll")
+```
+
 ## When to reach for logmon
 
 Reach for it when any of these are true:
@@ -424,11 +438,11 @@ Domains are isolated broker instances — each has its own log/span buffers, rec
 
 - **`list_domains()`** — live domains with ports, source, log/span counts, `bound_sessions` (which sessions are bound to each domain; disconnected holders suffixed), and **liveness**: `last_log_received_at` / `last_span_received_at`, `idle_secs`, `stale`. A `last_*_received_at` of `null` means nothing has shipped to that domain yet — the "is my stack actually reaching this domain, or did I misconfigure the port?" check.
 - **`create_domain(name, gelf_port?, otlp_grpc_port?, otlp_http_port?, ...)`** — create (or idempotently ensure) an ephemeral domain. Omitted ports auto-allocate; `0` disables that receiver.
-- **`use_domain(name)`** — bind this session; subsequent queries and trigger notifications target it until you switch again.
+- **`use_domain(name)`** — set the fallback domain for this session. Use this on single-conversation connections.
 - **`clear_domain()`** — dispose the bound domain's logs + spans (keeps it alive; seq stays monotonic).
 - **`delete_domain(name)`** — delete a domain and tear down its receivers (refuses `default`).
 
-The MCP shim can bind a domain **at connect** via the `LOGMON_DOMAIN` env var (or `--domain`), re-applied on every reconnect **when paired with a named `--session`** — set both once per worktree/project so every session auto-scopes to its track, durably. (An anonymous session can't resume a restart: it fails loud, never a silent revert to `default`; a missing domain is a loud error.) In CLI mode there is no `use` verb — pass `--domain NAME` (or `LOGMON_DOMAIN`) to scope one invocation (e.g. `logmon-mcp --domain t3 logs recent`); it resets to `default` when both are absent. Durable domains can be declared in `config.json`. **Lifecycle:** an ephemeral domain lives until you `delete_domain` it or the broker restarts — there is no idle auto-reaping (so a stopped stack's logs stay queryable), and re-creating with the same name + ports is an idempotent no-op.
+The MCP shim can bind a domain **at connect** via the `LOGMON_DOMAIN` env var (or `--domain`), re-applied on every reconnect **when paired with a named `--session`** — use this convenience for a connection dedicated to one project. On shared connections, pass the domain on each call. (An anonymous session can't resume a restart: it fails loud, never a silent revert to `default`; a missing domain is a loud error.) In CLI mode there is no `use` verb — pass `--domain NAME` (or `LOGMON_DOMAIN`) to scope one invocation (e.g. `logmon-mcp --domain t3 logs recent`); it resets to `default` when both are absent. Durable domains can be declared in `config.json`. **Lifecycle:** an ephemeral domain lives until you `delete_domain` it or the broker restarts — there is no idle auto-reaping (so a stopped stack's logs stay queryable), and re-creating with the same name + ports is an idempotent no-op.
 
 ### Provenance (`domain_data`)
 
@@ -582,7 +596,7 @@ load_case(path: "/abs/path/checkout-hang-260731-021530.md")   # loose files work
 
 ### Investigating a saved case with MCP
 
-1. **Establish identity and coverage.** Preserve the archive filename. Read its Markdown report for the capture reason, focus selector or anchor, time window, and provenance. Call `load_case` with the absolute path and bind your investigation session to the returned postmortem domain with `use_domain(name=…)`. Check `get_status()` and the report for omitted evidence and log/span eviction. A capture verdict of `cannot_verify` describes provenance; the runner's `FAIL` describes the execution.
+1. **Establish identity and coverage.** Preserve the archive filename. Read its Markdown report for the capture reason, focus selector or anchor, time window, and provenance. Call `load_case` with the absolute path and pass the returned postmortem domain on every investigation call. Check `get_status(domain=…)` and the report for omitted evidence and log/span eviction. A capture verdict of `cannot_verify` describes provenance; the runner's `FAIL` describes the execution.
 2. **Reconstruct the focus timeline.** For a trace-ID selector, take the ID from the report. Look for the first unexpected event, the span enclosing it, and the last observed event before the assertion or timeout. If the summary says `[no root]`, the retained spans cannot establish the full trace duration. Spans can arrive in batches; use event timestamps and durations for ordering. For an attempt-field selector, filter on that field (for example `get_recent_logs(filter="test_attempt_id=…")`) and inspect the individual traces it identifies. A capture without a focus ID may still have a trace on the anchor.
 3. **Check competing explanations.** Read the overlap table and inspect each relevant peer by its own trace ID in the same domain. Compare its interval with the focus slowdown or gap. Then examine domain-wide logs and any machine-load samples for shared-service errors or load. State the offset when comparing timestamps with an external report. Overlap alone establishes concurrency; a causal claim needs supporting evidence such as a recorded wait on the same resource.
 4. **Compare and report.** When an isolated rerun or passing baseline has a case, load it into a second postmortem domain. Compare the same operation in each, citing the trace or span ID, timestamp, duration and observed outcome. Qualify comparisons where a ring evicted early activity, a peer lacks a trace ID, or the window contains no load sample.
@@ -590,12 +604,11 @@ load_case(path: "/abs/path/checkout-hang-260731-021530.md")   # loose files work
 Example MCP reads after loading a case (substitute the returned domain and actual IDs):
 
 ```
-use_domain(name="case-domain")
-get_trace_logs(trace_id="focus-id")
-get_trace(trace_id="focus-id", include_logs=false)
-get_trace_summary(trace_id="focus-id")
-get_trace(trace_id="peer-id", include_logs=false)
-get_recent_logs(filter="l>=WARN", count=20)
+get_trace_logs(domain="case-domain", trace_id="focus-id")
+get_trace(domain="case-domain", trace_id="focus-id", include_logs=false)
+get_trace_summary(domain="case-domain", trace_id="focus-id")
+get_trace(domain="case-domain", trace_id="peer-id", include_logs=false)
+get_recent_logs(domain="case-domain", filter="l>=WARN", count=20)
 ```
 
 To inspect only the selected execution, call `load_case(path=…, scope="focus", domain="case-focus")`. A shared deadline case lists every execution and focus ID. Pass its `focus_trace_id` when several are declared. To test a concurrency hypothesis, load the same document again with `scope="all", domain="case-window"`. This default view includes the earliest direct peer and untagged records through capture. Older cases support the full load and can have a shorter window. Inspect the saved coverage before interpreting a missing event.

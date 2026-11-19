@@ -6,10 +6,9 @@ Use the absolute Markdown path in these MCP calls, substituting the path from th
 
 ```text
 load_case(path="/tmp/run/cases/example--ID/example--ID.md", scope="focus", domain="execution")
-use_domain(name="execution")
-get_recent_logs(count=20)
+get_recent_logs(domain="execution", count=20)
 load_case(path="/tmp/run/cases/example--ID/example--ID.md", domain="whole-window")
-use_domain(name="whole-window")
+get_recent_logs(domain="whole-window", count=20)
 ```
 
 The focus domain contains records tagged with the declared trace ID. The full window includes direct peers’ earlier activity, untagged records and machine samples. For a shared deadline case, choose an execution in the crossings table and pass its trace ID as `focus_trace_id` with `scope="focus"`. A captured deadline crossing can be followed by an OK verdict. Read the final execution record for the outcome.

@@ -927,15 +927,21 @@ impl CollectorRegistry {
         name: &str,
         now: DateTime<Utc>,
     ) -> Result<CollectorSnapshot, RegistryError> {
+        self.reset_in_domain(owner, name, now, None).map(|(view, _)| view)
+    }
+
+    pub fn reset_in_domain(
+        &self, owner: &SessionId, name: &str, now: DateTime<Utc>, domain: Option<&DomainId>,
+    ) -> Result<(CollectorSnapshot, DomainId), RegistryError> {
         let mut g = self.entries.write().expect("registry lock poisoned");
         let e = g
             .iter_mut()
-            .find(|e| &e.owner == owner && e.collector.def().name == name)
+            .find(|e| &e.owner == owner && e.collector.def().name == name && domain.is_none_or(|d| d == &e.domain))
             .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
         let taken = e.collector.swap(now);
         e.ingest_baseline = e.metrics.trace_ingest_loss();
         e.zeroed_by = Some("reset");
-        Ok(taken)
+        Ok((taken, e.domain.clone()))
     }
 
     /// Record the current window as a snapshot, and by default start a fresh
@@ -956,6 +962,14 @@ impl CollectorRegistry {
     where
         F: FnOnce(&CollectorSnapshot) -> Projected,
     {
+        self.snapshot_in_domain(owner, req, project, None)
+    }
+
+    pub fn snapshot_in_domain<F>(
+        &self, owner: &SessionId, req: SnapshotRequest, project: F, domain: Option<&DomainId>,
+    ) -> Result<SnapshotOutcome, RegistryError>
+    where F: FnOnce(&CollectorSnapshot) -> Projected,
+    {
         let SnapshotRequest {
             name,
             label,
@@ -967,11 +981,11 @@ impl CollectorRegistry {
         } = req;
         let name = name.as_str();
         // Step 1, under the write lock: reserve the label and take the data.
-        let (view, ingest, label, id) = {
+        let (view, ingest, label, id, pin) = {
             let mut g = self.entries.write().expect("registry lock poisoned");
             let e = g
                 .iter_mut()
-                .find(|e| &e.owner == owner && e.collector.def().name == name)
+                .find(|e| &e.owner == owner && e.collector.def().name == name && domain.is_none_or(|d| d == &e.domain))
                 .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
             let id = e.id;
             policy
@@ -995,7 +1009,7 @@ impl CollectorRegistry {
             } else {
                 e.collector.snapshot()
             };
-            (view, ingest, label, id)
+            (view, ingest, label, id, e.domain.to_string())
         };
 
         // Step 2, outside every lock: the expensive part.
@@ -1006,7 +1020,7 @@ impl CollectorRegistry {
         };
 
         // Step 3: file it.
-        let snap = StoredSnapshot::from_view(
+        let mut snap = StoredSnapshot::from_view(
             label,
             description,
             meta,
@@ -1016,6 +1030,7 @@ impl CollectorRegistry {
             ingest,
             projected,
         );
+        snap.domain = Some(pin);
         // The window was already taken in step 1, so a collector removed under
         // us must NOT turn into an error: that would discard a run the caller
         // asked to keep and which exists nowhere else. Return it instead, and
@@ -1116,12 +1131,15 @@ impl CollectorRegistry {
     }
 
     pub fn remove(&self, owner: &SessionId, name: &str) -> Result<(), RegistryError> {
+        self.remove_in_domain(owner, name, None).map(|_| ())
+    }
+
+    pub fn remove_in_domain(&self, owner: &SessionId, name: &str, domain: Option<&DomainId>) -> Result<DomainId, RegistryError> {
         let mut g = self.entries.write().expect("registry lock poisoned");
-        let before = g.len();
-        g.retain(|e| !(&e.owner == owner && e.collector.def().name == name));
-        if g.len() == before {
-            return Err(RegistryError::NotFound(name.to_string()));
-        }
+        let index = g.iter().position(|e| &e.owner == owner && e.collector.def().name == name
+            && domain.is_none_or(|d| d == &e.domain))
+            .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
+        let pin = g.remove(index).domain;
         // The file is deleted after the lock — file I/O never runs under it — unless a write
         // ordered after the removal has succeeded on the path (see `FileLedger`).
         let since = self.files.now();
@@ -1131,7 +1149,7 @@ impl CollectorRegistry {
         // daemon whose sessions are swept every 24 hours would leak files
         // forever.
         self.delete_unless_written_since(owner, name, since);
-        Ok(())
+        Ok(pin)
     }
 
     /// Move every collector owned by `old` to `new`, rewriting their files.

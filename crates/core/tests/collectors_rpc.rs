@@ -4234,3 +4234,38 @@ fn an_unbounded_window_starts_where_the_store_can_still_answer() {
         "and the loss is on the wire whichever name the verdict takes: {explicit}"
     );
 }
+
+#[test]
+fn explicit_collector_reads_and_mutations_observe_the_pin_at_capture() {
+    let h = harness();
+    h.domains.insert(make_domain("blue"));
+    let s = h.sessions.create_named("desk").unwrap();
+    h.call(&s,"collectors.add",json!({"name":"timing","filter":"sv=svc","domain":"blue"})).unwrap();
+    let other = h.call(&s,"collectors.list",json!({"domain":"default"})).unwrap();
+    assert_eq!(other["count"],0);
+    for method in ["collectors.get","collectors.snapshot","collectors.reset","collectors.remove"] {
+        assert!(h.call(&s,method,json!({"name":"timing","domain":"default"})).is_err(),"{method} used a collector in another lane");
+    }
+    h.call(&s,"collectors.snapshot",json!({"name":"timing","label":"before","domain":"blue"})).unwrap();
+    h.call(&s,"collectors.edit",json!({"name":"timing","domain":"default"})).unwrap();
+    h.call(&s,"collectors.snapshot",json!({"name":"timing","label":"after","domain":"default"})).unwrap();
+    for (domain,label,other) in [("blue","before","after"),("default","after","before")] {
+        let r=h.call(&s,"collectors.get",json!({"domain":domain,"name":"timing","snapshot":label})).unwrap();
+        assert_eq!(r["domain"],domain);
+        assert!(h.call(&s,"collectors.get",json!({"domain":domain,"name":"timing","snapshot":other})).is_err());
+        let history=h.call(&s,"collectors.history",json!({"name":"timing","domain":domain})).unwrap();
+        assert_eq!(history["count"],1);
+        assert_eq!(history["snapshots"][0]["label"],label);
+        assert_eq!(history["snapshots"][0]["domain"],domain);
+        let good=format!("timing@{label}");
+        let wrong=format!("timing@{other}");
+        for (method, params) in [
+            ("collectors.document",json!({"names":[wrong],"domain":domain})),
+            ("collectors.diff",json!({"a":good,"b":wrong,"domain":domain})),
+        ] {
+            assert!(h.call(&s,method,params).is_err(),"{method} crossed domains");
+        }
+        let doc=h.call(&s,"collectors.document",json!({"names":["timing@*"],"domain":domain})).unwrap();
+        assert_eq!(doc["domain"],domain);
+    }
+}

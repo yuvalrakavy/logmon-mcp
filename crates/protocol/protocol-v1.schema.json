@@ -1580,6 +1580,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -1670,11 +1678,16 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "logs",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "LogEntry": {
@@ -1814,6 +1827,14 @@
             "null"
           ],
           "format": "double"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -1889,13 +1910,18 @@
           "description": "True when the field-NAME cap was reached and some names are missing from\n`fields`. A truncated map presented as the whole one would be the same\nsilent-undercount this read exists to prevent.",
           "type": "boolean",
           "default": false
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "fields",
         "matched",
         "scanned",
-        "buffer_total"
+        "buffer_total",
+        "domain"
       ],
       "$defs": {
         "FieldStats": {
@@ -2277,6 +2303,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -2419,13 +2453,18 @@
           "items": {
             "$ref": "#/$defs/Suppressed"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "levels",
         "matched",
         "scanned",
-        "buffer_total"
+        "buffer_total",
+        "domain"
       ],
       "$defs": {
         "LogGroup": {
@@ -2781,6 +2820,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -2803,11 +2850,16 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "logs",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "LogEntry": {
@@ -2956,6 +3008,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -3062,12 +3122,17 @@
             "$ref": "#/$defs/NarrowedRange"
           },
           "default": []
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "logs",
         "count",
-        "format"
+        "format",
+        "domain"
       ],
       "$defs": {
         "LogEntry": {
@@ -3315,7 +3380,17 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "FiltersList",
       "type": "object",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
+        }
+      }
     },
     "FiltersListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3327,10 +3402,15 @@
           "items": {
             "$ref": "#/$defs/FilterInfo"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "filters"
+        "filters",
+        "domain"
       ],
       "$defs": {
         "FilterInfo": {
@@ -3374,6 +3454,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3390,10 +3478,15 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "id"
+        "id",
+        "domain"
       ]
     },
     "FiltersEdit": {
@@ -3420,6 +3513,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3445,11 +3546,16 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "id",
-        "filter"
+        "filter",
+        "domain"
       ]
     },
     "FiltersRemove": {
@@ -3462,6 +3568,14 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3478,17 +3592,32 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "removed"
+        "removed",
+        "domain"
       ]
     },
     "TriggersList": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "TriggersList",
       "type": "object",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
+        }
+      }
     },
     "TriggersListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3500,10 +3629,15 @@
           "items": {
             "$ref": "#/$defs/TriggerInfo"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "triggers"
+        "triggers",
+        "domain"
       ],
       "$defs": {
         "TriggerInfo": {
@@ -3615,6 +3749,14 @@
           "description": "When `true`, the trigger auto-removes after its first match. Defaults\nto `false`; old clients without this field continue to deserialize.",
           "type": "boolean",
           "default": false
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3631,10 +3773,15 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "id"
+        "id",
+        "domain"
       ]
     },
     "TriggersEdit": {
@@ -3695,6 +3842,14 @@
             "boolean",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3751,6 +3906,10 @@
           "format": "uint32",
           "minimum": 0,
           "default": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
@@ -3759,7 +3918,8 @@
         "pre_window",
         "post_window",
         "notify_context",
-        "match_count"
+        "match_count",
+        "domain"
       ]
     },
     "TriggersRemove": {
@@ -3772,6 +3932,14 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3788,10 +3956,15 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "removed"
+        "removed",
+        "domain"
       ]
     },
     "TracesRecent": {
@@ -3814,6 +3987,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -3864,11 +4045,16 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "traces",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "TraceSummary": {
@@ -3942,6 +4128,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -3978,6 +4172,10 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
@@ -3985,7 +4183,8 @@
         "spans",
         "logs",
         "span_count",
-        "log_count"
+        "log_count",
+        "domain"
       ],
       "$defs": {
         "SpanEntry": {
@@ -4255,6 +4454,14 @@
         "trace_id": {
           "description": "32-character hex trace ID",
           "type": "string"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -4288,6 +4495,10 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
@@ -4295,7 +4506,8 @@
         "total_duration_ms",
         "breakdown",
         "other_ms",
-        "span_count"
+        "span_count",
+        "domain"
       ],
       "$defs": {
         "TraceSummaryBreakdownEntry": {
@@ -4372,6 +4584,14 @@
             "",
             null
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -4430,6 +4650,10 @@
             "null"
           ],
           "format": "double"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "$defs": {
@@ -4623,7 +4847,10 @@
             "count"
           ]
         }
-      }
+      },
+      "required": [
+        "domain"
+      ]
     },
     "TracesLogs": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4640,6 +4867,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -4679,11 +4914,16 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "logs",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "LogEntry": {
@@ -4822,6 +5062,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -4844,11 +5092,16 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "spans",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "SpanEntry": {
@@ -5043,6 +5296,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -5106,11 +5367,16 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "spans",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "SpanEntry": {
@@ -5383,6 +5649,14 @@
             "boolean",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -5500,6 +5774,10 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
@@ -5509,7 +5787,8 @@
         "document_bytes",
         "logdata",
         "spandata",
-        "notes"
+        "notes",
+        "domain"
       ],
       "$defs": {
         "EvidenceVerdict": {
@@ -5718,6 +5997,14 @@
           "description": "If true, overwrite an existing bookmark with the same qualified name.",
           "type": "boolean",
           "default": false
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -5741,12 +6028,17 @@
         },
         "replaced": {
           "type": "boolean"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "qualified_name",
         "seq",
-        "replaced"
+        "replaced",
+        "domain"
       ]
     },
     "BookmarksList": {
@@ -5760,6 +6052,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -5779,11 +6079,16 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "bookmarks",
-        "count"
+        "count",
+        "domain"
       ],
       "$defs": {
         "BookmarkInfo": {
@@ -5829,6 +6134,14 @@
         "name": {
           "description": "Bare name (resolved against current session) or qualified\n\"session/name\".",
           "type": "string"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -5843,10 +6156,15 @@
       "properties": {
         "removed": {
           "type": "string"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "removed"
+        "removed",
+        "domain"
       ]
     },
     "BookmarksClear": {
@@ -5860,6 +6178,14 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -5876,11 +6202,16 @@
         },
         "session": {
           "type": "string"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "removed_count",
-        "session"
+        "session",
+        "domain"
       ]
     },
     "SessionsList": {
@@ -5988,7 +6319,17 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "StatusGet",
       "type": "object",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
+        }
+      }
     },
     "StatusGetResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6089,8 +6430,12 @@
           "format": "uint64",
           "minimum": 0
         },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        },
         "current_domain": {
-          "description": "The domain the calling session is currently bound to (§7). Additive:\nan older daemon that omits it deserializes as `\"\"`.",
+          "description": "Effective domain for this status query (§7). Additive:\nan older daemon that omits it deserializes as `\"\"`.",
           "type": "string",
           "default": ""
         },
@@ -6123,7 +6468,8 @@
       "required": [
         "daemon_uptime_secs",
         "receivers",
-        "store"
+        "store",
+        "domain"
       ],
       "$defs": {
         "TestLogLane": {
@@ -7589,6 +7935,14 @@
         "name": {
           "description": "The collector to zero.",
           "type": "string"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -7605,6 +7959,14 @@
         "name": {
           "description": "The collector to remove.",
           "type": "string"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -8256,6 +8618,14 @@
           "items": {
             "$ref": "#/$defs/DomainDataEntry"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -8339,10 +8709,15 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "outcomes"
+        "outcomes",
+        "domain"
       ],
       "$defs": {
         "DomainDataOutcome": {
@@ -8389,6 +8764,14 @@
           "items": {
             "type": "string"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -8438,10 +8821,15 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "outcomes"
+        "outcomes",
+        "domain"
       ],
       "$defs": {
         "DomainDataRemoveOutcome": {
@@ -8490,6 +8878,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -8546,7 +8942,8 @@
       "type": "object",
       "properties": {
         "domain": {
-          "type": "string"
+          "type": "string",
+          "description": "Domain that answered this call."
         },
         "keys": {
           "type": "array",
@@ -8627,6 +9024,22 @@
       "description": "Payload of `notifications/trigger_fired`.",
       "type": "object",
       "properties": {
+        "domain": {
+          "description": "Domain whose telemetry fired the trigger. Older brokers omitted this field.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "scope": {
+          "description": "Caller scope supplied at registration.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "trigger_id": {
           "type": "integer",
           "format": "uint32",
@@ -9357,6 +9770,14 @@
           "items": {
             "$ref": "#/$defs/DomainDataEntry"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -9467,8 +9888,8 @@
           "default": []
         },
         "domain": {
-          "description": "The domain the collector is pinned to. Rebinding the session later does\nnot move it.",
-          "type": "string"
+          "type": "string",
+          "description": "Domain that answered this call."
         },
         "max_sample_bytes": {
           "type": "integer",
@@ -9542,7 +9963,17 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "CollectorsList",
       "type": "object",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
+        }
+      }
     },
     "CollectorsListResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -9565,12 +9996,17 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "collectors",
         "count",
-        "reserved_bytes"
+        "reserved_bytes",
+        "domain"
       ],
       "$defs": {
         "CollectorInfo": {
@@ -9959,6 +10395,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -9990,11 +10434,16 @@
         },
         "discarded": {
           "$ref": "#/$defs/CollectorsDiscarded"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "name",
-        "discarded"
+        "discarded",
+        "domain"
       ],
       "$defs": {
         "CollectorsDiscarded": {
@@ -10077,11 +10526,16 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "removed",
-        "reserved_bytes"
+        "reserved_bytes",
+        "domain"
       ]
     },
     "TracesProfile": {
@@ -10138,6 +10592,14 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false
@@ -10391,6 +10853,14 @@
             "boolean",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -10423,6 +10893,14 @@
             "null"
           ],
           "default": null
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -10490,13 +10968,18 @@
           "items": {
             "$ref": "#/$defs/Suppressed"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "collector",
         "snapshots",
         "count",
-        "evicted"
+        "evicted",
+        "domain"
       ],
       "$defs": {
         "SnapshotSummary": {
@@ -11410,6 +11893,14 @@
             "boolean",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -11480,6 +11971,10 @@
           "items": {
             "$ref": "#/$defs/Suppressed"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
@@ -11487,7 +11982,8 @@
         "b",
         "level",
         "trustworthy",
-        "rows"
+        "rows",
+        "domain"
       ],
       "$defs": {
         "DiffArm": {
@@ -12542,6 +13038,14 @@
             "boolean",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        },
+        "scope": {
+          "type": "string",
+          "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
         }
       },
       "additionalProperties": false,
@@ -12584,12 +13088,17 @@
           "items": {
             "type": "string"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "content",
         "format",
-        "bytes"
+        "bytes",
+        "domain"
       ]
     },
     "ProfileResult": {
@@ -13971,6 +14480,42 @@
         "qualified_name",
         "seq",
         "created_at"
+      ]
+    },
+    "CollectorsGetResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
+      ]
+    },
+    "CollectorsSnapshotResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
+      ]
+    },
+    "TracesProfileResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
       ]
     }
   }

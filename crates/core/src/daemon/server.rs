@@ -74,6 +74,8 @@ fn pipeline_event_to_trigger_fired(
 ) -> Result<serde_json::Value, serde_json::Error> {
     Ok(serde_json::json!({
         "trigger_id": ev.trigger_id,
+        "domain": ev.domain,
+        "scope": ev.scope,
         "description": ev.trigger_description,
         "filter_string": ev.filter_string,
         "pre_window": ev.pre_window,
@@ -660,6 +662,7 @@ async fn run_initialized(
                     sessions.restore_named(
                         name,
                         &crate::daemon::persistence::PersistedSession {
+                            pinned_watches: Vec::new(),
                             triggers: Vec::new(),
                             filters: Vec::new(),
                             client_info: None,
@@ -1128,6 +1131,12 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     info!(?session_id, is_new, "session started");
 
+    // Subscribe before acknowledging so a fast client can arm a watch on any
+    // domain without racing the start of live delivery.
+    let mut event_rx = sessions
+        .subscribe_notifications(&session_id)
+        .expect("registered session");
+
     // 4. Send session start response
     let mut start_result = handler.build_session_start_result(&session_id);
     start_result.is_new = is_new;
@@ -1141,23 +1150,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
         let notification = RpcNotification::new(TRIGGER_FIRED_METHOD, payload);
         write_bounded(&mut writer, &notification).await?;
     }
-
-    // 6. Subscribe to the CONNECT-TIME domain's pipeline events for live
-    //    trigger notifications (F6). A reconnecting named session may already
-    //    be bound to a non-default domain; resolve it rather than assume. If
-    //    the bound domain has vanished, fall back to `default` (always present)
-    //    — the handler still surfaces the vanished-domain error on data
-    //    requests. (Re-subscribe on `use_domain` arrives with binding, §9.4.)
-    let connect_domain = sessions.domain_of(&session_id);
-    let mut event_rx = domains
-        .get(&connect_domain)
-        .or_else(|| domains.get(&DomainId::default_domain()))
-        .expect("default domain is always present")
-        .pipeline
-        .subscribe_events();
-    // The domain whose event channel `event_rx` is currently subscribed to.
-    // Tracked so the loop can re-subscribe when the binding changes (§9.4).
-    let mut current_domain = connect_domain;
 
     // 7. Main loop. Requests are read through the connection's `RequestReader`: the read races
     //    the notification branch, and a request half-received when a notification wins must
@@ -1189,17 +1181,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                             }
                         }
                         write_bounded(&mut writer, &response).await?;
-                        // §9.4: if the request rebound this session (domains.use),
-                        // re-point the event subscription at the newly-bound
-                        // domain's channel so live trigger notifications follow
-                        // the rebind. F1 already cleared any stale queued events.
-                        let bound = sessions.domain_of(&session_id);
-                        if bound != current_domain {
-                            if let Some(d) = domains.get(&bound) {
-                                event_rx = d.pipeline.subscribe_events();
-                                current_domain = bound;
-                            }
-                        }
                     }
                     Ok(None) => {
                         // EOF
@@ -1215,9 +1196,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             event_result = event_rx.recv() => {
                 match event_result {
                     Ok(event) => {
-                        // The broadcast carries events for ALL sessions; only
-                        // forward those tagged with our session_id.
-                        if event.session_id != session_id.to_string() {
+                        // Legacy watches follow the binding; pinned watches follow their domain.
+                        if !event.pinned && event.domain != sessions.domain_of(&session_id).as_str() {
                             continue;
                         }
                         let payload = pipeline_event_to_trigger_fired(&event)?;
@@ -1234,26 +1214,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         warn!(?session_id, n, "broadcast lagged, dropped events");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // The subscribed domain's pipeline was torn down — the
-                        // domain was deleted while this session was bound to it.
-                        // Keep the connection ALIVE by re-subscribing to the
-                        // session's current binding (or `default` if that is also
-                        // gone) so the client can `domains.use` to rebind rather
-                        // than being disconnected. Queries meanwhile surface the
-                        // vanished-domain error (§5). `default` is never deletable,
-                        // so this cannot busy-loop.
-                        let bound = sessions.domain_of(&session_id);
-                        if let Some(d) = domains.get(&bound) {
-                            event_rx = d.pipeline.subscribe_events();
-                            current_domain = bound;
-                        } else if let Some(d) = domains.get(&DomainId::default_domain()) {
-                            info!(?session_id, "bound domain deleted; event channel re-subscribed to default");
-                            event_rx = d.pipeline.subscribe_events();
-                            current_domain = DomainId::default_domain();
-                        } else {
-                            info!(?session_id, "event channel closed; no domain to re-subscribe");
-                            break;
-                        }
+                        break;
                     }
                 }
             }

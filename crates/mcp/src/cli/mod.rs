@@ -160,7 +160,10 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
             .first()
             .is_some_and(|a| a.eq_ignore_ascii_case("status"))
         && (argv.len() == 1 || argv.get(1).is_some_and(|a| a.eq_ignore_ascii_case("get")));
-    let session_name = (!lane_status).then(|| globals.session.as_deref().unwrap_or("cli"));
+    let session_name = globals
+        .session
+        .as_deref()
+        .or(if lane_status { None } else { Some("cli") });
 
     let broker = match connect::connect_cli(session_name, &argv).await {
         Ok(b) => b,
@@ -186,37 +189,48 @@ pub async fn dispatch(globals: Globals, argv: Vec<String>) -> i32 {
         return 0;
     }
 
-    // Bind this invocation's domain BEFORE the command runs — to `--domain` if
-    // given, else back to `default`. The CLI connects with a persistent NAMED
-    // session ("cli"), so this reset is load-bearing: without it a prior
-    // `--domain X` would stick server-side and silently scope later UNFLAGGED
-    // invocations to X.
-    //
-    // Registry-management verbs skip the bind, because binding to a domain you
-    // are about to create cannot succeed.
-    //
-    // **This is a hand-kept list.** An earlier comment here claimed the opposite while
-    // sitting directly above the literals. It cannot be derived today: nothing
-    // in the manifest says which verbs are domain-agnostic. The honest fix is a
-    // manifest hint (`cli.domain_agnostic`), which belongs with the daemon work
-    // rather than smuggled in under a comment that denies the problem.
-    let skip_bind = argv.first().map(String::as_str) == Some("domains")
-        && matches!(
-            argv.get(1).map(String::as_str),
-            Some("create") | Some("resize") | Some("delete") | Some("list")
-        );
-    if !skip_bind {
-        let target = globals.domain.unwrap_or_else(|| "default".to_string());
-        if let Err(e) = broker
-            .domains_use(logmon_broker_protocol::DomainsUse { name: target })
-            .await
-        {
-            format::error(&format!("--domain bind failed: {e}"), json);
-            return 1;
-        }
-    }
+    generic::dispatch(&broker, &argv, json, globals.domain.as_deref()).await
+}
 
-    generic::dispatch(&broker, &argv, json).await
+/// Apply CLI routing after the daemon's manifest has identified the command.
+/// Some older methods use `domain` for their own operations, such as re-pinning a collector.
+async fn route_command(
+    broker: &logmon_broker_sdk::Broker,
+    entry: &logmon_broker_protocol::mcp_tools::ManifestEntry,
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    domain: Option<&str>,
+) -> Result<(), String> {
+    let method = entry.method.as_str();
+    if logmon_broker_protocol::mcp_tools::supports_explicit_domain(method)
+        && (domain.is_some() || params.contains_key("domain"))
+    {
+        if entry
+            .input_schema
+            .as_ref()
+            .and_then(|s| s.pointer("/properties/domain"))
+            .is_none()
+        {
+            return Err(
+                "This broker does not support per-call domain routing for this command.".into(),
+            );
+        }
+        if let Some(target) = domain {
+            params
+                .entry("domain")
+                .or_insert_with(|| serde_json::Value::from(target));
+        }
+    } else if !matches!(
+        method,
+        "domains.create" | "domains.resize" | "domains.delete" | "domains.list"
+    ) {
+        // Historical CLI default, including when resuming a previously named session.
+        let name = domain.unwrap_or("default").to_owned();
+        broker
+            .domains_use(logmon_broker_protocol::DomainsUse { name })
+            .await
+            .map_err(|e| format!("--domain bind failed: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Polling passes the domain in the RPC. Binding the shared named CLI session

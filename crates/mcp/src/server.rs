@@ -6,7 +6,7 @@
 //! a versioned structured result and client-side transport error contract.
 //! Domain discovery exposes both its rendered text and structured payload.
 
-use logmon_broker_protocol::mcp_tools::ManifestEntry;
+use logmon_broker_protocol::mcp_tools::{supports_explicit_domain, ManifestEntry};
 use logmon_broker_sdk::Broker;
 use rmcp::handler::server::router::tool::ToolRoute;
 use rmcp::handler::server::tool::{ToolCallContext, ToolRouter};
@@ -229,7 +229,9 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                             .and_then(|d| d.as_str())
                             .map(str::to_string)
                     };
-                    let text = match body.or_else(rendered) {
+                    let presentation = body.or_else(rendered);
+                    let rendered_reply = presentation.is_some();
+                    let text = match presentation {
                         // `notes()` rides with every arm that replaces the
                         // envelope, and with NO arm that prints it: the JSON
                         // already carries `warnings`, so appending there would
@@ -239,7 +241,14 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                             .unwrap_or_else(|e| format!("unserialisable reply: {e}")),
                     };
                     let mut response = CallToolResult::success(vec![Content::text(text)]);
-                    if matches!(method.as_str(), "domains.list" | "status.get") {
+                    if supports_explicit_domain(&method) && rendered_reply {
+                        if let Some(domain) = result["domain"].as_str() {
+                            response
+                                .content
+                                .push(Content::text(format!("domain: {domain}")));
+                        }
+                    }
+                    if method == "domains.list" || supports_explicit_domain(&method) {
                         let mut structured = result;
                         if let Some(fields) = structured.as_object_mut() {
                             fields.remove("_display");
@@ -259,11 +268,21 @@ pub fn forwarding_route(entry: &ManifestEntry) -> Option<ToolRoute<GelfMcpServer
                     })?;
                     wrote.push(format!("{} ({} bytes)", f.path.display(), f.body.len()));
                 }
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                let mut response = CallToolResult::success(vec![Content::text(format!(
                     "wrote {}{}",
                     wrote.join(", "),
                     notes(&result)
-                ))]))
+                ))]);
+                if supports_explicit_domain(&method) {
+                    if let Some(domain) = result["domain"].as_str() {
+                        response
+                            .content
+                            .push(Content::text(format!("domain: {domain}")));
+                        // The payload has already been written to the caller's file.
+                        response.structured_content = Some(serde_json::json!({"domain": domain}));
+                    }
+                }
+                Ok(response)
             })
         },
     ))

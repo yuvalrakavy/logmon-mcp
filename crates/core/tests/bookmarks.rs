@@ -399,3 +399,95 @@ fn anonymous_bookmark_cleanup_spans_all_touched_domains() {
          (default + t3), got {removed}"
     );
 }
+
+#[test]
+fn concurrent_rebinds_do_not_change_an_explicit_read_or_its_bookmark_owner() {
+    let sessions = Arc::new(SessionRegistry::new());
+    let sid = sessions.create_anonymous();
+    let domains = Arc::new(DomainRegistry::new());
+    for lane in ["default", "b"] {
+        let d = Domain::new(
+            DomainConfig {
+                name: DomainId::new(lane).unwrap(),
+                gelf_port: 0,
+                otlp_grpc_port: 0,
+                otlp_http_port: 0,
+                log_buffer_size: 10,
+                span_buffer_size: 10,
+                source: DomainSource::Config,
+            },
+            0,
+        );
+        let mut record = make_entry(Level::Info, lane);
+        record.seq = d.pipeline.assign_seq();
+        d.pipeline.append_to_store(record);
+        domains.insert(Arc::new(d));
+    }
+    let policy = DomainPolicy {
+        max_domains: 5,
+        default_log_buffer_size: 10,
+        default_span_buffer_size: 10,
+        stale_after_secs: 60,
+    };
+    let handler = RpcHandler::new(
+        domains,
+        sessions.clone(),
+        Arc::new(logmon_broker_core::collector::registry::CollectorRegistry::new()),
+        vec![],
+        policy,
+    );
+    call(
+        &handler,
+        &sid,
+        "bookmarks.add",
+        json!({"domain":"b","scope":"reading","name":"last"}),
+    )
+    .unwrap();
+    assert_eq!(sessions.domain_of(&sid), DomainId::default_domain());
+    assert_eq!(
+        handler.clear_session_bookmarks(&sid),
+        1,
+        "explicit targets participate in disconnect cleanup"
+    );
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        threads.spawn(|| {
+            start.wait();
+            for i in 0..400 {
+                let lane = if i % 2 == 0 { "b" } else { "default" };
+                call(&handler, &sid, "domains.use", json!({"name":lane})).unwrap();
+            }
+        });
+        start.wait();
+        for _ in 0..400 {
+            let value = call(&handler, &sid, "logs.recent", json!({"domain":"b"})).unwrap();
+            assert_eq!(value["domain"], "b");
+            let rows = value["logs"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["message"], "b");
+        }
+    });
+}
+
+#[test]
+fn scoped_bookmarks_survive_named_session_restore_and_rename() {
+    let sessions = SessionRegistry::new();
+    sessions.create_named("owner").unwrap();
+    let bookmarks = BookmarkStore::new();
+    for (scope, seq) in [(None, 1), (Some("a"), 2), (Some("b"), 3)] {
+        bookmarks
+            .scoped(scope)
+            .add("owner", "last", seq, None, false)
+            .unwrap();
+    }
+    let snapshot = sessions.snapshot_named_for_persistence(&bookmarks);
+    let restored = BookmarkStore::new();
+    SessionRegistry::new().restore_named("owner", &snapshot["owner"], &restored);
+    assert_eq!(restored.rename_session("owner", "renamed"), 3);
+    for (scope, seq) in [(None, 1), (Some("a"), 2), (Some("b"), 3)] {
+        assert_eq!(restored.scoped(scope).get("renamed/last").unwrap().seq, seq);
+    }
+    assert_eq!(restored.scoped(Some("a")).clear_scope("renamed"), 1);
+    assert_eq!(restored.list_all_scopes().len(), 2);
+    assert_eq!(restored.clear_session("renamed"), 2);
+}

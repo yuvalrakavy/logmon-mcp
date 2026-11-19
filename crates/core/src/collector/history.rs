@@ -73,6 +73,9 @@ impl SnapshotPolicy {
 /// One recorded run.
 #[derive(Clone)]
 pub struct StoredSnapshot {
+    /// Pin of the window when it was captured, independent of subsequent re-pins.
+    /// Older persisted snapshots have unknown provenance.
+    pub domain: Option<String>,
     pub label: String,
     pub description: Option<String>,
     /// Provenance logmon cannot infer — commit, build profile, configuration.
@@ -139,6 +142,7 @@ impl StoredSnapshot {
         let window_start = view.window_start();
         let wall_ms = (taken_at - window_start).num_microseconds().unwrap_or(0) as f64 / 1000.0;
         Self {
+            domain: None,
             label,
             description,
             meta,

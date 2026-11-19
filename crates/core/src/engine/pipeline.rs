@@ -19,13 +19,17 @@ use tokio::sync::broadcast;
 /// directly to clients.
 ///
 /// The `session_id` field tags every event with the session it belongs to.
-/// This is the single broadcast for all connected clients, so each
-/// connection filters by `session_id` before forwarding to its socket.
+/// Network notifications are delivered through the owning session. The domain
+/// pipeline also broadcasts these events to local observers.
 #[derive(Clone, serde::Serialize)]
 pub struct PipelineEvent {
     /// The session this event belongs to, as the daemon-internal string form
     /// of [`crate::daemon::session::SessionId`]. Used for fan-out filtering.
     pub session_id: String,
+    pub domain: String,
+    pub scope: Option<String>,
+    /// Explicit registrations survive rebinding.
+    pub pinned: bool,
     pub trigger_id: u32,
     pub trigger_description: Option<String>,
     pub filter_string: String,

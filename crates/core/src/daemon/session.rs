@@ -9,8 +9,9 @@ use crate::span::types::{SpanEntry, SpanStatus, TraceSummary};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -142,14 +143,114 @@ fn run_contained(what: &str, work: impl FnOnce()) {
 // Private types
 // ---------------------------------------------------------------------------
 
+pub(crate) struct WatchState {
+    pub(crate) triggers: TriggerManager,
+    filters: RwLock<Vec<BufferFilterEntry>>,
+    next_filter_id: Arc<AtomicU32>,
+    pub(crate) post_window_remaining: AtomicU32,
+}
+
+impl WatchState {
+    pub(crate) fn add_filter(&self, filter: &str, desc: Option<&str>) -> Result<u32, SessionError> {
+        let condition = parse_filter(filter)?;
+        let filter_id = self.next_filter_id.fetch_add(1, Ordering::Relaxed);
+        let entry = BufferFilterEntry {
+            id: filter_id,
+            condition,
+            filter_string: filter.to_string(),
+            description: desc.map(String::from),
+        };
+        self.filters
+            .write()
+            .expect("filters lock poisoned")
+            .push(entry);
+        Ok(filter_id)
+    }
+    pub(crate) fn edit_filter(
+        &self,
+        filter_id: u32,
+        filter: Option<&str>,
+        desc: Option<&str>,
+    ) -> Result<FilterInfo, SessionError> {
+        // Parse new filter first (fail fast)
+        let new_condition = match filter {
+            Some(f) => Some((f, parse_filter(f)?)),
+            None => None,
+        };
+
+        let mut filters = self.filters.write().expect("filters lock poisoned");
+        let entry = filters
+            .iter_mut()
+            .find(|f| f.id == filter_id)
+            .ok_or_else(|| SessionError::NotFound(format!("filter {filter_id}")))?;
+
+        if let Some((filter_str, condition)) = new_condition {
+            entry.filter_string = filter_str.to_string();
+            entry.condition = condition;
+        }
+        if let Some(d) = desc {
+            entry.description = Some(d.to_string());
+        }
+
+        Ok(FilterInfo {
+            id: entry.id,
+            filter_string: entry.filter_string.clone(),
+            description: entry.description.clone(),
+        })
+    }
+    pub(crate) fn remove_filter(&self, filter_id: u32) -> Result<(), SessionError> {
+        let mut filters = self.filters.write().expect("filters lock poisoned");
+        let pos = filters
+            .iter()
+            .position(|f| f.id == filter_id)
+            .ok_or_else(|| SessionError::NotFound(format!("filter {filter_id}")))?;
+        filters.remove(pos);
+        Ok(())
+    }
+    fn new(triggers: TriggerManager) -> Self {
+        Self {
+            triggers,
+            filters: RwLock::new(Vec::new()),
+            next_filter_id: Arc::new(AtomicU32::new(1)),
+            post_window_remaining: AtomicU32::new(0),
+        }
+    }
+    fn empty_namespace(&self) -> Arc<Self> {
+        Arc::new(Self {
+            triggers: self.triggers.empty_namespace(),
+            filters: RwLock::new(Vec::new()),
+            next_filter_id: self.next_filter_id.clone(),
+            post_window_remaining: AtomicU32::new(0),
+        })
+    }
+    pub(crate) fn list_filters(&self) -> Vec<FilterInfo> {
+        self.filters
+            .read()
+            .unwrap()
+            .iter()
+            .map(|f| FilterInfo {
+                id: f.id,
+                filter_string: f.filter_string.clone(),
+                description: f.description.clone(),
+            })
+            .collect()
+    }
+}
+
+impl std::ops::Deref for SessionState {
+    type Target = WatchState;
+    fn deref(&self) -> &Self::Target {
+        &self.watches
+    }
+}
+
 struct SessionState {
     name: Option<String>,
-    triggers: TriggerManager,
-    filters: RwLock<Vec<BufferFilterEntry>>,
-    next_filter_id: AtomicU32,
+    watches: Arc<WatchState>,
+    pinned: RwLock<HashMap<(DomainId, Option<String>), Arc<WatchState>>>,
+    notifications: broadcast::Sender<Arc<PipelineEvent>>,
     notification_queue: Mutex<VecDeque<PipelineEvent>>,
     max_queue_size: usize,
-    post_window_remaining: AtomicU32,
     connected: AtomicBool,
     last_seen: Mutex<Instant>,
     /// Caller-supplied identity/metadata blob from `session.start`. The
@@ -159,10 +260,6 @@ struct SessionState {
     /// state). Mutable — unlike `name` — because `use_domain` switches it.
     /// Defaults to `default`; never persisted (connect-time state, §4).
     domain: RwLock<DomainId>,
-    /// Every domain this session has been bound to over its lifetime (seeded
-    /// with `default`, extended on each `set_domain`). An anonymous session that
-    /// switched domains may hold bookmarks in more than one store; on disconnect
-    /// they must be cleared across ALL of them (§5), not just the current one.
     touched_domains: RwLock<HashSet<DomainId>>,
 }
 
@@ -170,12 +267,11 @@ impl SessionState {
     fn new_anonymous() -> Self {
         Self {
             name: None,
-            triggers: TriggerManager::new(),
-            filters: RwLock::new(Vec::new()),
-            next_filter_id: AtomicU32::new(1),
+            watches: Arc::new(WatchState::new(TriggerManager::new())),
+            pinned: RwLock::new(HashMap::new()),
+            notifications: broadcast::channel(256).0,
             notification_queue: Mutex::new(VecDeque::new()),
             max_queue_size: 1000,
-            post_window_remaining: AtomicU32::new(0),
             connected: AtomicBool::new(true),
             last_seen: Mutex::new(Instant::now()),
             client_info: RwLock::new(None),
@@ -187,12 +283,11 @@ impl SessionState {
     fn new_named(name: &str) -> Self {
         Self {
             name: Some(name.to_string()),
-            triggers: TriggerManager::new(),
-            filters: RwLock::new(Vec::new()),
-            next_filter_id: AtomicU32::new(1),
+            watches: Arc::new(WatchState::new(TriggerManager::new())),
+            pinned: RwLock::new(HashMap::new()),
+            notifications: broadcast::channel(256).0,
             notification_queue: Mutex::new(VecDeque::new()),
             max_queue_size: 1000,
-            post_window_remaining: AtomicU32::new(0),
             connected: AtomicBool::new(true),
             last_seen: Mutex::new(Instant::now()),
             client_info: RwLock::new(None),
@@ -204,12 +299,22 @@ impl SessionState {
     fn to_info(&self, id: &SessionId) -> SessionInfo {
         let now = Instant::now();
         let last = *self.last_seen.lock().expect("last_seen lock poisoned");
+        let pinned = self.pinned.read().expect("pinned watch lock poisoned");
+        let scoped_triggers = pinned
+            .values()
+            .map(|watch| watch.triggers.len())
+            .sum::<usize>();
+        let scoped_filters = pinned
+            .values()
+            .map(|watch| watch.filters.read().expect("filters lock poisoned").len())
+            .sum::<usize>();
         SessionInfo {
             id: id.clone(),
             name: self.name.clone(),
             connected: self.connected.load(Ordering::Relaxed),
-            trigger_count: self.triggers.list().len(),
-            filter_count: self.filters.read().expect("filters lock poisoned").len(),
+            trigger_count: self.triggers.len() + scoped_triggers,
+            filter_count: self.filters.read().expect("filters lock poisoned").len()
+                + scoped_filters,
             queue_size: self
                 .notification_queue
                 .lock()
@@ -574,10 +679,23 @@ impl SessionRegistry {
         }
     }
 
-    /// Every domain this session has been bound to (seeded with `default`,
-    /// extended on each [`Self::set_domain`]). Empty for an unknown session.
-    /// Used on disconnect to clear an anonymous session's bookmarks across every
-    /// domain it touched (§5), not just its current binding.
+    /// Track an explicitly addressed domain for disconnect cleanup.
+    pub fn record_domain_touch(&self, id: &SessionId, domain: &DomainId) {
+        if let Some(state) = self
+            .sessions
+            .read()
+            .expect("sessions lock poisoned")
+            .get(id)
+        {
+            state
+                .touched_domains
+                .write()
+                .expect("touched_domains lock poisoned")
+                .insert(domain.clone());
+        }
+    }
+
+    /// Domains visited by binding or by explicit request, including the default domain.
     pub fn touched_domains(&self, id: &SessionId) -> Vec<DomainId> {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
         match sessions.get(id) {
@@ -598,9 +716,8 @@ impl SessionRegistry {
     ///
     /// When the binding actually CHANGES, the session's cross-domain carryover
     /// is dropped so no data from the old domain bleeds into the new one:
-    /// - the notification queue is cleared (F1) — a queued event references the
-    ///   old domain's records and must not reach a client now reading another
-    ///   domain;
+    /// - queued notifications for legacy watches are cleared (F1). Explicitly
+    ///   pinned events retain their domain and scope across a rebind;
     /// - the post-trigger window is reset to 0 (F3) — a window opened by a
     ///   trigger that fired on the old domain must not shape storage in the new.
     pub fn set_domain(&self, id: &SessionId, domain: DomainId) {
@@ -624,7 +741,7 @@ impl SessionRegistry {
                         .notification_queue
                         .lock()
                         .expect("queue lock poisoned")
-                        .clear();
+                        .retain(|event| event.pinned);
                     state.post_window_remaining.store(0, Ordering::Relaxed);
                     true
                 } else {
@@ -699,6 +816,74 @@ impl SessionRegistry {
             .collect()
     }
 
+    pub(crate) fn watch(
+        &self,
+        id: &SessionId,
+        domain: Option<&DomainId>,
+        scope: Option<&str>,
+        create: bool,
+    ) -> Result<Arc<WatchState>, SessionError> {
+        let sessions = self.sessions.read().unwrap();
+        let state = sessions
+            .get(id)
+            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
+        let Some(domain) = domain else {
+            return Ok(state.watches.clone());
+        };
+        let key = (domain.clone(), scope.map(str::to_owned));
+        if let Some(w) = state.pinned.read().unwrap().get(&key) {
+            return Ok(w.clone());
+        }
+        let empty = || state.watches.empty_namespace();
+        if !create {
+            return Ok(empty());
+        }
+        let mut pinned = state.pinned.write().unwrap();
+        // Drop spent oneshot scopes and removed registrations. An outstanding
+        // reference can still register or finish a post-window on this watch.
+        pinned.retain(|_, w| {
+            Arc::strong_count(w) > 1
+                || !w.triggers.is_empty()
+                || !w.filters.read().unwrap().is_empty()
+                || w.post_window_remaining.load(Ordering::Relaxed) > 0
+        });
+        Ok(pinned.entry(key).or_insert_with(empty).clone())
+    }
+
+    pub(crate) fn watches_for_domain(
+        &self,
+        domain: &DomainId,
+        sort: bool,
+    ) -> Vec<(SessionId, Option<String>, bool, Arc<WatchState>)> {
+        let sessions = self.sessions.read().unwrap();
+        let mut result = Vec::new();
+        for (id, state) in sessions.iter() {
+            if state.is_in_domain(domain) {
+                result.push((id.clone(), None, false, state.watches.clone()));
+            }
+            for ((pin, scope), w) in state.pinned.read().unwrap().iter() {
+                if pin == domain {
+                    result.push((id.clone(), scope.clone(), true, w.clone()));
+                }
+            }
+        }
+        if sort {
+            result
+                .sort_by_cached_key(|(_, _, _, w)| std::cmp::Reverse(w.triggers.max_pre_window()));
+        }
+        result
+    }
+
+    pub(crate) fn subscribe_notifications(
+        &self,
+        id: &SessionId,
+    ) -> Option<broadcast::Receiver<Arc<PipelineEvent>>> {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|state| state.notifications.subscribe())
+    }
     // --- Trigger operations (per-session) ---
 
     pub fn evaluate_triggers(&self, id: &SessionId, entry: &LogEntry) -> Vec<TriggerMatch> {
@@ -805,24 +990,7 @@ impl SessionRegistry {
         filter: &str,
         desc: Option<&str>,
     ) -> Result<u32, SessionError> {
-        let condition = parse_filter(filter)?;
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-        let state = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
-        let filter_id = state.next_filter_id.fetch_add(1, Ordering::Relaxed);
-        let entry = BufferFilterEntry {
-            id: filter_id,
-            condition,
-            filter_string: filter.to_string(),
-            description: desc.map(String::from),
-        };
-        state
-            .filters
-            .write()
-            .expect("filters lock poisoned")
-            .push(entry);
-        Ok(filter_id)
+        self.watch(id, None, None, false)?.add_filter(filter, desc)
     }
 
     pub fn edit_filter(
@@ -832,51 +1000,12 @@ impl SessionRegistry {
         filter: Option<&str>,
         desc: Option<&str>,
     ) -> Result<FilterInfo, SessionError> {
-        // Parse new filter first (fail fast)
-        let new_condition = match filter {
-            Some(f) => Some((f, parse_filter(f)?)),
-            None => None,
-        };
-
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-        let state = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
-
-        let mut filters = state.filters.write().expect("filters lock poisoned");
-        let entry = filters
-            .iter_mut()
-            .find(|f| f.id == filter_id)
-            .ok_or_else(|| SessionError::NotFound(format!("filter {filter_id}")))?;
-
-        if let Some((filter_str, condition)) = new_condition {
-            entry.filter_string = filter_str.to_string();
-            entry.condition = condition;
-        }
-        if let Some(d) = desc {
-            entry.description = Some(d.to_string());
-        }
-
-        Ok(FilterInfo {
-            id: entry.id,
-            filter_string: entry.filter_string.clone(),
-            description: entry.description.clone(),
-        })
+        self.watch(id, None, None, false)?
+            .edit_filter(filter_id, filter, desc)
     }
 
     pub fn remove_filter(&self, id: &SessionId, filter_id: u32) -> Result<(), SessionError> {
-        let sessions = self.sessions.read().expect("sessions lock poisoned");
-        let state = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound(id.to_string()))?;
-
-        let mut filters = state.filters.write().expect("filters lock poisoned");
-        let pos = filters
-            .iter()
-            .position(|f| f.id == filter_id)
-            .ok_or_else(|| SessionError::NotFound(format!("filter {filter_id}")))?;
-        filters.remove(pos);
-        Ok(())
+        self.watch(id, None, None, false)?.remove_filter(filter_id)
     }
 
     // --- Post-trigger window (per-session) ---
@@ -950,23 +1079,30 @@ impl SessionRegistry {
 
     // --- Notification queue ---
 
-    /// If disconnected named session, push to queue. If connected, do nothing
-    /// (the daemon forwards via broadcast channel separately).
+    /// Connected listeners receive notifications through their session channel
+    /// regardless of binding. A named session queues notifications while
+    /// disconnected or between reconnect and receiver subscription.
     pub fn send_or_queue_notification(&self, id: &SessionId, event: PipelineEvent) {
         let sessions = self.sessions.read().expect("sessions lock poisoned");
-        if let Some(state) = sessions.get(id) {
-            if !state.connected.load(Ordering::Relaxed) {
-                // Only queue for disconnected named sessions
-                if state.name.is_some() {
-                    let mut queue = state
-                        .notification_queue
-                        .lock()
-                        .expect("queue lock poisoned");
-                    if queue.len() < state.max_queue_size {
-                        queue.push_back(event);
-                    }
-                }
+        let Some(state) = sessions.get(id) else {
+            return;
+        };
+        // Serialize with the reconnect drain, so an event cannot land in the
+        // queue just after the receiver drains it and switches to live delivery.
+        let mut queue = state
+            .notification_queue
+            .lock()
+            .expect("queue lock poisoned");
+        let event = if state.connected.load(Ordering::Relaxed) {
+            match state.notifications.send(Arc::new(event)) {
+                Ok(_) => return,
+                Err(e) => Arc::unwrap_or_clone(e.0),
             }
+        } else {
+            event
+        };
+        if state.name.is_some() && queue.len() < state.max_queue_size {
+            queue.push_back(event);
         }
     }
 
@@ -995,8 +1131,31 @@ impl SessionRegistry {
         trigger: &TriggerMatch,
         trace_summary: Option<TraceSummary>,
     ) -> PipelineEvent {
+        Self::build_scoped_span_event(
+            id,
+            &DomainId::default_domain(),
+            None,
+            false,
+            span,
+            trigger,
+            trace_summary,
+        )
+    }
+
+    pub(crate) fn build_scoped_span_event(
+        id: &SessionId,
+        domain: &DomainId,
+        scope: Option<String>,
+        pinned: bool,
+        span: &SpanEntry,
+        trigger: &TriggerMatch,
+        trace_summary: Option<TraceSummary>,
+    ) -> PipelineEvent {
         PipelineEvent {
             session_id: id.to_string(),
+            domain: domain.to_string(),
+            scope,
+            pinned,
             trigger_id: trigger.id,
             trigger_description: trigger.description.clone(),
             filter_string: trigger.filter_string.clone(),
@@ -1054,14 +1213,8 @@ impl SessionRegistry {
         let mut descriptions = Vec::new();
         let mut policy = Vec::new();
 
-        for state in sessions.values() {
-            if !state.is_in_domain(domain) {
-                continue;
-            }
-            let filters = state.filters.read().expect("filters lock poisoned");
-            if filters.is_empty() {
-                continue;
-            }
+        let mut observe = |watch: &WatchState| {
+            let filters = watch.filters.read().expect("filters lock poisoned");
             for f in filters.iter() {
                 // Collected unconditionally, and from inside the same guard
                 // that decides — this IS the policy that made this decision,
@@ -1073,6 +1226,16 @@ impl SessionRegistry {
                     if let Some(ref desc) = f.description {
                         descriptions.push(desc.clone());
                     }
+                }
+            }
+        };
+        for state in sessions.values() {
+            if state.is_in_domain(domain) {
+                observe(&state.watches);
+            }
+            for ((pin, _), watch) in state.pinned.read().unwrap().iter() {
+                if pin == domain {
+                    observe(watch);
                 }
             }
         }
@@ -1120,12 +1283,9 @@ impl SessionRegistry {
     /// The largest pre_window across the triggers of sessions bound to
     /// `domain` — the domain-scoped form of [`Self::max_pre_window`].
     pub fn max_pre_window_for_domain(&self, domain: &DomainId) -> u32 {
-        self.sessions
-            .read()
-            .expect("sessions lock poisoned")
-            .values()
-            .filter(|state| state.is_in_domain(domain))
-            .map(|s| s.triggers.max_pre_window())
+        self.watches_for_domain(domain, false)
+            .iter()
+            .map(|(_, _, _, w)| w.triggers.max_pre_window())
             .max()
             .unwrap_or(0)
     }
@@ -1158,58 +1318,76 @@ impl SessionRegistry {
                 .is_ok_and(|p| crate::filter::parser::contains_bookmark_qualifier(&p))
         };
 
-        for pt in &persisted.triggers {
-            if pt.pre_window as usize > crate::daemon::persistence::MAX_BUFFER_SIZE {
-                tracing::warn!(
-                    session = name,
-                    filter = %pt.filter,
-                    pre_window = pt.pre_window,
-                    "persisted trigger's pre_window exceeds the buffer limit; not restored"
-                );
-                continue;
-            }
-            if carries_bookmark(&pt.filter) {
-                tracing::warn!(
-                    session = name,
-                    filter = %pt.filter,
-                    "persisted trigger carries a bookmark or cursor qualifier, which never \
-                     matches in a registered trigger; not restored"
-                );
-                continue;
-            }
-            let _ = state.triggers.add(
-                &pt.filter,
-                pt.pre_window,
-                pt.post_window,
-                pt.notify_context,
-                pt.description.as_deref(),
-                pt.oneshot,
-            );
-        }
-
-        // Restore filters
-        {
-            let mut filters = state.filters.write().expect("filters lock poisoned");
-            for pf in &persisted.filters {
-                if carries_bookmark(&pf.filter) {
-                    tracing::warn!(
-                        session = name,
-                        filter = %pf.filter,
-                        "persisted filter carries a bookmark or cursor qualifier, which never \
-                         matches in a registered filter; not restored"
+        let restore =
+            |watch: &WatchState,
+             triggers: &[crate::daemon::persistence::PersistedTrigger],
+             saved_filters: &[crate::daemon::persistence::PersistedFilter]| {
+                for pt in triggers {
+                    if pt.pre_window as usize > crate::daemon::persistence::MAX_BUFFER_SIZE {
+                        tracing::warn!(
+                            session = name,
+                            filter = %pt.filter,
+                            pre_window = pt.pre_window,
+                            "persisted trigger's pre_window exceeds the buffer limit; not restored"
+                        );
+                        continue;
+                    }
+                    if carries_bookmark(&pt.filter) {
+                        tracing::warn!(
+                            session = name,
+                            filter = %pt.filter,
+                            "persisted trigger carries a bookmark or cursor qualifier, which never \
+                             matches in a registered trigger; not restored"
+                        );
+                        continue;
+                    }
+                    let _ = watch.triggers.add(
+                        &pt.filter,
+                        pt.pre_window,
+                        pt.post_window,
+                        pt.notify_context,
+                        pt.description.as_deref(),
+                        pt.oneshot,
                     );
-                    continue;
                 }
-                if let Ok(condition) = parse_filter(&pf.filter) {
-                    let filter_id = state.next_filter_id.fetch_add(1, Ordering::Relaxed);
-                    filters.push(BufferFilterEntry {
-                        id: filter_id,
-                        condition,
-                        filter_string: pf.filter.clone(),
-                        description: pf.description.clone(),
-                    });
+
+                // Restore filters
+                {
+                    let mut filters = watch.filters.write().expect("filters lock poisoned");
+                    for pf in saved_filters {
+                        if carries_bookmark(&pf.filter) {
+                            tracing::warn!(
+                                session = name,
+                                filter = %pf.filter,
+                                "persisted filter carries a bookmark or cursor qualifier, which never \
+                                 matches in a registered filter; not restored"
+                            );
+                            continue;
+                        }
+                        if let Ok(condition) = parse_filter(&pf.filter) {
+                            let filter_id = watch.next_filter_id.fetch_add(1, Ordering::Relaxed);
+                            filters.push(BufferFilterEntry {
+                                id: filter_id,
+                                condition,
+                                filter_string: pf.filter.clone(),
+                                description: pf.description.clone(),
+                            });
+                        }
+                    }
                 }
-            }
+            };
+        restore(&state.watches, &persisted.triggers, &persisted.filters);
+        for pin in &persisted.pinned_watches {
+            let Ok(domain) = DomainId::new(&pin.domain) else {
+                continue;
+            };
+            let watch = state.watches.empty_namespace();
+            restore(&watch, &pin.triggers, &pin.filters);
+            state
+                .pinned
+                .write()
+                .unwrap()
+                .insert((domain, pin.scope.clone()), watch);
         }
 
         // Restore client_info
@@ -1226,6 +1404,7 @@ impl SessionRegistry {
         for pb in &persisted.bookmarks {
             let qualified_name = format!("{}/{}", name, pb.name);
             bookmark_store.insert_persisted(crate::store::bookmarks::Bookmark {
+                scope: pb.scope.clone(),
                 qualified_name,
                 name: pb.name.clone(),
                 session: name.to_string(),
@@ -1262,7 +1441,7 @@ impl SessionRegistry {
 
         // Snapshot all bookmarks once and bucket by session — avoids re-listing
         // (and re-locking) per session inside the loop.
-        let all_bookmarks = bookmark_store.list();
+        let all_bookmarks = bookmark_store.list_all_scopes();
         let mut bookmarks_by_session: std::collections::HashMap<String, Vec<PersistedBookmark>> =
             std::collections::HashMap::new();
         for b in all_bookmarks {
@@ -1270,6 +1449,7 @@ impl SessionRegistry {
                 .entry(b.session.clone())
                 .or_default()
                 .push(PersistedBookmark {
+                    scope: b.scope,
                     name: b.name,
                     seq: b.seq,
                     created_at: b.created_at,
@@ -1281,27 +1461,49 @@ impl SessionRegistry {
         let mut out = std::collections::HashMap::new();
         for (id, state) in sessions.iter() {
             let SessionId::Named(name) = id else { continue };
-            let triggers: Vec<PersistedTrigger> = state
-                .triggers
-                .list()
-                .into_iter()
-                .map(|t| PersistedTrigger {
-                    filter: t.filter_string,
-                    pre_window: t.pre_window,
-                    post_window: t.post_window,
-                    notify_context: t.notify_context,
-                    description: t.description,
-                    oneshot: t.oneshot,
-                })
-                .collect();
-            let filters: Vec<PersistedFilter> = state
-                .filters
+            let snapshot = |watch: &WatchState| {
+                let triggers: Vec<PersistedTrigger> = watch
+                    .triggers
+                    .list()
+                    .into_iter()
+                    .map(|t| PersistedTrigger {
+                        filter: t.filter_string,
+                        pre_window: t.pre_window,
+                        post_window: t.post_window,
+                        notify_context: t.notify_context,
+                        description: t.description,
+                        oneshot: t.oneshot,
+                    })
+                    .collect();
+                let filters: Vec<PersistedFilter> = watch
+                    .filters
+                    .read()
+                    .expect("filters lock poisoned")
+                    .iter()
+                    .map(|f| PersistedFilter {
+                        filter: f.filter_string.clone(),
+                        description: f.description.clone(),
+                    })
+                    .collect();
+                (triggers, filters)
+            };
+            let (triggers, filters) = snapshot(&state.watches);
+            let pinned_watches = state
+                .pinned
                 .read()
-                .expect("filters lock poisoned")
+                .unwrap()
                 .iter()
-                .map(|f| PersistedFilter {
-                    filter: f.filter_string.clone(),
-                    description: f.description.clone(),
+                .filter_map(|((domain, scope), watch)| {
+                    let (triggers, filters) = snapshot(watch);
+                    if triggers.is_empty() && filters.is_empty() {
+                        return None;
+                    }
+                    Some(crate::daemon::persistence::PersistedWatch {
+                        domain: domain.to_string(),
+                        scope: scope.clone(),
+                        triggers,
+                        filters,
+                    })
                 })
                 .collect();
             let client_info = state
@@ -1313,6 +1515,7 @@ impl SessionRegistry {
             out.insert(
                 name.clone(),
                 PersistedSession {
+                    pinned_watches,
                     triggers,
                     filters,
                     client_info,

@@ -193,6 +193,55 @@ impl Tool {
     }
 }
 
+/// Verbs with request-local domain selection and optional caller scope. These
+/// arguments are consumed by dispatch before decoding a method's payload.
+/// `collectors.edit.domain` already means "re-pin", and `cases.load.domain`
+/// names the destination; neither is a request target.
+pub fn supports_explicit_domain(method: &str) -> bool {
+    matches!(
+        method,
+        "logs.recent"
+            | "logs.context"
+            | "logs.export"
+            | "logs.fields"
+            | "logs.profile"
+            | "traces.recent"
+            | "traces.get"
+            | "traces.logs"
+            | "traces.summary"
+            | "traces.slow"
+            | "spans.context"
+            | "spans.export"
+            | "traces.profile"
+            | "collectors.add"
+            | "collectors.get"
+            | "collectors.list"
+            | "collectors.snapshot"
+            | "collectors.history"
+            | "collectors.diff"
+            | "collectors.document"
+            | "collectors.reset"
+            | "collectors.remove"
+            | "bookmarks.add"
+            | "bookmarks.list"
+            | "bookmarks.remove"
+            | "bookmarks.clear"
+            | "triggers.add"
+            | "triggers.list"
+            | "triggers.edit"
+            | "triggers.remove"
+            | "filters.add"
+            | "filters.list"
+            | "filters.edit"
+            | "filters.remove"
+            | "cases.create"
+            | "domain_data.get"
+            | "domain_data.update"
+            | "domain_data.remove"
+            | "status.get"
+    )
+}
+
 /// Every agent-facing tool this build defines.
 ///
 /// Source order matches `crates/mcp/src/server.rs`, which makes a diff against
@@ -870,6 +919,56 @@ pub fn manifest() -> Vec<ManifestEntry> {
 #[cfg(test)]
 mod manifest_tests {
     use super::*;
+
+    #[test]
+    fn domain_queries_declare_optional_routing_fields() {
+        let entries = manifest();
+        for method in [
+            "logs.recent",
+            "logs.context",
+            "logs.export",
+            "logs.fields",
+            "logs.profile",
+            "traces.recent",
+            "traces.get",
+            "traces.logs",
+            "traces.summary",
+            "traces.slow",
+            "spans.context",
+            "spans.export",
+            "traces.profile",
+            "collectors.add",
+            "collectors.get",
+            "collectors.snapshot",
+            "bookmarks.add",
+            "bookmarks.list",
+            "triggers.add",
+            "triggers.list",
+            "filters.add",
+            "filters.list",
+            "cases.create",
+            "domain_data.get",
+            "domain_data.update",
+            "status.get",
+        ] {
+            let input = entries
+                .iter()
+                .find(|e| e.method == method)
+                .unwrap()
+                .input_schema
+                .as_ref()
+                .unwrap();
+            for key in ["domain", "scope"] {
+                assert!(
+                    input["properties"].get(key).is_some(),
+                    "{method} lacks {key}"
+                );
+                assert!(!input["required"]
+                    .as_array()
+                    .is_some_and(|v| v.iter().any(|k| k == key)));
+            }
+        }
+    }
 
     /// A shim registering from the manifest can only expose what the manifest
     /// describes, so a tool whose parameters resolve to nothing is a tool that

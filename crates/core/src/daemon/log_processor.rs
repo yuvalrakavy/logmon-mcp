@@ -61,9 +61,9 @@ pub fn process_entry_for_domain(
     // 3. Evaluate triggers per session (scoped to this domain)
     let mut any_post_window_active = false;
 
-    let session_ids = sessions.active_session_ids_sorted_by_pre_window_for_domain(domain);
+    let watches = sessions.watches_for_domain(domain, true);
 
-    for sid in &session_ids {
+    for (sid, scope, pinned, watch) in &watches {
         // 4a. Advance this session's post-window. It governs STORAGE only —
         // during the window every entry is stored unconditionally, bypassing
         // the session's filters, so the context after a trigger is captured.
@@ -76,12 +76,12 @@ pub fn process_entry_for_domain(
         // never be evaluated at all. Firing suppression is now per-trigger,
         // inside `TriggerManager::evaluate`, where a trigger debounces only
         // itself.
-        if sessions.decrement_post_window(sid) {
+        if crate::engine::trigger::decrement_if_active(&watch.post_window_remaining) {
             any_post_window_active = true;
         }
 
         // 4b. Evaluate triggers
-        let matches = sessions.evaluate_triggers(sid, entry);
+        let matches = watch.triggers.evaluate(entry);
         if !matches.is_empty() {
             let trigger_max_pre = matches.iter().map(|m| m.pre_window).max().unwrap_or(0);
             let trigger_max_post = matches.iter().map(|m| m.post_window).max().unwrap_or(0);
@@ -113,7 +113,9 @@ pub fn process_entry_for_domain(
             // Activate post-window for this session. EXTEND rather than set:
             // a match can now land inside an already-open window, and a small
             // post_window must not truncate a larger one still in flight.
-            sessions.extend_post_window(sid, trigger_max_post);
+            watch
+                .post_window_remaining
+                .fetch_max(trigger_max_post, std::sync::atomic::Ordering::Relaxed);
             any_post_window_active = true;
 
             // Build notification event and send/queue
@@ -131,6 +133,9 @@ pub fn process_entry_for_domain(
                 }
                 let event = PipelineEvent {
                     session_id: sid.to_string(),
+                    domain: domain.to_string(),
+                    scope: scope.clone(),
+                    pinned: *pinned,
                     trigger_id: m.id,
                     trigger_description: m.description.clone(),
                     filter_string: m.filter_string.clone(),
@@ -144,10 +149,8 @@ pub fn process_entry_for_domain(
                     trace_id: entry.trace_id,
                     trace_summary: None,
                 };
-                // Queue for disconnected named sessions (no-op for connected)
-                // and broadcast to all live subscribers; the per-connection
-                // task in `daemon::server` filters the broadcast by
-                // `session_id` before writing to its socket.
+                // Route to this session across all its watched domains. The
+                // pipeline broadcast remains available to local subscribers.
                 sessions.send_or_queue_notification(sid, event.clone());
                 pipeline.send_event(event);
 
@@ -157,7 +160,7 @@ pub fn process_entry_for_domain(
                 // once per evaluation — but the remove returns NotFound rather
                 // than panicking either way).
                 if m.oneshot {
-                    let _ = sessions.remove_trigger(sid, m.id);
+                    let _ = watch.triggers.remove(m.id);
                     any_oneshot_removed = true;
                 }
             }

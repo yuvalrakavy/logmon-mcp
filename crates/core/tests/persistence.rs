@@ -19,6 +19,7 @@ fn test_state_roundtrip() {
     state.named_sessions.insert(
         "test".to_string(),
         PersistedSession {
+            pinned_watches: Vec::new(),
             triggers: vec![PersistedTrigger {
                 filter: "l>=ERROR".to_string(),
                 pre_window: 500,
@@ -51,6 +52,7 @@ fn test_persisted_trigger_roundtrip_with_oneshot() {
     state.named_sessions.insert(
         "named".to_string(),
         PersistedSession {
+            pinned_watches: Vec::new(),
             triggers: vec![PersistedTrigger {
                 filter: "l>=ERROR".to_string(),
                 pre_window: 0,
@@ -198,10 +200,12 @@ fn test_bookmarks_roundtrip_with_seq_field() {
     state.named_sessions.insert(
         "named".to_string(),
         PersistedSession {
+            pinned_watches: Vec::new(),
             triggers: vec![],
             filters: vec![],
             client_info: None,
             bookmarks: vec![PersistedBookmark {
+                scope: None,
                 name: "anchor".to_string(),
                 seq: 42,
                 created_at: chrono::Utc::now(),

@@ -462,3 +462,76 @@ async fn rename_rejects_invalid_names() {
         assert!(result.is_err(), "{bad:?} must be rejected");
     }
 }
+
+#[tokio::test]
+async fn explicit_domain_reads_pin_records_and_isolate_cursors_without_rebinding() {
+    let daemon = spawn_test_daemon().await;
+    let mut c = daemon.connect_anon().await;
+    daemon.inject_log(Level::Info, "resident default").await;
+    wait_for_log(&mut c, "resident default").await;
+    let b: DomainInfo = c
+        .call("domains.create", json!({"name":"explicit-b"}))
+        .await
+        .unwrap();
+    send_gelf(b.gelf_port, "resident B").await;
+    let mut seen = Value::Null;
+    for _ in 0..10 {
+        seen = c
+            .call("logs.recent", json!({"domain":"explicit-b"}))
+            .await
+            .unwrap();
+        if seen.to_string().contains("resident B") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen["domain"], "explicit-b");
+    assert!(seen.to_string().contains("resident B"));
+    assert!(!seen.to_string().contains("resident default"));
+    let bound: Value = c.call("logs.recent", json!({})).await.unwrap();
+    assert_eq!(bound["domain"], "default");
+    assert!(bound.to_string().contains("resident default"));
+    let err = c
+        .call::<Value>("logs.recent", json!({"domain":"missing-b"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("missing-b"));
+    for scope in ["x", "y"] {
+        let params = json!({"scope":scope,"filter":"c>=last","domain":"explicit-b"});
+        let r: Value = c.call("logs.recent", params.clone()).await.unwrap();
+        assert!(r.to_string().contains("resident B"), "{r}");
+        let r: Value = c.call("logs.recent", params).await.unwrap();
+        assert!(r["logs"].as_array().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_explicit_domain_never_reads_the_bound_ring() {
+    let daemon = spawn_test_daemon().await;
+    let mut c = daemon.connect_anon().await;
+    let err = c
+        .call::<Value>("logs.recent", json!({"domain":"absent-lane"}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("absent-lane"));
+}
+
+#[tokio::test]
+async fn cursor_scopes_advance_independently() {
+    let daemon = spawn_test_daemon().await;
+    let mut c = daemon.connect_anon().await;
+    daemon
+        .inject_log(Level::Info, "shared cursor evidence")
+        .await;
+    wait_for_log(&mut c, "shared cursor evidence").await;
+    for scope in ["alice", "bob"] {
+        let r: Value = c
+            .call("logs.recent", json!({"filter":"c>=same","scope":scope}))
+            .await
+            .unwrap();
+        assert!(
+            r.to_string().contains("shared cursor evidence"),
+            "{scope}: {r}"
+        );
+    }
+}

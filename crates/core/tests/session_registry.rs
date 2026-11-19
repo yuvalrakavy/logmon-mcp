@@ -318,6 +318,9 @@ fn test_notification_queue() {
     registry.disconnect(&id);
 
     let event = PipelineEvent {
+        domain: "default".into(),
+        scope: None,
+        pinned: false,
         session_id: id.to_string(),
         trigger_id: 1,
         trigger_description: None,
@@ -476,6 +479,7 @@ fn a_persisted_bookmark_filter_or_trigger_is_not_restored() {
     let mut oversize = trigger("l>=WARN");
     oversize.pre_window = 10_000_001;
     let persisted = PersistedSession {
+        pinned_watches: Vec::new(),
         triggers: vec![trigger("l>=ERROR"), trigger("c>=cur"), oversize],
         filters: vec![filter("l>=WARN"), filter("b>=mark")],
         client_info: None,

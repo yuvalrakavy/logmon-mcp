@@ -71,7 +71,7 @@ struct Trigger {
 /// Decrement `counter` by one if it is positive, reporting whether it WAS
 /// positive (i.e. whether a post-window is currently active). Mirrors the
 /// session-level counter's CAS loop in `daemon::session`.
-fn decrement_if_active(counter: &AtomicU32) -> bool {
+pub(crate) fn decrement_if_active(counter: &AtomicU32) -> bool {
     loop {
         let current = counter.load(Ordering::Relaxed);
         if current == 0 {
@@ -113,7 +113,7 @@ pub const DEFAULT_TRIGGER_NOTIFY_CONTEXT: u32 = 5;
 
 pub struct TriggerManager {
     triggers: RwLock<Vec<Trigger>>,
-    next_id: AtomicU32,
+    next_id: std::sync::Arc<AtomicU32>,
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +125,13 @@ pub enum TriggerError {
 }
 
 impl TriggerManager {
+    pub(crate) fn empty_namespace(&self) -> Self {
+        Self {
+            triggers: RwLock::new(Vec::new()),
+            next_id: self.next_id.clone(),
+        }
+    }
+
     pub fn new() -> Self {
         let trigger1 = Trigger {
             id: 1,
@@ -155,8 +162,15 @@ impl TriggerManager {
 
         TriggerManager {
             triggers: RwLock::new(vec![trigger1, trigger2]),
-            next_id: AtomicU32::new(3),
+            next_id: std::sync::Arc::new(AtomicU32::new(3)),
         }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.triggers.read().unwrap().len()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn list(&self) -> Vec<TriggerInfo> {

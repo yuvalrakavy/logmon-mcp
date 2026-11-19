@@ -74,7 +74,11 @@ The payoff is that a tool is declared in exactly one place —
 each client that wants to reach it. Nothing can drift, because there is no second
 copy to drift from.
 
-**Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. A session targets one via `use_domain` (MCP) or the `--domain` flag (CLI). For a per-worktree / per-project setup, set **`LOGMON_DOMAIN`** in the MCP server's env once — **alongside a named `--session`** — so the shim binds that domain at connect and **re-binds it on every reconnect** (durable across daemon restarts). Reconnect-preservation needs a named session: an anonymous session can't resume a restart, so it fails *loud* (never a silent revert to `default`) and the shim is restarted. Every session then auto-scopes with zero per-call ceremony. Create the domain before the shim connects; a missing domain is a loud handshake error, not a silent fallback.
+**Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. When you know the domain, pass it on each MCP call, for example `get_recent_logs(domain="staging", filter="l>=ERROR")`. The reply identifies the domain that supplied the evidence, even on an empty result. An unknown domain returns an error.
+
+Two conversations may share one MCP connection. Each can read a different domain without changing the other's binding. Give each investigation a stable `scope` when using cursors or bookmarks. For example, `get_recent_logs(domain="staging", scope="checkout-regression", filter="c>=last")` advances that investigation’s cursor. Pass the same domain and scope when arming a trigger, and match them on incoming notifications.
+
+For a single-conversation connection, `use_domain` sets the default for later calls that omit `domain`. To keep an initial binding across reconnects, set `LOGMON_DOMAIN` alongside a named `--session` and create the domain before connecting.
 
 ## Installation
 

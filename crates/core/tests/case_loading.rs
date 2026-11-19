@@ -890,3 +890,27 @@ fn a_loaded_domain_does_not_claim_it_received_what_it_holds() {
     );
     assert_eq!(store["current_size"], 6, "while still holding its records");
 }
+
+#[tokio::test]
+async fn postmortem_guard_checks_the_explicit_target_even_when_bound_live() {
+    let h = sealed_harness(); // default is sealed
+    let create = h
+        .handler
+        .handle_async(
+            &h.session,
+            &RpcRequest::new(12, "domains.create", json!({"name":"other-live"})),
+        )
+        .await;
+    assert!(create.error.is_none(), "{:?}", create.error);
+    call(&h, "domains.use", json!({"name":"other-live"}));
+    let denied = h.handler.handle(
+        &h.session,
+        &RpcRequest::new(
+            13,
+            "domain_data.update",
+            json!({"domain":"default","entries":[{"path":"/extra","value":"x"}]}),
+        ),
+    );
+    assert!(denied.error.unwrap().message.contains("loaded case"));
+    assert_eq!(call(&h, "status.get", json!({}))["domain"], "other-live");
+}

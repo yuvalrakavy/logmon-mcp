@@ -6,6 +6,8 @@ pub const SEQ_BLOCK_SIZE: u64 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_watches: Vec<PersistedWatch>,
     #[serde(default)]
     pub triggers: Vec<PersistedTrigger>,
     #[serde(default)]
@@ -23,7 +25,17 @@ pub struct PersistedSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWatch {
+    pub domain: String,
+    pub scope: Option<String>,
+    pub triggers: Vec<PersistedTrigger>,
+    pub filters: Vec<PersistedFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedBookmark {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     /// Bare bookmark name (NOT the qualified `session/name` form). The owning
     /// session is implicit in [`PersistedSession`]'s map key.
     pub name: String,

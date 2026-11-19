@@ -84,6 +84,20 @@ fn workload() -> Value {
     })
 }
 
+async fn daemon_with_otlp() -> TestDaemonHandle {
+    let free = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        l.local_addr().expect("bound").port()
+    };
+    let config = DaemonConfig {
+        gelf_port: 0,
+        otlp_grpc_port: free(),
+        otlp_http_port: free(),
+        ..Default::default()
+    };
+    TestDaemonHandle::spawn_with_real_receivers_config(config).await
+}
+
 async fn otlp_http_port(d: &TestDaemonHandle) -> u16 {
     let mut client = d.connect_anon().await;
     let result: Value = client.call("status.get", json!({})).await.expect("status");
@@ -144,17 +158,7 @@ async fn the_driving_workflow_over_a_real_daemon() {
     // (it does mean kernel-assigned for GELF). So a free port is picked here
     // and handed over, which also keeps this off 4317/4318 and out of the way
     // of a developer's own daemon.
-    let free = || {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-        l.local_addr().expect("bound").port()
-    };
-    let config = DaemonConfig {
-        gelf_port: 0,
-        otlp_grpc_port: free(),
-        otlp_http_port: free(),
-        ..Default::default()
-    };
-    let d = TestDaemonHandle::spawn_with_real_receivers_config(config).await;
+    let d = daemon_with_otlp().await;
     let port = otlp_http_port(&d).await;
 
     let mut client = d.connect_named("perf", None).await;
@@ -235,4 +239,39 @@ async fn the_driving_workflow_over_a_real_daemon() {
     assert_eq!(profiled["sampled"]["self_ms"], 600.0);
 
     d.shutdown().await;
+}
+
+#[tokio::test]
+async fn otlp_span_fires_a_scoped_trigger_outside_its_sessions_bound_domain() {
+    let daemon = daemon_with_otlp().await;
+    let port = otlp_http_port(&daemon).await;
+    let mut caller = daemon.connect_anon().await;
+    let _: Value = caller
+        .call("domains.create", json!({"name":"lane"}))
+        .await
+        .unwrap();
+    let _: Value = caller
+        .call("domains.use", json!({"name":"lane"}))
+        .await
+        .unwrap();
+    let added: Value = caller
+        .call(
+            "triggers.add",
+            json!({
+                "domain":"default","scope":"load","filter":"d>=10","oneshot":true,
+                "post_window":0,"pre_window":0
+            }),
+        )
+        .await
+        .unwrap();
+    post_spans(port, &workload()).await;
+    let notice = caller
+        .expect_trigger_fired(added["id"].as_u64().unwrap() as u32)
+        .await;
+    assert_eq!(notice.params["domain"], "default");
+    assert_eq!(notice.params["scope"], "load");
+    assert!(notice.params["matched_entry"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("[span]"));
 }

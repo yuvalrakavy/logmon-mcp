@@ -180,3 +180,34 @@ async fn logmon_domain_env_scopes_the_invocation() {
         "--domain must override LOGMON_DOMAIN"
     );
 }
+
+#[tokio::test]
+async fn reading_an_explicit_domain_leaves_the_cli_sessions_binding_alone() {
+    let (daemon, cli) = spawn_with_cli().await;
+    assert!(run(&cli, &["domains", "create", "--name", "blue"])
+        .await
+        .status
+        .success());
+    let out = run(
+        &cli,
+        &[
+            "--session",
+            "desk",
+            "--domain",
+            "blue",
+            "logs",
+            "recent",
+            "--json",
+        ],
+    )
+    .await;
+    assert!(out.status.success(), "{out:?}");
+    let mut session = daemon.connect_named("desk", None).await;
+    let info: serde_json::Value = session
+        .call("status.get", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(info["current_domain"], "default", "polling rebound desk");
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["domain"], "blue");
+}

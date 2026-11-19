@@ -686,7 +686,7 @@ fn emit(reply: &Value, json: bool) {
 }
 
 /// Run one command. `argv` is everything after the global flags.
-pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
+pub async fn dispatch(broker: &Broker, argv: &[String], json: bool, domain: Option<&str>) -> i32 {
     let entries = match fetch_manifest(broker).await {
         Ok(e) => e,
         Err(e) => {
@@ -746,6 +746,11 @@ pub async fn dispatch(broker: &Broker, argv: &[String], json: bool) -> i32 {
             return 1;
         }
     };
+
+    if let Err(error) = super::route_command(broker, m.entry, &mut params, domain).await {
+        format::error(&error, json);
+        return 1;
+    }
 
     // A local output path is consumed here, never forwarded: the daemon would
     // resolve it against its own working directory.
@@ -1293,7 +1298,10 @@ mod tests {
         });
 
         let e = coerce(r#"["a","b"]"#, Some(&schema)).expect_err("refused");
-        assert!(e.contains("REPETITION"), "the error must say what to do: {e}");
+        assert!(
+            e.contains("REPETITION"),
+            "the error must say what to do: {e}"
+        );
 
         // An ordinary value still passes, or the check above would be satisfied
         // by refusing everything.

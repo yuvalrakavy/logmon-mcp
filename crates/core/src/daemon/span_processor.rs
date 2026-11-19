@@ -71,16 +71,24 @@ pub fn process_span_for_domain(
     // per-session cost (`benches/span_ingest.rs`). `match_count` is now
     // incremented inside `evaluate_span`, at match time, exactly as the log
     // path does it.
-    let session_ids = sessions.active_session_ids_for_domain(domain);
+    let watches = sessions.watches_for_domain(domain, false);
     let mut any_oneshot_removed = false;
-    for sid in &session_ids {
-        for trigger in sessions.evaluate_span_triggers(sid, span) {
+    for (sid, scope, pinned, watch) in &watches {
+        for trigger in watch.triggers.evaluate_span(span) {
             let trace_summary = build_trace_summary(span.trace_id, store);
-            let event = SessionRegistry::build_span_event(sid, span, &trigger, trace_summary);
+            let event = SessionRegistry::build_scoped_span_event(
+                sid,
+                domain,
+                scope.clone(),
+                *pinned,
+                span,
+                &trigger,
+                trace_summary,
+            );
             sessions.send_or_queue_notification(sid, event.clone());
             pipeline.send_event(event);
             if trigger.oneshot {
-                let _ = sessions.remove_trigger(sid, trigger.id);
+                let _ = watch.triggers.remove(trigger.id);
                 any_oneshot_removed = true;
             }
         }

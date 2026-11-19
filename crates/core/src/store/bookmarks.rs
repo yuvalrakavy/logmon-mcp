@@ -5,6 +5,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct Bookmark {
+    pub scope: Option<String>,
     pub qualified_name: String,
     pub name: String,
     pub session: String,
@@ -48,11 +49,17 @@ pub enum BookmarkError {
 /// [`CursorCommit::commit`] or dropped (which is a no-op — the cursor stays at
 /// its current position). The `#[must_use]` reminds callers to handle the
 /// result of the query phase.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BookmarkKey {
+    scope: Option<String>,
+    qualified: String,
+}
+
 #[derive(Debug)]
 #[must_use = "CursorCommit must be committed or explicitly dropped after the query phase"]
 pub struct CursorCommit {
-    bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,
-    qualified_name: String,
+    bookmarks: Arc<RwLock<HashMap<BookmarkKey, Bookmark>>>,
+    key: BookmarkKey,
     session: String,
     name: String,
     lower_bound: u64,
@@ -92,7 +99,7 @@ impl CursorCommit {
             return;
         }
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        match map.get_mut(&self.qualified_name) {
+        match map.get_mut(&self.key) {
             Some(b) => {
                 if b.seq == self.lower_bound && b.late_mark == self.late_mark {
                     b.seq = seq;
@@ -102,9 +109,10 @@ impl CursorCommit {
             None if seq != self.lower_bound => {
                 // Evicted during the lock-free query phase — re-insert at the new position.
                 map.insert(
-                    self.qualified_name.clone(),
+                    self.key.clone(),
                     Bookmark {
-                        qualified_name: self.qualified_name.clone(),
+                        qualified_name: self.key.qualified.clone(),
+                        scope: self.key.scope.clone(),
                         session: self.session.clone(),
                         name: self.name.clone(),
                         seq,
@@ -125,21 +133,36 @@ impl CursorCommit {
 /// arbitrary entry is dropped to make room (HashSet has no insertion order).
 const MAX_RECENTLY_EVICTED: usize = 1024;
 
+#[derive(Clone)]
 pub struct BookmarkStore {
-    bookmarks: Arc<RwLock<HashMap<String, Bookmark>>>,
+    scope: Option<String>,
+    bookmarks: Arc<RwLock<HashMap<BookmarkKey, Bookmark>>>,
     /// Tracks names removed by `sweep` since the last call to
     /// `cursor_read_and_advance` for that name. Lets the primitive distinguish
     /// "fresh auto-create" from "post-eviction auto-recreate" so we can WARN
     /// in the latter case. Bounded to `MAX_RECENTLY_EVICTED` entries; arbitrary
     /// victim dropped when over.
-    recently_evicted: Mutex<HashSet<String>>,
+    recently_evicted: Arc<Mutex<HashSet<BookmarkKey>>>,
 }
 
 impl BookmarkStore {
+    pub fn scoped(&self, scope: Option<&str>) -> Self {
+        Self {
+            scope: scope.map(str::to_owned),
+            ..self.clone()
+        }
+    }
+    fn key(&self, qualified: &str) -> BookmarkKey {
+        BookmarkKey {
+            scope: self.scope.clone(),
+            qualified: qualified.into(),
+        }
+    }
     pub fn new() -> Self {
         Self {
             bookmarks: Arc::new(RwLock::new(HashMap::new())),
-            recently_evicted: Mutex::new(HashSet::new()),
+            scope: None,
+            recently_evicted: Arc::default(),
         }
     }
 }
@@ -237,6 +260,7 @@ impl BookmarkStore {
         }
         let qualified_name = format!("{session}/{name}");
         let bookmark = Bookmark {
+            scope: self.scope.clone(),
             qualified_name: qualified_name.clone(),
             name: name.to_string(),
             session: session.to_string(),
@@ -248,11 +272,12 @@ impl BookmarkStore {
             floor: seq,
         };
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        let existed = map.contains_key(&qualified_name);
+        let key = self.key(&qualified_name);
+        let existed = map.contains_key(&key);
         if existed && !replace {
             return Err(BookmarkError::AlreadyExists(qualified_name));
         }
-        map.insert(qualified_name, bookmark.clone());
+        map.insert(key, bookmark.clone());
         Ok((bookmark, existed))
     }
 
@@ -267,25 +292,42 @@ impl BookmarkStore {
     /// source of truth at startup.
     pub fn insert_persisted(&self, bookmark: Bookmark) {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        map.insert(bookmark.qualified_name.clone(), bookmark);
+        map.insert(
+            BookmarkKey {
+                scope: bookmark.scope.clone(),
+                qualified: bookmark.qualified_name.clone(),
+            },
+            bookmark,
+        );
+    }
+
+    pub fn list_all_scopes(&self) -> Vec<Bookmark> {
+        self.list_matching(|_| true)
     }
 
     pub fn list(&self) -> Vec<Bookmark> {
+        self.list_matching(|bookmark| bookmark.scope == self.scope)
+    }
+
+    fn list_matching(&self, include: impl Fn(&Bookmark) -> bool) -> Vec<Bookmark> {
         let map = self.bookmarks.read().expect("bookmarks lock poisoned");
-        let mut v: Vec<Bookmark> = map.values().cloned().collect();
-        // Newest seq first; tie-break on qualified_name so equal-seq ordering
-        // is deterministic (HashMap iteration order is not).
-        v.sort_by(|a, b| {
+        let mut entries: Vec<_> = map
+            .values()
+            .filter(|bookmark| include(bookmark))
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| {
             b.seq
                 .cmp(&a.seq)
                 .then_with(|| a.qualified_name.cmp(&b.qualified_name))
+                .then_with(|| a.scope.cmp(&b.scope))
         });
-        v
+        entries
     }
 
     pub fn remove(&self, qualified_name: &str) -> Result<(), BookmarkError> {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        map.remove(qualified_name)
+        map.remove(&self.key(qualified_name))
             .map(|_| ())
             .ok_or_else(|| BookmarkError::NotFound(qualified_name.to_string()))
     }
@@ -300,7 +342,7 @@ impl BookmarkStore {
     ///   observes the eviction signal atomically with the entry's removal.
     pub fn sweep(&self, log_lost_below: u64, span_lost_below: u64) {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        let evicted: Vec<String> = map
+        let evicted: Vec<BookmarkKey> = map
             .iter()
             .filter(|(_, b)| should_evict(b.seq, log_lost_below, span_lost_below))
             .map(|(k, _)| k.clone())
@@ -327,16 +369,22 @@ impl BookmarkStore {
     /// Remove every bookmark whose `session` field equals `session`.
     /// Returns the number of bookmarks removed.
     pub fn clear_session(&self, session: &str) -> usize {
+        self.clear_session_inner(session, true)
+    }
+    pub fn clear_scope(&self, session: &str) -> usize {
+        self.clear_session_inner(session, false)
+    }
+    fn clear_session_inner(&self, session: &str, all: bool) -> usize {
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
         let before = map.len();
-        map.retain(|_, b| b.session != session);
+        map.retain(|key, b| b.session != session || !all && key.scope != self.scope);
         // Its record of evicted cursors goes too: kept, a later session of the same name got a
         // "cursor was evicted" warning for a cursor it never had. (Lock order as `sweep`.)
         let prefix = format!("{session}/");
         self.recently_evicted
             .lock()
             .expect("recently_evicted poisoned")
-            .retain(|q| !q.starts_with(&prefix));
+            .retain(|q| !q.qualified.starts_with(&prefix) || !all && q.scope != self.scope);
         before - map.len()
     }
 
@@ -351,7 +399,7 @@ impl BookmarkStore {
             return 0;
         }
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        let keys: Vec<String> = map
+        let keys: Vec<BookmarkKey> = map
             .iter()
             .filter(|(_, b)| b.session == old)
             .map(|(k, _)| k.clone())
@@ -360,7 +408,13 @@ impl BookmarkStore {
             let mut b = map.remove(key).expect("listed under the same lock");
             b.session = new.to_string();
             b.qualified_name = format!("{new}/{}", b.name);
-            map.insert(b.qualified_name.clone(), b);
+            map.insert(
+                BookmarkKey {
+                    scope: key.scope.clone(),
+                    qualified: b.qualified_name.clone(),
+                },
+                b,
+            );
         }
         // Its record of evicted cursors moves with it, so a cursor evicted before the rename
         // still warns when it is recreated after it. (Lock order as `sweep`.)
@@ -369,14 +423,17 @@ impl BookmarkStore {
             .recently_evicted
             .lock()
             .expect("recently_evicted poisoned");
-        let moved: Vec<String> = recent
+        let moved: Vec<BookmarkKey> = recent
             .iter()
-            .filter(|q| q.starts_with(&old_prefix))
+            .filter(|q| q.qualified.starts_with(&old_prefix))
             .cloned()
             .collect();
         for q in moved {
             recent.remove(&q);
-            recent.insert(format!("{new}/{}", &q[old_prefix.len()..]));
+            recent.insert(BookmarkKey {
+                scope: q.scope,
+                qualified: format!("{new}/{}", &q.qualified[old_prefix.len()..]),
+            });
         }
         keys.len()
     }
@@ -386,7 +443,7 @@ impl BookmarkStore {
         self.bookmarks
             .read()
             .expect("bookmarks lock poisoned")
-            .get(qualified_name)
+            .get(&self.key(qualified_name))
             .cloned()
     }
 
@@ -413,7 +470,8 @@ impl BookmarkStore {
     ) -> (u64, CursorCommit) {
         let qualified_name = format!("{session}/{name}");
         let mut map = self.bookmarks.write().expect("bookmarks lock poisoned");
-        let (lower_bound, late_mark, floor) = match map.get(&qualified_name) {
+        let key = self.key(&qualified_name);
+        let (lower_bound, late_mark, floor) = match map.get(&key) {
             Some(b) => (b.seq, b.late_mark, b.floor),
             None => {
                 // Check whether this is a post-eviction auto-recreate.
@@ -424,7 +482,7 @@ impl BookmarkStore {
                         .recently_evicted
                         .lock()
                         .expect("recently_evicted poisoned");
-                    recent.remove(&qualified_name)
+                    recent.remove(&key)
                 };
                 if was_evicted {
                     tracing::warn!(
@@ -438,8 +496,9 @@ impl BookmarkStore {
                     );
                 }
                 map.insert(
-                    qualified_name.clone(),
+                    key.clone(),
                     Bookmark {
+                        scope: self.scope.clone(),
                         qualified_name: qualified_name.clone(),
                         session: session.to_string(),
                         name: name.to_string(),
@@ -458,7 +517,7 @@ impl BookmarkStore {
             lower_bound,
             CursorCommit {
                 bookmarks: self.bookmarks.clone(),
-                qualified_name,
+                key,
                 session: session.to_string(),
                 name: name.to_string(),
                 lower_bound,
@@ -479,20 +538,20 @@ mod tests {
     fn the_record_of_evicted_cursors_follows_the_session() {
         let store = BookmarkStore::new();
         for q in ["old/cur", "other/cur"] {
-            store.recently_evicted.lock().unwrap().insert(q.into());
+            store.recently_evicted.lock().unwrap().insert(store.key(q));
         }
         store.rename_session("old", "new");
         {
             let r = store.recently_evicted.lock().unwrap();
-            assert!(r.contains("new/cur"), "{r:?}");
-            assert!(!r.contains("old/cur"), "{r:?}");
-            assert!(r.contains("other/cur"), "{r:?}");
+            assert!(r.contains(&store.key("new/cur")), "{r:?}");
+            assert!(!r.contains(&store.key("old/cur")), "{r:?}");
+            assert!(r.contains(&store.key("other/cur")), "{r:?}");
         }
         store.clear_session("new");
         let r = store.recently_evicted.lock().unwrap();
-        assert!(!r.contains("new/cur"), "{r:?}");
+        assert!(!r.contains(&store.key("new/cur")), "{r:?}");
         assert!(
-            r.contains("other/cur"),
+            r.contains(&store.key("other/cur")),
             "another session's record is untouched: {r:?}"
         );
     }

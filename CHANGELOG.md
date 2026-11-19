@@ -5,6 +5,10 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Explicit domains and scoped investigation state
+
+Pass `domain` on individual MCP reads and watches when several callers share a connection. Successful replies identify the serving domain. Pass a caller-specific `scope` to isolate named cursors and bookmarks and to identify trigger notifications.
+
 ### Added — read-only progress for parallel test runs
 
 Query a domain’s current run, active executions, verdicts, cases and recent runs using the CLI or MCP. Domain listings expose a compact active-run projection. Runners can supply a planned execution count at begin. See the [progress API](docs/test-log-progress.md).

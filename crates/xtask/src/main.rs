@@ -55,7 +55,7 @@ fn verify_schema(expected: &PathBuf) -> anyhow::Result<()> {
 }
 
 fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
-    let schema = json!({
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "logmon-broker-protocol-v1",
         "description": format!("logmon broker JSON-RPC protocol, PROTOCOL_VERSION = {}", PROTOCOL_VERSION),
@@ -258,6 +258,39 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
             "BookmarkInfo":          schema_for!(BookmarkInfo),
         }
     });
+    // These two fields belong to the request routing envelope, independently
+    // of each handler's payload (which can itself deny unknown fields).
+    let defs = schema["definitions"]
+        .as_object_mut()
+        .expect("definitions map");
+    for tool in mcp_tools::TOOLS
+        .iter()
+        .filter(|t| mcp_tools::supports_explicit_domain(t.method))
+    {
+        let name = tool.definition_name();
+        let request = defs.get_mut(&name).expect("every tool has an input schema");
+        request["properties"]["domain"] = json!({
+            "type": "string", "description": "Existing domain to use for this call. Omit to use the session binding."
+        });
+        request["properties"]["scope"] = json!({
+            "type": "string", "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
+        });
+        let response = defs
+            .entry(format!("{name}Result"))
+            .or_insert_with(|| json!({"type":"object"}));
+        response["properties"]["domain"] =
+            json!({"type":"string", "description":"Domain that answered this call."});
+        let required = response
+            .as_object_mut()
+            .unwrap()
+            .entry("required")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("required property names");
+        if !required.iter().any(|k| k == "domain") {
+            required.push(json!("domain"));
+        }
+    }
     let pretty = serde_json::to_string_pretty(&schema)?;
     fs::write(out, format!("{pretty}\n"))?;
     println!("wrote {}", out.display());

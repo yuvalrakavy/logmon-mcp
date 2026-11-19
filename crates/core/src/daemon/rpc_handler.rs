@@ -173,6 +173,38 @@ fn validate_sizes(initial: usize, maximum: Option<usize>) -> Result<(), String> 
     Ok(())
 }
 
+/// One dispatch keeps the real session identity and a strong reference to its resolved lane.
+struct CallContext<'a> {
+    session: &'a SessionId,
+    target: Option<Arc<Domain>>,
+    scope: Option<&'a str>,
+    explicit: bool,
+}
+
+impl std::ops::Deref for CallContext<'_> {
+    type Target = SessionId;
+    fn deref(&self) -> &SessionId {
+        self.session
+    }
+}
+
+impl<'a> CallContext<'a> {
+    fn collector_pin(&self) -> Option<&DomainId> {
+        self.target
+            .as_ref()
+            .filter(|_| self.explicit)
+            .map(|domain| domain.id())
+    }
+    fn unscoped(session: &'a SessionId) -> Self {
+        Self {
+            session,
+            target: None,
+            scope: None,
+            explicit: false,
+        }
+    }
+}
+
 pub struct RpcHandler {
     /// The set of live domains. Every query resolves its bound domain out of
     /// here at the RPC boundary (see [`Self::resolve_domain`]); the store-level
@@ -257,7 +289,10 @@ impl RpcHandler {
     /// holds the registry lock — that is what makes delete-while-bound
     /// graceful. Returns the reader-side vanished-domain error (no silent
     /// fallback to `default`, §5) if the binding points at a deleted domain.
-    fn resolve_domain(&self, session_id: &SessionId) -> Result<Arc<Domain>, String> {
+    fn resolve_domain(&self, session_id: &CallContext<'_>) -> Result<Arc<Domain>, String> {
+        if let Some(target) = &session_id.target {
+            return Ok(target.clone());
+        }
         let id = self.sessions.domain_of(session_id);
         self.domains
             .get(&id)
@@ -418,7 +453,8 @@ impl RpcHandler {
         // The case's own era, not a freshly minted one: preserved seqs are
         // meaningless without the incarnation they belong to.
         if let Some(inc) = &case.front.incarnation {
-            let _ = registry.set_reserved("/logmon/incarnation", inc.clone(), case.front.captured_at);
+            let _ =
+                registry.set_reserved("/logmon/incarnation", inc.clone(), case.front.captured_at);
         }
 
         let info = PostmortemInfo {
@@ -443,7 +479,8 @@ impl RpcHandler {
                     otlp_grpc_port: 0,
                     otlp_http_port: 0,
                     log_buffer_size: case.front.logdata.as_ref().map_or(0, |r| r.records) as usize,
-                    span_buffer_size: case.front.spandata.as_ref().map_or(0, |r| r.records) as usize,
+                    span_buffer_size: case.front.spandata.as_ref().map_or(0, |r| r.records)
+                        as usize,
                     // Ephemeral, NOT Config: `domains.delete` refuses Config, and
                     // deleting the domain is the only honest way to discard a case.
                     source: DomainSource::Ephemeral,
@@ -470,14 +507,18 @@ impl RpcHandler {
     /// The `omit_logdata` / `omit_spandata` docs already promised this refusal;
     /// a deep gate found only the MUTATORS were guarded, so the promise was the
     /// only thing standing between a reader and that silence.
-    fn require_evidence(&self, session_id: &SessionId, spans: bool) -> Result<(), String> {
+    fn require_evidence(&self, session_id: &CallContext<'_>, spans: bool) -> Result<(), String> {
         let Ok(d) = self.resolve_domain(session_id) else {
             return Ok(());
         };
         let Some(pm) = &d.postmortem else {
             return Ok(());
         };
-        let omitted = if spans { pm.spans_omitted } else { pm.logs_omitted };
+        let omitted = if spans {
+            pm.spans_omitted
+        } else {
+            pm.logs_omitted
+        };
         if !omitted {
             return Ok(());
         }
@@ -513,7 +554,7 @@ impl RpcHandler {
     /// is enforced by there being no such call. They are about operations that
     /// would be **inert**: accepted, silently doing nothing, and reading to the
     /// caller as a thing that happened.
-    fn require_live(&self, session_id: &SessionId, op: &str) -> Result<(), String> {
+    fn require_live(&self, session_id: &CallContext<'_>, op: &str) -> Result<(), String> {
         // **A `?` here would change six handlers' contract.** `filters.edit` and
         // the collector verbs are session-keyed and deliberately do NOT require
         // a resolvable bound domain — session config is global, only data is
@@ -575,8 +616,44 @@ impl RpcHandler {
         ))
     }
 
+    fn resolve_call<'a>(
+        &self,
+        session: &'a SessionId,
+        request: &'a RpcRequest,
+    ) -> Result<CallContext<'a>, String> {
+        if !logmon_broker_protocol::mcp_tools::supports_explicit_domain(&request.method) {
+            return Ok(CallContext::unscoped(session));
+        }
+        let scope = opt_str(&request.params, "scope")?;
+        let name = opt_str(&request.params, "domain")?;
+        let id = match name {
+            Some(name) => {
+                DomainId::new(name).map_err(|e| format!("invalid domain {name:?}: {e}"))?
+            }
+            None => self.sessions.domain_of(session),
+        };
+        let domain = self.domains.get(&id).ok_or_else(|| match name {
+            Some(_) => format!("unknown domain \"{id}\""),
+            None => format!("domain \"{id}\" no longer exists — use_domain to rebind"),
+        })?;
+        if name.is_some() {
+            self.sessions.record_domain_touch(session, domain.id());
+        }
+        Ok(CallContext {
+            session,
+            target: Some(domain),
+            scope,
+            explicit: name.is_some(),
+        })
+    }
+
     /// Handle an RPC request for a given session.
     pub fn handle(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
+        let context = match self.resolve_call(session_id, request) {
+            Ok(context) => context,
+            Err(message) => return RpcResponse::error(request.id, -32602, &message),
+        };
+        let session_id = &context;
         let result = match request.method.as_str() {
             "test_log.status" | "test_log.list" => self.handle_test_log_query(session_id, &request.method, &request.params),
             name if name.starts_with("test_log.") => self.handle_test_log(session_id, name, &request.params),
@@ -648,7 +725,14 @@ impl RpcHandler {
         };
 
         match result {
-            Ok(value) => RpcResponse::success(request.id, Self::maybe_render(request, value)),
+            Ok(mut value) => {
+                if let Some(target) = &context.target {
+                    if value.get("domain").is_none() {
+                        value["domain"] = json!(target.id().to_string());
+                    }
+                }
+                RpcResponse::success(request.id, Self::maybe_render(request, value))
+            }
             Err(msg) => RpcResponse::error(request.id, -32601, &msg),
         }
     }
@@ -694,7 +778,7 @@ impl RpcHandler {
 
     fn handle_test_log(
         &self,
-        sid: &SessionId,
+        sid: &CallContext<'_>,
         method: &str,
         params: &Value,
     ) -> Result<Value, String> {
@@ -710,7 +794,7 @@ impl RpcHandler {
 
     async fn handle_test_log_close(
         &self,
-        sid: &SessionId,
+        sid: &CallContext<'_>,
         request: &RpcRequest,
     ) -> Result<Value, String> {
         use std::time::{Duration, Instant};
@@ -777,7 +861,10 @@ impl RpcHandler {
     /// `domains.list` — delegates to the synchronous [`Self::handle`].
     pub async fn handle_async(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         if matches!(request.method.as_str(), "test_log.close" | "test_log.seal") {
-            return match self.handle_test_log_close(session_id, request).await {
+            return match self
+                .handle_test_log_close(&CallContext::unscoped(session_id), request)
+                .await
+            {
                 Ok(value) => RpcResponse::success(request.id, value),
                 Err(error) => RpcResponse::error(request.id, -32601, &error),
             };
@@ -1279,7 +1366,7 @@ impl RpcHandler {
     /// disconnect and be readable by whoever captures the case later.
     fn resolve_domain_data(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
     ) -> Result<(String, Arc<crate::domain_data::persist::DomainRegistry>), String> {
         let store = self
             .domain_data
@@ -1318,7 +1405,7 @@ impl RpcHandler {
     /// `DomainDataRejection::SigilNotAllowedHere` already says so.
     fn apply_data_entries(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         raw: Option<&Value>,
     ) -> Result<(Vec<DomainDataOutcome>, Option<String>), String> {
         let (_, reg) = self.resolve_domain_data(session_id)?;
@@ -1347,7 +1434,7 @@ impl RpcHandler {
     /// capture that records nothing new is ordinary.
     fn apply_case_data_entries(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         raw: Option<&Value>,
     ) -> Result<(Vec<DomainDataOutcome>, Option<String>, ScopedData), String> {
         // Absent and empty are the same request here, and neither is an error:
@@ -1401,7 +1488,7 @@ impl RpcHandler {
 
     fn handle_domain_data_update(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "update_domain_data")?;
@@ -1416,7 +1503,7 @@ impl RpcHandler {
 
     fn handle_domain_data_remove(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "remove_domain_data")?;
@@ -1442,7 +1529,7 @@ impl RpcHandler {
 
     fn handle_domain_data_get(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
@@ -1516,7 +1603,7 @@ impl RpcHandler {
     /// Dispose the BOUND domain's data — logs AND spans — keeping the domain and
     /// its receivers alive; seq stays monotonic. (`logs.clear` is the logs-only,
     /// back-compat cousin.)
-    fn handle_domains_clear(&self, session_id: &SessionId) -> Result<Value, String> {
+    fn handle_domains_clear(&self, session_id: &CallContext<'_>) -> Result<Value, String> {
         self.require_live(session_id, "clear_domain")?;
         let d = self.resolve_domain(session_id)?;
         let estimated_memory_bytes_before =
@@ -1555,7 +1642,7 @@ impl RpcHandler {
     fn parse_and_resolve_filter(
         &self,
         filter_str: Option<&str>,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         d: &Domain,
     ) -> Result<
         (
@@ -1575,7 +1662,7 @@ impl RpcHandler {
         // numbered before it existed are not this cursor's to count as lost (gh #23).
         let resolved = crate::filter::bookmark_resolver::resolve_bookmarks_at(
             parsed,
-            &d.bookmarks,
+            &d.bookmarks.scoped(session_id.scope),
             &session_id.to_string(),
             d.pipeline.late_counter(),
         )
@@ -1590,7 +1677,7 @@ impl RpcHandler {
     fn parse_and_resolve_filter_without_cursor(
         &self,
         filter_str: Option<&str>,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         d: &Domain,
         method: &str,
     ) -> Result<Option<crate::filter::parser::ParsedFilter>, String> {
@@ -1614,7 +1701,11 @@ impl RpcHandler {
     /// look correct on any fixture smaller than the default. Hence
     /// `for_each_log`, which also avoids cloning a record per match for data
     /// folded and discarded.
-    fn handle_logs_fields(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_logs_fields(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let filter_string = opt_str(params, "filter")?.unwrap_or("ALL");
@@ -1645,22 +1736,22 @@ impl RpcHandler {
             crate::filter::parser::parse_filter(filter_string).map_err(|e| e.to_string())?
         };
         if crate::filter::parser::contains_cursor_qualifier(&parsed) {
-            return Err("cursor qualifier not permitted in logs.fields; use b>= for a \
+            return Err(
+                "cursor qualifier not permitted in logs.fields; use b>= for a \
                         read-only window"
-                .to_string());
+                    .to_string(),
+            );
         }
         let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
             parsed,
-            &d.bookmarks,
+            &d.bookmarks.scoped(session_id.scope),
             &session_id.to_string(),
         )
         .map_err(|e| e.to_string())?
         .filter;
 
         let mut map = crate::logs::fields::FieldMap::new();
-        let (counts, stats) = d
-            .pipeline
-            .for_each_log(Some(&resolved), |e| map.observe(e));
+        let (counts, stats) = d.pipeline.for_each_log(Some(&resolved), |e| map.observe(e));
         let names_capped = map.names_capped();
         let mut fields = map.finish(counts.matched, top_values);
         if min_coverage_pct > 0.0 {
@@ -1691,7 +1782,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_logs_profile(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_logs_profile(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, false)?;
         use crate::logs::profile::{Axis, GroupMap, MAX_KEYS};
 
@@ -1761,22 +1856,22 @@ impl RpcHandler {
             crate::filter::parser::parse_filter(filter_string).map_err(|e| e.to_string())?
         };
         if crate::filter::parser::contains_cursor_qualifier(&parsed) {
-            return Err("cursor qualifier not permitted in logs.profile; use b>= for a \
+            return Err(
+                "cursor qualifier not permitted in logs.profile; use b>= for a \
                         read-only window"
-                .to_string());
+                    .to_string(),
+            );
         }
         let resolved = crate::filter::bookmark_resolver::resolve_bookmarks(
             parsed,
-            &d.bookmarks,
+            &d.bookmarks.scoped(session_id.scope),
             &session_id.to_string(),
         )
         .map_err(|e| e.to_string())?
         .filter;
 
         let mut map = GroupMap::new(axis, keys.clone());
-        let (counts, stats) = d
-            .pipeline
-            .for_each_log(Some(&resolved), |e| map.observe(e));
+        let (counts, stats) = d.pipeline.for_each_log(Some(&resolved), |e| map.observe(e));
 
         let levels = map.levels();
         let bounds = map.bounds();
@@ -1814,7 +1909,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_logs_recent(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_logs_recent(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(50);
@@ -1893,7 +1992,11 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_logs_context(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_logs_context(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let seq = req_u64(params, "seq")?;
@@ -1903,7 +2006,11 @@ impl RpcHandler {
         Ok(json!({ "logs": entries, "count": entries.len() }))
     }
 
-    fn handle_logs_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_logs_export(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
@@ -2045,7 +2152,7 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_logs_clear(&self, session_id: &SessionId) -> Result<Value, String> {
+    fn handle_logs_clear(&self, session_id: &CallContext<'_>) -> Result<Value, String> {
         self.require_live(session_id, "clear_logs")?;
         let d = self.resolve_domain(session_id)?;
         let cleared = d.pipeline.clear_logs();
@@ -2081,7 +2188,7 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_status(&self, session_id: &SessionId) -> Result<Value, String> {
+    fn handle_status(&self, session_id: &CallContext<'_>) -> Result<Value, String> {
         // Neither of the two broker facts below depends on a domain, so they are
         // bound here rather than inside the payload — the placement records that
         // they *could* be served when `resolve_domain` fails.
@@ -2104,10 +2211,13 @@ impl RpcHandler {
         let trace_ingest = d.metrics.trace_ingest_loss();
         // §7 situational awareness: where the session is bound + what is
         // narrowing it, so one call answers "where am I / what's filtering me".
-        let current_domain = self.sessions.domain_of(session_id).to_string();
+        let current_domain = d.id().to_string();
+        let pin = (session_id.explicit || session_id.scope.is_some()).then_some(d.id());
         let active_filters: Vec<String> = self
             .sessions
-            .list_filters(session_id)
+            .watch(session_id, pin, session_id.scope, false)
+            .map_err(|e| e.to_string())?
+            .list_filters()
             .iter()
             .map(|f| f.filter_string.clone())
             .collect();
@@ -2199,8 +2309,22 @@ impl RpcHandler {
     // filters.*
     // -----------------------------------------------------------------------
 
-    fn handle_filters_list(&self, session_id: &SessionId) -> Result<Value, String> {
-        let filters = self.sessions.list_filters(session_id);
+    fn session_watch(
+        &self,
+        ctx: &CallContext<'_>,
+        domain: &Domain,
+        create: bool,
+    ) -> Result<Arc<super::session::WatchState>, String> {
+        let pin = (ctx.explicit || ctx.scope.is_some()).then_some(domain.id());
+        self.sessions
+            .watch(ctx, pin, ctx.scope, create)
+            .map_err(|e| e.to_string())
+    }
+
+    fn handle_filters_list(&self, session_id: &CallContext<'_>) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, false)?;
+        let filters = watch.list_filters();
         let items: Vec<Value> = filters
             .iter()
             .map(|f| {
@@ -2214,29 +2338,36 @@ impl RpcHandler {
         Ok(json!({ "filters": items }))
     }
 
-    fn handle_filters_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_filters_add(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_live(session_id, "add_filter")?;
         let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, true)?;
         let filter = req_str(params, "filter")?;
         refuse_bookmark_qualifier(filter)?;
         let desc = opt_str(params, "description")?;
-        let id = self
-            .sessions
-            .add_filter(session_id, filter, desc)
-            .map_err(|e| e.to_string())?;
+        let id = watch.add_filter(filter, desc).map_err(|e| e.to_string())?;
         sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "id": id }))
     }
 
-    fn handle_filters_edit(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_filters_edit(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_live(session_id, "edit_filter")?;
+        let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, false)?;
         let filter_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
         refuse_bookmark_in_edit(filter)?;
         let desc = opt_str(params, "description")?;
-        let info = self
-            .sessions
-            .edit_filter(session_id, filter_id, filter, desc)
+        let info = watch
+            .edit_filter(filter_id, filter, desc)
             .map_err(|e| e.to_string())?;
         Ok(json!({
             "id": info.id,
@@ -2247,15 +2378,14 @@ impl RpcHandler {
 
     fn handle_filters_remove(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "remove_filter")?;
         let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, false)?;
         let filter_id = req_u32(params, "id")?;
-        self.sessions
-            .remove_filter(session_id, filter_id)
-            .map_err(|e| e.to_string())?;
+        watch.remove_filter(filter_id).map_err(|e| e.to_string())?;
         sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "removed": filter_id }))
     }
@@ -2264,8 +2394,10 @@ impl RpcHandler {
     // triggers.*
     // -----------------------------------------------------------------------
 
-    fn handle_triggers_list(&self, session_id: &SessionId) -> Result<Value, String> {
-        let triggers = self.sessions.list_triggers(session_id);
+    fn handle_triggers_list(&self, session_id: &CallContext<'_>) -> Result<Value, String> {
+        let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, false)?;
+        let triggers = watch.triggers.list();
         let items: Vec<Value> = triggers
             .iter()
             .map(|t| {
@@ -2285,9 +2417,14 @@ impl RpcHandler {
         Ok(json!({ "triggers": items }))
     }
 
-    fn handle_triggers_add(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_triggers_add(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_live(session_id, "add_trigger")?;
         let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, true)?;
         let filter = req_str(params, "filter")?;
         refuse_bookmark_qualifier(filter)?;
         // Omitted windows default to 500/200/5 (§6, decision #4) so an ad-hoc
@@ -2302,9 +2439,9 @@ impl RpcHandler {
             .unwrap_or(crate::engine::trigger::DEFAULT_TRIGGER_NOTIFY_CONTEXT);
         let desc = opt_str(params, "description")?;
         let oneshot = opt_bool(params, "oneshot")?.unwrap_or(false);
-        let id = self
-            .sessions
-            .add_trigger(session_id, filter, pre, post, ctx, desc, oneshot)
+        let id = watch
+            .triggers
+            .add(filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "id": id }))
@@ -2312,11 +2449,12 @@ impl RpcHandler {
 
     fn handle_triggers_edit(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "edit_trigger")?;
         let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, false)?;
         let trigger_id = req_u32(params, "id")?;
         let filter = opt_str(params, "filter")?;
         refuse_bookmark_in_edit(filter)?;
@@ -2328,11 +2466,9 @@ impl RpcHandler {
         let ctx = opt_u32(params, "notify_context")?;
         let desc = opt_str(params, "description")?;
         let oneshot = opt_bool(params, "oneshot")?;
-        let info = self
-            .sessions
-            .edit_trigger(
-                session_id, trigger_id, filter, pre, post, ctx, desc, oneshot,
-            )
+        let info = watch
+            .triggers
+            .edit(trigger_id, filter, pre, post, ctx, desc, oneshot)
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({
@@ -2350,14 +2486,16 @@ impl RpcHandler {
 
     fn handle_triggers_remove(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "remove_trigger")?;
         let d = self.resolve_domain(session_id)?;
+        let watch = self.session_watch(session_id, &d, false)?;
         let trigger_id = req_u32(params, "id")?;
-        self.sessions
-            .remove_trigger(session_id, trigger_id)
+        watch
+            .triggers
+            .remove(trigger_id)
             .map_err(|e| e.to_string())?;
         sync_pre_buffer_size_for_domain(&d.pipeline, &self.sessions, d.id());
         Ok(json!({ "removed": trigger_id }))
@@ -2369,7 +2507,7 @@ impl RpcHandler {
 
     fn handle_traces_recent(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
@@ -2404,7 +2542,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_get(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_traces_get(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let trace_id_hex = req_str(params, "trace_id")?;
@@ -2438,7 +2580,7 @@ impl RpcHandler {
 
     fn handle_traces_summary(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
@@ -2513,7 +2655,11 @@ impl RpcHandler {
         }))
     }
 
-    fn handle_traces_slow(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_traces_slow(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let min_duration = opt_f64(params, "min_duration_ms")?.unwrap_or(100.0);
@@ -2598,7 +2744,11 @@ impl RpcHandler {
         }
     }
 
-    fn handle_traces_logs(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_traces_logs(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         // Reads LOGS, by trace id -- the tool's name says traces.
         self.require_evidence(session_id, false)?;
         let d = self.resolve_domain(session_id)?;
@@ -2639,7 +2789,7 @@ impl RpcHandler {
 
     fn handle_spans_context(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
@@ -2662,7 +2812,11 @@ impl RpcHandler {
     /// carries several hundred kilobytes of JSONL, and handing that back through
     /// a tool result puts the whole thing in the model's context, which is the
     /// outcome §5.2's document/logdata split exists to prevent.
-    fn handle_cases_create(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_cases_create(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_live(session_id, "create_case")?;
         use crate::cases::document as doc;
 
@@ -2755,8 +2909,16 @@ impl RpcHandler {
         // The span scan is unfiltered because the range it would be filtered by
         // is the thing being computed. It is bounded by the ring, and a capture
         // is a deliberate one-shot action rather than a query on a hot path.
-        let mut below: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s < anchor.seq).collect();
-        let mut above: Vec<u64> = log_ctx.iter().map(|e| e.seq).filter(|s| *s > anchor.seq).collect();
+        let mut below: Vec<u64> = log_ctx
+            .iter()
+            .map(|e| e.seq)
+            .filter(|s| *s < anchor.seq)
+            .collect();
+        let mut above: Vec<u64> = log_ctx
+            .iter()
+            .map(|e| e.seq)
+            .filter(|s| *s > anchor.seq)
+            .collect();
         d.span_store.for_each_matching(None, |s| {
             if s.seq < anchor.seq {
                 below.push(s.seq);
@@ -3059,7 +3221,6 @@ impl RpcHandler {
                     chrono_tz::UTC,
                     logs.iter().filter(|_| !omit_logdata),
                     spans.iter().filter(|_| !omit_spandata),
-
                 );
             }
             let doc_bytes = rendered.body.as_bytes().to_vec();
@@ -3074,14 +3235,20 @@ impl RpcHandler {
                     // Bulk first: if evidence fails to land the document must
                     // not point at a file that is not there.
                     if !omit_logdata {
-                        (&f.logdata).write_all(&log_buf).map_err(|e| fail(&f.paths[1], e))?;
+                        (&f.logdata)
+                            .write_all(&log_buf)
+                            .map_err(|e| fail(&f.paths[1], e))?;
                     }
                     if !omit_spandata {
-                        (&f.spandata).write_all(&span_buf).map_err(|e| fail(&f.paths[2], e))?;
+                        (&f.spandata)
+                            .write_all(&span_buf)
+                            .map_err(|e| fail(&f.paths[2], e))?;
                     }
                     let reg_path = dir.join(crate::cases::bundle::registry_entry_name(&stem));
                     std::fs::write(&reg_path, &registry_bytes).map_err(|e| fail(&reg_path, e))?;
-                    (&f.document).write_all(&doc_bytes).map_err(|e| fail(&f.paths[0], e))?;
+                    (&f.document)
+                        .write_all(&doc_bytes)
+                        .map_err(|e| fail(&f.paths[0], e))?;
                     // `claim` creates all three exclusively before the omit flags
                     // are read, so an omitted file would be left at zero bytes —
                     // a third state the format has no name for. `write_jsonl`'s
@@ -3089,10 +3256,8 @@ impl RpcHandler {
                     // header, and `load` treats a missing header as truncation.
                     // Remove them so the directory matches the front matter,
                     // whose key is already absent.
-                    for (omit, path) in [
-                        (omit_logdata, &f.paths[1]),
-                        (omit_spandata, &f.paths[2]),
-                    ] {
+                    for (omit, path) in [(omit_logdata, &f.paths[1]), (omit_spandata, &f.paths[2])]
+                    {
                         if omit {
                             let _ = std::fs::remove_file(path);
                         }
@@ -3161,7 +3326,10 @@ impl RpcHandler {
             stem: files.stem,
             // One path for a bundle, three for the loose form. The caller is
             // told what was actually written rather than a fixed shape.
-            paths: claim_paths.iter().map(|p| p.display().to_string()).collect(),
+            paths: claim_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
             verdict,
             document_bytes,
             // Zeroes for omitted evidence, and the document's absent key is
@@ -3190,7 +3358,7 @@ impl RpcHandler {
     fn resolve_case_anchor(
         &self,
         d: &std::sync::Arc<crate::daemon::domain::Domain>,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         raw: Option<&Value>,
     ) -> Result<crate::cases::document::Anchor, String> {
         use crate::cases::document::Anchor;
@@ -3230,12 +3398,16 @@ impl RpcHandler {
             // `other-session/name` still works, because `qualify` passes a name
             // that already carries a session through unchanged.
             let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
-            let b = d.bookmarks.get(&qualified).ok_or_else(|| {
-                format!(
+            let b = d
+                .bookmarks
+                .scoped(session_id.scope)
+                .get(&qualified)
+                .ok_or_else(|| {
+                    format!(
                     "no bookmark `{qualified}` on this domain. Bookmarks are session-scoped: use \
                      `<session>/{name}` to anchor on another session's mark."
                 )
-            })?;
+                })?;
             // A bookmark marks a BOUNDARY, not a record: `b>=name` selects
             // `seq > bookmark.seq`, strictly. So the anchor is the first stored
             // entry after the mark — the same entry `b>=name` would hand back
@@ -3290,7 +3462,7 @@ impl RpcHandler {
     /// `cases.create` call names the domain for the NEXT capture, not this one:
     /// it appears in this document's registry copy while the stem still comes
     /// from whatever `/case-name` held on entry.
-    fn case_name_for(&self, session_id: &SessionId) -> Option<String> {
+    fn case_name_for(&self, session_id: &CallContext<'_>) -> Option<String> {
         let (_, reg) = self.resolve_domain_data(session_id).ok()?;
         reg.read(|r| {
             r.get(crate::domain_data::CASE_NAME_KEY)
@@ -3307,7 +3479,7 @@ impl RpcHandler {
     /// copy, which the document then states rather than omits.
     fn case_registry_copy(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> (Vec<crate::cases::document::RegistryFact>, Option<String>) {
         let Ok((_, reg)) = self.resolve_domain_data(session_id) else {
@@ -3373,7 +3545,11 @@ impl RpcHandler {
     /// independently of the log pipeline, so the verdict here is computed
     /// against the span store's own `oldest_seq`. A log window reported complete
     /// says nothing about whether the spans over that same range survived.
-    fn handle_spans_export(&self, session_id: &SessionId, params: &Value) -> Result<Value, String> {
+    fn handle_spans_export(
+        &self,
+        session_id: &CallContext<'_>,
+        params: &Value,
+    ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
         let d = self.resolve_domain(session_id)?;
         let count = opt_usize(params, "count")?.unwrap_or(usize::MAX);
@@ -3515,7 +3691,7 @@ impl RpcHandler {
 
     fn handle_bookmarks_add(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
@@ -3537,6 +3713,7 @@ impl RpcHandler {
         // trigger stores late too — those stored before the add are not replayed (gh #23).
         let (bookmark, replaced) = d
             .bookmarks
+            .scoped(session_id.scope)
             .add_at(
                 &session,
                 name,
@@ -3555,7 +3732,7 @@ impl RpcHandler {
 
     fn handle_bookmarks_list(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
@@ -3564,6 +3741,7 @@ impl RpcHandler {
 
         let items: Vec<Value> = d
             .bookmarks
+            .scoped(session_id.scope)
             .list()
             .into_iter()
             .filter(|b| session_filter.is_none_or(|s| b.session == s))
@@ -3584,19 +3762,22 @@ impl RpcHandler {
 
     fn handle_bookmarks_remove(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
         let name = req_str(params, "name")?;
         let qualified = crate::store::bookmarks::qualify(name, &session_id.to_string());
-        d.bookmarks.remove(&qualified).map_err(|e| e.to_string())?;
+        d.bookmarks
+            .scoped(session_id.scope)
+            .remove(&qualified)
+            .map_err(|e| e.to_string())?;
         Ok(json!({ "removed": qualified }))
     }
 
     fn handle_bookmarks_clear(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let d = self.resolve_domain(session_id)?;
@@ -3606,7 +3787,7 @@ impl RpcHandler {
         let session = opt_str(params, "session")?
             .map(str::to_string)
             .unwrap_or_else(|| session_id.to_string());
-        let removed_count = d.bookmarks.clear_session(&session);
+        let removed_count = d.bookmarks.scoped(session_id.scope).clear_scope(&session);
         Ok(json!({ "removed_count": removed_count, "session": session }))
     }
 
@@ -3725,7 +3906,7 @@ impl RpcHandler {
 
     fn handle_collectors_add(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "add_collector")?;
@@ -3741,7 +3922,7 @@ impl RpcHandler {
         // that will never be presented again, so the collector would be
         // unreachable the moment the session disconnected — holding a slice of
         // the daemon-wide reservation that nothing could ever release.
-        if matches!(session_id, SessionId::Anonymous(_)) {
+        if matches!(session_id.session, SessionId::Anonymous(_)) {
             return Err(
                 "collectors require a named session: they outlive a disconnect, and \
                         an anonymous session's identity does not. Call session.start with a \
@@ -3795,7 +3976,7 @@ impl RpcHandler {
             threshold: threshold.flatten(),
         };
 
-        let domain_id = self.sessions.domain_of(session_id);
+        let domain_id = d.id().clone();
         let collector = self
             .collectors
             .add(session_id, &domain_id, d.metrics.clone(), def, Utc::now())
@@ -3837,11 +4018,61 @@ impl RpcHandler {
         Ok(result)
     }
 
-    fn handle_collectors_list(&self, session_id: &SessionId) -> Result<Value, String> {
+    fn live_collector(&self, ctx: &CallContext<'_>, name: &str) -> Result<ArmedCollector, String> {
+        self.collectors
+            .get(ctx, name)
+            .filter(|a| ctx.collector_pin().is_none_or(|target| target == &a.domain))
+            .ok_or_else(|| {
+                format!("no collector named `{name}` in this session and requested domain")
+            })
+    }
+
+    fn recorded_collector(
+        &self,
+        ctx: &CallContext<'_>,
+        name: &str,
+        label: &str,
+    ) -> Result<StoredSnapshot, String> {
+        let snap = self
+            .collectors
+            .get_snapshot(ctx, name, label)
+            .map_err(|e| e.to_string())?;
+        if ctx
+            .collector_pin()
+            .is_some_and(|target| snap.domain.as_deref() != Some(target.as_str()))
+        {
+            return Err(format!(
+                "no snapshot `{name}@{label}` with provenance in the requested domain"
+            ));
+        }
+        Ok(snap)
+    }
+
+    fn collector_history(
+        &self,
+        ctx: &CallContext<'_>,
+        name: &str,
+    ) -> Result<(Vec<StoredSnapshot>, u64), String> {
+        let (mut snaps, evicted) = self
+            .collectors
+            .history(ctx, name)
+            .map_err(|e| e.to_string())?;
+        if let Some(target) = ctx.collector_pin() {
+            snaps.retain(|s| s.domain.as_deref() == Some(target.as_str()));
+        }
+        Ok((snaps, evicted))
+    }
+
+    fn handle_collectors_list(&self, session_id: &CallContext<'_>) -> Result<Value, String> {
         let items: Vec<Value> = self
             .collectors
             .list(session_id)
             .iter()
+            .filter(|a| {
+                session_id
+                    .collector_pin()
+                    .is_none_or(|pin| pin == &a.domain)
+            })
             .map(|a| {
                 let snap = a.collector.snapshot();
                 // §10: the orphan check is LAZY, evaluated here rather than at
@@ -3882,7 +4113,7 @@ impl RpcHandler {
 
     fn handle_collectors_get(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let name = req_str(params, "name")?;
@@ -3897,16 +4128,14 @@ impl RpcHandler {
         // failure this whole surface exists to close.
         let opts = self.profile_options(params)?;
         if let Some(label) = opt_str(params, "snapshot")? {
-            let snap = self
-                .collectors
-                .get_snapshot(session_id, name, label)
-                .map_err(|e| e.to_string())?;
-            return Ok(snapshot_as_profile(&snap, &opts));
+            let snap = self.recorded_collector(session_id, name, label)?;
+            let mut out = snapshot_as_profile(&snap, &opts);
+            if let Some(pin) = snap.domain {
+                out["domain"] = json!(pin);
+            }
+            return Ok(out);
         }
-        let armed = self
-            .collectors
-            .get(session_id, name)
-            .ok_or_else(|| format!("no collector named `{name}` in this session"))?;
+        let armed = self.live_collector(session_id, name)?;
         let result = crate::collector::project::profile(
             &armed.collector.snapshot(),
             self.ingest_basis(&armed),
@@ -3914,6 +4143,7 @@ impl RpcHandler {
             Utc::now(),
         );
         let mut out = serde_json::to_value(result).map_err(|e| e.to_string())?;
+        out["domain"] = json!(armed.domain.as_str());
         // Only on a live read. A rolling window is live state, so a recorded run
         // has none — and reporting the LIVE verdict beside a recorded run's
         // numbers would attach a fact about now to a window that closed.
@@ -3925,7 +4155,7 @@ impl RpcHandler {
 
     fn handle_collectors_edit(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "edit_collector")?;
@@ -4040,7 +4270,7 @@ impl RpcHandler {
 
     fn handle_collectors_snapshot(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "snapshot_collector")?;
@@ -4052,7 +4282,7 @@ impl RpcHandler {
         };
         let snap = self
             .collectors
-            .snapshot(
+            .snapshot_in_domain(
                 session_id,
                 SnapshotRequest {
                     name: name.to_string(),
@@ -4073,6 +4303,7 @@ impl RpcHandler {
                     now: Utc::now(),
                 },
                 crate::collector::project::project_for_snapshot,
+                session_id.collector_pin(),
             )
             .map_err(|e| e.to_string())?;
         let mut out = snapshot_summary(&snap.snapshot);
@@ -4092,14 +4323,11 @@ impl RpcHandler {
 
     fn handle_collectors_history(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         let name = req_str(params, "name")?;
-        let (mut snapshots, evicted) = self
-            .collectors
-            .history(session_id, name)
-            .map_err(|e| e.to_string())?;
+        let (mut snapshots, evicted) = self.collector_history(session_id, name)?;
         // `limit` takes the most RECENT n, then they are presented oldest
         // first — the order a sequence of runs is read in.
         if let Some(limit) = opt_usize(params, "limit")? {
@@ -4158,7 +4386,7 @@ impl RpcHandler {
     /// `collectors.diff` — compare two arms (§5.6).
     fn handle_collectors_diff(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         use crate::collector::diff::{diff, DiffAllowances, DiffGroupBy, DiffOptions};
@@ -4195,7 +4423,7 @@ impl RpcHandler {
     /// `collectors.document` — render a measurement for a reader (§9).
     fn handle_collectors_document(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         use crate::collector::diff::{DiffAllowances, DiffGroupBy};
@@ -4284,7 +4512,7 @@ impl RpcHandler {
     /// which is why it is spelled this way rather than as a separate parameter.
     fn resolve_arm(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         spec: &str,
     ) -> Result<crate::collector::diff::Arm, String> {
         use crate::collector::diff::Arm;
@@ -4306,10 +4534,7 @@ impl RpcHandler {
             // metrics handle, so a domain deleted and recreated under the
             // collector reads as unknown rather than as zero loss.
             None => {
-                let armed = self
-                    .collectors
-                    .get(session_id, name)
-                    .ok_or_else(|| format!("no collector named `{name}` in this session"))?;
+                let armed = self.live_collector(session_id, name)?;
                 let ingest = match self.ingest_basis(&armed) {
                     crate::collector::project::IngestBasis::Same { baseline, current } => {
                         Some(current.since(baseline))
@@ -4324,10 +4549,7 @@ impl RpcHandler {
                 ))
             }
             Some("*") => {
-                let (snapshots, _evicted) = self
-                    .collectors
-                    .history(session_id, name)
-                    .map_err(|e| e.to_string())?;
+                let (snapshots, _evicted) = self.collector_history(session_id, name)?;
                 if snapshots.is_empty() {
                     return Err(format!(
                         "collector `{name}` has no recorded runs to merge. Take one with \
@@ -4337,10 +4559,7 @@ impl RpcHandler {
                 Arm::merged(spec.to_string(), &snapshots).map_err(|e| e.to_string())
             }
             Some(label) => {
-                let s = self
-                    .collectors
-                    .get_snapshot(session_id, name, label)
-                    .map_err(|e| e.to_string())?;
+                let s = self.recorded_collector(session_id, name, label)?;
                 Ok(Arm::from_snapshot(spec.to_string(), &s))
             }
         }
@@ -4348,20 +4567,21 @@ impl RpcHandler {
 
     fn handle_collectors_reset(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "reset_collector")?;
         let name = req_str(params, "name")?;
-        let taken = self
+        let (taken, pin) = self
             .collectors
-            .reset(session_id, name, Utc::now())
+            .reset_in_domain(session_id, name, Utc::now(), session_id.collector_pin())
             .map_err(|e| e.to_string())?;
         // The discarded run is summarised rather than dropped silently: a
         // reset issued a moment too early is otherwise unrecoverable, and the
         // headline numbers are cheap to hand back.
         Ok(json!({
             "name": name,
+            "domain": pin.as_str(),
             "discarded": {
                 "matched": taken.total.count,
                 "total_ms": crate::collector::exact::ns_to_ms(taken.total.total_ns),
@@ -4373,15 +4593,17 @@ impl RpcHandler {
 
     fn handle_collectors_remove(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_live(session_id, "remove_collector")?;
         let name = req_str(params, "name")?;
-        self.collectors
-            .remove(session_id, name)
+        let pin = self
+            .collectors
+            .remove_in_domain(session_id, name, session_id.collector_pin())
             .map_err(|e| e.to_string())?;
         Ok(json!({
+            "domain": pin.as_str(),
             "removed": name,
             "reserved_bytes": self.collectors.reserved_bytes(),
         }))
@@ -4396,7 +4618,7 @@ impl RpcHandler {
     /// rather than by a sample budget.
     fn handle_traces_profile(
         &self,
-        session_id: &SessionId,
+        session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
         self.require_evidence(session_id, true)?;
@@ -4424,7 +4646,7 @@ impl RpcHandler {
         // `None` arm existed to fall back on.
         let parsed = crate::filter::bookmark_resolver::resolve_bookmarks(
             parsed,
-            &d.bookmarks,
+            &d.bookmarks.scoped(session_id.scope),
             &session_id.to_string(),
         )
         .map_err(|e| e.to_string())?
@@ -4549,6 +4771,7 @@ fn snapshot_summary(s: &StoredSnapshot) -> Value {
         ..p.clone()
     });
     json!({
+        "domain": s.domain,
         "label": s.label,
         "description": s.description,
         "meta": s.meta,
@@ -5374,7 +5597,10 @@ mod render_hook_tests {
     fn an_unclaimed_method_adds_no_key_even_when_asked() {
         let before = json!({"cleared": 3});
         let after = RpcHandler::maybe_render(&req("logs.clear", true), before.clone());
-        assert_eq!(after, before, "an unclaimed method must not grow `_display`");
+        assert_eq!(
+            after, before,
+            "an unclaimed method must not grow `_display`"
+        );
         assert!(after.get("_display").is_none());
     }
 

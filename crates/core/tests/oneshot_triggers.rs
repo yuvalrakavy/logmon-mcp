@@ -166,6 +166,7 @@ async fn restored_trigger_preserves_oneshot() {
     state.named_sessions.insert(
         "persisted".to_string(),
         PersistedSession {
+            pinned_watches: Vec::new(),
             triggers: vec![PersistedTrigger {
                 filter: "l>=ERROR".to_string(),
                 pre_window: 0,

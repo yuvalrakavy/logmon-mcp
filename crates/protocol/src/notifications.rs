@@ -8,6 +8,12 @@ use crate::LogEntry;
 /// Payload of `notifications/trigger_fired`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TriggerFiredPayload {
+    /// Domain whose telemetry fired the trigger. Older brokers omitted this field.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// Caller scope supplied at registration.
+    #[serde(default)]
+    pub scope: Option<String>,
     pub trigger_id: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
