@@ -1212,7 +1212,7 @@ mod tests {
             "and only the near match — a full dump would prove nothing: {e}"
         );
 
-        assert!(err("list_collectors", &["--bogus", "1"]).contains("takes no parameters"));
+        assert!(err("list_domains", &["--bogus", "1"]).contains("takes no parameters"));
     }
 
     /// A mistyped NESTED field was answered with "did you mean --threshold" —

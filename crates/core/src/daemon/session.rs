@@ -244,10 +244,12 @@ impl std::ops::Deref for SessionState {
     }
 }
 
+type PinnedWatches = HashMap<(DomainId, Option<String>), Arc<WatchState>>;
+
 struct SessionState {
     name: Option<String>,
     watches: Arc<WatchState>,
-    pinned: RwLock<HashMap<(DomainId, Option<String>), Arc<WatchState>>>,
+    pinned: RwLock<PinnedWatches>,
     notifications: broadcast::Sender<Arc<PipelineEvent>>,
     notification_queue: Mutex<VecDeque<PipelineEvent>>,
     max_queue_size: usize,
