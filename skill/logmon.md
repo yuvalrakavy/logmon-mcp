@@ -1,7 +1,7 @@
 ---
 name: logmon
 user_invocable: true
-description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Use the offline reader for a runner’s test-log JSONL and load_case for a saved logmon case. Skip unrelated static logs and projects without telemetry.
+description: Use when the user mentions logs, traces, errors, crashes, or performance, or asks what happened at runtime. Use when investigating a flaky test, a slow request, or a panic. Use when the logmon MCP tools (get_recent_logs, get_recent_traces, add_trigger, add_bookmark, …) are available. Use the offline reader for a runner’s test-log JSONL and analyze saved .case.zip files with load_case, trace queries and peer timelines. Skip unrelated static logs and projects without telemetry.
 ---
 
 # Using the log monitor (logmon)
@@ -581,15 +581,25 @@ load_case(path: "/abs/path/checkout-hang-260731-021530.case.zip")
 load_case(path: "/abs/path/checkout-hang-260731-021530.md")   # loose files work too
 ```
 
-**Reach for this when the question is historical or the evidence came from elsewhere** —
-"was this slow three months ago too?", or a case file a colleague sent from a production
-box. The case becomes a sealed **postmortem domain** named after its own stem, and every
-read tool works against it. So the comparison is two calls:
+### Investigating a saved case with MCP
+
+1. **Establish identity and coverage.** Preserve the archive filename. Read its Markdown report for the capture reason, focus selector or anchor, time window, and provenance. Call `load_case` with the absolute path and bind your investigation session to the returned postmortem domain with `use_domain(name=…)`. Check `get_status()` and the report for omitted evidence and log/span eviction. A capture verdict of `cannot_verify` describes provenance; the runner's `FAIL` describes the execution.
+2. **Reconstruct the focus timeline.** For a trace-ID selector, take the ID from the report. Look for the first unexpected event, the span enclosing it, and the last observed event before the assertion or timeout. If the summary says `[no root]`, the retained spans cannot establish the full trace duration. Spans can arrive in batches; use event timestamps and durations for ordering. For an attempt-field selector, filter on that field (for example `get_recent_logs(filter="test_attempt_id=…")`) and inspect the individual traces it identifies. A capture without a focus ID may still have a trace on the anchor.
+3. **Check competing explanations.** Read the overlap table and inspect each relevant peer by its own trace ID in the same domain. Compare its interval with the focus slowdown or gap. Then examine domain-wide logs and any machine-load samples for shared-service errors or load. State the offset when comparing timestamps with an external report. Overlap alone establishes concurrency; a causal claim needs supporting evidence such as a recorded wait on the same resource.
+4. **Compare and report.** When an isolated rerun or passing baseline has a case, load it into a second postmortem domain. Compare the same operation in each, citing the trace or span ID, timestamp, duration and observed outcome. Qualify comparisons where a ring evicted early activity, a peer lacks a trace ID, or the window contains no load sample.
+
+Example MCP reads after loading a case (substitute the returned domain and actual IDs):
 
 ```
-profile_traces(domain: "checkout-hang-260731-021530")   # then
-profile_traces()                                        # now
+use_domain(name="case-domain")
+get_trace_logs(trace_id="focus-id")
+get_trace(trace_id="focus-id", include_logs=false)
+get_trace_summary(trace_id="focus-id")
+get_trace(trace_id="peer-id", include_logs=false)
+get_recent_logs(filter="l>=WARN", count=20)
 ```
+
+Current brokers load the captured window. Focus it at query time with the selector above. On a broker whose `load_case` schema advertises `scope`, `all` is the default for inspecting peers and untagged activity; use `focus` for target-only analysis when the archive declares a focus trace. Older archives can start later than the earliest peer, so check the saved window before interpreting a missing event.
 
 **The things that bite:**
 
