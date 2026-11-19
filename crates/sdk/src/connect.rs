@@ -213,7 +213,7 @@ impl Broker {
                     // Reconnecting (or PermanentlyFailed for anonymous). The
                     // bridge's own EOF notify will also fire; both paths are
                     // idempotent.
-                    self.inner.enter_disconnect().await;
+                    self.inner.enter_disconnect(&bridge.disconnect_notify()).await;
                 }
                 Err(map_bridge_error(e))
             }

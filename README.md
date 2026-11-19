@@ -76,9 +76,9 @@ copy to drift from.
 
 **Domains.** The broker can host multiple isolated **domains** — each a full instance with its own receivers (ports), ring buffers, and per-session triggers/filters, so unrelated log streams never interleave. The `default` domain is the always-on anchor; declare durable ones in `config.json` (see [Configuration](#configuration)) or create ephemeral ones at runtime. When you know the domain, pass it on each MCP call, for example `get_recent_logs(domain="staging", filter="l>=ERROR")`. The reply identifies the domain that supplied the evidence, even on an empty result. An unknown domain returns an error.
 
-Two conversations may share one MCP connection. Each can read a different domain without changing the other's binding. Give each investigation a stable `scope` when using cursors or bookmarks. For example, `get_recent_logs(domain="staging", scope="checkout-regression", filter="c>=last")` advances that investigation’s cursor. Pass the same domain and scope when arming a trigger, and match them on incoming notifications.
+Each Claude session has its own MCP connection. A parent and its subagents share that connection. The parent can set its default with `use_domain`. A subagent working on another lane passes `domain` on each call, including `clear_logs` and every test-log lifecycle operation. Give each investigation a stable `scope` when using cursors or bookmarks. For example, `get_recent_logs(domain="staging", scope="checkout-regression", filter="c>=last")` advances that investigation’s cursor. Pass the same domain and scope when arming a trigger, and match them on incoming notifications.
 
-For a single-conversation connection, `use_domain` sets the default for later calls that omit `domain`. To keep an initial binding across reconnects, set `LOGMON_DOMAIN` alongside a named `--session` and create the domain before connecting.
+Calls that omit `domain` use the session default. To keep an initial binding across reconnects, set `LOGMON_DOMAIN` alongside a named `--session` and create the domain before connecting.
 
 ## Installation
 

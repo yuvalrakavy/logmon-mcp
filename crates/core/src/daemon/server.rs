@@ -808,12 +808,13 @@ async fn run_initialized(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
                             accept_failures_in_a_row = 0;
                             let handler = handler.clone();
                             let domains = domains.clone();
                             let sessions = sessions.clone();
                             connection_tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, handler, domains, sessions).await {
+                                if let Err(e) = handle_connection(stream, handler, domains, sessions, peer_pid).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -915,7 +916,7 @@ async fn run_initialized(
                             let domains = domains.clone();
                             let sessions = sessions.clone();
                             connection_tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, handler, domains, sessions).await {
+                                if let Err(e) = handle_connection(stream, handler, domains, sessions, None).await {
                                     warn!("connection error: {e}");
                                 }
                             });
@@ -983,6 +984,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     handler: Arc<RpcHandler>,
     domains: Arc<DomainRegistry>,
     sessions: Arc<SessionRegistry>,
+    peer_pid: Option<i32>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -1129,7 +1131,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     // until some unrelated trigger or filter change resynced it.
     handler.resync_pre_buffers();
 
-    info!(?session_id, is_new, "session started");
+    info!(?session_id, is_new, ?peer_pid, "session started");
 
     // Subscribe before acknowledging so a fast client can arm a watch on any
     // domain without racing the start of live delivery.

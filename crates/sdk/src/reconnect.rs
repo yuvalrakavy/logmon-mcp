@@ -129,12 +129,15 @@ impl ConnectionManager {
     /// the transition into either `Reconnecting` (named session) or
     /// `PermanentlyFailed(SessionLost)` (anonymous session). Idempotent:
     /// repeated calls during an in-flight reconnect are no-ops.
-    pub(crate) async fn enter_disconnect(self: &Arc<Self>) {
+    pub(crate) async fn enter_disconnect(self: &Arc<Self>, disconnected: &Arc<Notify>) {
         let mut state = self.state.lock().await;
         match &*state {
             // Already handling — no-op.
             ConnectionState::Reconnecting | ConnectionState::PermanentlyFailed(_) => return,
-            ConnectionState::Connected(_) => {}
+            ConnectionState::Connected(bridge)
+                if Arc::ptr_eq(&bridge.disconnect_notify(), disconnected) => {}
+            // A delayed failure from an older socket cannot retire the new connection.
+            ConnectionState::Connected(_) => return,
         }
 
         if self.session_name.is_none() {
@@ -210,6 +213,12 @@ async fn reconnect_loop(mgr: Arc<ConnectionManager>) {
                 // SessionLost for anonymous, etc.).
                 spawn_disconnect_watcher(mgr.clone(), disconnect);
                 tracing::info!(attempt, "reconnect succeeded");
+                return;
+            }
+            Err(BrokerError::SessionLost) => {
+                *mgr.state.lock().await =
+                    ConnectionState::PermanentlyFailed(TerminalReason::SessionLost);
+                mgr.state_changed.notify_waiters();
                 return;
             }
             Err(e) => {
@@ -300,7 +309,9 @@ async fn try_handshake(
     let result = match parse_daemon_message_from_str(&response_line)
         .map_err(|e| BrokerError::Protocol(e.to_string()))?
     {
-        DaemonMessage::Response(resp) => parse_session_start_response(resp)?,
+        DaemonMessage::Response(resp) => {
+            parse_session_start_response(resp, params.name.as_deref())?
+        }
         DaemonMessage::Notification(_) => {
             return Err(BrokerError::Protocol(
                 "daemon sent a notification before session.start response".into(),
@@ -311,7 +322,10 @@ async fn try_handshake(
     Ok((bridge, pending_reader, result.is_new))
 }
 
-fn parse_session_start_response(resp: RpcResponse) -> Result<SessionStartResult, BrokerError> {
+fn parse_session_start_response(
+    resp: RpcResponse,
+    expected_name: Option<&str>,
+) -> Result<SessionStartResult, BrokerError> {
     if let Some(err) = resp.error {
         return Err(BrokerError::Method {
             code: err.code,
@@ -321,7 +335,13 @@ fn parse_session_start_response(resp: RpcResponse) -> Result<SessionStartResult,
     let value = resp
         .result
         .ok_or_else(|| BrokerError::Protocol("session.start response had no result".into()))?;
-    serde_json::from_value(value).map_err(|e| BrokerError::Protocol(e.to_string()))
+    let result: SessionStartResult =
+        serde_json::from_value(value).map_err(|e| BrokerError::Protocol(e.to_string()))?;
+    if expected_name.is_some_and(|name| name != result.session_id) {
+        tracing::error!(?expected_name, actual = %result.session_id, "broker returned a different session identity");
+        return Err(BrokerError::SessionLost);
+    }
+    Ok(result)
 }
 
 async fn read_one_line(pending_reader: &mut PendingReader) -> Result<String, BrokerError> {
@@ -420,7 +440,9 @@ pub(crate) async fn initial_connect(
     let result = match parse_daemon_message_from_str(&response_line)
         .map_err(|e| BrokerError::Protocol(e.to_string()))?
     {
-        DaemonMessage::Response(resp) => parse_session_start_response(resp)?,
+        DaemonMessage::Response(resp) => {
+            parse_session_start_response(resp, params.name.as_deref())?
+        }
         DaemonMessage::Notification(_) => {
             return Err(BrokerError::Protocol(
                 "daemon sent a notification before session.start response".into(),
@@ -459,6 +481,6 @@ pub(crate) async fn initial_connect(
 pub(crate) fn spawn_disconnect_watcher(mgr: Arc<ConnectionManager>, disconnect: Arc<Notify>) {
     tokio::spawn(async move {
         disconnect.notified().await;
-        mgr.enter_disconnect().await;
+        mgr.enter_disconnect(&disconnect).await;
     });
 }

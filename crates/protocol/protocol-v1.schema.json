@@ -947,6 +947,10 @@
             "null"
           ],
           "format": "double"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1011,6 +1015,10 @@
             "string",
             "null"
           ]
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1086,6 +1094,10 @@
           "description": "Additional evidence; conventional keys include message, failed_test, file and line.",
           "type": "object",
           "additionalProperties": true
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1148,6 +1160,10 @@
           "description": "Sampler payload, including load or process details.",
           "type": "object",
           "additionalProperties": true
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1170,6 +1186,10 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1194,6 +1214,10 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1215,6 +1239,10 @@
           "items": {
             "$ref": "#/$defs/TestLogEnd"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
         }
       },
       "required": [
@@ -1432,10 +1460,15 @@
           "items": {
             "$ref": "#/$defs/TestLogPendingCase"
           }
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "run_id"
+        "run_id",
+        "domain"
       ],
       "additionalProperties": true,
       "$defs": {
@@ -1489,6 +1522,10 @@
             "$ref": "#/$defs/TestLogAck"
           },
           "default": []
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "$defs": {
@@ -1540,7 +1577,10 @@
           ],
           "additionalProperties": true
         }
-      }
+      },
+      "required": [
+        "domain"
+      ]
     },
     "TestVerdict": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3359,7 +3399,13 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "LogsClear",
       "type": "object",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        }
+      }
     },
     "LogsClearResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3370,10 +3416,15 @@
           "type": "integer",
           "format": "uint",
           "minimum": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
-        "cleared"
+        "cleared",
+        "domain"
       ]
     },
     "FiltersList": {
@@ -14480,6 +14531,66 @@
         "qualified_name",
         "seq",
         "created_at"
+      ]
+    },
+    "TestLogBeginResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
+      ]
+    },
+    "TestLogStartResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
+      ]
+    },
+    "TestLogEndResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
+      ]
+    },
+    "TestLogMachineLoadResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
+      ]
+    },
+    "TestLogSealResult": {
+      "type": "object",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
+        }
+      },
+      "required": [
+        "domain"
       ]
     },
     "CollectorsGetResult": {

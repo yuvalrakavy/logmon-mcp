@@ -200,7 +200,15 @@ impl Tool {
 pub fn supports_explicit_domain(method: &str) -> bool {
     matches!(
         method,
-        "logs.recent"
+        "logs.clear"
+            | "test_log.begin"
+            | "test_log.start"
+            | "test_log.end"
+            | "test_log.replay"
+            | "test_log.machine_load"
+            | "test_log.close"
+            | "test_log.seal"
+            | "logs.recent"
             | "logs.context"
             | "logs.export"
             | "logs.fields"
@@ -262,7 +270,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "begin_test_log",
         method: "test_log.begin",
-        description: "Open the run's JSONL file in the bound domain, or return the existing owner when a different run is active.",
+        description: "Open the run's JSONL file in the selected domain (session default when omitted), or return the existing owner when a different run is active.",
         cli: Cli::PLAIN,
     },
     Tool {
@@ -351,7 +359,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "clear_logs",
         method: "logs.clear",
-        description: "Clear all log entries from the in-memory buffer.",
+        description: "Clear the selected domain’s log buffer. Omitting domain uses the session default.",
         cli: Cli::PLAIN,
     },
     Tool {

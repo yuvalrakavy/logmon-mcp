@@ -12,7 +12,9 @@ Use logmon when the user wants to know **what the running program actually did**
 
 ## Querying a known domain
 
-Pass `domain` on every supported MCP call when you know the target, including the follow-up that opens a trace, exports evidence or creates a case. Verify the returned `domain` before drawing a conclusion from an empty result. Use `use_domain` as a convenience on a single-conversation connection. A desktop host can share one shim across conversations.
+Pass `domain` on every supported MCP call when you know the target, including the follow-up that opens a trace, exports evidence or creates a case. Verify the returned `domain` before drawing a conclusion from an empty result. Each Claude session owns its connection and shares it with its subagents. Let the parent set the session default with `use_domain`. A subagent working on another lane passes its own `domain` on each call, including `clear_logs` and every test-log lifecycle operation. A `run_id` identifies a run within that domain.
+
+If a named shim reports `session lost`, restart that shim with its original session name and check `get_status` before continuing. Compare the session name and current domain. For a Unix broker, correlate the shim PID with `peer_pid` on the broker’s session-start log entry.
 
 Choose a stable, caller-specific `scope` for named cursors and bookmarks. Use the same scope for the bookmark and every read that references it. Another conversation can use the same bare cursor name independently. Match trigger notifications to the domain and scope used to arm them.
 
@@ -403,7 +405,7 @@ Points worth knowing before you rely on it:
 
 ### Status
 
-- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`gelf_tcp_oversize_dropped`**, **`trace_ingest`**, plus **`current_domain`** (your bound domain), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
+- **`get_status()`** — uptime, receivers, store stats, **`receiver_drops`** counts, **`gelf_tcp_oversize_dropped`**, **`trace_ingest`**, plus **`current_domain`** (the domain serving this status request), **`active_filters`** (what's narrowing you), and **`receiver_liveness`** (per-listener last-received — pinpoints *which* port is silent). Check the drop counts when investigating "missing logs."
 
   It also reports **`broker_version`** and **`broker_tools`** — see below.
 
@@ -438,7 +440,7 @@ Domains are isolated broker instances — each has its own log/span buffers, rec
 
 - **`list_domains()`** — live domains with ports, source, log/span counts, `bound_sessions` (which sessions are bound to each domain; disconnected holders suffixed), and **liveness**: `last_log_received_at` / `last_span_received_at`, `idle_secs`, `stale`. A `last_*_received_at` of `null` means nothing has shipped to that domain yet — the "is my stack actually reaching this domain, or did I misconfigure the port?" check.
 - **`create_domain(name, gelf_port?, otlp_grpc_port?, otlp_http_port?, ...)`** — create (or idempotently ensure) an ephemeral domain. Omitted ports auto-allocate; `0` disables that receiver.
-- **`use_domain(name)`** — set the fallback domain for this session. Use this on single-conversation connections.
+- **`use_domain(name)`** — set the fallback domain for this session. The parent owns this choice when it shares the connection with subagents.
 - **`clear_domain()`** — dispose the bound domain's logs + spans (keeps it alive; seq stays monotonic).
 - **`delete_domain(name)`** — delete a domain and tear down its receivers (refuses `default`).
 
@@ -926,7 +928,7 @@ Don't suggest editing `~/.config/logmon/state.json` or `daemon.pid` by hand unle
 
 ### "I cleared logs and now I have no context"
 
-`clear_logs` is shared across all sessions and destructive. There's no undo. Going forward, prefer `add_bookmark("checkpoint")` + `b>=checkpoint` for scoped queries — same outcome, no data loss, and other sessions aren't affected.
+`clear_logs(domain="staging")` clears the staging log buffer for all of its readers. Omitting `domain` clears the session’s default lane. There's no undo. Going forward, prefer `add_bookmark("checkpoint")` + `b>=checkpoint` for scoped queries — same outcome, no data loss, and other sessions aren't affected.
 
 ## Multi-session behavior
 

@@ -720,3 +720,82 @@ async fn shared_stdio_routes_interleaved_reads_without_rebinding() {
         assert!(!scoped["structuredContent"].to_string().contains("private-two"), "{scoped}");
     }).await;
 }
+
+/// Manual wall-clock regression for the reported eleven-minute idle interval.
+#[tokio::test]
+#[ignore = "takes eleven minutes"]
+async fn first_call_after_eleven_minutes_retains_named_shim_identity() {
+    with_mcp(|mcp, _| {
+        std::thread::sleep(std::time::Duration::from_secs(11 * 60));
+        for _ in 0..2 {
+            let result = mcp.request("tools/call", json!({"name":"get_status","arguments":{}}));
+            assert_eq!(
+                result["result"]["structuredContent"]["session"]["name"], "mcp-test",
+                "{result}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn subagent_lifecycle_and_clear_leave_parent_bound_to_its_lane() {
+    with_mcp(|mcp, scratch| {
+        let call = |mcp: &mut Mcp, tool: &str, args: Value| {
+            let r = mcp.request("tools/call", json!({"name":tool,"arguments":args}));
+            assert!(r.get("error").is_none() && r["result"]["isError"] != true, "{tool}: {r}");
+            r["result"]["structuredContent"].clone()
+        };
+        let mut ports = Vec::new();
+        for lane in ["parent", "child"] {
+            call(mcp, "create_domain", json!({"name":lane,"otlp_grpc_port":0,"otlp_http_port":0}));
+            let domains = call(mcp, "list_domains", json!({}));
+            let d = domains["domains"].as_array().unwrap().iter().find(|r| r["name"] == lane).unwrap();
+            ports.push(d["gelf_port"].as_u64().unwrap() as u16);
+        }
+        call(mcp, "use_domain", json!({"name":"parent"}));
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for (lane, port) in ["parent", "child"].into_iter().zip(ports) {
+            let msg = json!({"version":"1.1","host":"fixture","level":6,"short_message":lane});
+            socket.send_to(msg.to_string().as_bytes(), ("127.0.0.1", port)).unwrap();
+            for _ in 0..100 {
+                if call(mcp, "get_recent_logs", json!({"domain":lane}))["count"] == 1 { break; }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(call(mcp, "get_recent_logs", json!({"domain":lane}))["count"], 1);
+        }
+        for lane in ["parent", "child"] {
+            let mut args = json!({"run_id":"same-id","jsonl_path":scratch.join(lane),"grace_period_ms":0});
+            if lane == "child" { args["domain"] = json!(lane); }
+            let r = call(mcp, "begin_test_log", args);
+            assert_eq!(r["domain"], lane);
+            assert_ne!(r["status"], "refused");
+        }
+        let start = json!({"domain":"child","run_id":"same-id","execution_id":"execution",
+            "name":"test","selector":{"field":"trace_id","value":"abcd"},"started_at":"2026-01-01T00:00:00Z"});
+        let mut end = start.clone();
+        end["ended_at"] = json!("2026-01-01T00:00:01Z");
+        end["verdict"] = json!("OK");
+        let mut replay = end.clone();
+        replay.as_object_mut().unwrap().remove("domain");
+        for (tool, args) in [
+            ("start_test",start), ("end_test",end),
+            ("replay_end_tests",json!({"domain":"child","run_id":"same-id","events":[replay]})),
+            ("machine_load",json!({"domain":"child","run_id":"same-id","ts":"2026-01-01T00:00:01Z","host":"fixture"})),
+            ("end_test_log",json!({"domain":"child","run_id":"same-id","wait_timeout_ms":500})),
+        ] {
+            let r = call(mcp, tool, args);
+            assert_eq!(r["domain"], "child", "{tool}: {r}");
+            assert_ne!(r["status"], "refused", "{tool}: {r}");
+        }
+        assert!(mcp.call("clear_logs", json!({"domain":"absent"})).unwrap_err().contains("absent"));
+        assert!(call(mcp,"clear_logs",json!({"domain":"child"}))["cleared"].as_u64().unwrap() >= 1);
+        assert_eq!(call(mcp,"get_recent_logs",json!({"domain":"child"}))["count"],0);
+        assert_eq!(call(mcp,"get_recent_logs",json!({}))["logs"][0]["message"],"parent");
+        let parent = call(mcp,"test_log_status",json!({"domain":"parent"}));
+        assert_eq!(parent["test_log"]["executions"]["started"],0);
+        call(mcp,"begin_test_log",json!({"domain":"child","run_id":"abandoned","jsonl_path":scratch.join("abandoned")}));
+        assert_eq!(call(mcp,"seal_test_log",json!({"domain":"child","run_id":"abandoned"}))["domain"],"child");
+        assert_eq!(call(mcp,"end_test_log",json!({"run_id":"same-id","wait_timeout_ms":0}))["domain"],"parent");
+    }).await;
+}

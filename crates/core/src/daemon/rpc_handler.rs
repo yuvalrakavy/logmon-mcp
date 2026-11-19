@@ -822,6 +822,7 @@ impl RpcHandler {
             };
             status = next;
         }
+        status["domain"] = json!(domain.id().to_string());
         Ok(status)
     }
 
@@ -861,8 +862,12 @@ impl RpcHandler {
     /// `domains.list` — delegates to the synchronous [`Self::handle`].
     pub async fn handle_async(&self, session_id: &SessionId, request: &RpcRequest) -> RpcResponse {
         if matches!(request.method.as_str(), "test_log.close" | "test_log.seal") {
+            let context = match self.resolve_call(session_id, request) {
+                Ok(context) => context,
+                Err(message) => return RpcResponse::error(request.id, -32602, &message),
+            };
             return match self
-                .handle_test_log_close(&CallContext::unscoped(session_id), request)
+                .handle_test_log_close(&context, request)
                 .await
             {
                 Ok(value) => RpcResponse::success(request.id, value),

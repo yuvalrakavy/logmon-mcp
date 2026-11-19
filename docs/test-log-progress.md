@@ -48,3 +48,5 @@ Use `unknown_domain` for an absent lane, `run_not_found` for an explicit ID abse
 ## Reproduce the polling benchmark
 
 Build the release broker and CLI with `cargo build --release --all-features`, then run `python3 scripts/bench-test-log-progress.py target/release`. The script starts an isolated broker with eight domains, sends logs, spans and lifecycle calls from eight workers in each domain, and compares two runs of the same workload. The second run launches separate CLI processes for domain discovery, current status on every lane, and retained history on one lane every two seconds. The output reports wall time and latency percentiles including process startup. Both runs verify final counts and the transition back to idle.
+
+A parent may set its session default with `use_domain`. A subagent using a second lane passes that lane as `domain` on begin, start, end, replay, machine-load, close, and seal. Pass it on status and list as well. Each lifecycle reply identifies its serving domain. Clearing logs also accepts an explicit domain.

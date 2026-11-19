@@ -293,7 +293,9 @@ fn spawn_reader_loop(
             pending.closed = true;
             pending.calls.clear();
         }
-        disconnect.notify_waiters();
+        // Each bridge has one disconnect watcher. Preserve the signal if EOF
+        // arrives before that watcher has started waiting.
+        disconnect.notify_one();
     });
 }
 

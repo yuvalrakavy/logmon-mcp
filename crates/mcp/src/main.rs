@@ -61,7 +61,9 @@ async fn run_mcp_stdio(session: Option<String>, domain: Option<String>) -> anyho
 
     auto_start::ensure_broker_running().await?;
 
-    let mut builder = Broker::connect();
+    let mut builder = Broker::connect().client_info(serde_json::json!({
+        "client": "logmon-mcp", "pid": std::process::id(),
+    }));
     if let Some(name) = session {
         builder = builder.session_name(name);
     }

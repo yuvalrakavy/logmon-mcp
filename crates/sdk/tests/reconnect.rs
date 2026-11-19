@@ -151,3 +151,65 @@ async fn resurrection_treated_as_session_lost() {
         "Reconnected must not fire on daemon resurrection"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn named_connections_reject_a_different_identity_before_serving_calls() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    for at_resume in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            for wrong in if at_resume {
+                vec![false, true]
+            } else {
+                vec![true]
+            } {
+                let (stream, _) = tokio::time::timeout(TIGHT_TIMEOUT, listener.accept()).await.expect("named client must reconnect even if EOF preceded its watcher").unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(req["method"], "session.start");
+                assert_eq!(req["params"]["name"], "named-parent");
+                assert_eq!(req["params"]["domain"], "parent-lane");
+                let response = serde_json::json!({"jsonrpc":"2.0","id":req["id"],"result":{
+                    "session_id":if wrong { "anonymous-id" } else { "named-parent" },
+                    "is_new":!wrong,"queued_notifications":0,"trigger_count":0,"filter_count":0,
+                    "daemon_uptime_secs":100,"buffer_size":100,"receivers":[]}});
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                if wrong {
+                    line.clear();
+                    assert_eq!(tokio::time::timeout(TIGHT_TIMEOUT, reader.read_line(&mut line)).await.unwrap().unwrap(),0,
+                        "a named client sent an application request under the wrong identity: {line}");
+                }
+            }
+        });
+        let broker = Broker::connect()
+            .socket_path(path)
+            .session_name("named-parent")
+            .domain("parent-lane")
+            .call_timeout(TIGHT_TIMEOUT)
+            .open()
+            .await;
+        if at_resume {
+            let broker = broker.expect("initial named handshake");
+            server.await.unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    broker.triggers_list(TriggersList {}).await,
+                    Err(BrokerError::SessionLost)
+                ));
+            }
+        } else {
+            assert!(matches!(broker, Err(BrokerError::SessionLost)));
+            server.await.unwrap();
+        }
+    }
+}
