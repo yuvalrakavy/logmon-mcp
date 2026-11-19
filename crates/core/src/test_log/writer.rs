@@ -66,7 +66,13 @@ pub(super) struct Health {
 impl Health {
     pub fn json(&self) -> Value {
         let error = self.error.load_full();
-        json!({"write_error":error.as_deref(),"lost_records":self.lost.load(Ordering::Acquire)})
+        let lost = self.lost.load(Ordering::Acquire);
+        let error = if lost == 0 {
+            json!(error.as_deref())
+        } else {
+            json!({"code":"journal_queue_overflow","lost_records":lost,"latest_write_error":error.as_deref()})
+        };
+        json!({"write_error":error,"lost_records":lost})
     }
 }
 type Shared = Arc<(Mutex<State>, Condvar, Arc<Health>)>;
@@ -230,6 +236,10 @@ mod tests {
         second.append(row.clone());
         assert_eq!(first.status()["lost_records"], 0);
         assert_eq!(second.status()["lost_records"], 1);
+        assert_eq!(
+            second.progress_health().json()["write_error"]["code"],
+            "journal_queue_overflow"
+        );
         budget.release(1, MAX_BYTES - bytes);
         second.append(row);
         assert_eq!(second.status()["lost_records"], 1);
