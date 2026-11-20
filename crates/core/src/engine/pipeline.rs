@@ -1,6 +1,6 @@
 use crate::engine::epoch::EpochLog;
-use crate::engine::pre_buffer::PreTriggerBuffer;
 use crate::engine::epoch::FilterPolicy;
+use crate::engine::pre_buffer::PreTriggerBuffer;
 use crate::engine::seq_counter::SeqCounter;
 use crate::filter::parser::ParsedFilter;
 use crate::gelf::message::LogEntry;
@@ -249,7 +249,8 @@ impl LogPipeline {
 
     /// Store records that may be older than records already held, keeping the ring in seq
     /// order. Returns how many held records moved. See `InMemoryStore::insert_sorted`.
-    pub fn insert_sorted(&self, batch: Vec<LogEntry>) -> usize {
+    pub fn insert_sorted(&self, mut batch: Vec<LogEntry>) -> usize {
+        self.test_log.filter_reinserted_logs(&mut batch);
         self.store.insert_sorted(batch)
     }
 
@@ -409,7 +410,26 @@ impl LogPipeline {
     // --- Pre-buffer operations ---
 
     pub fn pre_buffer_append(&self, entry: LogEntry) {
+        if self.test_log.retained_log_allowed(&entry) {
+            self.pre_buffer_append_admitted(entry);
+        }
+    }
+
+    pub(crate) fn pre_buffer_append_admitted(&self, entry: LogEntry) {
         self.pre_buffer.append(entry);
+    }
+
+    pub(crate) fn store_trigger_context(&self, pre_window: usize, trace_id: Option<u128>) {
+        // Only records admitted at the pre-buffer boundary reach this merge.
+        // A shared record's original admission stays valid when peers later cross a limit.
+        let mut rows = self.pre_buffer.flush(pre_window);
+        if let Some(trace_id) = trace_id {
+            rows.extend(self.pre_buffer.entries_by_trace_id(trace_id));
+        }
+        for row in &mut rows {
+            row.source = crate::gelf::message::LogSource::PreTrigger;
+        }
+        self.store.insert_sorted(rows);
     }
 
     pub fn pre_buffer_copy(&self, count: usize) -> Vec<LogEntry> {

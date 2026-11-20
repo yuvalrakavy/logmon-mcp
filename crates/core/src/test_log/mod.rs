@@ -1,6 +1,7 @@
 //! Run ownership, execution lifecycle and capture admission for a single domain.
 
 mod progress;
+mod quota;
 mod run;
 mod writer;
 
@@ -13,7 +14,7 @@ use logmon_broker_protocol::*;
 use run::Run;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -27,8 +28,32 @@ pub struct TestLog {
     history: Arc<progress::History>,
     state: Mutex<State>,
     observing: AtomicBool,
+    pending_logs: Mutex<HashSet<u64>>,
+    pending_spans: Mutex<HashSet<u64>>,
     changed: Condvar,
     writer_budget: Arc<writer::QueueBudget>,
+}
+
+/// A processor keeps this marker from sequence assignment through observation.
+/// Snapshot admission can distinguish a pending callback from later ring rows.
+pub(crate) struct IngestObservation<'a> {
+    pending: &'a Mutex<HashSet<u64>>,
+    seq: Option<u64>,
+}
+
+impl IngestObservation<'_> {
+    pub(crate) fn assigned(&mut self, seq: u64) {
+        self.pending.lock().unwrap().insert(seq);
+        self.seq = Some(seq);
+    }
+}
+
+impl Drop for IngestObservation<'_> {
+    fn drop(&mut self) {
+        if let Some(seq) = self.seq {
+            self.pending.lock().unwrap().remove(&seq);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -92,6 +117,29 @@ fn full_failure_limit(config: &TestLogBegin) -> u64 {
 }
 
 impl TestLog {
+    pub(crate) fn track_log(&self, seq: u64) -> IngestObservation<'_> {
+        let mut observation = IngestObservation {
+            pending: &self.pending_logs,
+            seq: None,
+        };
+        observation.assigned(seq);
+        observation
+    }
+
+    pub(crate) fn track_span(&self) -> IngestObservation<'_> {
+        IngestObservation {
+            pending: &self.pending_spans,
+            seq: None,
+        }
+    }
+
+    pub(crate) fn pending_ingest(&self) -> (Vec<u64>, Vec<u64>) {
+        (
+            self.pending_logs.lock().unwrap().iter().copied().collect(),
+            self.pending_spans.lock().unwrap().iter().copied().collect(),
+        )
+    }
+
     pub fn status(&self, domain: &str, run_id: Option<&str>) -> Value {
         self.history.status(domain, run_id)
     }
@@ -245,7 +293,7 @@ impl TestLog {
             }
         }
         let id = config.run_id.clone();
-        let mut run = Run::new(config, journal, provenance, self.history.clone());
+        let mut run = Run::new(d, config, journal, provenance, self.history.clone());
         run.append(
             "begin-test-log",
             json!({"settings":run.config,"sampling_algorithm":"fnv1a64-v1"}),
@@ -310,6 +358,47 @@ impl TestLog {
                 r.observe_log(record)
             }
         }
+    }
+
+    pub(crate) fn admit_log(&self, record: &LogEntry) -> bool {
+        self.admit(quota::Record::Log(record))
+    }
+
+    pub(crate) fn admit_span(&self, record: &SpanEntry) -> bool {
+        self.admit(quota::Record::Span(record))
+    }
+
+    fn admit(&self, record: quota::Record<'_>) -> bool {
+        if !self.observing.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.run.as_mut().is_none_or(|run| {
+            let (accepted, crossed) = run.admit_record(record);
+            if crossed {
+                self.changed.notify_all();
+            }
+            accepted
+        })
+    }
+
+    pub(crate) fn filter_reinserted_logs(&self, batch: &mut Vec<LogEntry>) {
+        if self.observing.load(Ordering::Acquire) {
+            if let Some(run) = self.state.lock().unwrap().run.as_ref() {
+                batch.retain(|row| run.allows_reinsert(row));
+            }
+        }
+    }
+
+    pub(crate) fn retained_log_allowed(&self, record: &LogEntry) -> bool {
+        !self.observing.load(Ordering::Acquire)
+            || self
+                .state
+                .lock()
+                .unwrap()
+                .run
+                .as_ref()
+                .is_none_or(|run| run.allows_reinsert(record))
     }
     pub fn observe_span(&self, record: &SpanEntry) {
         if self.observing.load(Ordering::Acquire) {

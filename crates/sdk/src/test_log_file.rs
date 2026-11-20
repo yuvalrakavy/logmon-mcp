@@ -109,6 +109,10 @@ impl TestLogFile {
                 entry.insert("summary_final".into(), Value::Bool(kind == "summary-final"));
             }
             "case-ready" | "case-skipped" | "case-error" => {
+                if kind == "case-skipped" {
+                    entry.remove("case_size");
+                    entry.remove("case_detail");
+                }
                 for key in ["case_status", "case_path", "case_size", "case_detail"] {
                     if let Some(v) = row.remove(key) {
                         entry.insert(key.into(), v);
@@ -116,6 +120,19 @@ impl TestLogFile {
                 }
                 if let Some(message) = row.remove("message") {
                     entry.insert("case_error".into(), message);
+                }
+            }
+            "telemetry-fault" => {
+                for key in ["fault", "telemetry_limit"] {
+                    if let Some(value) = row.remove(key) {
+                        entry.insert(key.into(), value);
+                    }
+                }
+            }
+            "telemetry-tail-error" => {
+                entry.remove("telemetry_tail_path");
+                if let Some(error) = row.remove("telemetry_tail_error") {
+                    entry.insert("telemetry_tail_error".into(), error);
                 }
             }
             "late-telemetry" | "late-telemetry-counts" => {

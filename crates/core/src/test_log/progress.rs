@@ -52,6 +52,7 @@ struct View {
     max_failures: u64,
     finalized: usize,
     replayed: usize,
+    excessive_telemetry: usize,
 }
 
 const VERDICTS: [&str; 5] = ["OK", "FAIL", "TIMEOUT", "ABORTED", "NO_VERDICT"];
@@ -64,7 +65,8 @@ impl View {
             "cases":{"requested":pending+ready+failed+skipped,"ready_executions":ready,
             "distinct_cases_written":self.files.len(),"pending":pending,"failed":failed,"skipped":skipped,
             "refused_by_max_failures":0,"minimal_by_failure_limit":minimal,"max_failures":self.max_failures},
-            "summaries":{"final":self.finalized,"pending":self.ended-self.finalized},"replayed_ends":self.replayed})
+            "summaries":{"final":self.finalized,"pending":self.ended-self.finalized},"replayed_ends":self.replayed,
+            "faults":{"excessive_telemetry":self.excessive_telemetry}})
     }
 }
 type Object = serde_json::Map<String, Value>;
@@ -177,6 +179,7 @@ struct Model {
     outcomes: HashMap<String, usize>,
     finals: HashSet<String>,
     decisions: HashMap<String, Decision>,
+    faults: HashSet<String>,
     sealed: bool,
     default_timeout: u64,
 }
@@ -252,6 +255,7 @@ impl Progress {
                 | "end-test"
                 | "incomplete"
                 | "summary-final"
+                | "telemetry-fault"
                 | "case-ready"
                 | "case-error"
                 | "case-skipped"
@@ -266,7 +270,11 @@ impl Progress {
         let now = Utc::now();
         m.view.last = Some(now);
         let id = d["execution_id"].as_str().unwrap_or_default();
+        if d["fault"] == super::quota::FAULT && m.faults.insert(id.to_owned()) {
+            m.view.excessive_telemetry += 1;
+        }
         match event {
+            "telemetry-fault" => m.decision(id, d, false),
             "test-log-plan" => {
                 m.view.planned = d["planned_executions"].as_u64();
                 m.view.max_failures = d["max_failures"].as_u64().expect("derived failure limit");
@@ -383,7 +391,7 @@ impl Model {
                 return;
             }
             self.view.cases[old.bucket] -= 1;
-        } else if d["case_size"] == "minimal" {
+        } else if d["case_detail"] == "failure_limit" {
             self.view.cases[4] += 1;
         }
         let reason = match bucket {

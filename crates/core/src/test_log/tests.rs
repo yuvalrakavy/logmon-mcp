@@ -10,14 +10,17 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_capacity(20)
+    }
+    fn with_capacity(capacity: usize) -> Self {
         let domain = Arc::new(Domain::new(
             DomainConfig {
                 name: DomainId::new("tests").unwrap(),
                 gelf_port: 0,
                 otlp_grpc_port: 0,
                 otlp_http_port: 0,
-                log_buffer_size: 20,
-                span_buffer_size: 20,
+                log_buffer_size: capacity,
+                span_buffer_size: capacity,
                 source: DomainSource::Ephemeral,
             },
             0,
@@ -90,6 +93,324 @@ impl Fixture {
         let path = self.dir.path().join(row["case_path"].as_str().unwrap());
         crate::cases::load::load(&path).unwrap().logs.unwrap()
     }
+    fn with_run(&self, f: impl FnOnce(&mut Run)) {
+        f(self
+            .domain
+            .test_log
+            .state
+            .lock()
+            .unwrap()
+            .run
+            .as_mut()
+            .unwrap());
+    }
+}
+
+fn ingest_quota_log(f: &Fixture, mut row: LogEntry) -> LogEntry {
+    crate::daemon::log_processor::process_entry_for_domain(
+        &mut row,
+        &f.domain.pipeline,
+        &crate::daemon::session::SessionRegistry::new(),
+        f.domain.id(),
+    );
+    row
+}
+
+fn quota_log(f: &Fixture, trace: u128, level: Level, message: &str) -> LogEntry {
+    let mut row = LogEntry::synthetic(level, message);
+    row.trace_id = Some(trace);
+    ingest_quota_log(f, row)
+}
+
+fn quota_span(f: &Fixture, trace: u128, id: u64) {
+    use crate::span::types::{SpanEntry, SpanKind, SpanStatus};
+    let now = Utc::now();
+    let mut span = SpanEntry {
+        seq: 0,
+        trace_id: trace,
+        span_id: id,
+        parent_span_id: None,
+        start_time: now,
+        end_time: now,
+        duration_ms: 0.0,
+        name: "test span".into(),
+        kind: SpanKind::Internal,
+        service_name: "test".into(),
+        status: SpanStatus::Ok,
+        attributes: Default::default(),
+        events: Vec::new(),
+    };
+    crate::daemon::span_processor::process_span_for_domain(
+        &mut span,
+        &f.domain.span_store,
+        &crate::daemon::session::SessionRegistry::new(),
+        &f.domain.pipeline,
+        &crate::collector::registry::CollectorRegistry::new(),
+        f.domain.id(),
+    );
+}
+
+#[test]
+fn ruling_14_crossing_reports_all_shared_executions_and_keeps_old_rows() {
+    let f = Fixture::new();
+    f.begin("one", 3000);
+    let a = f.event("a");
+    let mut b = a.clone();
+    b["execution_id"] = json!("b");
+    b["name"] = json!("other execution with the same trace");
+    f.rpc("start", a.clone());
+    f.rpc("start", b.clone());
+    quota_log(&f, 9, Level::Info, "neighbor");
+    for _ in 0..6 {
+        quota_log(&f, 1, Level::Info, "target");
+    }
+    let case = f.case_row("a");
+    assert_eq!(f.case_row("b")["case_path"], case["case_path"]);
+    let archive = f.case_logs(&case);
+    assert_eq!(archive.iter().filter(|l| l.message == "target").count(), 5);
+    assert_eq!(f.domain.pipeline.logs_by_trace_id(1).len(), 5);
+    assert_eq!(f.domain.pipeline.logs_by_trace_id(9).len(), 1);
+    assert_eq!(
+        f.domain.test_log.status("tests", None)["test_log"]["faults"]["excessive_telemetry"],
+        2
+    );
+    f.end_as(a, "OK");
+    f.end_as(b, "OK");
+    f.close("one");
+}
+
+#[test]
+fn ruling_15_refusal_covers_ingest_prebuffer_and_reinsert_but_keeps_shared_rows() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    f.domain.pipeline.resize_pre_buffer(20);
+    let a = f.event("a");
+    let mut b = f.event("b");
+    b["selector"] = json!({"field":"worker","value":"other"});
+    f.rpc("start", a.clone());
+    f.rpc("start", b.clone());
+    for _ in 0..5 {
+        quota_log(&f, 1, Level::Info, "kept");
+    }
+    let refused = quota_log(&f, 1, Level::Info, "refused");
+    f.domain.pipeline.insert_sorted(vec![refused.clone()]);
+    f.domain.pipeline.pre_buffer_append(refused.clone());
+    assert!(!f.domain.pipeline.contains_seq(refused.seq));
+    assert!(!f
+        .domain
+        .pipeline
+        .pre_buffer_entries_by_trace_id(1)
+        .iter()
+        .any(|r| r.seq == refused.seq));
+    let mut shared = LogEntry::synthetic(Level::Info, "shared");
+    shared.trace_id = Some(1);
+    shared
+        .additional_fields
+        .insert("worker".into(), json!("other"));
+    let shared = ingest_quota_log(&f, shared);
+    assert!(f.domain.pipeline.contains_seq(shared.seq));
+    f.end_as(a, "OK");
+    f.end_as(b, "OK");
+    f.close("one");
+    let end = f
+        .rows()
+        .into_iter()
+        .find(|r| r["execution_id"] == "a" && r["event"] == "end-test")
+        .unwrap();
+    assert_eq!(end["refused_telemetry"]["logs"], 1);
+    assert_eq!(
+        end["coverage"]["domain_loss_during_window"]["logs_dropped"],
+        0
+    );
+}
+
+#[test]
+fn ruling_16_ok_verdict_keeps_the_fault_refusal_count_and_tail_reference() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let a = f.event("a");
+    f.rpc("start", a.clone());
+    for _ in 0..7 {
+        quota_log(&f, 1, Level::Info, "target");
+    }
+    let ack = f.end_as(a, "OK");
+    assert_eq!(ack["fault"], "excessive_telemetry");
+    f.close("one");
+    let end = f
+        .rows()
+        .into_iter()
+        .find(|r| r["execution_id"] == "a" && r["event"] == "end-test")
+        .unwrap();
+    assert_eq!(end["verdict"], "OK");
+    assert_eq!(end["fault"], "excessive_telemetry");
+    assert_eq!(end["refused_telemetry"]["logs"], 2);
+    assert!(end["telemetry_tail_path"].is_string());
+}
+
+#[test]
+fn ruling_17_exact_limits_are_independent_and_the_next_span_crosses() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let a = f.event("a");
+    f.rpc("start", a.clone());
+    for n in 1..=5 {
+        quota_log(&f, 1, Level::Info, "target");
+        quota_span(&f, 1, n);
+    }
+    let count = || {
+        f.domain.test_log.status("tests", None)["test_log"]["faults"]["excessive_telemetry"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    assert_eq!(count(), 0);
+    quota_span(&f, 1, 6);
+    assert_eq!(count(), 1);
+    assert_eq!(f.domain.span_store.get_trace(1).len(), 5);
+    f.end_as(a, "OK");
+    f.close("one");
+}
+
+#[test]
+fn ruling_18_a_full_ring_does_not_fault_its_largest_under_limit_selector() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let a = f.event("a");
+    f.rpc("start", a.clone());
+    for trace in 2..18 {
+        quota_log(&f, trace, Level::Info, "neighbor");
+    }
+    for _ in 0..4 {
+        quota_log(&f, 1, Level::Info, "target");
+    }
+    assert_eq!(f.domain.pipeline.store_len(), 20);
+    let count = || {
+        f.domain.test_log.status("tests", None)["test_log"]["faults"]["excessive_telemetry"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    assert_eq!(count(), 0);
+    quota_log(&f, 1, Level::Info, "at limit");
+    assert_eq!(count(), 0);
+    quota_log(&f, 1, Level::Info, "crossing");
+    assert_eq!(count(), 1);
+    f.end_as(a, "OK");
+    f.close("one");
+}
+
+#[test]
+fn ruling_6_tail_writes_the_newest_two_hundred_at_end() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let a = f.event("a");
+    f.rpc("start", a.clone());
+    for _ in 0..5 {
+        quota_log(&f, 1, Level::Info, "held");
+    }
+    for i in 0..250 {
+        quota_log(&f, 1, Level::Info, &format!("tail-{i}"));
+        quota_span(&f, 1, i + 1);
+    }
+    f.end_as(a, "OK");
+    f.close("one");
+    let end = f
+        .rows()
+        .into_iter()
+        .find(|r| r["execution_id"] == "a" && r["event"] == "end-test")
+        .unwrap();
+    let path = f.dir.path().join(
+        end["telemetry_tail_path"]
+            .as_str()
+            .expect("tail path on end"),
+    );
+    let rows: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let messages: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.pointer("/record/message").and_then(Value::as_str))
+        .collect();
+    assert_eq!(messages.len(), 200);
+    assert_eq!(messages[0], "tail-50");
+    assert_eq!(messages[199], "tail-249");
+    let span_ids: Vec<_> = rows
+        .iter()
+        .filter_map(|r| r.pointer("/record/span_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(span_ids.len(), 200);
+    assert_eq!(span_ids[0], "0000000000000033");
+    assert_eq!(span_ids[199], "00000000000000fa");
+}
+
+#[test]
+fn ruling_6_all_error_selector_stops_after_the_thousandth_exemption() {
+    for (capacity, retained) in [(4096, 2024), (20, 10)] {
+        let f = Fixture::with_capacity(capacity);
+        f.begin("one", 0);
+        let a = f.event("a");
+        f.rpc("start", a.clone());
+        for i in 1..=retained + 1 {
+            quota_log(&f, 1, Level::Error, &format!("error-{i}"));
+        }
+        let held = f.domain.pipeline.logs_by_trace_id(1);
+        assert_eq!(held.len(), retained, "ring {capacity}");
+        assert_eq!(held.last().unwrap().message, format!("error-{retained}"));
+        f.end_as(a, "OK");
+        f.close("one");
+        let end = f
+            .rows()
+            .into_iter()
+            .find(|r| r["execution_id"] == "a" && r["event"] == "end-test")
+            .unwrap();
+        assert_eq!(end["refused_telemetry"]["logs"], 1);
+        let tail = f
+            .dir
+            .path()
+            .join(end["telemetry_tail_path"].as_str().unwrap());
+        let tail = std::fs::read_to_string(tail).unwrap();
+        assert!(tail.contains(&format!("\"message\":\"error-{retained}\"")));
+        assert!(tail.contains(&format!("\"message\":\"error-{}\"", retained + 1)));
+    }
+}
+
+#[test]
+fn ruling_7_tail_budget_is_shared_and_shortens_oldest_tails() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let large = "x".repeat(64 * 1024);
+    let mut events = Vec::new();
+    for trace in 1..=20 {
+        let mut execution = f.event(&format!("test-{trace}"));
+        execution["selector"]["value"] = json!(format!("{trace:032x}"));
+        f.rpc("start", execution.clone());
+        for _ in 0..25 {
+            quota_log(&f, trace, Level::Info, &large);
+        }
+        events.push(execution);
+    }
+    for execution in events {
+        f.end_as(execution, "OK");
+    }
+    f.close("one");
+    let endings: Vec<_> = f
+        .rows()
+        .into_iter()
+        .filter(|r| r["event"] == "end-test")
+        .collect();
+    let first = &endings[0];
+    let pool = first["telemetry_tail_pool_bytes"]
+        .as_u64()
+        .expect("shared budget bytes");
+    assert!(
+        pool > 15 * 1024 * 1024 && pool <= 16 * 1024 * 1024,
+        "{pool}"
+    );
+    assert_eq!(first["telemetry_tail_shortened"]["logs"], 20);
+    assert_eq!(
+        endings.last().unwrap()["telemetry_tail_shortened"]["logs"],
+        0
+    );
 }
 
 #[test]
@@ -239,7 +560,10 @@ fn slow_cases_yield_to_failures_and_green_reruns_have_their_own_slots() {
             "pending"
         );
     }
-    assert_eq!(attempt("pressure", "OK", None)["case_size"], "bare");
+    assert_eq!(
+        attempt("pressure", "OK", None)["case_status"],
+        "skipped_queue_full"
+    );
     assert_eq!(attempt("red", "FAIL", None)["case_status"], "pending");
     assert_eq!(attempt("another", "FAIL", None)["case_size"], "minimal");
     assert_eq!(
@@ -474,19 +798,37 @@ fn ruling_12_plan_drives_the_default_full_failure_limit() {
     ] {
         let f = Fixture::new();
         let mut begin = json!({
-            "run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),"grace_period_ms":0,
+            "run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),"grace_period_ms":60_000,
             "planned_executions":planned,
         });
         assert_eq!(f.rpc("begin", begin.clone())["status"], "accepted");
         let limit =
             || f.domain.test_log.status("tests", None)["test_log"]["cases"]["max_failures"].clone();
         assert_eq!(limit(), want, "planned {planned:?}");
+        let fail = |number, size| {
+            let id = format!("failure-{number}");
+            let outcome = f.end_as(f.event(&id), "FAIL");
+            assert_eq!(
+                outcome["case_size"], size,
+                "plan {planned:?}, failure {number}"
+            );
+            // Release the fixture's snapshot after each real admission. The
+            // fixture is checking failure rank independently of queue pressure.
+            f.with_run(|run| run.take_pending_for_test(&id, false));
+        };
+        for number in 1..=want {
+            fail(number, "full");
+        }
+        fail(want + 1, "minimal");
         if planned.is_none() {
             begin["planned_executions"] = json!(1_000);
             assert_eq!(f.rpc("begin", begin)["status"], "accepted");
             assert_eq!(limit(), 100);
+            for number in want + 2..=100 {
+                fail(number, "full");
+            }
+            fail(101, "minimal");
         }
-        f.close("one");
     }
 }
 
@@ -537,17 +879,27 @@ fn ruling_13_step_has_reserved_slot_and_excess_ends_get_bare_cases() {
     f.begin("one", 3000);
     for i in 0..7 {
         assert_eq!(
-            f.end_as(f.event(&format!("test-{i}")), "FAIL")["case_status"],
-            "pending"
+            f.end_as(f.event(&format!("test-{i}")), "FAIL")["case_size"],
+            "full",
+            "test ending {} must use a full slot",
+            i + 1,
         );
     }
     let test = f.event("a");
     f.rpc("start", test.clone());
     f.log(1, "selector evidence outside bare case");
-    assert_eq!(f.end_as(test, "FAIL")["case_size"], "bare");
+    assert_eq!(
+        f.end_as(test, "FAIL")["case_size"],
+        "bare",
+        "eighth test ending"
+    );
     let mut step = f.event("step");
     step["name"] = json!("step:5-rust");
-    assert_eq!(f.end_as(step, "ABORTED")["case_size"], "full");
+    assert_eq!(
+        f.end_as(step, "ABORTED")["case_size"],
+        "full",
+        "reserved step ending"
+    );
     let mut next_step = f.event("next-step");
     next_step["name"] = json!("step:6-dsl");
     assert_eq!(f.end_as(next_step, "TIMEOUT")["case_size"], "bare");
@@ -562,6 +914,173 @@ fn ruling_13_step_has_reserved_slot_and_excess_ends_get_bare_cases() {
         1
     );
     f.close("one");
+}
+
+#[test]
+fn reader_writing_slot_is_counted_and_reused_after_completion() {
+    let f = Fixture::new();
+    f.begin("one", 60_000);
+    for i in 0..7 {
+        assert_eq!(
+            f.end_as(f.event(&format!("test-{i}")), "FAIL")["case_size"],
+            "full"
+        );
+    }
+    f.with_run(|run| run.take_pending_for_test("test-0", true));
+    assert_eq!(
+        f.end_as(f.event("overflow"), "FAIL")["case_size"],
+        "bare",
+        "one slot in writing and six pending"
+    );
+    f.with_run(|run| {
+        run.finish_writer_for_test("test-0");
+        run.tick(&f.domain, Instant::now());
+    });
+    assert_eq!(f.end_as(f.event("reuse"), "FAIL")["case_size"], "full");
+}
+
+#[test]
+fn reader_eight_deadline_members_share_one_slot_under_pressure() {
+    let f = Fixture::new();
+    f.begin("one", 3000);
+    for i in 0..6 {
+        assert_eq!(
+            f.end_as(f.event(&format!("pending-{i}")), "FAIL")["case_size"],
+            "full"
+        );
+    }
+    for i in 0..8 {
+        let mut event = f.event(&format!("deadline-{i}"));
+        event["test_timeout_ms"] = json!(250);
+        f.rpc("start", event);
+    }
+    assert_eq!(
+        f.domain.test_log.status("tests", None)["test_log"]["executions"]["in_flight"],
+        8
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    let timed_out = loop {
+        let rows: Vec<_> = f
+            .rows()
+            .into_iter()
+            .filter(|row| row["event"] == "incomplete")
+            .collect();
+        if rows.len() == 8 {
+            break rows;
+        }
+        assert!(Instant::now() < until, "eight deadlines");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        timed_out
+            .iter()
+            .filter(|row| row["case_size"] == "full")
+            .count(),
+        8
+    );
+    let mut step = f.event("step");
+    step["name"] = json!("step:6-dsl");
+    assert_eq!(f.end_as(step, "ABORTED")["case_size"], "full");
+    f.close("one");
+    let paths: HashMap<_, _> = f
+        .rows()
+        .into_iter()
+        .filter(|row| row["event"] == "case-ready")
+        .map(|row| {
+            (
+                row["execution_id"].as_str().unwrap().to_owned(),
+                row["case_path"].clone(),
+            )
+        })
+        .collect();
+    for i in 1..8 {
+        assert_eq!(paths[&format!("deadline-{i}")], paths["deadline-0"]);
+    }
+}
+
+#[test]
+fn reader_optional_queue_skips_only_charge_the_rerun_attempt() {
+    let f = Fixture::new();
+    f.rpc(
+        "begin",
+        json!({"run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),
+        "grace_period_ms":60_000,"max_rerun_cases":1,"max_slow_pass_cases":1}),
+    );
+    for i in 0..7 {
+        f.end_as(f.event(&format!("full-{i}")), "FAIL");
+    }
+    let slow = |id| {
+        let mut event = f.event(id);
+        event["started_at"] = json!(Utc::now() - chrono::Duration::seconds(1));
+        event["slow_if"] = json!("elapsed > 0ms");
+        f.rpc("start", event.clone());
+        f.end_as(event, "OK")
+    };
+    let rerun = |id| {
+        let mut event = f.event(id);
+        event["rerun_of"] = json!("full-0");
+        f.end_as(event, "OK")
+    };
+    assert_eq!(slow("too-full-slow")["case_status"], "skipped_queue_full");
+    assert_eq!(rerun("too-full-rerun")["case_status"], "skipped_queue_full");
+    f.with_run(|run| run.take_pending_for_test("full-0", false));
+    assert_eq!(rerun("late-rerun")["case_status"], "skipped_rerun_limit");
+    assert_eq!(slow("late-slow")["case_status"], "pending");
+}
+
+#[test]
+fn reader_displaced_slow_pass_has_no_case_size_in_report_input() {
+    let f = Fixture::new();
+    f.begin("one", 60_000);
+    for i in 0..6 {
+        f.end_as(f.event(&format!("full-{i}")), "FAIL");
+    }
+    let mut slow = f.event("slow");
+    slow["started_at"] = json!(Utc::now() - chrono::Duration::seconds(1));
+    slow["slow_if"] = json!("elapsed > 0ms");
+    f.rpc("start", slow.clone());
+    assert_eq!(f.end_as(slow, "OK")["case_size"], "full");
+    let mut step = f.event("step-slow");
+    step["name"] = json!("step:5-rust");
+    step["started_at"] = json!(Utc::now() - chrono::Duration::seconds(1));
+    step["slow_if"] = json!("elapsed > 0ms");
+    f.rpc("start", step.clone());
+    assert_eq!(f.end_as(step, "OK")["case_size"], "full");
+    assert_eq!(f.end_as(f.event("red"), "FAIL")["case_size"], "full");
+    let cutoff = Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows = f.rows();
+        if rows
+            .iter()
+            .any(|row| row["event"] == "end-test" && row["execution_id"] == "red")
+        {
+            let row = rows
+                .iter()
+                .find(|row| row["event"] == "case-skipped" && row["execution_id"] == "slow")
+                .unwrap();
+            assert_eq!(row["case_status"], "evicted_for_priority");
+            assert_eq!(row.get("case_size"), Some(&Value::Null), "{row:?}");
+            assert!(!rows.iter().any(|row| {
+                row["event"] == "case-skipped" && row["execution_id"] == "step-slow"
+            }));
+            break;
+        }
+        assert!(Instant::now() < cutoff);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn reader_late_plan_is_refused_when_run_has_closed() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    f.close("one");
+    let response = f.rpc(
+        "begin",
+        json!({"run_id":"one",
+        "jsonl_path":f.dir.path().join("one.jsonl"),"planned_executions":40}),
+    );
+    assert_eq!(response["code"], "run_closed");
 }
 
 #[test]
@@ -901,6 +1420,8 @@ fn repeated_begin_sets_an_unknown_plan_once() {
     assert!(log.status("tests", None)["test_log"]["executions"]["planned"].is_null());
 
     begin["planned_executions"] = json!(40);
+    let unused_path = f.dir.path().join("unused.jsonl");
+    begin["jsonl_path"] = json!(unused_path);
     begin["max_failures"] = json!(1);
     assert_eq!(f.rpc("begin", begin.clone())["status"], "accepted");
     assert_eq!(f.rpc("begin", begin.clone())["status"], "already_applied");
@@ -919,6 +1440,7 @@ fn repeated_begin_sets_an_unknown_plan_once() {
     execution["ended_at"] = json!(Utc::now());
     assert_eq!(f.rpc("end", execution)["status"], "accepted");
     f.close("one");
+    assert!(!unused_path.exists());
     let rows = f.rows();
     assert_eq!(
         rows.iter()

@@ -5,6 +5,12 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ## Unreleased
 
+### Added — test-log limits telemetry per selector
+
+Runs can set the fraction of each ring a selector can use. Crossing the limit
+captures a case and records an `excessive_telemetry` fault alongside the runner’s
+verdict. A bounded tail preserves recent refusals and travels with the report.
+
 ### Explicit domains and scoped investigation state
 
 Pass `domain` on individual MCP reads and watches when several callers share a connection. Successful replies identify the serving domain. Pass a caller-specific `scope` to isolate named cursors and bookmarks and to identify trigger notifications.
@@ -16,6 +22,8 @@ Query a domain’s current run, active executions, verdicts, cases and recent ru
 ### Fixed — test-log cases survive capture pressure
 
 Abnormal endings get a case even when the capture budget or snapshot queue is exhausted. Reports name full, minimal, and bare cases and show how much evidence was omitted. One snapshot slot is reserved for `step:*` executions. The full failure limit follows the planned execution count unless the runner overrides it. Failed reruns now follow the failure policy.
+
+`skipped_failure_limit` is replaced by a minimal case, with a bare fallback under capture pressure. Setting `--max-failures 0` used to disable failure cases and now requests a minimal case for each failure covered by the limit. With neither a plan nor an override, the default is 50, down from 500. `skipped_capture_budget` is replaced by cut cases, bare cases for abnormal endings with no room, or `skipped_pool_exhausted` for optional captures. `skipped_queue_full` still applies to slow passes and OK reruns. An abnormal ending that cannot get a slot now gets a bare case.
 
 ### Fixed — an SDK call hung forever when the broker closed the connection mid-call
 

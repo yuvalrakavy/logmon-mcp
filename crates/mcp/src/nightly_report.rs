@@ -91,6 +91,9 @@ impl Report {
         if field(row, "verdict") != "OK" {
             out.push("failed or incomplete");
         }
+        if field(row, "fault") == "excessive_telemetry" {
+            out.push("excessive_telemetry");
+        }
         if !field(row, "rerun_of").is_empty() {
             out.push("rerun");
         }
@@ -134,6 +137,7 @@ impl Report {
         let mut pending = 0;
         let mut case_errors = 0;
         let mut coverage_gaps = 0;
+        let mut telemetry_faults = 0;
         let mut rows = String::new();
         for (id, row) in &self.log.executions {
             let verdict = row
@@ -159,6 +163,7 @@ impl Report {
                 }
             }
             let flags = self.reasons(id, row);
+            telemetry_faults += usize::from(flags.contains(&"excessive_telemetry"));
             coverage_gaps += usize::from(flags.iter().any(|s| {
                 matches!(
                     *s,
@@ -197,6 +202,9 @@ impl Report {
             if let Some(path) = row.get("case_path").and_then(Value::as_str) {
                 let _ = write!(rows, " [case](<{path}>)");
             }
+            if field(row, "fault") == "excessive_telemetry" {
+                append_telemetry_details(&mut rows, row);
+            }
             if let Some(original) = self.log.executions.get(field(row, "rerun_of")) {
                 let _ = write!(
                     rows,
@@ -220,6 +228,8 @@ impl Report {
             || coverage_gaps > 0
         {
             "Completed with evidence gaps"
+        } else if telemetry_faults > 0 {
+            "Completed with telemetry limit faults"
         } else {
             "Test-log completed normally"
         };
@@ -228,6 +238,12 @@ impl Report {
             let _ = writeln!(
                 out,
                 "Executions with known loss or incomplete ring coverage: {coverage_gaps}."
+            );
+        }
+        if telemetry_faults > 0 {
+            let _ = writeln!(
+                out,
+                "Executions with telemetry limit faults: {telemetry_faults}."
             );
         }
         if let Some(at) = self.settled_at {
@@ -247,7 +263,7 @@ impl Report {
         if let Some((lo, hi)) = self.loads {
             let _ = writeln!(out, "\nSampled machine load: {lo}–{hi}.");
         }
-        out.push_str("\n## Exceptional executions\n\nIncludes failed or incomplete executions, reruns, case decisions, deadline crossings, late telemetry and evidence loss. Run-level journal gaps appear in failed-test-log.jsonl.\n\n");
+        out.push_str("\n## Exceptional executions\n\nIncludes failed or incomplete executions, reruns, case decisions, deadline crossings, telemetry limit faults, late telemetry and evidence loss. Run-level journal gaps appear in failed-test-log.jsonl.\n\n");
         out.push_str(if rows.is_empty() { "None.\n" } else { &rows });
         slow.sort_by(|a, b| b.0.total_cmp(&a.0));
         if !slow.is_empty() {
@@ -257,6 +273,48 @@ impl Report {
             }
         }
         out
+    }
+}
+
+fn append_telemetry_details(out: &mut String, row: &Row) {
+    let flatten = logmon_broker_core::render::escape::flatten;
+    if let Some(refused) = row.get("refused_telemetry") {
+        let logs = refused["logs"].as_u64().unwrap_or(0);
+        let spans = refused["spans"].as_u64().unwrap_or(0);
+        let _ = write!(out, ", refused telemetry (logs {logs}, spans {spans})");
+    }
+    if let Some(limit) = row.get("telemetry_limit") {
+        if let (Some(kind), Some(count), Some(ring)) = (
+            limit["kind"].as_str(),
+            limit["limit"].as_u64(),
+            limit["ring_size"].as_u64(),
+        ) {
+            let _ = write!(
+                out,
+                ", limit {count} {} in a {ring}-record ring",
+                flatten(kind)
+            );
+        }
+        if let Some(peers) = limit["shared_with"].as_array() {
+            for peer in peers {
+                if let Some(name) = peer["name"].as_str() {
+                    let _ = write!(out, ", shares the selector of {}", flatten(name));
+                }
+            }
+        }
+    }
+    if let Some(path) = row.get("telemetry_tail_path").and_then(Value::as_str) {
+        let _ = write!(out, " [telemetry tail](<{path}>)");
+    }
+    if let Some(shortened) = row.get("telemetry_tail_shortened") {
+        let logs = shortened["logs"].as_u64().unwrap_or(0);
+        let spans = shortened["spans"].as_u64().unwrap_or(0);
+        if logs > 0 || spans > 0 {
+            let _ = write!(out, ", tail shortened (logs {logs}, spans {spans})");
+        }
+    }
+    if let Some(error) = row.get("telemetry_tail_error").and_then(Value::as_str) {
+        let _ = write!(out, ", telemetry tail write error ({})", flatten(error));
     }
 }
 
@@ -344,6 +402,31 @@ fn append_case<W: Write + io::Seek>(
     Ok(reference.into())
 }
 
+fn append_telemetry_tail<W: Write + io::Seek>(
+    out: &mut ZipWriter<W>,
+    root: &Path,
+    reference: &str,
+) -> Result<()> {
+    let rel = Path::new(reference);
+    ensure!(
+        rel.parent() == Some(Path::new("cases"))
+            && rel
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            && reference.ends_with(".telemetry-tail.jsonl"),
+        "invalid telemetry tail reference {reference}"
+    );
+    let source = root
+        .join(rel)
+        .canonicalize()
+        .with_context(|| format!("opening telemetry tail {reference}"))?;
+    ensure!(
+        source.starts_with(root.join("cases")),
+        "telemetry tail outside cases directory"
+    );
+    copy_member(out, reference, File::open(source)?)
+}
+
 pub fn archive(path: &Path, output: &Path, unresolved: usize) -> Result<()> {
     let path = path.canonicalize()?;
     let root = path.parent().context("missing journal directory")?;
@@ -364,6 +447,7 @@ pub fn archive(path: &Path, output: &Path, unresolved: usize) -> Result<()> {
     let mut out = ZipWriter::new(tmp.as_file_mut());
     out.add_directory("cases/", SimpleFileOptions::default())?;
     let mut refs = BTreeMap::new();
+    let mut tails = BTreeSet::new();
     for row in report.log.executions.values_mut() {
         if let Some(Value::String(reference)) = row.get_mut("case_path") {
             let archived = match refs.get(reference) {
@@ -374,6 +458,10 @@ pub fn archive(path: &Path, output: &Path, unresolved: usize) -> Result<()> {
                 }
             };
             reference.clone_from(archived);
+        }
+        let tail = field(row, "telemetry_tail_path");
+        if !tail.is_empty() && tails.insert(tail.to_owned()) {
+            append_telemetry_tail(&mut out, root, tail)?;
         }
     }
     let exceptional: BTreeSet<_> = report
@@ -464,6 +552,68 @@ mod tests {
             .unwrap()
             .markdown()
             .contains("Finalization pending"));
+    }
+
+    #[test]
+    fn reader_displaced_slow_pass_renders_a_skip_without_a_case_size() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("test.jsonl");
+        write_rows(
+            &journal,
+            &[
+                json!({"event":"end-test","execution_id":"a","name":"slow test","verdict":"OK",
+                    "case_status":"pending","case_size":"full"}),
+                json!({"event":"case-skipped","execution_id":"a","case_status":"evicted_for_priority"}),
+                json!({"event":"run-settled"}),
+            ],
+        );
+        let report = Report::open(&journal, 0).unwrap().markdown();
+        assert!(
+            !report.contains("full case evicted_for_priority"),
+            "{report}"
+        );
+        assert!(report.contains("case evicted_for_priority"), "{report}");
+    }
+
+    #[test]
+    fn b1_report_and_archive_keep_an_ok_telemetry_fault_and_its_tail() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("test.jsonl");
+        let output = dir.path().join("run.zip");
+        let tail = "cases/a.telemetry-tail.jsonl";
+        std::fs::create_dir(dir.path().join("cases")).unwrap();
+        std::fs::write(dir.path().join(tail), "{\"record\":{}}\n").unwrap();
+        write_rows(
+            &journal,
+            &[
+                json!({"event":"end-test","execution_id":"a","name":"test a","verdict":"OK",
+                "fault":"excessive_telemetry","refused_telemetry":{"logs":2,"spans":1},
+                "telemetry_tail_shortened":{"logs":1,"spans":0},
+                "telemetry_limit":{"kind":"logs","limit":5,"ring_size":20,
+                    "shared_with":[{"execution_id":"b","name":"test b"}]},
+                "telemetry_tail_path":tail}),
+                json!({"event":"run-settled"}),
+            ],
+        );
+        let summary = Report::open(&journal, 0).unwrap().markdown();
+        assert!(summary.contains("test a (a) — OK"), "{summary}");
+        assert!(summary.contains("excessive_telemetry"));
+        assert!(summary.contains("refused telemetry (logs 2, spans 1)"));
+        assert!(summary.contains("tail shortened (logs 1, spans 0)"));
+        assert!(summary.contains("5 logs in a 20-record ring"));
+        assert!(summary.contains("shares the selector of test b"));
+        assert!(summary.contains(tail));
+        archive(&journal, &output, 0).unwrap();
+        let mut zip = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        assert!(zip.by_name(tail).is_ok());
+        let mut failed = String::new();
+        zip.by_name("failed-test-log.jsonl")
+            .unwrap()
+            .read_to_string(&mut failed)
+            .unwrap();
+        assert!(failed.contains("excessive_telemetry"));
     }
 
     #[test]

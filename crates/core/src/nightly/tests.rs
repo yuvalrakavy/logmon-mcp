@@ -170,11 +170,89 @@ fn cut_snapshot_counts_a_pending_ingest_callback_once() {
         .unwrap()
         .set_available(super::log_bytes(&error) + 96);
     d.pipeline.append_to_store(error);
+    let _observation = d.test_log.track_log(info.seq);
     d.pipeline.append_to_store(info.clone());
 
     let mut snap = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
     snap.observe_log(&info);
     assert_eq!(snap.coverage()["omitted_records"]["selector_other"], 1);
+}
+
+#[test]
+fn reader_omitted_log_is_counted_once_after_an_intervening_store() {
+    let d = domain();
+    let mut kept = LogEntry::synthetic(Level::Error, "kept");
+    kept.seq = d.pipeline.assign_seq();
+    kept.trace_id = Some(10);
+    d.test_log
+        .capture_pool
+        .lock()
+        .unwrap()
+        .set_available(super::log_bytes(&kept) + 96);
+    d.pipeline.append_to_store(kept);
+    let mut inflight = LogEntry::synthetic(Level::Info, "in flight");
+    inflight.seq = d.pipeline.assign_seq();
+    inflight.trace_id = Some(10);
+    let _observation = d.test_log.track_log(inflight.seq);
+    d.pipeline.append_to_store(inflight.clone());
+    let mut machine_load = LogEntry::synthetic(Level::Info, "machine-load");
+    machine_load.seq = d.pipeline.assign_seq();
+    d.pipeline.append_to_store(machine_load);
+    let now = Utc::now();
+    let mut capture = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
+    capture.observe_log(&inflight);
+    assert_eq!(capture.coverage()["omitted_records"]["selector_other"], 1);
+}
+
+#[test]
+fn reader_omitted_span_is_counted_once_after_an_intervening_store() {
+    let d = domain();
+    let mut kept = span();
+    kept.status = SpanStatus::Error("kept".into());
+    d.test_log
+        .capture_pool
+        .lock()
+        .unwrap()
+        .set_available(super::span_bytes(&kept) + 96);
+    d.span_store.insert(kept);
+    let mut inflight = span();
+    inflight.span_id = 10;
+    let mut observation = d.test_log.track_span();
+    inflight.seq = d
+        .span_store
+        .insert_notifying(inflight.clone(), |seq| observation.assigned(seq));
+    let mut newer = span();
+    newer.trace_id = 11;
+    d.span_store.insert(newer);
+    let now = Utc::now();
+    let mut capture = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
+    capture.observe_span(&inflight);
+    assert_eq!(capture.coverage()["omitted_records"]["selector_other"], 1);
+}
+
+#[test]
+fn reader_late_selector_error_span_replaces_a_lower_priority_log() {
+    let d = domain();
+    let mut log = LogEntry::synthetic(Level::Info, "lower priority");
+    log.trace_id = Some(10);
+    log.seq = d.pipeline.assign_seq();
+    let mut late = span();
+    late.status = SpanStatus::Error("late error".into());
+    let bytes = super::log_bytes(&log).max(super::span_bytes(&late)) + 96;
+    d.test_log.capture_pool.lock().unwrap().set_available(bytes);
+    d.pipeline.append_to_store(log);
+    let now = Utc::now();
+    let mut capture = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
+    late.seq = d.pipeline.assign_seq();
+    capture.observe_span(&late);
+    let omissions = capture.coverage()["omitted_records"].clone();
+    assert_eq!(omissions["selector_other"], 1);
+    assert_eq!(omissions["selector_error"], 0);
+    let dir = tempfile::tempdir().unwrap();
+    let path = capture.write(dir.path(), &json!({}), vec![]).unwrap();
+    let case = cases::load::load(&path).unwrap();
+    assert_eq!(case.logs.unwrap().len(), 1, "capture marker only");
+    assert_eq!(case.spans.unwrap()[0].seq, late.seq);
 }
 
 #[test]

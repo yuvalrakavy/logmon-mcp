@@ -127,8 +127,8 @@ pub struct CaptureSnapshot {
     spans: BTreeMap<u64, Arc<SpanEntry>>,
     log_floor: u64,
     span_floor: u64,
-    log_tip: Option<u64>,
-    span_tip: Option<u64>,
+    captured_pending_logs: Vec<u64>,
+    captured_pending_spans: Vec<u64>,
     domain_drops: Value,
     ring_coverage: Value,
     pool: Arc<Mutex<CapturePool>>,
@@ -282,8 +282,8 @@ impl CaptureSnapshot {
             spans: BTreeMap::new(),
             log_floor: 0,
             span_floor: 0,
-            log_tip: None,
-            span_tip: None,
+            captured_pending_logs: Vec::new(),
+            captured_pending_spans: Vec::new(),
             ring_coverage: Value::Null,
             domain_drops: json!({"gelf_udp":drops.gelf_udp,"gelf_tcp":drops.gelf_tcp,
                 "otlp_http_logs":drops.otlp_http_logs,"otlp_http_traces":drops.otlp_http_traces,
@@ -300,21 +300,25 @@ impl CaptureSnapshot {
             domain.span_store.with_retained(|spans| {
                 snapshot.log_floor = logs.lost_below;
                 snapshot.span_floor = spans.lost_below;
-                // Each stream stores a record before its single processor calls
-                // into the run. At most its newest captured record can still
-                // have an observation waiting behind the verdict's state lock.
-                snapshot.log_tip = logs
-                    .records
-                    .iter()
-                    .rev()
-                    .find(|log| log.seq < anchor_seq)
-                    .map(|log| log.seq);
-                snapshot.span_tip = spans
-                    .records
-                    .iter()
-                    .rev()
-                    .find(|span| span.seq < anchor_seq)
-                    .map(|span| span.seq);
+                let (mut pending_logs, mut pending_spans) = domain.test_log.pending_ingest();
+                // Only suppress callbacks for records this snapshot actually
+                // visited. A processor can have a sequence before it stores.
+                pending_logs.retain(|&seq| {
+                    seq < anchor_seq
+                        && logs
+                            .records
+                            .binary_search_by_key(&seq, |row| row.seq)
+                            .is_ok()
+                });
+                pending_spans.retain(|&seq| {
+                    seq < anchor_seq
+                        && spans
+                            .records
+                            .binary_search_by_key(&seq, |row| row.seq)
+                            .is_ok()
+                });
+                snapshot.captured_pending_logs = pending_logs;
+                snapshot.captured_pending_spans = pending_spans;
                 snapshot.capture_records(&logs, &spans);
                 snapshot.ring_coverage = coverage(&logs, &spans, anchor_seq, start, end);
             })
@@ -435,7 +439,7 @@ impl CaptureSnapshot {
     }
 
     pub fn observe_log(&mut self, log: &LogEntry) {
-        if self.log_tip == Some(log.seq) {
+        if self.captured_pending_logs.contains(&log.seq) {
             return;
         }
         if let Some(priority) = Record::Log(log).priority(self) {
@@ -474,7 +478,7 @@ impl CaptureSnapshot {
         }
     }
     pub fn observe_span(&mut self, span: &SpanEntry) {
-        if self.span_tip == Some(span.seq) {
+        if self.captured_pending_spans.contains(&span.seq) {
             return;
         }
         if let Some(priority) = Record::Span(span).priority(self) {

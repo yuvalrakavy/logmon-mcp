@@ -54,6 +54,10 @@ pub fn process_entry_for_domain(
 ) {
     // 1. Assign seq
     entry.seq = pipeline.assign_seq();
+    if !pipeline.test_log.admit_log(entry) {
+        return;
+    }
+    let _observation = pipeline.test_log.track_log(entry.seq);
 
     // 2. (The pre-trigger buffer takes this entry AFTER its triggers are evaluated — see
     //    below — so a trigger's pre-window is the N records before the match.)
@@ -101,14 +105,7 @@ pub fn process_entry_for_domain(
             // skips anything already held — a record a filter stored earlier keeps its own
             // `source`. One merge per firing session, before that session's `context_before`
             // below reads the ring.
-            let mut flushed = pipeline.pre_buffer_copy(trigger_max_pre as usize);
-            if let Some(tid) = entry.trace_id {
-                flushed.extend(pipeline.pre_buffer_entries_by_trace_id(tid));
-            }
-            for e in &mut flushed {
-                e.source = LogSource::PreTrigger;
-            }
-            pipeline.insert_sorted(flushed);
+            pipeline.store_trigger_context(trigger_max_pre as usize, entry.trace_id);
 
             // Activate post-window for this session. EXTEND rather than set:
             // a match can now land inside an already-open window, and a small
@@ -179,7 +176,7 @@ pub fn process_entry_for_domain(
     // The entry joins the pre-trigger buffer only now, after its own triggers ran. Appended
     // before them (as it once was), it sat in the buffer when it fired, and a pre-window of N
     // flushed the matching record itself as one of the N — N-1 records before the match.
-    pipeline.pre_buffer_append(entry.clone());
+    pipeline.pre_buffer_append_admitted(entry.clone());
 
     // 5. Buffer storage (if entry not already stored by trigger logic)
     if !pipeline.contains_seq(entry.seq) {

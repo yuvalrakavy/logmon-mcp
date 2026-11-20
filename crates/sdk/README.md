@@ -84,7 +84,9 @@ through `logmon_broker_sdk::test_log` and the following methods on `Broker`.
 | `test_log_replay` | Run ID and up to 100 original end payloads in delivery order |
 | `test_log_close` / `test_log_seal` | Run ID and wait budget in milliseconds |
 
-If the plan was unknown at begin, call `test_log_begin` again with the same run ID and JSONL path and set `planned_executions` while the run is open.
+If the plan was unknown at begin, call `test_log_begin` again with the same run ID and set `planned_executions` while the run is open. The request still requires the JSONL path. The broker keeps the original journal and settings.
+
+Set `execution_limit_percent` at begin to configure each selector’s share of the log and span rings. The test-log journal separates the `excessive_telemetry` fault and refusal counts from the runner’s verdict. See the [telemetry limit guide](../../docs/test-log-progress.md#per-selector-telemetry-limit).
 
 Set one caller-side deadline around connection acquisition, sending and waiting for a
 start or end reply. The driver distributes `lifecycle_ack_timeout_ms` from the run

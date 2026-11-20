@@ -118,8 +118,14 @@ pub struct TestLogRunSummary {
     pub cases: TestLogCaseCounts,
     pub summaries: TestLogSummaryCounts,
     pub replayed_ends: u64,
+    #[serde(default)]
+    pub faults: TestLogFaultCounts,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TestLogFaultCounts {
+    pub excessive_telemetry: u64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TestLogRunningExecution {
     pub name: String,

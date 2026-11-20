@@ -48,8 +48,12 @@ pub fn process_span_for_domain(
     collectors: &CollectorRegistry,
     domain: &DomainId,
 ) {
+    if !pipeline.test_log.admit_span(span) {
+        return;
+    }
     // 1. Store unconditionally. The store assigns the seq; this copy takes it too.
-    span.seq = store.insert(span.clone());
+    let mut observation = pipeline.test_log.track_span();
+    span.seq = store.insert_notifying(span.clone(), |seq| observation.assigned(seq));
     let span: &SpanEntry = span;
 
     // 2. Fold into any collector pinned to this domain whose filter matches.
@@ -61,6 +65,7 @@ pub fn process_span_for_domain(
     // it (§4.4).
     collectors.ingest_span(domain, span);
     pipeline.test_log.observe_span(span);
+    drop(observation);
 
     // 3. Evaluate span triggers for each session bound to this domain.
     //

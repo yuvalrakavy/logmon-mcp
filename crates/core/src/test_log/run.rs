@@ -1,4 +1,8 @@
-use super::{refused, writer::Journal};
+use super::{
+    quota::{Quotas, Record, TailWriter, FAULT},
+    refused,
+    writer::Journal,
+};
 use crate::cases::document::RegistryFact;
 use crate::daemon::domain::Domain;
 use crate::gelf::message::{Level, LogEntry};
@@ -9,7 +13,7 @@ use logmon_broker_protocol::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Weak};
 use std::time::{Duration, Instant};
 
 const MAX_SNAPSHOTS: usize = 8;
@@ -52,6 +56,8 @@ struct Execution {
     capture_deadline: Option<Instant>,
     late_logs: u64,
     late_spans: u64,
+    quota: usize,
+    telemetry_end: Option<Value>,
 }
 
 impl Execution {
@@ -160,7 +166,11 @@ pub(super) struct Run {
     close_written: bool,
     entries: HashMap<String, Execution>,
     // Keep ingestion proportional to selector fields and matching executions.
-    index: HashMap<String, HashMap<String, Vec<String>>>,
+    index: HashMap<String, HashMap<String, usize>>,
+    quotas: Quotas,
+    last_log_admission: Option<(u64, bool)>,
+    tail_writer: TailWriter,
+    domain: Weak<Domain>,
     active: HashSet<String>,
     grace: HashSet<String>,
     pending: HashMap<String, Pending>,
@@ -234,6 +244,164 @@ impl Slow {
 }
 
 impl Run {
+    #[cfg(test)]
+    pub(super) fn take_pending_for_test(&mut self, id: &str, writing: bool) {
+        self.pending.remove(id).expect("pending case for test");
+        if writing {
+            assert!(self.writing.insert(id.into()));
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn finish_writer_for_test(&self, id: &str) {
+        self.finished_tx
+            .send((id.into(), Err("test writer finished".into())))
+            .unwrap();
+    }
+
+    fn matching_groups<'a>(&'a self, record: Record<'a>) -> impl Iterator<Item = usize> + 'a {
+        self.index.iter().filter_map(move |(field, values)| {
+            let value = match record {
+                Record::Log(log) => Selector::log_value(field, log),
+                Record::Span(span) => Selector::span_value(field, span),
+            }?;
+            values.get(value.as_ref()).copied()
+        })
+    }
+
+    pub fn allows_reinsert(&self, log: &LogEntry) -> bool {
+        if let Some((seq, allowed)) = self.last_log_admission {
+            if seq == log.seq {
+                return allowed;
+            }
+        }
+        self.quotas.allows_reinsert(
+            log,
+            self.matching_groups(Record::Log(log)).filter(|&id| {
+                self.quotas.groups[id].live > 0 || self.quotas.groups[id].crossing.is_some()
+            }),
+        )
+    }
+
+    pub fn admit_record(&mut self, record: Record<'_>) -> (bool, bool) {
+        let groups = if self.active.is_empty() {
+            Vec::new()
+        } else {
+            self.matching_groups(record)
+                .filter(|&id| self.quotas.groups[id].live > 0)
+                .collect()
+        };
+        let (accepted, mut crossed) = self.quotas.admit(record, &groups);
+        if let Record::Log(log) = record {
+            self.last_log_admission = Some((log.seq, accepted));
+        }
+        crossed.sort_unstable();
+        for &group in &crossed {
+            self.capture_crossing(group);
+        }
+        (accepted, !crossed.is_empty())
+    }
+
+    fn telemetry_fault(&self, id: &str) -> Value {
+        let ex = &self.entries[id];
+        let group = &self.quotas.groups[ex.quota];
+        let Some(crossing) = group.crossing else {
+            return Value::Null;
+        };
+        let peers = group
+            .executions
+            .iter()
+            .filter(|peer| peer.as_str() != id)
+            .map(|peer| json!({"execution_id":peer,"name":self.entries[peer].start.name}))
+            .collect();
+        json!({"fault":FAULT,"telemetry_limit":crossing.details(peers)})
+    }
+
+    fn append_telemetry_fault(&self, id: &str) {
+        let mut data = self.telemetry_fault(id);
+        data["execution_id"] = json!(id);
+        data["name"] = json!(self.entries[id].start.name);
+        data["case_status"] = json!(self.entries[id].decision);
+        data["case_size"] = json!(self.entries[id].case_size.map(CaptureSize::as_str));
+        self.append("telemetry-fault", data);
+    }
+
+    fn capture_crossing(&mut self, group: usize) {
+        let members = self.quotas.groups[group].executions.clone();
+        let Some(owner) = members.iter().find(|id| self.active.contains(*id)).cloned() else {
+            return;
+        };
+        let Some(domain) = self.domain.upgrade() else {
+            return;
+        };
+        self.quotas.groups[group].case_owner = Some(owner.clone());
+        let registry = self.provenance.clone();
+        self.admit(&domain, &owner, FAULT, Utc::now(), false, &registry);
+        for id in members {
+            self.join_crossing_case(&id);
+        }
+    }
+
+    fn join_crossing_case(&mut self, id: &str) {
+        let group = &self.quotas.groups[self.entries[id].quota];
+        let Some(owner) = &group.case_owner else {
+            return;
+        };
+        let size = self.entries[owner].case_size;
+        let detail = self.entries[owner].case_detail;
+        let ex = self.entries.get_mut(id).unwrap();
+        if ex.decision.is_none() {
+            ex.reason = Some(FAULT);
+            ex.case_size = size;
+            ex.case_detail = detail;
+            ex.decision = Some("pending".into());
+        }
+        self.append_telemetry_fault(id);
+        if self.entries[id].reason == Some(FAULT) && id != owner {
+            if let Some(path) = &group.case_path {
+                self.append(
+                    "case-ready",
+                    json!({"execution_id":id,"case_status":"ready",
+                    "case_path":path,"case_size":size.map(CaptureSize::as_str),"case_detail":detail}),
+                );
+            } else if let Some(error) = &group.case_error {
+                self.append(
+                    "case-error",
+                    json!({"execution_id":id,"case_status":"error","message":error}),
+                );
+            }
+        }
+    }
+
+    fn finish_telemetry(&mut self, d: &Domain, id: &str) {
+        if !self.active.remove(id) {
+            return;
+        }
+        let quota = self.entries[id].quota;
+        if self.quotas.groups[quota].crossing.is_some() {
+            let dir = self.journal.path.parent().expect("absolute journal");
+            let (mut data, job) = self.quotas.save(quota, id, dir);
+            if let Some(job) = job {
+                if let Err(error) = self.tail_writer.send(job) {
+                    data.as_object_mut().unwrap().remove("telemetry_tail_path");
+                    data["telemetry_tail_error"] = json!(error);
+                }
+            }
+            self.entries.get_mut(id).unwrap().telemetry_end = Some(data);
+        }
+        self.quotas.finish(quota, d.pipeline.current_seq());
+    }
+
+    fn add_telemetry(&self, id: &str, data: &mut Value) {
+        if let Some(fault) = self.telemetry_fault(id).as_object() {
+            let result = data.as_object_mut().expect("execution row");
+            result.extend(fault.clone());
+            if let Some(info) = &self.entries[id].telemetry_end {
+                result.extend(info.as_object().expect("end telemetry").clone());
+            }
+        }
+    }
+
     fn is_step(&self, id: &str) -> bool {
         self.entries[id].start.name.starts_with("step:")
     }
@@ -241,17 +409,8 @@ impl Run {
     fn snapshot_slot_available(&self, step: bool) -> bool {
         let mut total = 0;
         let mut tests = 0;
-        let pending_members = self
-            .pending
-            .values()
-            .flat_map(|p| p.members.iter().map(|m| &m.0));
-        for id in self
-            .pending
-            .keys()
-            .chain(pending_members)
-            .chain(&self.writing)
-            .chain(self.writing_members.values().flatten())
-        {
+        // A deadline group reserves one slot from admission through writing.
+        for id in self.pending.keys().chain(&self.writing) {
             if self.entries[id].case_size != Some(CaptureSize::Bare) {
                 total += 1;
                 tests += usize::from(!self.is_step(id));
@@ -296,6 +455,11 @@ impl Run {
         {
             return Err("summary_sample_percent must be between 0 and 100".into());
         }
+        if c.execution_limit_percent
+            .is_some_and(|p| !(p > 0. && p <= 100.))
+        {
+            return Err("execution_limit_percent must be greater than 0 and at most 100".into());
+        }
         if let Some(cond) = &c.slow_if {
             Slow::parse(cond)?;
         }
@@ -316,6 +480,7 @@ impl Run {
         Ok(())
     }
     pub fn new(
+        domain: &Arc<Domain>,
         config: TestLogBegin,
         journal: Journal,
         provenance: Vec<RegistryFact>,
@@ -324,6 +489,13 @@ impl Run {
         let (tx, rx) = mpsc::channel();
         let began_at = Utc::now();
         let journal = Arc::new(journal);
+        let quotas = Quotas::new(
+            [
+                domain.pipeline.store.ring_info().0.current,
+                domain.span_store.ring_info().0.current,
+            ],
+            config.execution_limit_percent.unwrap_or(25.),
+        );
         Self {
             progress: super::progress::Progress::new(&config, began_at, journal.clone(), history),
             config,
@@ -334,6 +506,10 @@ impl Run {
             close_written: false,
             entries: HashMap::new(),
             index: HashMap::new(),
+            quotas,
+            last_log_admission: None,
+            domain: Arc::downgrade(domain),
+            tail_writer: TailWriter::default(),
             active: HashSet::new(),
             grace: HashSet::new(),
             pending: HashMap::new(),
@@ -404,12 +580,13 @@ impl Run {
         } else {
             s.selector.value.clone()
         };
-        self.index
+        let quota = *self
+            .index
             .entry(s.selector.field.clone())
             .or_default()
             .entry(key)
-            .or_default()
-            .push(id.clone());
+            .or_insert(self.quotas.groups.len());
+        self.quotas.register(quota, id.clone());
         self.active.insert(id.clone());
         self.entries.insert(
             id,
@@ -435,6 +612,8 @@ impl Run {
                 coverage: json!({"collection_mode":mode,"coverage_as_of":Utc::now()}),
                 late_logs: 0,
                 late_spans: 0,
+                quota,
+                telemetry_end: None,
             },
         );
         Ok(())
@@ -455,6 +634,12 @@ impl Run {
         let id = s.execution_id.clone();
         self.register(s, "live", Some(loss_counters(d)))?;
         self.append("start-test", payload);
+        if self.quotas.groups[self.entries[&id].quota]
+            .crossing
+            .is_some()
+        {
+            self.join_crossing_case(&id);
+        }
         Ok(json!({"status":"accepted","run_id":self.config.run_id,"execution_id":id}))
     }
     pub fn machine_load(&mut self, domain: &Domain, sample: TestLogMachineLoad) -> Value {
@@ -462,8 +647,7 @@ impl Run {
             return refused(&sample.run_id, "run_closed");
         }
         self.append("machine-load", serde_json::to_value(&sample).unwrap());
-        // Keep machine telemetry subject to the same retention and snapshot
-        // budget as every other record. It has no execution selector.
+        // Machine rows have no trace ID, but can match an explicit field selector.
         let mut row = LogEntry::synthetic(Level::Info, "machine-load");
         row.timestamp = sample.ts;
         row.host = sample.host;
@@ -474,8 +658,10 @@ impl Run {
             .insert("run_id".into(), json!(sample.run_id));
         row.additional_fields
             .insert("sample".into(), json!(sample.fields));
-        domain.pipeline.append_to_store(row.clone());
-        self.observe_log(&row);
+        if self.admit_record(Record::Log(&row)).0 {
+            domain.pipeline.append_to_store(row.clone());
+            self.observe_log(&row);
+        }
         json!({"status":"accepted","run_id":self.config.run_id})
     }
     pub fn end(
@@ -503,10 +689,10 @@ impl Run {
                 {
                     return Ok(refused(&e.run_id, "execution_outcome_conflict"));
                 }
-                return Ok(
-                    json!({"status":"already_applied","run_id":e.run_id,"execution_id":id,"case_status":old.decision,
-                        "case_size":old.case_size.map(CaptureSize::as_str),"case_detail":old.case_detail}),
-                );
+                let mut ack = json!({"status":"already_applied","run_id":e.run_id,"execution_id":id,"case_status":old.decision,
+                    "case_size":old.case_size.map(CaptureSize::as_str),"case_detail":old.case_detail});
+                self.add_telemetry(&id, &mut ack);
+                return Ok(ack);
             }
         }
         if self.closing {
@@ -531,6 +717,12 @@ impl Run {
                 "ring_backfill",
                 None,
             )?;
+            if self.quotas.groups[self.entries[&id].quota]
+                .crossing
+                .is_some()
+            {
+                self.join_crossing_case(&id);
+            }
         }
         let ex = self.entries.get_mut(&id).unwrap();
         let promote = !ex.sampled && e.verdict != TestVerdict::Ok;
@@ -591,7 +783,7 @@ impl Run {
         ex.end_fields_hash = fields_hash;
         ex.end = Some(e.clone());
         ex.deadline = Some(deadline);
-        self.active.remove(&id);
+        self.finish_telemetry(d, &id);
         self.grace.insert(id.clone());
         self.provenance = reg.to_vec();
         if self.entries[&id].decision.is_none() {
@@ -602,6 +794,7 @@ impl Run {
         }
         let ex = &self.entries[&id];
         let mut data = ex.summary_data();
+        self.add_telemetry(&id, &mut data);
         data["fields"] = json!(e.fields);
         data["case_status"] = json!(ex.decision);
         data["snapshot_delayed"] = json!(replay);
@@ -622,10 +815,10 @@ impl Run {
             .unwrap()
             .fields
             .clear();
-        Ok(
-            json!({"status":"accepted","run_id":e.run_id,"execution_id":id,"case_status":self.entries[&id].decision,
-                "case_size":self.entries[&id].case_size.map(CaptureSize::as_str),"case_detail":self.entries[&id].case_detail}),
-        )
+        let mut ack = json!({"status":"accepted","run_id":e.run_id,"execution_id":id,"case_status":self.entries[&id].decision,
+            "case_size":self.entries[&id].case_size.map(CaptureSize::as_str),"case_detail":self.entries[&id].case_detail});
+        self.add_telemetry(&id, &mut ack);
+        Ok(ack)
     }
 
     fn admit(
@@ -640,9 +833,15 @@ impl Run {
         self.entries.get_mut(id).unwrap().reason = Some(reason);
         let is_slow = reason == "slow_pass";
         let is_rerun = reason == "rerun";
+        let optional = is_slow || is_rerun;
         let step = self.is_step(id);
         let mut size = CaptureSize::Full;
-        let skip = if is_rerun {
+        let skip = if reason == FAULT {
+            size = CaptureSize::Minimal;
+            None
+        } else if is_rerun {
+            // The cap counts successful rerun attempts requesting capture,
+            // including those that find no capture room.
             self.reruns += 1;
             (self.reruns > self.config.max_rerun_cases.unwrap_or(10))
                 .then_some("skipped_rerun_limit")
@@ -675,7 +874,7 @@ impl Run {
         } else {
             None
         };
-        if !self.snapshot_slot_available(step) {
+        if group.is_none() && !self.snapshot_slot_available(step) {
             let displace = (!is_slow)
                 .then(|| {
                     self.pending
@@ -691,13 +890,20 @@ impl Run {
                 .flatten();
             if let Some(old) = displace {
                 self.pending.remove(&old);
-                self.entries.get_mut(&old).unwrap().decision = Some("evicted_for_priority".into());
+                let evicted = self.entries.get_mut(&old).unwrap();
+                evicted.decision = Some("evicted_for_priority".into());
+                evicted.case_size = None;
+                evicted.case_detail = None;
                 self.append(
                     "case-skipped",
-                    json!({"execution_id":old,"case_status":"evicted_for_priority"}),
+                    json!({"execution_id":old,"case_status":"evicted_for_priority","case_size":null,"case_detail":null}),
                 );
             }
             if !self.snapshot_slot_available(step) {
+                if optional {
+                    self.entries.get_mut(id).unwrap().decision = Some("skipped_queue_full".into());
+                    return;
+                }
                 size = CaptureSize::Bare;
             }
         }
@@ -720,10 +926,14 @@ impl Run {
                 .map_or(start, |at| start.min(at))
         };
         let snapshot = CaptureSnapshot::for_execution_size(d, selector, window_start, end, size);
+        if optional && snapshot.size == CaptureSize::Bare {
+            self.entries.get_mut(id).unwrap().decision = Some("skipped_pool_exhausted".into());
+            return;
+        }
         let case_detail = match (size, snapshot.size) {
             (CaptureSize::Bare, _) => Some("capture_queue_full"),
             (_, CaptureSize::Bare) => Some("capture_pool_exhausted"),
-            (_, CaptureSize::Minimal) => Some("failure_limit"),
+            (_, CaptureSize::Minimal) if reason != FAULT => Some("failure_limit"),
             _ => None,
         };
         let size = snapshot.size;
@@ -747,7 +957,7 @@ impl Run {
             Vec::new()
         };
         let snapshot_at = snapshot.captured_at();
-        let metadata = json!({
+        let mut metadata = json!({
             "run_id": self.config.run_id,
             "domain": d.id().as_str(),
             "execution_id": id,
@@ -770,6 +980,11 @@ impl Run {
             "captured_at": snapshot_at,
             "grace_cutoff": ex.coverage["grace_cutoff"],
         });
+        if reason == FAULT {
+            let fault = self.telemetry_fault(id);
+            metadata["fault"] = fault["fault"].clone();
+            metadata["telemetry_limit"] = fault["telemetry_limit"].clone();
+        }
         let ex = self.entries.get_mut(id).unwrap();
         ex.coverage["case_snapshot_at"] = json!(snapshot_at);
         ex.case_size = Some(size);
@@ -778,7 +993,7 @@ impl Run {
         if is_slow {
             self.slow += 1;
         }
-        let ready = if size == CaptureSize::Bare {
+        let ready = if size == CaptureSize::Bare || reason == FAULT {
             now
         } else {
             ex.capture_deadline.expect("set by capture caller")
@@ -850,13 +1065,8 @@ impl Run {
             }
         }
         let ids: Vec<_> = self
-            .index
-            .iter()
-            .filter_map(|(field, values)| {
-                let value = Selector::log_value(field, log)?;
-                values.get(value.as_ref())
-            })
-            .flatten()
+            .matching_groups(Record::Log(log))
+            .flat_map(|group| &self.quotas.groups[group].executions)
             .cloned()
             .collect();
         for id in ids {
@@ -894,13 +1104,8 @@ impl Run {
             }
         }
         let ids: Vec<_> = self
-            .index
-            .iter()
-            .filter_map(|(field, values)| {
-                let value = Selector::span_value(field, span)?;
-                values.get(value.as_ref())
-            })
-            .flatten()
+            .matching_groups(Record::Span(span))
+            .flat_map(|group| &self.quotas.groups[group].executions)
             .cloned()
             .collect();
         for id in ids {
@@ -943,11 +1148,12 @@ impl Run {
         if !closing {
             ex.timed_out = true;
         }
-        self.active.remove(id);
         if closing {
             ex.deadline = Some(deadline);
             self.grace.insert(id.into());
         }
+        self.finish_telemetry(d, id);
+        let ex = &mut self.entries.get_mut(id).unwrap();
         if ex.decision.is_none() {
             ex.capture_deadline = Some(deadline);
             let end = if closing { ex.last_seen } else { Utc::now() };
@@ -955,6 +1161,7 @@ impl Run {
         }
         let ex = &self.entries[id];
         let mut data = ex.summary_data();
+        self.add_telemetry(id, &mut data);
         data["reason"] = json!(reason);
         data["last_observed_at"] = json!(ex.last_seen);
         data[if closing { "closed_at" } else { "captured_at" }] = json!(Utc::now());
@@ -988,6 +1195,7 @@ impl Run {
         for id in open {
             self.force(d, &id, reason, reg, true);
         }
+        self.quotas.clear_tails();
         self.append(
             if seal {
                 "seal-test-log"
@@ -1001,7 +1209,7 @@ impl Run {
     /// Sleep until the next deadline; an RPC wakes this thread when it changes
     /// the work list. Only active file jobs need a short completion poll.
     pub fn next_wake(&self, now: Instant) -> Duration {
-        let mut delay = if self.writing.is_empty() {
+        let mut delay = if self.writing.is_empty() && self.tail_writer.pending == 0 {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(10)
@@ -1044,7 +1252,46 @@ impl Run {
         self.last_late_flush = now;
     }
 
+    fn publish_case_result(&mut self, id: &str, result: Result<&std::path::Path, &str>) {
+        let ex = &self.entries[id];
+        let affected = if ex.reason == Some(FAULT) {
+            let group = &mut self.quotas.groups[ex.quota];
+            match result {
+                Ok(path) => group.case_path = Some(path.into()),
+                Err(error) => group.case_error = Some(error.into()),
+            }
+            group
+                .executions
+                .iter()
+                .filter(|peer| self.entries[*peer].reason == Some(FAULT))
+                .cloned()
+                .collect()
+        } else {
+            vec![id.to_owned()]
+        };
+        for id in affected {
+            let ex = &self.entries[&id];
+            match result {
+                Ok(path) => self.append("case-ready", json!({"execution_id":id,"case_status":"ready","case_path":path,
+                    "case_size":ex.case_size.map(CaptureSize::as_str),"case_detail":ex.case_detail})),
+                Err(error) => self.append("case-error", json!({"execution_id":id,"case_status":"error","message":error})),
+            }
+        }
+    }
+
     pub fn tick(&mut self, d: &Arc<Domain>, now: Instant) {
+        for (id, result) in self.tail_writer.collect() {
+            if let Err(error) = result {
+                if let Some(info) = &mut self.entries.get_mut(&id).unwrap().telemetry_end {
+                    info.as_object_mut().unwrap().remove("telemetry_tail_path");
+                    info["telemetry_tail_error"] = json!(error);
+                }
+                self.append(
+                    "telemetry-tail-error",
+                    json!({"execution_id":id,"telemetry_tail_error":error}),
+                );
+            }
+        }
         if now.saturating_duration_since(self.last_late_flush) >= Duration::from_secs(1)
             && !self.dirty_late.is_empty()
         {
@@ -1084,21 +1331,16 @@ impl Run {
         while let Ok((id, result)) = self.finished_rx.try_recv() {
             self.writing.remove(&id);
             let member_ids = self.writing_members.remove(&id).unwrap_or_default();
-            for id in std::iter::once(id).chain(member_ids) {
-                let ex = &self.entries[&id];
-                let relative = result.as_ref().map_err(String::as_str).and_then(|path| {
+            let relative = result
+                .as_ref()
+                .map_err(String::as_str)
+                .and_then(|path| {
                     path.strip_prefix(self.journal.path.parent().unwrap())
                         .map_err(|_| "case outside run directory")
-                });
-                if let Ok(path) = relative {
-                    self.append("case-ready",json!({"execution_id":id,"case_status":"ready","case_path":path,
-                        "case_size":ex.case_size.map(CaptureSize::as_str),"case_detail":ex.case_detail}));
-                } else if let Err(error) = relative {
-                    self.append(
-                        "case-error",
-                        json!({"execution_id":id,"case_status":"error","message":error}),
-                    );
-                }
+                })
+                .map(std::path::Path::to_path_buf);
+            for id in std::iter::once(id).chain(member_ids) {
+                self.publish_case_result(&id, relative.as_deref().map_err(|&error| error));
             }
         }
         loop {
@@ -1135,8 +1377,9 @@ impl Run {
                     self.writing.insert(id);
                 }
                 Err(e) => {
+                    let error = e.to_string();
                     for id in std::iter::once(id).chain(members) {
-                        self.append("case-error",json!({"execution_id":id,"case_status":"error","message":e.to_string()}));
+                        self.publish_case_result(&id, Err(&error));
                     }
                 }
             }
@@ -1146,6 +1389,7 @@ impl Run {
             && self.grace.is_empty()
             && self.pending.is_empty()
             && self.writing.is_empty()
+            && self.tail_writer.pending == 0
         {
             self.close_written = true;
             self.append(
@@ -1168,6 +1412,7 @@ impl Run {
         } else {
             "pending"
         });
+        out["pending_telemetry_tails"] = json!(self.tail_writer.pending);
         out["pending_summaries"] = json!(self.grace.len() + self.active.len());
         let now = Instant::now();
         let mut pending = Vec::with_capacity(self.pending.len() + self.writing.len());

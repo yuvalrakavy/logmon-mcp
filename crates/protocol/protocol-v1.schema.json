@@ -671,6 +671,12 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "faults": {
+              "$ref": "#/$defs/TestLogFaultCounts",
+              "default": {
+                "excessive_telemetry": 0
+              }
             }
           },
           "required": [
@@ -849,6 +855,19 @@
             "final",
             "pending"
           ]
+        },
+        "TestLogFaultCounts": {
+          "type": "object",
+          "properties": {
+            "excessive_telemetry": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "excessive_telemetry"
+          ]
         }
       }
     },
@@ -968,6 +987,14 @@
         },
         "summary_sample_percent": {
           "description": "Stable percentage of chain names selected for detailed summaries (0 to 100).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "execution_limit_percent": {
+          "description": "Per-selector share of each ring when the run begins, in percent. Defaults to 25.",
           "type": [
             "number",
             "null"
@@ -1397,6 +1424,20 @@
             "null"
           ]
         },
+        "case_size": {
+          "description": "Evidence size when a case is admitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "case_detail": {
+          "description": "Capture constraint or policy that selected the case size.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "test_log_health": {
           "description": "A degraded writer may accept the lifecycle operation.",
           "type": [
@@ -1599,6 +1640,20 @@
             },
             "case_status": {
               "description": "Capture admission decision or case state.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "case_size": {
+              "description": "Evidence size when a case is admitted.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "case_detail": {
+              "description": "Capture constraint or policy that selected the case size.",
               "type": [
                 "string",
                 "null"

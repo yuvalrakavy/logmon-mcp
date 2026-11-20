@@ -1049,10 +1049,16 @@ and case eligibility apply to every execution. The default hard timeout is 600,0
 overridable with `--test-timeout-ms` on start. After a verdict, batched telemetry
 has a default 10,000 ms grace period, set with `--grace-period-ms` on begin.
 
+An active execution’s selector can use a configurable share of each ring, default
+25%. A crossing captures evidence and records the `excessive_telemetry` fault.
+The report distinguishes the runner’s verdict, the records refused after the
+crossing, and the retained tail. See the [telemetry limit guide](docs/test-log-progress.md#per-selector-telemetry-limit).
+
 An abnormal ending requests a case. The default full failure-case limit is 10%
 of the planned test count, rounded down with a minimum of 20 and a maximum of
-300. The default is 50 while the plan is unknown. Set `--max-failures` to override that
-limit. An execution named `step:*` does not spend the failure limit. Failed reruns
+300. With no plan or override the default is 50, down from 500. Set `--max-failures` to override that
+limit. Each eligible failure advances the count, including one that ultimately
+gets a bare case. An execution named `step:*` does not spend the failure limit. Failed reruns
 follow the failure policy. `--max-rerun-cases` limits cases for OK reruns, and
 `--max-slow-pass-cases` limits cases for slow passes. For slow passes, begin with
 `--slow-pass opt-out --slow-if 'elapsed > 4 * estimated'` or opt individual
@@ -1060,17 +1066,26 @@ executions in with a start condition.
 
 - A **full** case can include the selected execution’s records and overlapping telemetry.
 - A **minimal** case includes the verdict and the selector’s own records after the full failure limit is spent.
-- A **bare** case records the verdict, times, selector, omitted record counts, and the reason that no evidence fit. It uses neither a snapshot slot nor retained telemetry.
+- A **bare** case records the verdict, times, selector, omitted record counts, and the capture constraint for an abnormal ending or an excessive-telemetry crossing. It uses neither a snapshot slot nor retained telemetry. The runner’s failure message remains in the JSONL.
+
+`skipped_failure_limit` has been replaced by minimal cases. `--max-failures 0` previously disabled failure cases. It now requests a minimal case for every failure covered by the limit, with a bare fallback if it cannot fit. `skipped_capture_budget` has been replaced by cut cases, bare cases for abnormal endings, and `skipped_pool_exhausted` for optional captures with no room. A slow pass or OK rerun with no slot still returns `skipped_queue_full`. This spends no slow-pass allowance. An OK rerun still spends a rerun attempt, as it did before.
 
 Each domain has eight snapshot slots, including one reserved for `step:*`, and a
-shared 128 MiB retention budget. A record referenced by several cases is charged
+shared 128 MiB retention budget. A grouped deadline case uses one slot. Each
+member’s snapshot still spends capture-pool bytes, and the slot stays occupied
+while the group writes. A record referenced by several cases is charged
 once with a small per-case index charge. If a snapshot must be cut, priority goes
 to the selector’s Errors, its other records, window Errors, window Warnings,
 and remaining window records in that order. Each class keeps the latest arrivals
-first. The case reports how many records were omitted by class and covers the
+first. Once a record does not fit, lower-priority records are omitted. Later pool
+space does not refill an earlier omission. A higher-priority grace arrival can
+displace lower-priority evidence even if available bytes still cannot hold it.
+The case reports how many records were omitted by class and covers the
 retention state of both rings. A grouped deadline case reports counts for each
 execution because members' windows can overlap. Bare writes run independently
-of snapshot slots and skip the telemetry grace period.
+of snapshot slots and skip the telemetry grace period. One bare file writes at a
+time. The backlog is bounded by one metadata-only case per execution admitted to
+the active run, with no separate count cap.
 
 A driver recovering unconfirmed ends sends `test-log replay --run-id RUN --events
 'END_JSON'` with one flag per original event, up to 100 per batch. A refusal

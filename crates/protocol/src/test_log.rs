@@ -74,6 +74,9 @@ pub struct TestLogBegin {
     /// Stable percentage of chain names selected for detailed summaries (0 to 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_sample_percent: Option<f64>,
+    /// Per-selector share of each ring when the run begins, in percent. Defaults to 25.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_limit_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -180,6 +183,12 @@ pub struct TestLogAck {
     /// Capture admission decision or case state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_status: Option<String>,
+    /// Evidence size when a case is admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_size: Option<String>,
+    /// Capture constraint or policy that selected the case size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_detail: Option<String>,
     /// A degraded writer may accept the lifecycle operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_log_health: Option<String>,

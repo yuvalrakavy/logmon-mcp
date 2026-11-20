@@ -183,7 +183,11 @@ impl SpanStore {
         }
     }
 
-    pub fn insert(&self, mut span: SpanEntry) -> u64 {
+    pub fn insert(&self, span: SpanEntry) -> u64 {
+        self.insert_notifying(span, |_| {})
+    }
+
+    pub(crate) fn insert_notifying(&self, mut span: SpanEntry, assigned: impl FnOnce(u64)) -> u64 {
         let mut inner = self.inner.write().unwrap();
         // The seq is taken UNDER the write lock, in the same critical section as the push, so
         // the ring is seq-ordered by construction: two inserts can no longer take seqs in one
@@ -191,6 +195,7 @@ impl SpanStore {
         inner.total_received = inner.total_received.saturating_add(1);
         span.seq = self.seq_counter.next();
         let seq = span.seq;
+        assigned(seq);
 
         if inner.buffer.len() >= inner.capacity.current {
             let candidate = inner.buffer.front().map_or(span.end_time, |s| s.end_time);
