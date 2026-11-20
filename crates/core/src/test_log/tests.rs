@@ -1,6 +1,7 @@
 use super::*;
 use crate::daemon::domain::{DomainConfig, DomainId, DomainSource};
 use crate::gelf::message::{Level, LogEntry};
+use crate::span::types::SpanStatus;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -123,7 +124,11 @@ fn quota_log(f: &Fixture, trace: u128, level: Level, message: &str) -> LogEntry 
 }
 
 fn quota_span(f: &Fixture, trace: u128, id: u64) {
-    use crate::span::types::{SpanEntry, SpanKind, SpanStatus};
+    quota_span_with_status(f, trace, id, SpanStatus::Ok);
+}
+
+fn quota_span_with_status(f: &Fixture, trace: u128, id: u64, status: SpanStatus) {
+    use crate::span::types::{SpanEntry, SpanKind};
     let now = Utc::now();
     let mut span = SpanEntry {
         seq: 0,
@@ -136,7 +141,7 @@ fn quota_span(f: &Fixture, trace: u128, id: u64) {
         name: "test span".into(),
         kind: SpanKind::Internal,
         service_name: "test".into(),
-        status: SpanStatus::Ok,
+        status,
         attributes: Default::default(),
         events: Vec::new(),
     };
@@ -147,6 +152,162 @@ fn quota_span(f: &Fixture, trace: u128, id: u64) {
         &f.domain.pipeline,
         &crate::collector::registry::CollectorRegistry::new(),
         f.domain.id(),
+    );
+}
+
+#[test]
+fn reader_growable_ring_uses_its_maximum_and_fixed_ring_has_a_minimum_quota() {
+    for (maximum, quota, ring_size) in [(Some(8), 2, 4), (None, 1, 2)] {
+        let f = Fixture::with_capacity(2);
+        f.domain.pipeline.store.resize_with(Some(2), maximum, || ());
+        f.begin("one", 0);
+        let execution = f.event("a");
+        f.rpc("start", execution.clone());
+        quota_log(&f, 9, Level::Info, "neighbor");
+        for _ in 0..quota {
+            quota_log(&f, 1, Level::Info, "target");
+        }
+        assert_eq!(
+            f.domain.pipeline.logs_by_trace_id(1).len(),
+            quota,
+            "maximum {maximum:?}"
+        );
+        assert_eq!(f.domain.pipeline.store.ring_info().0.current, ring_size);
+        quota_log(&f, 1, Level::Info, "crossing");
+        let ack = f.end_as(execution, "OK");
+        assert_eq!(ack["telemetry_limit"]["limit"], quota);
+        assert_eq!(ack["telemetry_limit"]["ring_size"], maximum.unwrap_or(2));
+        f.close("one");
+    }
+}
+
+fn crossing_under_slot_pressure(name: &str, size: &str, detail: Option<&str>) {
+    let f = Fixture::new();
+    f.begin("one", 60_000);
+    for i in 0..7 {
+        assert_eq!(
+            f.end_as(f.event(&format!("test-{i}")), "FAIL")["case_size"],
+            "full"
+        );
+    }
+    let mut execution = f.event("a");
+    execution["name"] = json!(name);
+    f.rpc("start", execution);
+    for _ in 0..6 {
+        quota_log(&f, 1, Level::Info, "target");
+    }
+    let row = f.case_row("a");
+    assert_eq!(row["case_size"], size, "{name} crossing");
+    assert_eq!(row["case_detail"].as_str(), detail);
+}
+
+#[test]
+fn reader_crossing_without_a_test_slot_writes_a_bare_case() {
+    crossing_under_slot_pressure("ordinary test", "bare", Some("capture_queue_full"));
+}
+
+#[test]
+fn reader_step_crossing_uses_the_reserved_slot() {
+    crossing_under_slot_pressure("step:build", "minimal", None);
+}
+
+#[test]
+fn reader_tail_write_failure_is_reported_and_the_run_settles() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let execution = f.event("a");
+    f.rpc("start", execution.clone());
+    for _ in 0..6 {
+        quota_log(&f, 1, Level::Info, "target");
+    }
+    let case = f.case_row("a");
+    let case_path = f.dir.path().join(case["case_path"].as_str().unwrap());
+    let case_dir = case_path.parent().unwrap();
+    std::fs::rename(case_dir, f.dir.path().join("saved-cases")).unwrap();
+    std::fs::write(case_dir, b"blocks the tail file").unwrap();
+    assert!(f.end_as(execution, "OK")["telemetry_tail_path"].is_string());
+    assert_eq!(f.close("one")["finalization"], "settled");
+    assert!(
+        f.rows()
+            .iter()
+            .any(|row| row["event"] == "telemetry-tail-error"
+                && row["execution_id"] == "a"
+                && row["telemetry_tail_error"].is_string()),
+        "tail write error missing from the settled journal"
+    );
+}
+
+#[test]
+fn reader_log_crossing_applies_post_crossing_rules_to_spans() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let execution = f.event("a");
+    f.rpc("start", execution.clone());
+    quota_span(&f, 1, 1);
+    for _ in 0..6 {
+        quota_log(&f, 1, Level::Info, "target");
+    }
+    quota_span(&f, 1, 2);
+    quota_span_with_status(&f, 1, 3, SpanStatus::Error("kept".into()));
+    let spans = f.domain.span_store.get_trace(1);
+    assert_eq!(
+        spans.iter().map(|span| span.span_id).collect::<Vec<_>>(),
+        [1, 3]
+    );
+    let ack = f.end_as(execution, "OK");
+    assert_eq!(ack["telemetry_limit"]["kind"], "logs");
+    assert_eq!(ack["refused_telemetry"], json!({"logs":1,"spans":1}));
+    let ack: TestLogAck = serde_json::from_value(ack).unwrap();
+    assert_eq!(ack.refused_telemetry.unwrap().spans, 1);
+    f.close("one");
+}
+
+#[test]
+fn reader_sequential_executions_share_the_run_quota_and_crossing_case() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let first = f.event("a");
+    f.rpc("start", first.clone());
+    for _ in 0..3 {
+        quota_log(&f, 1, Level::Info, "first execution");
+    }
+    assert!(f.end_as(first.clone(), "OK")["fault"].is_null());
+
+    let event = |id: &str| {
+        let mut execution = f.event(id);
+        execution["selector"] = first["selector"].clone();
+        execution
+    };
+    let second = event("second");
+    f.rpc("start", second.clone());
+    for _ in 0..3 {
+        quota_log(&f, 1, Level::Info, "second execution");
+    }
+    assert_eq!(f.end_as(second, "OK")["fault"], "excessive_telemetry");
+    assert_eq!(f.domain.pipeline.logs_by_trace_id(1).len(), 5);
+    let crossing = f.case_row("second");
+
+    let later = event("later");
+    f.rpc("start", later.clone());
+    assert_eq!(f.case_row("later")["case_path"], crossing["case_path"]);
+    assert!(f.rows().iter().any(|row| row["event"] == "telemetry-fault"
+        && row["execution_id"] == "later"
+        && row["fault"] == "excessive_telemetry"));
+    quota_log(&f, 1, Level::Info, "refused on first arrival");
+    let ack = f.end_as(later, "FAIL");
+    assert_eq!(ack["refused_telemetry"]["logs"], 2);
+    f.close("one");
+    assert_eq!(
+        std::fs::read_dir(f.dir.path().join("cases"))
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "zip"))
+            .count(),
+        1
     );
 }
 
@@ -180,7 +341,7 @@ fn ruling_14_crossing_reports_all_shared_executions_and_keeps_old_rows() {
 }
 
 #[test]
-fn ruling_15_refusal_covers_ingest_prebuffer_and_reinsert_but_keeps_shared_rows() {
+fn ruling_15_ingest_refusal_keeps_rows_out_of_ring_and_prebuffer_but_keeps_shared_rows() {
     let f = Fixture::new();
     f.begin("one", 0);
     f.domain.pipeline.resize_pre_buffer(20);
@@ -193,8 +354,6 @@ fn ruling_15_refusal_covers_ingest_prebuffer_and_reinsert_but_keeps_shared_rows(
         quota_log(&f, 1, Level::Info, "kept");
     }
     let refused = quota_log(&f, 1, Level::Info, "refused");
-    f.domain.pipeline.insert_sorted(vec![refused.clone()]);
-    f.domain.pipeline.pre_buffer_append(refused.clone());
     assert!(!f.domain.pipeline.contains_seq(refused.seq));
     assert!(!f
         .domain

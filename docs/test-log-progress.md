@@ -41,13 +41,15 @@ If the count becomes known later, repeat `test-log begin` with the same domain a
 
 ## Per-selector telemetry limit
 
-`test-log begin --execution-limit-percent P` sets a per-selector share of each ring’s capacity at begin. The default is 25%. The broker rounds down and counts incoming logs and spans independently while an execution with that selector is active. Executions registered under the same selector field and value share the quota. A selector faults when its own count first exceeds either limit. Ring fullness alone cannot produce the fault.
+`test-log begin --execution-limit-percent P` sets a per-selector share for each ring. The default is 25%. The base is the ring’s configured maximum if it has one, or its current capacity at begin otherwise. The broker rounds down with a minimum of one record per stream. It counts logs and spans separately while an execution with that selector is active. Exceeding either count puts both streams under post-crossing admission rules. Ring fullness alone cannot produce the fault.
+
+Executions with the same selector field and value share the quota for the whole run. Counts persist between executions. A later execution under an already-crossed value is faulted at registration. It references the original crossing case for any verdict, including a failure.
 
 The crossing captures the selector’s retained records immediately. The case can be bare when the snapshot slots or capture pool are exhausted. The journal and report mark every execution sharing the selector with `excessive_telemetry` and preserve the runner’s verdict. The live and settled progress counters include `faults.excessive_telemetry`.
 
 After the crossing, a ring can admit up to the smaller of 1,000 Error records and that ring’s limit for the selector. Spans with Error status qualify. A record that also matches an active under-limit selector is kept without spending an over-limit selector’s allowance. The quota bounds admissions attributable to a selector. Records already present before registration and records shared with other selectors can also be resident. Live ring shrinking can change what fraction is resident. Existing records age out under ordinary ring eviction.
 
-Each over-limit selector can retain the latest 200 logs and 200 spans seen from the crossing onward outside the rings. Both admitted and refused records can appear in the tail. One 16 MiB budget per run charges encoded payload bytes, index overhead, and queued tail writes. Under pressure, the oldest buffered records across selectors leave first. End rows report refusal counts separately from loss, as well as the number of missing records from each retained tail window. The end row and offline report link the tail file beside the case. A run settles after its tail writes are resolved.
+Each over-limit selector can retain the latest 200 logs and 200 spans seen from the crossing onward outside the rings. Both admitted and refused records can appear in the tail. One 16 MiB budget per run charges encoding buffers, index overhead, and queued tail writes. Under pressure, the oldest buffered records across selectors leave first as new records are encoded. An encoding that runs out of space can already have displaced older entries. End rows report refusal counts separately from loss, as well as the number of missing records from each retained tail window. The end row and offline report link the tail file beside the case. A run settles after its tail writes are resolved.
 
 ## Error handling and compatibility
 

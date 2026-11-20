@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::time::Instant;
@@ -27,31 +27,72 @@ pub struct TestLog {
     pub(crate) capture_pool: Arc<Mutex<crate::nightly::CapturePool>>,
     history: Arc<progress::History>,
     state: Mutex<State>,
+    // Late telemetry can still be observed after admission goes idle.
     observing: AtomicBool,
-    pending_logs: Mutex<HashSet<u64>>,
-    pending_spans: Mutex<HashSet<u64>>,
+    admission_active: AtomicBool,
+    pending_logs: PendingIngest,
+    pending_spans: PendingIngest,
     changed: Condvar,
     writer_budget: Arc<writer::QueueBudget>,
+}
+
+#[derive(Default)]
+struct PendingIngest {
+    // The daemon has one processor per stream and domain. Keep its marker
+    // even while idle: an in-flight record can overlap begin and a snapshot.
+    current: AtomicU64,
+    // Direct callers can process several records concurrently.
+    concurrent: Mutex<HashSet<u64>>,
+}
+
+impl PendingIngest {
+    fn track(&self) -> IngestObservation<'_> {
+        IngestObservation {
+            pending: self,
+            seq: 0,
+            concurrent: false,
+        }
+    }
+
+    fn sequences(&self) -> Vec<u64> {
+        let concurrent = self.concurrent.lock().unwrap();
+        let seq = self.current.load(Ordering::Acquire);
+        concurrent
+            .iter()
+            .copied()
+            .chain((seq != 0).then_some(seq))
+            .collect()
+    }
 }
 
 /// A processor keeps this marker from sequence assignment through observation.
 /// Snapshot admission can distinguish a pending callback from later ring rows.
 pub(crate) struct IngestObservation<'a> {
-    pending: &'a Mutex<HashSet<u64>>,
-    seq: Option<u64>,
+    pending: &'a PendingIngest,
+    seq: u64,
+    concurrent: bool,
 }
 
 impl IngestObservation<'_> {
     pub(crate) fn assigned(&mut self, seq: u64) {
-        self.pending.lock().unwrap().insert(seq);
-        self.seq = Some(seq);
+        self.concurrent = self
+            .pending
+            .current
+            .compare_exchange(0, seq, Ordering::Release, Ordering::Relaxed)
+            .is_err();
+        if self.concurrent {
+            self.pending.concurrent.lock().unwrap().insert(seq);
+        }
+        self.seq = seq;
     }
 }
 
 impl Drop for IngestObservation<'_> {
     fn drop(&mut self) {
-        if let Some(seq) = self.seq {
-            self.pending.lock().unwrap().remove(&seq);
+        if self.concurrent {
+            self.pending.concurrent.lock().unwrap().remove(&self.seq);
+        } else if self.seq != 0 {
+            self.pending.current.store(0, Ordering::Release);
         }
     }
 }
@@ -118,25 +159,19 @@ fn full_failure_limit(config: &TestLogBegin) -> u64 {
 
 impl TestLog {
     pub(crate) fn track_log(&self, seq: u64) -> IngestObservation<'_> {
-        let mut observation = IngestObservation {
-            pending: &self.pending_logs,
-            seq: None,
-        };
+        let mut observation = self.pending_logs.track();
         observation.assigned(seq);
         observation
     }
 
     pub(crate) fn track_span(&self) -> IngestObservation<'_> {
-        IngestObservation {
-            pending: &self.pending_spans,
-            seq: None,
-        }
+        self.pending_spans.track()
     }
 
     pub(crate) fn pending_ingest(&self) -> (Vec<u64>, Vec<u64>) {
         (
-            self.pending_logs.lock().unwrap().iter().copied().collect(),
-            self.pending_spans.lock().unwrap().iter().copied().collect(),
+            self.pending_logs.sequences(),
+            self.pending_spans.sequences(),
         )
     }
 
@@ -315,8 +350,11 @@ impl TestLog {
                 run.tick(&domain, now);
                 run.update_ring_protection(&domain);
                 let delay = run.next_wake(Instant::now());
-                let settled = run.is_settled();
-                if settled && !was_settled || !guard.draining.is_empty() {
+                let just_settled = run.is_settled() && !was_settled;
+                if just_settled {
+                    owner.admission_active.store(false, Ordering::Release);
+                }
+                if just_settled || !guard.draining.is_empty() {
                     guard.prune_settled(&owner.history);
                 }
                 drop(domain);
@@ -337,6 +375,7 @@ impl TestLog {
                 },
             );
         }
+        self.admission_active.store(true, Ordering::Release);
         self.observing.store(true, Ordering::Release);
         self.changed.notify_all();
         Ok(json!({"status":"accepted","run_id":id,"test_log_health":health}))
@@ -369,7 +408,7 @@ impl TestLog {
     }
 
     fn admit(&self, record: quota::Record<'_>) -> bool {
-        if !self.observing.load(Ordering::Acquire) {
+        if !self.admission_active.load(Ordering::Acquire) {
             return true;
         }
         let mut state = self.state.lock().unwrap();
@@ -382,24 +421,6 @@ impl TestLog {
         })
     }
 
-    pub(crate) fn filter_reinserted_logs(&self, batch: &mut Vec<LogEntry>) {
-        if self.observing.load(Ordering::Acquire) {
-            if let Some(run) = self.state.lock().unwrap().run.as_ref() {
-                batch.retain(|row| run.allows_reinsert(row));
-            }
-        }
-    }
-
-    pub(crate) fn retained_log_allowed(&self, record: &LogEntry) -> bool {
-        !self.observing.load(Ordering::Acquire)
-            || self
-                .state
-                .lock()
-                .unwrap()
-                .run
-                .as_ref()
-                .is_none_or(|run| run.allows_reinsert(record))
-    }
     pub fn observe_span(&self, record: &SpanEntry) {
         if self.observing.load(Ordering::Acquire) {
             if let Some(r) = self.state.lock().unwrap().run.as_mut() {

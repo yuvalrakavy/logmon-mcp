@@ -63,26 +63,9 @@ enum TailRecord<'a> {
     Span(&'a SpanEntry),
 }
 
-// Count first so serializing a large record never allocates a buffer outside
-// the shared budget. Reserve for the payload and both index entries.
+// Allow for the tail entry and its indexes, plus the chunk descriptor storage.
 const TAIL_ENTRY_OVERHEAD: usize = 192;
-
-#[derive(Default)]
-struct RecordLength(usize);
-
-impl Write for RecordLength {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > TAIL_BYTES - TAIL_ENTRY_OVERHEAD - self.0 {
-            return Err(std::io::Error::other("record exceeds tail byte budget"));
-        }
-        self.0 += bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+const TAIL_CHUNK_OVERHEAD: usize = 2 * std::mem::size_of::<TailChunk>();
 
 struct Charge {
     used: Arc<Mutex<usize>>,
@@ -109,9 +92,65 @@ impl Drop for Charge {
     }
 }
 
-struct TailEntry {
+struct TailChunk {
     bytes: Box<[u8]>,
+    written: usize,
     _charge: Charge,
+}
+
+struct TailEntry(Vec<TailChunk>);
+
+struct TailEncoder<'a> {
+    quotas: &'a mut Quotas,
+    chunks: Vec<TailChunk>,
+    charged: usize,
+}
+
+impl Write for TailEncoder<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        if self
+            .chunks
+            .last()
+            .is_none_or(|c| c.written == c.bytes.len())
+        {
+            // Charge each buffer before allocating it. Separate chunks avoid
+            // holding both an old and a larger copy during a buffer resize.
+            let first = self.chunks.is_empty();
+            let overhead = TAIL_CHUNK_OVERHEAD + usize::from(first) * TAIL_ENTRY_OVERHEAD;
+            let next = self
+                .chunks
+                .last()
+                .map_or(512, |chunk| (chunk.bytes.len() * 2).min(4096));
+            let target = next.max(bytes.len().min(65536));
+            let capacity = target.min((TAIL_BYTES - self.charged).saturating_sub(overhead));
+            if capacity == 0 {
+                return Err(std::io::Error::other("record exceeds tail byte budget"));
+            }
+            let used = capacity + overhead;
+            let charge = self
+                .quotas
+                .reserve(used)
+                .ok_or_else(|| std::io::Error::other("tail byte budget exhausted"))?;
+            self.charged += used;
+            self.chunks.push(TailChunk {
+                bytes: vec![0; capacity].into_boxed_slice(),
+                written: 0,
+                _charge: charge,
+            });
+        }
+        let chunk = self.chunks.last_mut().unwrap();
+        let len = bytes.len().min(chunk.bytes.len() - chunk.written);
+        chunk.bytes[chunk.written..chunk.written + len].copy_from_slice(&bytes[..len]);
+        chunk.written += len;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -132,9 +171,6 @@ pub(super) struct Group {
     pub case_owner: Option<String>,
     pub case_path: Option<PathBuf>,
     pub case_error: Option<String>,
-    last_base_log: u64,
-    last_error_log: u64,
-    inactive_since: Option<u64>,
 }
 
 pub(super) struct Quotas {
@@ -151,7 +187,7 @@ impl Quotas {
         Self {
             groups: Vec::new(),
             capacities,
-            limits: capacities.map(|size| (size as f64 * percent / 100.) as u64),
+            limits: capacities.map(|size| ((size as f64 * percent / 100.) as u64).max(1)),
             used: Arc::default(),
             arrival: 0,
             tail: BTreeMap::new(),
@@ -164,7 +200,6 @@ impl Quotas {
         }
         let group = &mut self.groups[group];
         group.live += 1;
-        group.inactive_since = None;
         group.executions.push(execution);
     }
 
@@ -185,9 +220,6 @@ impl Quotas {
             if stream.seen < limit {
                 stream.seen += 1;
                 under_limit = true;
-                if let Record::Log(log) = record {
-                    group.last_base_log = log.seq;
-                }
             } else {
                 group.crossing = Some(Crossing {
                     kind,
@@ -204,11 +236,7 @@ impl Quotas {
                 .all(|&id| self.groups[id].streams[kind].errors < limit.min(ERROR_ALLOWANCE));
         if exempt_error {
             for &id in groups {
-                let group = &mut self.groups[id];
-                group.streams[kind].errors += 1;
-                if let Record::Log(log) = record {
-                    group.last_error_log = log.seq;
-                }
+                self.groups[id].streams[kind].errors += 1;
             }
         }
         let accepted = under_limit || exempt_error;
@@ -219,22 +247,6 @@ impl Quotas {
             }
         }
         (accepted, crossed)
-    }
-
-    pub fn allows_reinsert(&self, log: &LogEntry, groups: impl Iterator<Item = usize>) -> bool {
-        let mut matched = false;
-        for id in groups {
-            matched = true;
-            let group = &self.groups[id];
-            if group.crossing.is_none()
-                || log.seq <= group.last_base_log
-                || (log.level == Level::Error && log.seq <= group.last_error_log)
-                || group.inactive_since.is_some_and(|end| log.seq > end)
-            {
-                return true;
-            }
-        }
-        !matched
     }
 
     fn remove_tail(&mut self, arrival: u64) {
@@ -266,35 +278,24 @@ impl Quotas {
                 self.remove_tail(arrival);
             }
         }
-        let record = record.serializable();
-        let mut len = RecordLength::default();
-        if serde_json::to_writer(&mut len, &record).is_err() {
+        let mut encoder = TailEncoder {
+            quotas: self,
+            chunks: Vec::new(),
+            charged: 0,
+        };
+        if serde_json::to_writer(&mut encoder, &record.serializable()).is_err() {
             return;
         }
-        if let Some(charge) = self.reserve(len.0 + TAIL_ENTRY_OVERHEAD) {
-            let mut bytes = Vec::with_capacity(len.0);
-            if serde_json::to_writer(&mut bytes, &record).is_err() {
-                return;
-            }
-            self.arrival += 1;
-            let entry = Arc::new(TailEntry {
-                bytes: bytes.into_boxed_slice(),
-                _charge: charge,
-            });
-            self.groups[id].streams[kind]
-                .tail
-                .insert((ordinal, self.arrival));
-            self.tail.insert(self.arrival, (id, kind, ordinal, entry));
-        }
+        let entry = Arc::new(TailEntry(encoder.chunks));
+        self.arrival += 1;
+        self.groups[id].streams[kind]
+            .tail
+            .insert((ordinal, self.arrival));
+        self.tail.insert(self.arrival, (id, kind, ordinal, entry));
     }
 
-    pub fn finish(&mut self, id: usize, seq: u64) {
-        let group = &mut self.groups[id];
-        group.live -= 1;
-        if group.live > 0 {
-            return;
-        }
-        group.inactive_since = Some(seq);
+    pub fn finish(&mut self, id: usize) {
+        self.groups[id].live -= 1;
     }
 
     pub fn clear_tails(&mut self) {
@@ -375,7 +376,9 @@ impl TailJob {
             {
                 let mut writer = BufWriter::new(file);
                 for row in &self.rows {
-                    writer.write_all(&row.bytes)?;
+                    for chunk in &row.0 {
+                        writer.write_all(&chunk.bytes[..chunk.written])?;
+                    }
                     writer.write_all(b"\n")?;
                 }
                 writer.flush()?;

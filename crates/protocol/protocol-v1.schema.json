@@ -1438,6 +1438,69 @@
             "null"
           ]
         },
+        "fault": {
+          "description": "Telemetry fault independent of the runner’s verdict.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "telemetry_limit": {
+          "description": "Limit and other executions sharing the selector that crossed it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestLogTelemetryLimit"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "refused_telemetry": {
+          "description": "Refused telemetry by stream, separate from domain loss.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestLogTelemetryCounts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "telemetry_tail_shortened": {
+          "description": "Records missing from the configured tail window by stream.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestLogTelemetryCounts"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "telemetry_tail_pool_bytes": {
+          "description": "Bytes charged to the run’s shared tail budget when the execution ended.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "telemetry_tail_path": {
+          "description": "Journal-relative path to the queued tail file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "telemetry_tail_error": {
+          "description": "Tail error known when the acknowledgement was produced.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "test_log_health": {
           "description": "A degraded writer may accept the lifecycle operation.",
           "type": [
@@ -1449,7 +1512,84 @@
       "required": [
         "status"
       ],
-      "additionalProperties": true
+      "additionalProperties": true,
+      "$defs": {
+        "TestLogTelemetryLimit": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "description": "Stream that crossed first.",
+              "$ref": "#/$defs/TestLogTelemetryStream"
+            },
+            "limit": {
+              "description": "Number of records that stream could admit before crossing.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ring_size": {
+              "description": "Ring capacity used to calculate the limit.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shared_with": {
+              "description": "Other executions registered under this selector value.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TestLogTelemetryPeer"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "limit",
+            "ring_size",
+            "shared_with"
+          ]
+        },
+        "TestLogTelemetryStream": {
+          "type": "string",
+          "enum": [
+            "logs",
+            "spans"
+          ]
+        },
+        "TestLogTelemetryPeer": {
+          "type": "object",
+          "properties": {
+            "execution_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "execution_id",
+            "name"
+          ]
+        },
+        "TestLogTelemetryCounts": {
+          "type": "object",
+          "properties": {
+            "logs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "spans": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "logs",
+            "spans"
+          ]
+        }
+      }
     },
     "TestLogPendingCase": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1659,6 +1799,69 @@
                 "null"
               ]
             },
+            "fault": {
+              "description": "Telemetry fault independent of the runner’s verdict.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "telemetry_limit": {
+              "description": "Limit and other executions sharing the selector that crossed it.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TestLogTelemetryLimit"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "refused_telemetry": {
+              "description": "Refused telemetry by stream, separate from domain loss.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TestLogTelemetryCounts"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "telemetry_tail_shortened": {
+              "description": "Records missing from the configured tail window by stream.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TestLogTelemetryCounts"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "telemetry_tail_pool_bytes": {
+              "description": "Bytes charged to the run’s shared tail budget when the execution ended.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "telemetry_tail_path": {
+              "description": "Journal-relative path to the queued tail file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "telemetry_tail_error": {
+              "description": "Tail error known when the acknowledgement was produced.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "test_log_health": {
               "description": "A degraded writer may accept the lifecycle operation.",
               "type": [
@@ -1671,6 +1874,81 @@
             "status"
           ],
           "additionalProperties": true
+        },
+        "TestLogTelemetryLimit": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "description": "Stream that crossed first.",
+              "$ref": "#/$defs/TestLogTelemetryStream"
+            },
+            "limit": {
+              "description": "Number of records that stream could admit before crossing.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "ring_size": {
+              "description": "Ring capacity used to calculate the limit.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "shared_with": {
+              "description": "Other executions registered under this selector value.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/TestLogTelemetryPeer"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "limit",
+            "ring_size",
+            "shared_with"
+          ]
+        },
+        "TestLogTelemetryStream": {
+          "type": "string",
+          "enum": [
+            "logs",
+            "spans"
+          ]
+        },
+        "TestLogTelemetryPeer": {
+          "type": "object",
+          "properties": {
+            "execution_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "execution_id",
+            "name"
+          ]
+        },
+        "TestLogTelemetryCounts": {
+          "type": "object",
+          "properties": {
+            "logs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "spans": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "logs",
+            "spans"
+          ]
         }
       },
       "required": [

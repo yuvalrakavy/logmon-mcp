@@ -7,9 +7,11 @@ anything behaviour-visible; PATCH is reserved for fixes nobody has to know about
 
 ### Added — test-log limits telemetry per selector
 
-Runs can set the fraction of each ring a selector can use. Crossing the limit
-captures a case and records an `excessive_telemetry` fault alongside the runner’s
-verdict. A bounded tail preserves recent refusals and travels with the report.
+The per-selector telemetry limit is on for every test-log run by default. At 25%
+of each default 10,000-record ring, a selector gets 2,500 logs and 2,500 spans.
+Set another share with `test-log begin --execution-limit-percent P`. Crossing the
+limit captures a case and records an `excessive_telemetry` fault alongside the
+runner’s verdict. A bounded tail preserves recent refusals and travels with the report.
 
 ### Explicit domains and scoped investigation state
 

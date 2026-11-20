@@ -168,7 +168,6 @@ pub(super) struct Run {
     // Keep ingestion proportional to selector fields and matching executions.
     index: HashMap<String, HashMap<String, usize>>,
     quotas: Quotas,
-    last_log_admission: Option<(u64, bool)>,
     tail_writer: TailWriter,
     domain: Weak<Domain>,
     active: HashSet<String>,
@@ -269,20 +268,6 @@ impl Run {
         })
     }
 
-    pub fn allows_reinsert(&self, log: &LogEntry) -> bool {
-        if let Some((seq, allowed)) = self.last_log_admission {
-            if seq == log.seq {
-                return allowed;
-            }
-        }
-        self.quotas.allows_reinsert(
-            log,
-            self.matching_groups(Record::Log(log)).filter(|&id| {
-                self.quotas.groups[id].live > 0 || self.quotas.groups[id].crossing.is_some()
-            }),
-        )
-    }
-
     pub fn admit_record(&mut self, record: Record<'_>) -> (bool, bool) {
         let groups = if self.active.is_empty() {
             Vec::new()
@@ -292,9 +277,6 @@ impl Run {
                 .collect()
         };
         let (accepted, mut crossed) = self.quotas.admit(record, &groups);
-        if let Record::Log(log) = record {
-            self.last_log_admission = Some((log.seq, accepted));
-        }
         crossed.sort_unstable();
         for &group in &crossed {
             self.capture_crossing(group);
@@ -373,7 +355,7 @@ impl Run {
         }
     }
 
-    fn finish_telemetry(&mut self, d: &Domain, id: &str) {
+    fn finish_telemetry(&mut self, id: &str) {
         if !self.active.remove(id) {
             return;
         }
@@ -389,7 +371,7 @@ impl Run {
             }
             self.entries.get_mut(id).unwrap().telemetry_end = Some(data);
         }
-        self.quotas.finish(quota, d.pipeline.current_seq());
+        self.quotas.finish(quota);
     }
 
     fn add_telemetry(&self, id: &str, data: &mut Value) {
@@ -491,9 +473,10 @@ impl Run {
         let journal = Arc::new(journal);
         let quotas = Quotas::new(
             [
-                domain.pipeline.store.ring_info().0.current,
-                domain.span_store.ring_info().0.current,
-            ],
+                domain.pipeline.store.ring_info().0,
+                domain.span_store.ring_info().0,
+            ]
+            .map(|ring| ring.maximum.unwrap_or(ring.current)),
             config.execution_limit_percent.unwrap_or(25.),
         );
         Self {
@@ -507,7 +490,6 @@ impl Run {
             entries: HashMap::new(),
             index: HashMap::new(),
             quotas,
-            last_log_admission: None,
             domain: Arc::downgrade(domain),
             tail_writer: TailWriter::default(),
             active: HashSet::new(),
@@ -783,7 +765,7 @@ impl Run {
         ex.end_fields_hash = fields_hash;
         ex.end = Some(e.clone());
         ex.deadline = Some(deadline);
-        self.finish_telemetry(d, &id);
+        self.finish_telemetry(&id);
         self.grace.insert(id.clone());
         self.provenance = reg.to_vec();
         if self.entries[&id].decision.is_none() {
@@ -1152,7 +1134,7 @@ impl Run {
             ex.deadline = Some(deadline);
             self.grace.insert(id.into());
         }
-        self.finish_telemetry(d, id);
+        self.finish_telemetry(id);
         let ex = &mut self.entries.get_mut(id).unwrap();
         if ex.decision.is_none() {
             ex.capture_deadline = Some(deadline);

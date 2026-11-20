@@ -1049,10 +1049,28 @@ and case eligibility apply to every execution. The default hard timeout is 600,0
 overridable with `--test-timeout-ms` on start. After a verdict, batched telemetry
 has a default 10,000 ms grace period, set with `--grace-period-ms` on begin.
 
-An active execution’s selector can use a configurable share of each ring, default
-25%. A crossing captures evidence and records the `excessive_telemetry` fault.
+The per-selector telemetry limit is on for every test-log run by default. At 25%
+of each default 10,000-record ring, a selector gets 2,500 logs and 2,500 spans.
+Set another share with `test-log begin --execution-limit-percent P`. A crossing
+captures evidence and records the `excessive_telemetry` fault.
 The report distinguishes the runner’s verdict, the records refused after the
 crossing, and the retained tail. See the [telemetry limit guide](docs/test-log-progress.md#per-selector-telemetry-limit).
+
+Refused records bypass normal ingest processing, including triggers and
+notifications, log filter epoch tracking, span collectors, and test-log summaries
+and late-telemetry counts.
+
+Queued tail writes pin their records in the shared tail budget. A stalled write
+can cause older buffered records from other selectors to be evicted and can
+leave too little room for new tail entries.
+
+The journal can name a tail before its file is ready. A broker crash before the
+file is renamed into place can leave a dangling path and prevent report archival.
+
+The first active execution registered under a shared selector owns the
+crossing case. If it is an ordinary test, it can receive a bare case under
+slot pressure even if a peer sharing its selector is a `step:*` execution and
+the reserved slot is free.
 
 An abnormal ending requests a case. The default full failure-case limit is 10%
 of the planned test count, rounded down with a minimum of 20 and a maximum of
@@ -1065,8 +1083,8 @@ follow the failure policy. `--max-rerun-cases` limits cases for OK reruns, and
 executions in with a start condition.
 
 - A **full** case can include the selected execution’s records and overlapping telemetry.
-- A **minimal** case includes the verdict and the selector’s own records after the full failure limit is spent.
-- A **bare** case records the verdict, times, selector, omitted record counts, and the capture constraint for an abnormal ending or an excessive-telemetry crossing. It uses neither a snapshot slot nor retained telemetry. The runner’s failure message remains in the JSONL.
+- A **minimal** failure case includes the verdict and the selector’s own records after the full failure limit is spent. An excessive-telemetry crossing requests a minimal case with the selector’s own records before a verdict is available and spends no failure allowance.
+- A **bare** case records the times, selector, omitted record counts, capture constraint and any verdict already available. It can represent an abnormal ending or an excessive-telemetry crossing. It uses neither a snapshot slot nor retained telemetry. The runner’s failure message remains in the JSONL.
 
 `skipped_failure_limit` has been replaced by minimal cases. `--max-failures 0` previously disabled failure cases. It now requests a minimal case for every failure covered by the limit, with a bare fallback if it cannot fit. `skipped_capture_budget` has been replaced by cut cases, bare cases for abnormal endings, and `skipped_pool_exhausted` for optional captures with no room. A slow pass or OK rerun with no slot still returns `skipped_queue_full`. This spends no slow-pass allowance. An OK rerun still spends a rerun attempt, as it did before.
 

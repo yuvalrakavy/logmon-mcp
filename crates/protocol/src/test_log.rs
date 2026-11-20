@@ -168,6 +168,37 @@ pub struct TestLogReplay {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TestLogTelemetryCounts {
+    pub logs: u64,
+    pub spans: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TestLogTelemetryStream {
+    Logs,
+    Spans,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TestLogTelemetryPeer {
+    pub execution_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TestLogTelemetryLimit {
+    /// Stream that crossed first.
+    pub kind: TestLogTelemetryStream,
+    /// Number of records that stream could admit before crossing.
+    pub limit: u64,
+    /// Ring capacity used to calculate the limit.
+    pub ring_size: u64,
+    /// Other executions registered under this selector value.
+    pub shared_with: Vec<TestLogTelemetryPeer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TestLogAck {
     /// Daemon decision: accepted, already_applied or refused.
     pub status: String,
@@ -189,6 +220,27 @@ pub struct TestLogAck {
     /// Capture constraint or policy that selected the case size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_detail: Option<String>,
+    /// Telemetry fault independent of the runner’s verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<String>,
+    /// Limit and other executions sharing the selector that crossed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_limit: Option<TestLogTelemetryLimit>,
+    /// Refused telemetry by stream, separate from domain loss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_telemetry: Option<TestLogTelemetryCounts>,
+    /// Records missing from the configured tail window by stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_tail_shortened: Option<TestLogTelemetryCounts>,
+    /// Bytes charged to the run’s shared tail budget when the execution ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_tail_pool_bytes: Option<u64>,
+    /// Journal-relative path to the queued tail file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_tail_path: Option<String>,
+    /// Tail error known when the acknowledgement was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_tail_error: Option<String>,
     /// A degraded writer may accept the lifecycle operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_log_health: Option<String>,

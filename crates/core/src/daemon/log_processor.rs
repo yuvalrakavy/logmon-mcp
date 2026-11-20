@@ -176,7 +176,7 @@ pub fn process_entry_for_domain(
     // The entry joins the pre-trigger buffer only now, after its own triggers ran. Appended
     // before them (as it once was), it sat in the buffer when it fired, and a pre-window of N
     // flushed the matching record itself as one of the N — N-1 records before the match.
-    pipeline.pre_buffer_append_admitted(entry.clone());
+    pipeline.pre_buffer_append(entry.clone());
 
     // 5. Buffer storage (if entry not already stored by trigger logic)
     if !pipeline.contains_seq(entry.seq) {

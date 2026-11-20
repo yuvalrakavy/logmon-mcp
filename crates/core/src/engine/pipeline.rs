@@ -249,8 +249,7 @@ impl LogPipeline {
 
     /// Store records that may be older than records already held, keeping the ring in seq
     /// order. Returns how many held records moved. See `InMemoryStore::insert_sorted`.
-    pub fn insert_sorted(&self, mut batch: Vec<LogEntry>) -> usize {
-        self.test_log.filter_reinserted_logs(&mut batch);
+    pub fn insert_sorted(&self, batch: Vec<LogEntry>) -> usize {
         self.store.insert_sorted(batch)
     }
 
@@ -409,13 +408,8 @@ impl LogPipeline {
 
     // --- Pre-buffer operations ---
 
+    /// Append a record already admitted by the processor.
     pub fn pre_buffer_append(&self, entry: LogEntry) {
-        if self.test_log.retained_log_allowed(&entry) {
-            self.pre_buffer_append_admitted(entry);
-        }
-    }
-
-    pub(crate) fn pre_buffer_append_admitted(&self, entry: LogEntry) {
         self.pre_buffer.append(entry);
     }
 
@@ -429,7 +423,7 @@ impl LogPipeline {
         for row in &mut rows {
             row.source = crate::gelf::message::LogSource::PreTrigger;
         }
-        self.store.insert_sorted(rows);
+        self.insert_sorted(rows);
     }
 
     pub fn pre_buffer_copy(&self, count: usize) -> Vec<LogEntry> {
