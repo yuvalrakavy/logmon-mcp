@@ -74,7 +74,8 @@ pub struct TestLogBegin {
     /// Stable percentage of chain names selected for detailed summaries (0 to 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_sample_percent: Option<f64>,
-    /// Per-selector share of each ring when the run begins, in percent. Defaults to 25.
+    /// Per-selector share of each ring's configured maximum, or of its size at begin
+    /// when no maximum is set. Defaults to 25%, with a minimum of one record per ring.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_limit_percent: Option<f64>,
 }

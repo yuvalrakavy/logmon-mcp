@@ -43,6 +43,8 @@ If the count becomes known later, repeat `test-log begin` with the same domain a
 
 `test-log begin --execution-limit-percent P` sets a per-selector share for each ring. The default is 25%. The base is the ring’s configured maximum if it has one, or its current capacity at begin otherwise. The broker rounds down with a minimum of one record per stream. It counts logs and spans separately while an execution with that selector is active. Exceeding either count puts both streams under post-crossing admission rules. Ring fullness alone cannot produce the fault.
 
+With a maximum configured, the limit can equal or exceed the ring’s current size, so one selector can fill the ring until it grows, displacing records from before the run first.
+
 Executions with the same selector field and value share the quota for the whole run. Counts persist between executions. A later execution under an already-crossed value is faulted at registration. It references the original crossing case for any verdict, including a failure.
 
 The crossing captures the selector’s retained records immediately. The case can be bare when the snapshot slots or capture pool are exhausted. The journal and report mark every execution sharing the selector with `excessive_telemetry` and preserve the runner’s verdict. The live and settled progress counters include `faults.excessive_telemetry`.

@@ -994,7 +994,7 @@
           "format": "double"
         },
         "execution_limit_percent": {
-          "description": "Per-selector share of each ring when the run begins, in percent. Defaults to 25.",
+          "description": "Per-selector share of each ring's configured maximum, or of its size at begin\nwhen no maximum is set. Defaults to 25%, with a minimum of one record per ring.",
           "type": [
             "number",
             "null"

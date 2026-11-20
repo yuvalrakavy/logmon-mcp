@@ -1056,13 +1056,17 @@ captures evidence and records the `excessive_telemetry` fault.
 The report distinguishes the runner’s verdict, the records refused after the
 crossing, and the retained tail. See the [telemetry limit guide](docs/test-log-progress.md#per-selector-telemetry-limit).
 
+With a maximum configured, the limit can equal or exceed the ring’s current
+size, so one selector can fill the ring until it grows, displacing records from
+before the run first.
+
 Refused records bypass normal ingest processing, including triggers and
 notifications, log filter epoch tracking, span collectors, and test-log summaries
 and late-telemetry counts.
 
-Queued tail writes pin their records in the shared tail budget. A stalled write
-can cause older buffered records from other selectors to be evicted and can
-leave too little room for new tail entries.
+Queued tail writes pin their records in the shared tail budget. If a write
+stalls, a reservation can evict every unpinned tail record, including records
+from the same selector, and still fail.
 
 The journal can name a tail before its file is ready. A broker crash before the
 file is renamed into place can leave a dangling path and prevent report archival.
