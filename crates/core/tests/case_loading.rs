@@ -739,7 +739,13 @@ fn every_tool_that_is_not_read_only_is_refused_on_a_loaded_case() {
         if READ_ONLY.contains(&t.name) {
             continue;
         }
-        let req = RpcRequest::new(1, t.method, json!({}));
+        // An edit addresses its collector pin or explicit destination, independently of the binding.
+        let params = if t.method == "collectors.edit" {
+            json!({"name":"measurement","domain":"default"})
+        } else {
+            json!({})
+        };
+        let req = RpcRequest::new(1, t.method, params);
         let resp = h.handler.handle(&h.session, &req);
         let refused = resp
             .error
