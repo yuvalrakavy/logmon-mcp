@@ -7940,7 +7940,13 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "DomainsClear",
       "type": "object",
-      "additionalProperties": false
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Existing domain to use for this call. Omit to use the session binding."
+        }
+      }
     },
     "DomainsClearResult": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7970,11 +7976,16 @@
           "format": "uint",
           "minimum": 0,
           "default": 0
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain that answered this call."
         }
       },
       "required": [
         "logs_cleared",
-        "spans_cleared"
+        "spans_cleared",
+        "domain"
       ]
     },
     "CollectorsReset": {

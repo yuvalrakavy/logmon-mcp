@@ -566,6 +566,10 @@ impl RpcHandler {
         let Ok(d) = self.resolve_domain(session_id) else {
             return Ok(());
         };
+        Self::require_live_domain(&d, op)
+    }
+
+    fn require_live_domain(d: &Domain, op: &str) -> Result<(), String> {
         let Some(pm) = &d.postmortem else {
             return Ok(());
         };
@@ -885,7 +889,8 @@ impl RpcHandler {
                 Err(msg) => RpcResponse::error(request.id, -32601, &msg),
             };
         }
-        if matches!(request.method.as_str(), "domains.delete" | "domains.resize") {
+        // Keep collector pin validation and persistence ordered against domain replacement.
+        if matches!(request.method.as_str(), "domains.delete" | "domains.resize" | "collectors.edit") {
             let _guard = self.create_lock.lock().await;
             return self.handle(session_id, request);
         }
@@ -4163,7 +4168,6 @@ impl RpcHandler {
         session_id: &CallContext<'_>,
         params: &Value,
     ) -> Result<Value, String> {
-        self.require_live(session_id, "edit_collector")?;
         let name = req_str(params, "name")?;
         let level = match opt_str(params, "level")? {
             None => None,
@@ -4204,6 +4208,7 @@ impl RpcHandler {
                 let Some(dom) = self.domains.get(&id) else {
                     return Err(format!("domain \"{d}\" does not exist"));
                 };
+                Self::require_live_domain(&dom, "edit_collector")?;
                 (Some(id), Some(dom.metrics.clone()))
             }
         };
@@ -4247,9 +4252,23 @@ impl RpcHandler {
             );
         }
 
+        let repinning = change.domain.is_some();
         let out = self
             .collectors
-            .edit(session_id, name, change, new_metrics, Utc::now())
+            .edit(session_id, name, change, new_metrics, Utc::now(), |pin, metrics| {
+                if let Some(current) = self.domains.get(pin) {
+                    Self::require_live_domain(&current, "edit_collector")?;
+                    if Arc::ptr_eq(metrics, &current.metrics) {
+                        return Ok(());
+                    }
+                }
+                // An explicitly supplied live destination can repair an orphaned pin.
+                if repinning {
+                    Ok(())
+                } else {
+                    Err(format!("collector's pinned domain \"{pin}\" is gone or was recreated; supply a live destination to re-pin it"))
+                }
+            })
             .map_err(|e| e.to_string())?;
         let def = out.collector.def();
         Ok(json!({

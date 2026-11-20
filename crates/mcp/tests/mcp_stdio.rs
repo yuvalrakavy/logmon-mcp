@@ -799,3 +799,68 @@ async fn subagent_lifecycle_and_clear_leave_parent_bound_to_its_lane() {
         assert_eq!(call(mcp,"end_test_log",json!({"run_id":"same-id","wait_timeout_ms":0}))["domain"],"parent");
     }).await;
 }
+
+#[tokio::test]
+async fn shared_shim_clears_the_selected_domain_and_edits_on_the_collector_pin() {
+    with_mcp(|mcp, _| {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../core/tests/fixtures/cases/with-spans-260803-214501.md");
+        for lane in ["live", "archive"] {
+            mcp.call("create_domain", json!({"name":lane, "otlp_grpc_port":0})).unwrap();
+        }
+        mcp.call("add_collector", json!({"name":"old","filter":"ALL","domain":"archive"})).unwrap();
+        mcp.call("add_collector", json!({"name":"orphan","filter":"ALL","domain":"archive"})).unwrap();
+        mcp.call("delete_domain", json!({"name":"archive"})).unwrap();
+        assert!(mcp.call("edit_collector",json!({"name":"orphan","description":"missing pin"}))
+            .unwrap_err().contains("archive"));
+        mcp.call("edit_collector",json!({"name":"orphan","domain":"live"})).unwrap();
+        mcp.call("load_case", json!({"path":fixture,"domain":"archive"})).unwrap();
+        mcp.call("use_domain", json!({"name":"archive"})).unwrap();
+
+        let lanes = mcp.request("tools/call", json!({"name":"list_domains","arguments":{}}));
+        let live = lanes["result"]["structuredContent"]["domains"].as_array().unwrap()
+            .iter().find(|row| row["name"] == "live").unwrap();
+        let port = |key: &str| live[key].as_u64().unwrap() as u16;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let msg = json!({"version":"1.1","host":"test","short_message":"clear me","level":6});
+        socket.send_to(msg.to_string().as_bytes(), ("127.0.0.1",port("gelf_port"))).unwrap();
+        let body = json!({"resourceSpans":[{"resource":{},"scopeSpans":[{"spans":[{
+            "traceId":"00000000000000000000000000000001","spanId":"0000000000000001",
+            "name":"clear me","kind":1,"startTimeUnixNano":"1000000","endTimeUnixNano":"2000000"
+        }]}]}]}).to_string();
+        let mut http = std::net::TcpStream::connect(("127.0.0.1",port("otlp_http_port"))).unwrap();
+        write!(http,"POST /v1/traces HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+        let mut response = String::new();
+        BufReader::new(http).read_line(&mut response).unwrap();
+        assert!(response.contains(" 200 "), "{response}");
+        for _ in 0..100 {
+            let r = mcp.request("tools/call",json!({"name":"list_domains","arguments":{}}));
+            if r["result"]["structuredContent"]["domains"].as_array().unwrap().iter()
+                .any(|d| d["name"]=="live" && d["log_count"]==1 && d["span_count"]==1) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(mcp.call("clear_domain",json!({})).unwrap_err().contains("archive"));
+        assert!(mcp.call("clear_domain",json!({"domain":"missing"})).unwrap_err().contains("missing"));
+        let r = mcp.request("tools/call",json!({"name":"clear_domain","arguments":{"domain":"live"}}));
+        let cleared = &r["result"]["structuredContent"];
+        assert_eq!(cleared["domain"],"live","{r}");
+        assert_eq!(cleared["logs_cleared"],1);
+        assert_eq!(cleared["spans_cleared"],1);
+
+        mcp.call("add_collector",json!({"domain":"live","name":"c","filter":"ALL"})).unwrap();
+        mcp.call("edit_collector",json!({"name":"c","description":"on live"})).unwrap();
+        for dest in ["archive","missing"] {
+            let err = mcp.call("edit_collector",json!({"name":"c","domain":dest})).unwrap_err();
+            assert!(err.contains(dest),"{err}");
+        }
+        let err = mcp.call("edit_collector",json!({"name":"old","domain":"live"})).unwrap_err();
+        assert!(err.contains("archive"),"{err}");
+        mcp.call("get_collector",json!({"domain":"live","name":"c"})).unwrap();
+        mcp.call("edit_collector",json!({"name":"c","domain":"default"})).unwrap();
+        mcp.call("get_collector",json!({"domain":"default","name":"c"})).unwrap();
+        let r = mcp.request("tools/call",json!({"name":"get_recent_logs","arguments":{}}));
+        let logs = &r["result"]["structuredContent"];
+        assert_eq!(logs["domain"],"archive");
+        assert!(logs["count"].as_u64().unwrap()>0);
+    }).await;
+}

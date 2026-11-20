@@ -200,7 +200,8 @@ impl Tool {
 pub fn supports_explicit_domain(method: &str) -> bool {
     matches!(
         method,
-        "logs.clear"
+        "domains.clear"
+            | "logs.clear"
             | "test_log.begin"
             | "test_log.start"
             | "test_log.end"
@@ -460,7 +461,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "edit_collector",
         method: "collectors.edit",
-        description: "Change an armed collector. Editing only the description changes \
+        description: "Edit a collector on its current pin. The optional domain is its new live destination. Editing only the description changes \
                        nothing else; editing the filter, level, group_keys, max_sample_bytes \
                        or domain DISCARDS the live window, because a window and the \
                        definition describing it must not disagree. Recorded snapshots are \
@@ -652,7 +653,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "clear_domain",
         method: "domains.clear",
-        description: "Dispose the bound domain's data — logs and spans — keeping the domain and its receivers alive. Sequence numbers stay monotonic. (logs.clear is the logs-only cousin.)",
+        description: "Clear logs and spans in the selected domain (session default when omitted), keeping its receivers alive. Sequence numbers stay monotonic. (logs.clear is the logs-only cousin.)",
         cli: Cli::PLAIN,
     },
     Tool {

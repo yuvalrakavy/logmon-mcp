@@ -744,6 +744,7 @@ impl CollectorRegistry {
         change: CollectorEdit,
         new_metrics: Option<Arc<ReceiverMetrics>>,
         now: DateTime<Utc>,
+        validate_pin: impl FnOnce(&DomainId, &Arc<ReceiverMetrics>) -> Result<(), String>,
     ) -> Result<EditOutcome, RegistryError> {
         // Read-only in this first phase: everything is validated and the file is
         // built before anything is mutated, so the write can be the commit point.
@@ -753,6 +754,7 @@ impl CollectorRegistry {
             .position(|e| &e.owner == owner && e.collector.def().name == name)
             .ok_or_else(|| RegistryError::NotFound(name.to_string()))?;
 
+        validate_pin(&g[idx].domain, &g[idx].metrics).map_err(RegistryError::PolicyRejected)?;
         let old = g[idx].collector.def().clone();
         let structural = change.is_structural(&old);
         let mut def = (*old).clone();

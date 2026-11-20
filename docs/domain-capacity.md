@@ -25,3 +25,5 @@ Create accepts omitted sizes on an existing domain and compares supplied values 
 ## Surviving broker restarts
 
 Use `domains create --persist` when producers will outlive the broker, for example a development service sending to a stable port. The broker saves the name, actual ports and configured capacities and restarts the listeners with empty rings. An existing ephemeral domain needs to be deliberately replaced to switch its lifetime. Explicit deletion removes the saved definition. Inspect broker diagnostics if another process occupies a saved port. An unreachable UDP receiver can lose records silently, while TCP/OTLP delivery depends on the producer's retry behavior. A disposable test run can use the ephemeral default and recreate its domain when starting a new run.
+
+On a shared MCP connection, `clear_domain(domain="staging")` clears both rings in staging. The reply identifies the domain and gives the cleared log and span counts. Omitting `domain` uses the session default. Loaded cases refuse this operation.

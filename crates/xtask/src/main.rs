@@ -272,7 +272,7 @@ fn gen_schema(out: &PathBuf) -> anyhow::Result<()> {
         request["properties"]["domain"] = json!({
             "type": "string", "description": "Existing domain to use for this call. Omit to use the session binding."
         });
-        if tool.method != "logs.clear" && !tool.method.starts_with("test_log.") {
+        if !matches!(tool.method, "domains.clear" | "logs.clear") && !tool.method.starts_with("test_log.") {
             request["properties"]["scope"] = json!({
                 "type": "string", "description": "Caller namespace for session state such as cursors, bookmarks, filters and triggers."
             });
