@@ -7,7 +7,8 @@ use crate::store::memory::RetainedRing;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::EvidenceVerdict;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -126,10 +127,73 @@ pub struct CaptureSnapshot {
     spans: BTreeMap<u64, Arc<SpanEntry>>,
     log_floor: u64,
     span_floor: u64,
+    log_tip: Option<u64>,
+    span_tip: Option<u64>,
     domain_drops: Value,
     ring_coverage: Value,
     pool: Arc<Mutex<CapturePool>>,
-    over_budget: bool,
+    pub(crate) size: CaptureSize,
+    omitted: [usize; 5],
+    cutoff: Option<Priority>,
+    retained: BTreeSet<Priority>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureSize {
+    Full,
+    Minimal,
+    Bare,
+}
+
+impl CaptureSize {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+            Self::Bare => "bare",
+        }
+    }
+}
+
+// One shared sequence axis gives logs and spans the same newest-first order.
+type Priority = (usize, Reverse<u64>);
+
+enum Record<'a> {
+    Log(&'a LogEntry),
+    Span(&'a SpanEntry),
+}
+
+impl Record<'_> {
+    fn priority(&self, snapshot: &CaptureSnapshot) -> Option<Priority> {
+        let (own, in_window, error, warn, seq) = match self {
+            Self::Log(log) => (
+                snapshot.selector.matches_log(log),
+                (snapshot.start..=snapshot.end).contains(&log.timestamp),
+                log.level == Level::Error,
+                log.level == Level::Warn,
+                log.seq,
+            ),
+            Self::Span(span) => (
+                snapshot.selector.matches_span(span),
+                span.start_time <= snapshot.end && span.end_time >= snapshot.start,
+                matches!(span.status, SpanStatus::Error(_)),
+                false,
+                span.seq,
+            ),
+        };
+        let class = if own {
+            usize::from(!error)
+        } else if !in_window || snapshot.size == CaptureSize::Minimal {
+            return None;
+        } else if error {
+            2
+        } else if warn {
+            3
+        } else {
+            4
+        };
+        Some((class, Reverse(seq)))
+    }
 }
 
 pub(super) fn coverage(
@@ -155,6 +219,9 @@ pub(super) fn coverage(
 
 impl Drop for CaptureSnapshot {
     fn drop(&mut self) {
+        if self.logs.is_empty() && self.spans.is_empty() {
+            return;
+        }
         let mut pool = self.pool.lock().unwrap();
         let CapturePool {
             logs,
@@ -192,6 +259,16 @@ impl CaptureSnapshot {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Self {
+        Self::capture(domain, selector, start, end, CaptureSize::Full)
+    }
+
+    fn capture(
+        domain: &Domain,
+        selector: Selector,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        size: CaptureSize,
+    ) -> Self {
         let anchor_seq = domain.pipeline.assign_seq();
         let drops = domain.metrics.snapshot();
         let mut snapshot = Self {
@@ -205,12 +282,17 @@ impl CaptureSnapshot {
             spans: BTreeMap::new(),
             log_floor: 0,
             span_floor: 0,
+            log_tip: None,
+            span_tip: None,
             ring_coverage: Value::Null,
             domain_drops: json!({"gelf_udp":drops.gelf_udp,"gelf_tcp":drops.gelf_tcp,
                 "otlp_http_logs":drops.otlp_http_logs,"otlp_http_traces":drops.otlp_http_traces,
                 "otlp_grpc_logs":drops.otlp_grpc_logs,"otlp_grpc_traces":drops.otlp_grpc_traces}),
             pool: domain.test_log.capture_pool.clone(),
-            over_budget: false,
+            size,
+            omitted: [0; 5],
+            cutoff: None,
+            retained: BTreeSet::new(),
         };
         // Always lock logs before spans. Both stores remain fixed while the verdict
         // snapshot is copied; regular ingestion needs only its existing ring lock.
@@ -218,20 +300,84 @@ impl CaptureSnapshot {
             domain.span_store.with_retained(|spans| {
                 snapshot.log_floor = logs.lost_below;
                 snapshot.span_floor = spans.lost_below;
-                for log in logs.records {
-                    if log.seq < anchor_seq {
-                        snapshot.pin_log(log, true, || log.clone());
-                    }
-                }
-                for span in spans.records {
-                    if span.seq < anchor_seq {
-                        snapshot.pin_span(span, true, || span.clone());
-                    }
-                }
+                // Each stream stores a record before its single processor calls
+                // into the run. At most its newest captured record can still
+                // have an observation waiting behind the verdict's state lock.
+                snapshot.log_tip = logs
+                    .records
+                    .iter()
+                    .rev()
+                    .find(|log| log.seq < anchor_seq)
+                    .map(|log| log.seq);
+                snapshot.span_tip = spans
+                    .records
+                    .iter()
+                    .rev()
+                    .find(|span| span.seq < anchor_seq)
+                    .map(|span| span.seq);
+                snapshot.capture_records(&logs, &spans);
                 snapshot.ring_coverage = coverage(&logs, &spans, anchor_seq, start, end);
             })
         });
+        if size != CaptureSize::Bare
+            && snapshot.retained.is_empty()
+            && (snapshot.cutoff.is_some() || snapshot.pool.lock().unwrap().available < INDEX_BYTES)
+        {
+            snapshot.size = CaptureSize::Bare;
+        }
         snapshot
+    }
+
+    fn capture_records(&mut self, logs: &RetainedRing<LogEntry>, spans: &RetainedRing<SpanEntry>) {
+        if self.size == CaptureSize::Bare {
+            for record in logs
+                .records
+                .iter()
+                .map(|r| Record::Log(r))
+                .chain(spans.records.iter().map(|r| Record::Span(r)))
+            {
+                if let Some((class, Reverse(seq))) = record.priority(self) {
+                    if seq < self.anchor_seq {
+                        self.omitted[class] += 1;
+                    }
+                }
+            }
+            return;
+        }
+        // Stream the two rings in arrival order for each priority class.
+        // This keeps the temporary work independent of the number of candidates.
+        let classes = if self.size == CaptureSize::Minimal {
+            2
+        } else {
+            5
+        };
+        for class in 0..classes {
+            let mut logs = logs.records.iter().rev().peekable();
+            let mut spans = spans.records.iter().rev().peekable();
+            loop {
+                if logs
+                    .peek()
+                    .is_some_and(|log| spans.peek().is_none_or(|span| log.seq > span.seq))
+                {
+                    let log = logs.next().unwrap();
+                    if let Some(priority) = Record::Log(log)
+                        .priority(self)
+                        .filter(|key| key.0 == class && log.seq < self.anchor_seq)
+                    {
+                        self.offer(priority, |snap| snap.pin_log(log, true, || log.clone()));
+                    }
+                } else if let Some(span) = spans.next() {
+                    if let Some(priority) = Record::Span(span)
+                        .priority(self)
+                        .filter(|key| key.0 == class && span.seq < self.anchor_seq)
+                    {
+                        self.offer(priority, |snap| snap.pin_span(span, true, || span.clone()));
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     /// Preserve the domain through the broker cutoff, including activity
@@ -243,7 +389,17 @@ impl CaptureSnapshot {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Self {
-        let mut snapshot = Self::new(domain, selector, start, end.max(Utc::now()));
+        Self::for_execution_size(domain, selector, start, end, CaptureSize::Full)
+    }
+
+    pub(crate) fn for_execution_size(
+        domain: &Domain,
+        selector: Selector,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        size: CaptureSize,
+    ) -> Self {
+        let mut snapshot = Self::capture(domain, selector, start, end.max(Utc::now()), size);
         snapshot.end = end;
         snapshot
     }
@@ -267,25 +423,33 @@ impl CaptureSnapshot {
                 }
                 _ => true,
             });
-        self.over_budget |= other.over_budget;
+        for (count, member) in self.omitted.iter_mut().zip(other.omitted) {
+            *count += member;
+        }
         self.start = self.start.min(other.start);
         self.end = self.end.max(other.end);
     }
 
     pub fn is_over_budget(&self) -> bool {
-        self.over_budget
+        self.omitted.iter().any(|&count| count != 0)
     }
 
     pub fn observe_log(&mut self, log: &LogEntry) {
-        self.pin_log(log, false, || Arc::new(log.clone()));
-    }
-    fn pin_log(&mut self, log: &LogEntry, shared: bool, get: impl FnOnce() -> Arc<LogEntry>) {
-        if self.over_budget
-            || self.logs.contains_key(&log.seq)
-            || !(self.selector.matches_log(log) || (self.start..=self.end).contains(&log.timestamp))
-        {
+        if self.log_tip == Some(log.seq) {
             return;
         }
+        if let Some(priority) = Record::Log(log).priority(self) {
+            self.offer(priority, |snap| {
+                snap.pin_log(log, false, || Arc::new(log.clone()))
+            });
+        }
+    }
+    fn pin_log(
+        &mut self,
+        log: &LogEntry,
+        shared: bool,
+        get: impl FnOnce() -> Arc<LogEntry>,
+    ) -> bool {
         let mut pool = self.pool.lock().unwrap();
         let CapturePool {
             logs,
@@ -304,23 +468,27 @@ impl CaptureSnapshot {
         ) {
             Some(record) => {
                 self.logs.insert(log.seq, record);
+                true
             }
-            None => {
-                self.over_budget = true;
-            }
+            None => false,
         }
     }
     pub fn observe_span(&mut self, span: &SpanEntry) {
-        self.pin_span(span, false, || Arc::new(span.clone()));
-    }
-    fn pin_span(&mut self, span: &SpanEntry, shared: bool, get: impl FnOnce() -> Arc<SpanEntry>) {
-        if self.over_budget
-            || self.spans.contains_key(&span.seq)
-            || !(self.selector.matches_span(span)
-                || (span.start_time <= self.end && span.end_time >= self.start))
-        {
+        if self.span_tip == Some(span.seq) {
             return;
         }
+        if let Some(priority) = Record::Span(span).priority(self) {
+            self.offer(priority, |snap| {
+                snap.pin_span(span, false, || Arc::new(span.clone()))
+            });
+        }
+    }
+    fn pin_span(
+        &mut self,
+        span: &SpanEntry,
+        shared: bool,
+        get: impl FnOnce() -> Arc<SpanEntry>,
+    ) -> bool {
         let mut pool = self.pool.lock().unwrap();
         let CapturePool {
             spans,
@@ -339,11 +507,61 @@ impl CaptureSnapshot {
         ) {
             Some(record) => {
                 self.spans.insert(span.seq, record);
+                true
             }
-            None => {
-                self.over_budget = true;
-            }
+            None => false,
         }
+    }
+
+    fn offer(&mut self, priority: Priority, pin: impl Fn(&mut Self) -> bool) {
+        if self.retained.contains(&priority) {
+            return;
+        }
+        if self.size == CaptureSize::Bare || self.cutoff.is_some_and(|cutoff| priority >= cutoff) {
+            self.omitted[priority.0] += 1;
+            return;
+        }
+        // A late record can outrank evidence already pinned during the verdict.
+        loop {
+            if pin(self) {
+                self.retained.insert(priority);
+                return;
+            }
+            let Some(worst) = self.retained.last().copied().filter(|&key| key > priority) else {
+                self.omit(priority);
+                return;
+            };
+            self.retained.remove(&worst);
+            self.omit(worst);
+            let seq = worst.1 .0;
+            let mut pool = self.pool.lock().unwrap();
+            let CapturePool {
+                logs,
+                spans,
+                available,
+                shared_bytes,
+            } = &mut *pool;
+            *available += if self.logs.remove(&seq).is_some() {
+                unpin(logs, seq, shared_bytes)
+            } else {
+                self.spans.remove(&seq);
+                unpin(spans, seq, shared_bytes)
+            };
+        }
+    }
+
+    fn omit(&mut self, priority: Priority) {
+        self.omitted[priority.0] += 1;
+        self.cutoff = Some(self.cutoff.map_or(priority, |cutoff| cutoff.min(priority)));
+    }
+
+    fn omission_counts(&self) -> Value {
+        let [selector_error, selector_other, window_error, window_warn, window_other] =
+            self.omitted;
+        json!({
+            "selector_error":selector_error, "selector_other":selector_other,
+            "window_error":window_error, "window_warn":window_warn, "window_other":window_other,
+        })
     }
     pub fn captured_at(&self) -> DateTime<Utc> {
         self.captured_at
@@ -358,8 +576,25 @@ impl CaptureSnapshot {
             json!(self.spans.values().map(|s| s.start_time).min());
         result["coverage_as_of"] = json!(self.captured_at);
         result["receiver_drops_domain_lifetime"] = self.domain_drops.clone();
-        result["over_budget"] = json!(self.over_budget);
+        let cut = self.omitted.iter().any(|&count| count != 0);
+        result["over_budget"] =
+            json!(cut && self.size != CaptureSize::Bare || self.cutoff.is_some());
+        result["cut"] = json!(cut);
+        result["omitted_records"] = self.omission_counts();
         result
+    }
+
+    fn case_coverage(&self, metadata: &Value) -> Value {
+        let mut coverage = self.coverage();
+        if let Some(members) = metadata["deadline_members"].as_array() {
+            // Members' windows can overlap, and a record omitted from one
+            // member's snapshot might be present in a peer's snapshot.
+            coverage.as_object_mut().unwrap().remove("omitted_records");
+            coverage["omitted_records_by_execution"] = json!(members.iter().map(|member| {
+                json!({"execution_id":member["execution_id"],"records":member["coverage"]["omitted_records"]})
+            }).collect::<Vec<_>>());
+        }
+        coverage
     }
 
     fn render_summary(
@@ -394,10 +629,16 @@ impl CaptureSnapshot {
         writeln!(
             body,
             "Capture reason: {}
+
+Case size: {}
 ",
-            flatten(reason)
+            flatten(reason),
+            self.size.as_str(),
         )
         .unwrap();
+        if let Some(detail) = meta["case_detail"].as_str() {
+            writeln!(body, "Case detail: {}.\n", flatten(detail)).unwrap();
+        }
         let zone = zone(meta);
         let display = |v: &Value| {
             serde_json::from_value::<DateTime<Utc>>(v.clone())
@@ -560,7 +801,7 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
 ",
             self.logs.len(),
             self.spans.len(),
-            self.coverage(),
+            self.case_coverage(meta),
             self.anchor_seq
         )
         .unwrap();
@@ -573,9 +814,6 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
         metadata: &Value,
         registry: Vec<doc::RegistryFact>,
     ) -> Result<PathBuf, String> {
-        if self.over_budget {
-            return Err("domain capture pool byte budget exhausted".into());
-        }
         if self.logs.len() + self.spans.len() + 1 > cases::load::MAX_CASE_RECORDS {
             return Err("capture exceeds the standard case reader's record limit".into());
         }
@@ -672,7 +910,7 @@ Sequence {} contains the full lifecycle record, peer list and retention details 
                 .insert("case_context".into(), metadata.clone());
             marker
                 .additional_fields
-                .insert("coverage".into(), self.coverage());
+                .insert("coverage".into(), self.case_coverage(metadata));
             self.logs.insert(marker.seq, Arc::new(marker));
             let first = self
                 .logs

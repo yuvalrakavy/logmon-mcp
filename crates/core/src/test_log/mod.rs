@@ -83,6 +83,14 @@ fn refused(id: &str, code: &str) -> Value {
     json!({"status":"refused","run_id":id,"code":code})
 }
 
+fn full_failure_limit(config: &TestLogBegin) -> u64 {
+    config.max_failures.unwrap_or_else(|| {
+        config
+            .planned_executions
+            .map_or(50, |planned| (planned / 10).clamp(20, 300))
+    })
+}
+
 impl TestLog {
     pub fn status(&self, domain: &str, run_id: Option<&str>) -> Value {
         self.history.status(domain, run_id)
@@ -183,10 +191,29 @@ impl TestLog {
         if let Some(receipt) = state.closed.get(&config.run_id) {
             return Ok(receipt.result());
         }
-        if let Some(run) = &state.run {
+        if let Some(run) = state.run.as_mut() {
             if run.config.run_id == config.run_id {
+                let mut status = "already_applied";
+                if let Some(planned) = config
+                    .planned_executions
+                    .filter(|&planned| run.config.planned_executions != Some(planned))
+                {
+                    if run.closing {
+                        return Ok(refused(&config.run_id, "run_closed"));
+                    }
+                    if run.config.planned_executions.is_some() {
+                        return Ok(refused(&config.run_id, "planned_executions_conflict"));
+                    }
+                    run.config.planned_executions = Some(planned);
+                    run.last_activity = Utc::now();
+                    run.append(
+                        "test-log-plan",
+                        json!({"planned_executions":planned,"max_failures":full_failure_limit(&run.config)}),
+                    );
+                    status = "accepted";
+                }
                 return Ok(
-                    json!({"status":"already_applied","run_id":config.run_id,"closing":run.closing,"test_log_health":run.journal.status()["test_log_health"]}),
+                    json!({"status":status,"run_id":config.run_id,"closing":run.closing,"test_log_health":run.journal.status()["test_log_health"]}),
                 );
             }
             let result = run.close_result();

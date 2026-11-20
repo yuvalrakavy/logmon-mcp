@@ -183,7 +183,16 @@ impl Report {
                 let _ = write!(rows, ", {reason}");
             }
             if let Some(state) = row.get("case_status").and_then(Value::as_str) {
-                let _ = write!(rows, ", case {state}");
+                let size = field(row, "case_size");
+                if size.is_empty() {
+                    let _ = write!(rows, ", case {state}");
+                } else {
+                    let _ = write!(rows, ", {size} case {state}");
+                }
+                let detail = field(row, "case_detail");
+                if !detail.is_empty() {
+                    let _ = write!(rows, " ({detail})");
+                }
             }
             if let Some(path) = row.get("case_path").and_then(Value::as_str) {
                 let _ = write!(rows, " [case](<{path}>)");

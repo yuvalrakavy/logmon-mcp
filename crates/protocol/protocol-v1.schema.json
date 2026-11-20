@@ -391,6 +391,18 @@
                 "string",
                 "null"
               ]
+            },
+            "case_size": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "case_detail": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -434,9 +446,16 @@
               "minimum": 0
             },
             "refused_by_max_failures": {
+              "description": "Legacy counter retained for older clients. The limit now produces minimal cases.",
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "minimal_by_failure_limit": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
             },
             "max_failures": {
               "type": "integer",
@@ -784,9 +803,16 @@
               "minimum": 0
             },
             "refused_by_max_failures": {
+              "description": "Legacy counter retained for older clients. The limit now produces minimal cases.",
               "type": "integer",
               "format": "uint64",
               "minimum": 0
+            },
+            "minimal_by_failure_limit": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0,
+              "default": 0
             },
             "max_failures": {
               "type": "integer",
@@ -836,7 +862,7 @@
           "type": "string"
         },
         "planned_executions": {
-          "description": "Original number of planned executions. Zero is an explicitly empty plan.",
+          "description": "Planned executions. Set it on begin or repeat begin to fill an unknown count\nwhile the run is open. Zero is an explicitly empty plan.",
           "type": [
             "integer",
             "null"
@@ -893,7 +919,7 @@
           "minimum": 0
         },
         "max_failures": {
-          "description": "Number of primary failures eligible for cases, default 500.",
+          "description": "Override the number of test failures eligible for full cases. Otherwise use\n10% of the planned executions (20 to 300), or 50 if the plan is unknown.",
           "type": [
             "integer",
             "null"
@@ -902,7 +928,7 @@
           "minimum": 0
         },
         "max_rerun_cases": {
-          "description": "Number of isolated reruns eligible for cases, including passes.",
+          "description": "Number of OK isolated reruns eligible for cases. Failed reruns use the\nsame policy as other failed tests.",
           "type": [
             "integer",
             "null"
@@ -1400,6 +1426,13 @@
         "state": {
           "description": "Current pending state.",
           "type": "string"
+        },
+        "case_size": {
+          "description": "Size selected for the case.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1486,6 +1519,13 @@
             "state": {
               "description": "Current pending state.",
               "type": "string"
+            },
+            "case_size": {
+              "description": "Size selected for the case.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

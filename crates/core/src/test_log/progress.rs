@@ -21,7 +21,6 @@ struct Catalog {
 struct Slot {
     id: String,
     began: DateTime<Utc>,
-    planned: Option<u64>,
     fields: Value,
     path: String,
     journal: Arc<Health>,
@@ -38,6 +37,7 @@ struct Running {
 #[derive(Clone, Default)]
 struct View {
     state: &'static str,
+    planned: Option<u64>,
     last: Option<DateTime<Utc>>,
     completion: Option<DateTime<Utc>>,
     settled: Option<DateTime<Utc>>,
@@ -47,7 +47,7 @@ struct View {
     oldest: Vec<(String, Running)>,
     failures: VecDeque<Arc<Value>>,
     failure_total: usize,
-    cases: [usize; 5], // pending, ready, failed, skipped, skipped by failure limit
+    cases: [usize; 5], // pending, ready, failed, skipped, minimal by failure limit
     files: Arc<BTreeMap<String, Vec<String>>>,
     max_failures: u64,
     finalized: usize,
@@ -57,13 +57,13 @@ struct View {
 const VERDICTS: [&str; 5] = ["OK", "FAIL", "TIMEOUT", "ABORTED", "NO_VERDICT"];
 
 impl View {
-    fn aggregates(&self, planned: Option<u64>) -> Value {
-        let [pending, ready, failed, skipped, cap] = self.cases;
-        json!({"executions":{"planned":planned,"started":self.started,"ended":self.ended,
+    fn aggregates(&self) -> Value {
+        let [pending, ready, failed, skipped, minimal] = self.cases;
+        json!({"executions":{"planned":self.planned,"started":self.started,"ended":self.ended,
             "in_flight":self.started-self.ended,"by_verdict":Object::from_iter(VERDICTS.into_iter().zip(self.verdicts).map(|(k,n)|(k.into(),json!(n))))},
             "cases":{"requested":pending+ready+failed+skipped,"ready_executions":ready,
             "distinct_cases_written":self.files.len(),"pending":pending,"failed":failed,"skipped":skipped,
-            "refused_by_max_failures":cap,"max_failures":self.max_failures},
+            "refused_by_max_failures":0,"minimal_by_failure_limit":minimal,"max_failures":self.max_failures},
             "summaries":{"final":self.finalized,"pending":self.ended-self.finalized},"replayed_ends":self.replayed})
     }
 }
@@ -72,7 +72,7 @@ type Object = serde_json::Map<String, Value>;
 impl Slot {
     fn render(&self, v: &View, detail: bool) -> Value {
         let now = v.settled.unwrap_or_else(Utc::now);
-        let mut out = v.aggregates(self.planned);
+        let mut out = v.aggregates();
         let o = out.as_object_mut().unwrap();
         o.extend(
             json!({"run_id":self.id,"began_at":self.began,"state":v.state,
@@ -185,6 +185,8 @@ struct Decision {
     status: String,
     path: Value,
     reason: Value,
+    size: Value,
+    detail: Value,
 }
 impl Decision {
     fn apply(&self, row: &mut Value) {
@@ -192,6 +194,11 @@ impl Decision {
         row["case_path"] = self.path.clone();
         if !self.reason.is_null() {
             row["case_reason"] = self.reason.clone();
+        }
+        for (key, value) in [("case_size", &self.size), ("case_detail", &self.detail)] {
+            if !value.is_null() {
+                row[key] = value.clone();
+            }
         }
     }
 }
@@ -208,14 +215,14 @@ impl Progress {
     ) -> Self {
         let view = View {
             state: "open",
+            planned: config.planned_executions,
             last: Some(began),
-            max_failures: config.max_failures.unwrap_or(500),
+            max_failures: super::full_failure_limit(config),
             ..View::default()
         };
         let slot = Arc::new(Slot {
             id: config.run_id.clone(),
             began,
-            planned: config.planned_executions,
             fields: json!(config.fields),
             path: config.jsonl_path.clone(),
             journal: journal.progress_health(),
@@ -241,6 +248,7 @@ impl Progress {
         if !matches!(
             event,
             "start-test"
+                | "test-log-plan"
                 | "end-test"
                 | "incomplete"
                 | "summary-final"
@@ -259,6 +267,10 @@ impl Progress {
         m.view.last = Some(now);
         let id = d["execution_id"].as_str().unwrap_or_default();
         match event {
+            "test-log-plan" => {
+                m.view.planned = d["planned_executions"].as_u64();
+                m.view.max_failures = d["max_failures"].as_u64().expect("derived failure limit");
+            }
             "start-test" => {
                 if let Some(start) = timestamp(&d["started_at"]) {
                     let r = Running {
@@ -289,7 +301,7 @@ impl Progress {
                 m.view.state = if m.sealed { "sealed" } else { "closed" };
                 m.view.settled = Some(now);
                 // Preserve the original numeric executions field for existing readers.
-                d["aggregates"] = m.view.aggregates(self.slot.planned);
+                d["aggregates"] = m.view.aggregates();
             }
             _ => {}
         }
@@ -371,6 +383,8 @@ impl Model {
                 return;
             }
             self.view.cases[old.bucket] -= 1;
+        } else if d["case_size"] == "minimal" {
+            self.view.cases[4] += 1;
         }
         let reason = match bucket {
             2 => d.get("message").cloned().unwrap_or_else(|| json!(status)),
@@ -386,11 +400,10 @@ impl Model {
             },
             path: d["case_path"].clone(),
             reason,
+            size: d["case_size"].clone(),
+            detail: d["case_detail"].clone(),
         };
         self.view.cases[bucket] += 1;
-        if status == "skipped_failure_limit" {
-            self.view.cases[4] += 1;
-        }
         if let Some(path) = d["case_path"].as_str() {
             Arc::make_mut(&mut self.view.files)
                 .entry(path.into())

@@ -1049,17 +1049,28 @@ and case eligibility apply to every execution. The default hard timeout is 600,0
 overridable with `--test-timeout-ms` on start. After a verdict, batched telemetry
 has a default 10,000 ms grace period, set with `--grace-period-ms` on begin.
 
-Set `--max-failures` to the number of initial failures eligible for cases (default 500).
-Use `--max-rerun-cases` and `--max-slow-pass-cases` to budget those captures separately.
-For slow passes, begin with `--slow-pass opt-out --slow-if 'elapsed > 4 * estimated'`
-or opt individual executions in with a start condition. Captures record ring
-coverage and queue or budget skips. Inspect those fields when interpreting missing
-evidence. In each domain, admitted snapshots share a 128 MiB retention budget. A
-record referenced by several cases is charged once, with a small index charge per
-case. The snapshots keep their records through ring rollover. If a new snapshot
-would exceed the aggregate budget, end returns `skipped_capture_budget`. A ZIP
-worker streams the retained rows directly into a standard case with provenance
-and peer context.
+An abnormal ending requests a case. The default full failure-case limit is 10%
+of the planned test count, rounded down with a minimum of 20 and a maximum of
+300. The default is 50 while the plan is unknown. Set `--max-failures` to override that
+limit. An execution named `step:*` does not spend the failure limit. Failed reruns
+follow the failure policy. `--max-rerun-cases` limits cases for OK reruns, and
+`--max-slow-pass-cases` limits cases for slow passes. For slow passes, begin with
+`--slow-pass opt-out --slow-if 'elapsed > 4 * estimated'` or opt individual
+executions in with a start condition.
+
+- A **full** case can include the selected execution’s records and overlapping telemetry.
+- A **minimal** case includes the verdict and the selector’s own records after the full failure limit is spent.
+- A **bare** case records the verdict, times, selector, omitted record counts, and the reason that no evidence fit. It uses neither a snapshot slot nor retained telemetry.
+
+Each domain has eight snapshot slots, including one reserved for `step:*`, and a
+shared 128 MiB retention budget. A record referenced by several cases is charged
+once with a small per-case index charge. If a snapshot must be cut, priority goes
+to the selector’s Errors, its other records, window Errors, window Warnings,
+and remaining window records in that order. Each class keeps the latest arrivals
+first. The case reports how many records were omitted by class and covers the
+retention state of both rings. A grouped deadline case reports counts for each
+execution because members' windows can overlap. Bare writes run independently
+of snapshot slots and skip the telemetry grace period.
 
 A driver recovering unconfirmed ends sends `test-log replay --run-id RUN --events
 'END_JSON'` with one flag per original event, up to 100 per batch. A refusal

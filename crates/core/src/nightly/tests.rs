@@ -133,7 +133,7 @@ fn counts_are_selector_scoped_and_backfill_deduplicates_pending_callbacks() {
 }
 
 #[test]
-fn oversized_record_fails_explicitly_without_copying_it() {
+fn oversized_record_is_reported_without_copying_it() {
     let d = domain();
     let now = Utc::now();
     let mut snap = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
@@ -145,8 +145,36 @@ fn oversized_record_fails_explicitly_without_copying_it() {
     assert!(snap.is_over_budget());
     assert_eq!(d.test_log.capture_pool.lock().unwrap().available(), 1024);
     let dir = tempfile::tempdir().unwrap();
-    assert!(snap.write(dir.path(), &json!({}), vec![]).is_err());
-    assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+    let path = snap.write(dir.path(), &json!({}), vec![]).unwrap();
+    let logs = cases::load::load(&path).unwrap().logs.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0].additional_fields["coverage"]["omitted_records"]["selector_other"],
+        1
+    );
+}
+
+#[test]
+fn cut_snapshot_counts_a_pending_ingest_callback_once() {
+    let d = domain();
+    let now = Utc::now();
+    let mut error = LogEntry::synthetic(Level::Error, "error");
+    error.seq = d.pipeline.assign_seq();
+    error.trace_id = Some(10);
+    let mut info = LogEntry::synthetic(Level::Info, "after");
+    info.seq = d.pipeline.assign_seq();
+    info.trace_id = Some(10);
+    d.test_log
+        .capture_pool
+        .lock()
+        .unwrap()
+        .set_available(super::log_bytes(&error) + 96);
+    d.pipeline.append_to_store(error);
+    d.pipeline.append_to_store(info.clone());
+
+    let mut snap = CaptureSnapshot::new(&d, Selector::new("trace_id", "a"), now, now);
+    snap.observe_log(&info);
+    assert_eq!(snap.coverage()["omitted_records"]["selector_other"], 1);
 }
 
 #[test]

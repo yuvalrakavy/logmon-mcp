@@ -93,7 +93,10 @@ pub struct TestLogCaseCounts {
     pub pending: u64,
     pub failed: u64,
     pub skipped: u64,
+    /// Legacy counter retained for older clients. The limit now produces minimal cases.
     pub refused_by_max_failures: u64,
+    #[serde(default)]
+    pub minimal_by_failure_limit: u64,
     pub max_failures: u64,
 }
 
@@ -144,6 +147,10 @@ pub struct TestLogRecentFailure {
     pub rerun_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub case_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

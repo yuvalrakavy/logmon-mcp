@@ -3,7 +3,7 @@
 mod capture;
 mod summary;
 pub use capture::CaptureSnapshot;
-pub(crate) use capture::{log_bytes, span_bytes, CapturePool};
+pub(crate) use capture::{log_bytes, span_bytes, CapturePool, CaptureSize};
 pub use summary::{Selector, Summary};
 
 #[cfg(test)]

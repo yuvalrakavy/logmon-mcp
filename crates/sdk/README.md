@@ -84,6 +84,8 @@ through `logmon_broker_sdk::test_log` and the following methods on `Broker`.
 | `test_log_replay` | Run ID and up to 100 original end payloads in delivery order |
 | `test_log_close` / `test_log_seal` | Run ID and wait budget in milliseconds |
 
+If the plan was unknown at begin, call `test_log_begin` again with the same run ID and JSONL path and set `planned_executions` while the run is open.
+
 Set one caller-side deadline around connection acquisition, sending and waiting for a
 start or end reply. The driver distributes `lifecycle_ack_timeout_ms` from the run
 configuration (default 100 ms). A disconnected caller journals its original end

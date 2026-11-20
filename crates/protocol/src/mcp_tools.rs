@@ -271,7 +271,7 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: "begin_test_log",
         method: "test_log.begin",
-        description: "Open the run's JSONL file in the selected domain (session default when omitted), or return the existing owner when a different run is active.",
+        description: "Open the run's JSONL file in the selected domain (session default when omitted), or return the existing owner when a different run is active. Repeat begin with the same run ID and a planned execution count to fill an unknown count while the run is open. Set max_failures to override the limit for full failure cases. The default is 10% of the plan, bounded to 20–300, or 50 if the count is unknown.",
         cli: Cli::PLAIN,
     },
     Tool {

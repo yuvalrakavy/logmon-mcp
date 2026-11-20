@@ -40,7 +40,10 @@ impl Fixture {
         json!({"run_id":"one","execution_id":id,"name":format!("chain-{id}"),"selector":{"field":"trace_id","value":format!("{:032x}",if id=="a"{1}else{2})},"started_at":Utc::now()})
     }
     fn log(&self, trace: u128, msg: &str) {
-        let mut e = LogEntry::synthetic(Level::Info, msg);
+        self.log_at(trace, Level::Info, msg);
+    }
+    fn log_at(&self, trace: u128, level: Level, msg: &str) {
+        let mut e = LogEntry::synthetic(level, msg);
         e.seq = self.domain.pipeline.assign_seq();
         e.trace_id = Some(trace);
         self.domain.pipeline.append_to_store(e.clone());
@@ -63,6 +66,29 @@ impl Fixture {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+    fn end_as(&self, mut event: Value, verdict: &str) -> Value {
+        event["ended_at"] = json!(Utc::now());
+        event["verdict"] = json!(verdict);
+        self.rpc("end", event)
+    }
+    fn case_row(&self, id: &str) -> Value {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(row) = self
+                .rows()
+                .into_iter()
+                .find(|r| r["event"] == "case-ready" && r["execution_id"] == id)
+            {
+                return row;
+            }
+            assert!(Instant::now() < until, "no ready case for {id}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn case_logs(&self, row: &Value) -> Vec<LogEntry> {
+        let path = self.dir.path().join(row["case_path"].as_str().unwrap());
+        crate::cases::load::load(&path).unwrap().logs.unwrap()
     }
 }
 
@@ -169,7 +195,7 @@ fn unconfirmed_start_backfills_without_double_counting_or_spending_an_extra_case
     a["verdict"] = json!("FAIL");
     let result = f.rpc("replay", json!({"run_id":"one","events":[a.clone(),a]}));
     assert_eq!(result["results"][0]["status"], "applied");
-    assert_eq!(result["results"][0]["case_status"], "skipped_failure_limit");
+    assert_eq!(result["results"][0]["case_size"], "minimal");
     assert_eq!(result["results"][1]["status"], "already_applied");
     f.close("one");
     let row = f
@@ -207,21 +233,15 @@ fn slow_cases_yield_to_failures_and_green_reruns_have_their_own_slots() {
         e["verdict"] = json!(verdict);
         f.rpc("end", e)
     };
-    for i in 0..8 {
+    for i in 0..7 {
         assert_eq!(
             attempt(&format!("ok-{i}"), "OK", None)["case_status"],
             "pending"
         );
     }
-    assert_eq!(
-        attempt("pressure", "OK", None)["case_status"],
-        "skipped_queue_full"
-    );
+    assert_eq!(attempt("pressure", "OK", None)["case_size"], "bare");
     assert_eq!(attempt("red", "FAIL", None)["case_status"], "pending");
-    assert_eq!(
-        attempt("another", "FAIL", None)["case_status"],
-        "skipped_failure_limit"
-    );
+    assert_eq!(attempt("another", "FAIL", None)["case_size"], "minimal");
     assert_eq!(
         attempt("isolated", "OK", Some("red"))["case_status"],
         "pending"
@@ -232,15 +252,16 @@ fn slow_cases_yield_to_failures_and_green_reruns_have_their_own_slots() {
     );
     let pending = f.rpc("close", json!({"run_id":"one","wait_timeout_ms":0}));
     assert_eq!(pending["finalization"], "pending");
-    assert_eq!(pending["pending_cases"].as_array().unwrap().len(), 8);
     let ids: Vec<_> = pending["pending_cases"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|v| v["case_size"] != "bare")
         .map(|v| v["execution_id"].as_str().unwrap())
         .collect();
+    assert_eq!(ids.len(), 7);
     assert!(ids.contains(&"red") && ids.contains(&"isolated"));
-    assert!(!ids.contains(&"ok-7") && !ids.contains(&"ok-6"));
+    assert!(!ids.contains(&"ok-6") && !ids.contains(&"ok-4"));
 }
 
 #[test]
@@ -376,7 +397,175 @@ fn sampled_out_missing_start_still_reports_snapshot_and_independent_ring_bounds(
 }
 
 #[test]
-fn aggregate_capture_budget_refuses_new_snapshot_without_losing_accepted_case() {
+fn ruling_11_capture_salvages_priority_prefix_and_counts_omissions() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let a = f.event("a");
+    f.rpc("start", a.clone());
+    for (trace, level, text) in [
+        (9, Level::Info, "win-inf"),
+        (9, Level::Error, "old-err"),
+        (1, Level::Error, "own-err"),
+        (9, Level::Warn, "win-wrn"),
+        (1, Level::Info, "own-inf"),
+        (9, Level::Error, "new-err"),
+    ] {
+        f.log_at(trace, level, text);
+    }
+    let record = crate::nightly::log_bytes(&LogEntry::synthetic(Level::Info, "win-inf"));
+    f.domain
+        .test_log
+        .capture_pool
+        .lock()
+        .unwrap()
+        .set_available(3 * (record + 96));
+    assert_eq!(f.end_as(a, "FAIL")["case_status"], "pending");
+    f.close("one");
+    let case = f.case_row("a");
+    assert_eq!(case["case_size"], "full");
+    let logs = f.case_logs(&case);
+    let mut messages: Vec<_> = logs.iter().map(|r| r.message.as_str()).collect();
+    messages.sort_unstable();
+    assert_eq!(messages, ["failure", "new-err", "own-err", "own-inf"]);
+    let marker = logs.iter().find(|r| r.message == "failure").unwrap();
+    assert_eq!(marker.additional_fields["coverage"]["cut"], true);
+    assert_eq!(
+        marker.additional_fields["coverage"]["omitted_records"],
+        json!({"selector_error":0,"selector_other":0,"window_error":1,"window_warn":1,"window_other":1})
+    );
+}
+
+#[test]
+fn ruling_11_empty_capture_pool_writes_bare_case() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let a = f.event("a");
+    f.rpc("start", a.clone());
+    f.log(1, "own");
+    f.domain
+        .test_log
+        .capture_pool
+        .lock()
+        .unwrap()
+        .set_available(0);
+    assert_eq!(f.end_as(a, "TIMEOUT")["case_size"], "bare");
+    let row = f.case_row("a");
+    assert_eq!(row["case_detail"], "capture_pool_exhausted");
+    let logs = f.case_logs(&row);
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0].additional_fields["case_context"]["verdict"],
+        "TIMEOUT"
+    );
+    assert_eq!(
+        logs[0].additional_fields["coverage"]["omitted_records"]["selector_other"],
+        1
+    );
+    f.close("one");
+}
+
+#[test]
+fn ruling_12_plan_drives_the_default_full_failure_limit() {
+    for (planned, want) in [
+        (Some(40), 20),
+        (Some(1_000), 100),
+        (Some(7_000), 300),
+        (None, 50),
+    ] {
+        let f = Fixture::new();
+        let mut begin = json!({
+            "run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),"grace_period_ms":0,
+            "planned_executions":planned,
+        });
+        assert_eq!(f.rpc("begin", begin.clone())["status"], "accepted");
+        let limit =
+            || f.domain.test_log.status("tests", None)["test_log"]["cases"]["max_failures"].clone();
+        assert_eq!(limit(), want, "planned {planned:?}");
+        if planned.is_none() {
+            begin["planned_executions"] = json!(1_000);
+            assert_eq!(f.rpc("begin", begin)["status"], "accepted");
+            assert_eq!(limit(), 100);
+        }
+        f.close("one");
+    }
+}
+
+#[test]
+fn ruling_12_failed_reruns_get_cases_and_steps_do_not_spend_failure_limit() {
+    let f = Fixture::new();
+    f.rpc(
+        "begin",
+        json!({
+            "run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),
+            "grace_period_ms":0,"planned_executions":1_000,"max_failures":1,"max_rerun_cases":0,
+        }),
+    );
+    let mut step = f.event("step");
+    step["name"] = json!("step:5-rust");
+    f.rpc("start", step.clone());
+    assert_eq!(f.end_as(step, "ABORTED")["case_size"], "full");
+
+    let mut failed = f.event("a");
+    failed["rerun_of"] = json!("original");
+    f.rpc("start", failed.clone());
+    f.log(1, "target");
+    assert_eq!(f.end_as(failed, "FAIL")["case_size"], "full");
+
+    let mut repeat = f.event("b");
+    repeat["rerun_of"] = json!("original");
+    f.rpc("start", repeat.clone());
+    f.log(2, "selector only");
+    f.log(9, "outside selector");
+    assert_eq!(f.end_as(repeat, "TIMEOUT")["case_size"], "minimal");
+
+    let mut clean = f.event("clean");
+    clean["rerun_of"] = json!("original");
+    assert_eq!(f.end_as(clean, "OK")["case_status"], "skipped_rerun_limit");
+    f.close("one");
+    let logs = f.case_logs(&f.case_row("b"));
+    assert_eq!(
+        logs.iter()
+            .map(|row| row.message.as_str())
+            .collect::<Vec<_>>(),
+        ["selector only", "failure"]
+    );
+}
+
+#[test]
+fn ruling_13_step_has_reserved_slot_and_excess_ends_get_bare_cases() {
+    let f = Fixture::new();
+    f.begin("one", 3000);
+    for i in 0..7 {
+        assert_eq!(
+            f.end_as(f.event(&format!("test-{i}")), "FAIL")["case_status"],
+            "pending"
+        );
+    }
+    let test = f.event("a");
+    f.rpc("start", test.clone());
+    f.log(1, "selector evidence outside bare case");
+    assert_eq!(f.end_as(test, "FAIL")["case_size"], "bare");
+    let mut step = f.event("step");
+    step["name"] = json!("step:5-rust");
+    assert_eq!(f.end_as(step, "ABORTED")["case_size"], "full");
+    let mut next_step = f.event("next-step");
+    next_step["name"] = json!("step:6-dsl");
+    assert_eq!(f.end_as(next_step, "TIMEOUT")["case_size"], "bare");
+    for id in ["a", "next-step"] {
+        let row = f.case_row(id);
+        assert_eq!(row["case_detail"], "capture_queue_full");
+        assert_eq!(f.case_logs(&row).len(), 1);
+    }
+    let row = f.case_row("a");
+    assert_eq!(
+        f.case_logs(&row)[0].additional_fields["coverage"]["omitted_records"]["selector_other"],
+        1
+    );
+    f.close("one");
+}
+
+#[test]
+fn saturated_capture_pool_keeps_old_evidence_and_writes_a_bare_case() {
     let f = Fixture::new();
     f.domain
         .test_log
@@ -396,16 +585,18 @@ fn aggregate_capture_budget_refuses_new_snapshot_without_losing_accepted_case() 
     f.log(2, &"big B".repeat(2048));
     b["verdict"] = json!("FAIL");
     b["ended_at"] = json!(Utc::now());
-    assert_eq!(f.rpc("end", b)["case_status"], "skipped_capture_budget");
+    let bare = f.rpc("end", b);
+    assert_eq!(bare["case_size"], "bare");
+    assert_eq!(bare["case_detail"], "capture_pool_exhausted");
     f.close("one");
     let cases: Vec<_> = f
         .rows()
         .into_iter()
         .filter(|r| r["event"] == "case-ready")
         .collect();
-    assert_eq!(cases.len(), 1);
-    assert_eq!(cases[0]["execution_id"], "a");
-    let path = f.dir.path().join(cases[0]["case_path"].as_str().unwrap());
+    assert_eq!(cases.len(), 2);
+    let a = cases.iter().find(|r| r["execution_id"] == "a").unwrap();
+    let path = f.dir.path().join(a["case_path"].as_str().unwrap());
     assert!(crate::cases::load::load(&path)
         .unwrap()
         .logs
@@ -650,14 +841,16 @@ fn progress_counts_reconstruction_replay_caps_and_history_without_writer_lock() 
         "by_verdict":{"OK":0,"FAIL":24,"TIMEOUT":0,"ABORTED":0,"NO_VERDICT":0}})
     );
     assert_eq!(v["replayed_ends"], 24);
-    assert_eq!(v["cases"]["skipped"], 24);
-    assert_eq!(v["cases"]["refused_by_max_failures"], 24);
+    assert_eq!(v["cases"]["requested"], 24);
+    assert_eq!(v["cases"]["skipped"], 0);
+    assert_eq!(v["cases"]["refused_by_max_failures"], 0);
+    assert!(v["cases"]["minimal_by_failure_limit"].as_u64().unwrap() > 0);
     assert_eq!(v["recent_failures"].as_array().unwrap().len(), 20);
     assert_eq!(v["recent_failures"][0]["execution_id"], "23");
-    assert_eq!(
-        v["recent_failures"][0]["case_reason"],
-        "skipped_failure_limit"
-    );
+    assert!(matches!(
+        v["recent_failures"][0]["case_size"].as_str(),
+        Some("minimal" | "bare")
+    ));
     assert_eq!(v["recent_failures_truncated"], true);
     assert_eq!(log.list("lane")["runs"][0]["cases"].get("files"), None);
     assert_eq!(log.projection().unwrap().in_flight, 0);
@@ -692,6 +885,59 @@ fn progress_counts_reconstruction_replay_caps_and_history_without_writer_lock() 
         "sealed"
     );
     assert!(f.dir.path().join("one.jsonl").exists());
+}
+
+#[test]
+fn repeated_begin_sets_an_unknown_plan_once() {
+    let f = Fixture::new();
+    let log = &f.domain.test_log;
+    let mut begin = json!({
+        "run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),
+        "grace_period_ms":0,"max_failures":9
+    });
+    assert_eq!(f.rpc("begin", begin.clone())["status"], "accepted");
+    let mut execution = f.event("a");
+    f.rpc("start", execution.clone());
+    assert!(log.status("tests", None)["test_log"]["executions"]["planned"].is_null());
+
+    begin["planned_executions"] = json!(40);
+    begin["max_failures"] = json!(1);
+    assert_eq!(f.rpc("begin", begin.clone())["status"], "accepted");
+    assert_eq!(f.rpc("begin", begin.clone())["status"], "already_applied");
+    begin["planned_executions"] = json!(41);
+    let conflict = f.rpc("begin", begin);
+    assert_eq!(conflict["status"], "refused");
+    assert_eq!(conflict["code"], "planned_executions_conflict");
+
+    let detail = log.status("tests", None)["test_log"].clone();
+    assert_eq!(detail["executions"]["planned"], 40);
+    assert_eq!(detail["executions"]["started"], 1);
+    assert_eq!(detail["cases"]["max_failures"], 9);
+    assert_eq!(log.list("tests")["runs"][0]["executions"]["planned"], 40);
+
+    execution["verdict"] = json!("OK");
+    execution["ended_at"] = json!(Utc::now());
+    assert_eq!(f.rpc("end", execution)["status"], "accepted");
+    f.close("one");
+    let rows = f.rows();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r["event"] == "begin-test-log")
+            .count(),
+        1
+    );
+    let updates: Vec<_> = rows
+        .iter()
+        .filter(|r| r["event"] == "test-log-plan")
+        .collect();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0]["planned_executions"], 40);
+    let settled = rows.iter().find(|r| r["event"] == "run-settled").unwrap();
+    assert_eq!(settled["aggregates"]["executions"]["planned"], 40);
+    assert_eq!(
+        log.status("tests", Some("one"))["test_log"]["executions"]["planned"],
+        40
+    );
 }
 
 #[test]

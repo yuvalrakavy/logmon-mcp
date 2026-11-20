@@ -2,7 +2,7 @@ use super::{refused, writer::Journal};
 use crate::cases::document::RegistryFact;
 use crate::daemon::domain::Domain;
 use crate::gelf::message::{Level, LogEntry};
-use crate::nightly::{CaptureSnapshot, Selector, Summary};
+use crate::nightly::{CaptureSize, CaptureSnapshot, Selector, Summary};
 use crate::span::types::SpanEntry;
 use chrono::{DateTime, Utc};
 use logmon_broker_protocol::*;
@@ -46,6 +46,8 @@ struct Execution {
     sampled: bool,
     coverage: Value,
     decision: Option<String>,
+    case_size: Option<CaptureSize>,
+    case_detail: Option<&'static str>,
     reason: Option<&'static str>,
     capture_deadline: Option<Instant>,
     late_logs: u64,
@@ -86,7 +88,8 @@ impl Execution {
           "ended_at":self.end.as_ref().map(|e|e.ended_at),"verdict":self.end.as_ref().map(|e|e.verdict),
           "elapsed_ms":self.end.as_ref().map(|e|(e.ended_at-self.start.started_at).num_milliseconds()),
           "member_runtime_ms": self.member_runtime_ms,"deadline_crossed":self.timed_out,"supersedes_incomplete":self.timed_out && self.end.is_some(),"estimated_ms":self.start.estimated_ms,"test_timeout_ms":self.timeout_ms,
-          "case_reason":self.reason,"slow_if":self.start.slow_if,
+          "case_reason":self.reason,"case_size":self.case_size.map(CaptureSize::as_str),
+          "case_detail":self.case_detail,"slow_if":self.start.slow_if,
           "summary_status":if self.sampled{"collected"}else{"sampled_out"},
           "summary":self.summary.as_ref().map(Summary::json),"coverage":self.coverage,
           "closure_incomplete":self.forced || (self.timed_out && self.end.is_none()),"rerun_of":self.start.rerun_of})
@@ -231,6 +234,41 @@ impl Slow {
 }
 
 impl Run {
+    fn is_step(&self, id: &str) -> bool {
+        self.entries[id].start.name.starts_with("step:")
+    }
+
+    fn snapshot_slot_available(&self, step: bool) -> bool {
+        let mut total = 0;
+        let mut tests = 0;
+        let pending_members = self
+            .pending
+            .values()
+            .flat_map(|p| p.members.iter().map(|m| &m.0));
+        for id in self
+            .pending
+            .keys()
+            .chain(pending_members)
+            .chain(&self.writing)
+            .chain(self.writing_members.values().flatten())
+        {
+            if self.entries[id].case_size != Some(CaptureSize::Bare) {
+                total += 1;
+                tests += usize::from(!self.is_step(id));
+            }
+        }
+        total < MAX_SNAPSHOTS && (step || tests < MAX_SNAPSHOTS - 1)
+    }
+
+    fn writer_available(&self, size: CaptureSize) -> bool {
+        let bare = |id: &String| self.entries[id].case_size == Some(CaptureSize::Bare);
+        if size == CaptureSize::Bare {
+            !self.writing.iter().any(bare)
+        } else {
+            self.writing.iter().filter(|id| !bare(id)).count() < MAX_WRITERS
+        }
+    }
+
     pub(super) fn update_ring_protection(&self, domain: &Domain) {
         let since = self
             .active
@@ -387,6 +425,8 @@ impl Run {
                 end_fields_hash: 0,
                 member_runtime_ms: None,
                 decision: None,
+                case_size: None,
+                case_detail: None,
                 reason: None,
                 capture_deadline: None,
                 timed_out: false,
@@ -464,7 +504,8 @@ impl Run {
                     return Ok(refused(&e.run_id, "execution_outcome_conflict"));
                 }
                 return Ok(
-                    json!({"status":"already_applied","run_id":e.run_id,"execution_id":id,"case_status":old.decision}),
+                    json!({"status":"already_applied","run_id":e.run_id,"execution_id":id,"case_status":old.decision,
+                        "case_size":old.case_size.map(CaptureSize::as_str),"case_detail":old.case_detail}),
                 );
             }
         }
@@ -524,10 +565,10 @@ impl Run {
                 None
             }
         });
-        let reason = if e.rerun_of.is_some() {
-            Some("rerun")
-        } else if e.verdict != TestVerdict::Ok {
+        let reason = if e.verdict != TestVerdict::Ok {
             Some("failure")
+        } else if e.rerun_of.is_some() {
+            Some("rerun")
         } else if condition
             .and_then(|c| Slow::parse(c).ok())
             .is_some_and(|s| {
@@ -582,7 +623,8 @@ impl Run {
             .fields
             .clear();
         Ok(
-            json!({"status":"accepted","run_id":e.run_id,"execution_id":id,"case_status":self.entries[&id].decision}),
+            json!({"status":"accepted","run_id":e.run_id,"execution_id":id,"case_status":self.entries[&id].decision,
+                "case_size":self.entries[&id].case_size.map(CaptureSize::as_str),"case_detail":self.entries[&id].case_detail}),
         )
     }
 
@@ -597,7 +639,9 @@ impl Run {
     ) {
         self.entries.get_mut(id).unwrap().reason = Some(reason);
         let is_slow = reason == "slow_pass";
-        let is_rerun = self.entries[id].start.rerun_of.is_some();
+        let is_rerun = reason == "rerun";
+        let step = self.is_step(id);
+        let mut size = CaptureSize::Full;
         let skip = if is_rerun {
             self.reruns += 1;
             (self.reruns > self.config.max_rerun_cases.unwrap_or(10))
@@ -605,79 +649,103 @@ impl Run {
         } else if is_slow {
             (self.slow >= self.config.max_slow_pass_cases.unwrap_or(20))
                 .then_some("skipped_slow_limit")
-        } else {
+        } else if !step {
             self.primary += 1;
-            (self.primary > self.config.max_failures.unwrap_or(500))
-                .then_some("skipped_failure_limit")
+            if self.primary > super::full_failure_limit(&self.config) {
+                size = CaptureSize::Minimal;
+            }
+            None
+        } else {
+            None
         };
         if let Some(skip) = skip {
             self.entries.get_mut(id).unwrap().decision = Some(skip.into());
             return;
         }
         let now = Instant::now();
-        let group = if reason == "end_test_missing_at_deadline" {
+        let group = if size == CaptureSize::Full && reason == "end_test_missing_at_deadline" {
             self.pending
                 .iter()
-                .find(|(_, p)| p.group_until.is_some_and(|cutoff| now < cutoff))
+                .find(|(key, p)| {
+                    self.is_step(key) == step
+                        && p.snapshot.size == size
+                        && p.group_until.is_some_and(|cutoff| now < cutoff)
+                })
                 .map(|(key, _)| key.clone())
         } else {
             None
         };
-        if group.is_none() && self.pending.len() + self.writing.len() >= MAX_SNAPSHOTS {
+        if !self.snapshot_slot_available(step) {
             let displace = (!is_slow)
                 .then(|| {
                     self.pending
                         .iter()
-                        .filter(|(_, p)| p.reason == "slow_pass")
+                        .filter(|(key, p)| {
+                            p.reason == "slow_pass"
+                                && p.snapshot.size != CaptureSize::Bare
+                                && (step || !self.is_step(key))
+                        })
                         .max_by_key(|(_, p)| p.order)
                         .map(|(id, _)| id.clone())
                 })
                 .flatten();
             if let Some(old) = displace {
                 self.pending.remove(&old);
+                self.entries.get_mut(&old).unwrap().decision = Some("evicted_for_priority".into());
                 self.append(
                     "case-skipped",
                     json!({"execution_id":old,"case_status":"evicted_for_priority"}),
                 );
-            } else {
-                self.entries.get_mut(id).unwrap().decision = Some("skipped_queue_full".into());
-                return;
+            }
+            if !self.snapshot_slot_available(step) {
+                size = CaptureSize::Bare;
             }
         }
         let ex = &self.entries[id];
         let start = ex.start.started_at;
         let selector = Selector::new(&ex.start.selector.field, &ex.start.selector.value);
-        let mut overlaps: Vec<_> = self
-            .entries
-            .iter()
-            .filter(|(peer_id, peer)| {
+        let overlaps = || {
+            self.entries.iter().filter(|(peer_id, peer)| {
                 peer_id.as_str() != id
                     && peer.start.started_at <= end
                     && peer.end.as_ref().is_none_or(|e| e.ended_at >= start)
             })
-            .collect();
-        overlaps.sort_unstable_by_key(|(peer_id, peer)| (peer.start.started_at, *peer_id));
-        let window_start = overlaps
-            .first()
-            .map_or(start, |(_, peer)| start.min(peer.start.started_at));
-        let peers: Vec<_> = overlaps
-            .into_iter()
-            .map(|(peer_id, peer)| {
-                json!({
-                    "execution_id": peer_id,
-                    "name": peer.start.name,
-                    "selector": peer.start.selector,
-                    "started_at": peer.start.started_at,
-                    "ended_at": peer.end.as_ref().map(|e|e.ended_at),
-                    "active_at_capture": peer.end.is_none() && !peer.forced
+        };
+        let window_start = if size == CaptureSize::Minimal {
+            start
+        } else {
+            overlaps()
+                .map(|(_, peer)| peer.start.started_at)
+                .min()
+                .map_or(start, |at| start.min(at))
+        };
+        let snapshot = CaptureSnapshot::for_execution_size(d, selector, window_start, end, size);
+        let case_detail = match (size, snapshot.size) {
+            (CaptureSize::Bare, _) => Some("capture_queue_full"),
+            (_, CaptureSize::Bare) => Some("capture_pool_exhausted"),
+            (_, CaptureSize::Minimal) => Some("failure_limit"),
+            _ => None,
+        };
+        let size = snapshot.size;
+        let peers: Vec<_> = if size == CaptureSize::Full {
+            let mut overlaps: Vec<_> = overlaps().collect();
+            overlaps.sort_unstable_by_key(|(peer_id, peer)| (peer.start.started_at, *peer_id));
+            overlaps
+                .into_iter()
+                .map(|(peer_id, peer)| {
+                    json!({
+                        "execution_id": peer_id,
+                        "name": peer.start.name,
+                        "selector": peer.start.selector,
+                        "started_at": peer.start.started_at,
+                        "ended_at": peer.end.as_ref().map(|e|e.ended_at),
+                        "active_at_capture": peer.end.is_none() && !peer.forced
+                    })
                 })
-            })
-            .collect();
-        let snapshot = CaptureSnapshot::for_execution(d, selector, window_start, end);
-        if snapshot.is_over_budget() {
-            self.entries.get_mut(id).unwrap().decision = Some("skipped_capture_budget".into());
-            return;
-        }
+                .collect()
+        } else {
+            Vec::new()
+        };
         let snapshot_at = snapshot.captured_at();
         let metadata = json!({
             "run_id": self.config.run_id,
@@ -685,7 +753,9 @@ impl Run {
             "execution_id": id,
             "name": ex.start.name,
             "reason": reason,
-            "run_fields": self.config.fields,
+            "case_size": size.as_str(),
+            "case_detail": case_detail,
+            "run_fields": (size != CaptureSize::Bare).then_some(&self.config.fields),
             "display_timezone": self.config.display_timezone,
             "expanded_cases": self.config.expanded_cases,
             "window_start":window_start,
@@ -693,22 +763,27 @@ impl Run {
             "started_at": start,
             "ended_at": ex.end.as_ref().map(|e|e.ended_at),
             "verdict": ex.end.as_ref().map(|e|e.verdict),
-            "end": ex.end,
+            "end": ex.end.as_ref().filter(|_| size != CaptureSize::Bare),
             "peers": peers,
             "estimated_ms": ex.start.estimated_ms,
             "snapshot_delayed": delayed,
             "captured_at": snapshot_at,
             "grace_cutoff": ex.coverage["grace_cutoff"],
         });
-        self.entries.get_mut(id).unwrap().coverage["case_snapshot_at"] = json!(snapshot_at);
+        let ex = self.entries.get_mut(id).unwrap();
+        ex.coverage["case_snapshot_at"] = json!(snapshot_at);
+        ex.case_size = Some(size);
+        ex.case_detail = case_detail;
         self.order += 1;
         if is_slow {
             self.slow += 1;
         }
-        let ready = self.entries[id]
-            .capture_deadline
-            .expect("set by capture caller");
-        if let Some(group) = group {
+        let ready = if size == CaptureSize::Bare {
+            now
+        } else {
+            ex.capture_deadline.expect("set by capture caller")
+        };
+        if let Some(group) = group.filter(|_| size != CaptureSize::Bare) {
             self.pending.get_mut(&group).unwrap().members.push((
                 id.into(),
                 ready,
@@ -722,7 +797,8 @@ impl Run {
             id.into(),
             Pending {
                 snapshot,
-                group_until: (reason == "end_test_missing_at_deadline")
+                group_until: (size == CaptureSize::Full
+                    && reason == "end_test_missing_at_deadline")
                     .then(|| now + Duration::from_secs(60)),
                 members: Vec::new(),
                 ready,
@@ -730,9 +806,19 @@ impl Run {
                 order: self.order,
                 metadata,
                 registry: {
-                    let mut registry = reg.to_vec();
+                    let mut registry = if size == CaptureSize::Bare {
+                        Vec::new()
+                    } else {
+                        reg.to_vec()
+                    };
                     for path in ["/Build/commit", "/Build/profile", "/Action"] {
-                        if let Some(value) = self.config.fields.get(path).and_then(Value::as_str) {
+                        if let Some(value) = self
+                            .config
+                            .fields
+                            .get(path)
+                            .and_then(Value::as_str)
+                            .filter(|_| size != CaptureSize::Bare)
+                        {
                             registry.retain(|fact| fact.path != path);
                             registry.push(RegistryFact {
                                 path: path.into(),
@@ -932,8 +1018,8 @@ impl Run {
                 delay = delay.min(deadline.saturating_duration_since(now));
             }
         }
-        if self.writing.len() < MAX_WRITERS {
-            for capture in self.pending.values() {
+        for capture in self.pending.values() {
+            if self.writer_available(capture.snapshot.size) {
                 delay = delay.min(
                     capture
                         .ready_at(self.closing)
@@ -999,23 +1085,36 @@ impl Run {
             self.writing.remove(&id);
             let member_ids = self.writing_members.remove(&id).unwrap_or_default();
             for id in std::iter::once(id).chain(member_ids) {
-                match &result{
-                Ok(path)=>{
-                    match path.strip_prefix(self.journal.path.parent().unwrap()) {
-                        Ok(relative)=>self.append("case-ready",json!({"execution_id":id,"case_status":"ready","case_path":relative})),
-                        Err(_)=>self.append("case-error",json!({"execution_id":id,"case_status":"error","message":"case outside run directory"})),
-                    }
+                let ex = &self.entries[&id];
+                let relative = result.as_ref().map_err(String::as_str).and_then(|path| {
+                    path.strip_prefix(self.journal.path.parent().unwrap())
+                        .map_err(|_| "case outside run directory")
+                });
+                if let Ok(path) = relative {
+                    self.append("case-ready",json!({"execution_id":id,"case_status":"ready","case_path":path,
+                        "case_size":ex.case_size.map(CaptureSize::as_str),"case_detail":ex.case_detail}));
+                } else if let Err(error) = relative {
+                    self.append(
+                        "case-error",
+                        json!({"execution_id":id,"case_status":"error","message":error}),
+                    );
                 }
-                Err(error)=>self.append("case-error",json!({"execution_id":id,"case_status":"error","message":error})),
-            }
             }
         }
-        while self.writing.len() < MAX_WRITERS {
+        loop {
             let candidate = self
                 .pending
                 .iter()
-                .filter(|(_, p)| p.ready_at(self.closing) <= now)
-                .min_by_key(|(_, p)| (p.reason == "slow_pass", p.order))
+                .filter(|(_, p)| {
+                    self.writer_available(p.snapshot.size) && p.ready_at(self.closing) <= now
+                })
+                .min_by_key(|(_, p)| {
+                    (
+                        p.snapshot.size != CaptureSize::Bare,
+                        p.reason == "slow_pass",
+                        p.order,
+                    )
+                })
                 .map(|(id, _)| id.clone());
             let Some(id) = candidate else { break };
             let p = self.pending.remove(&id).unwrap();
@@ -1077,6 +1176,7 @@ impl Run {
                 pending.push(json!({
                     "execution_id": id,
                     "name": self.entries[id].start.name,
+                    "case_size": self.entries[id].case_size.map(CaptureSize::as_str),
                     "state": if capture.ready > now {"in_grace"} else {"queued"},
                 }));
             }
@@ -1089,6 +1189,7 @@ impl Run {
             pending.push(json!({
                 "execution_id": id,
                 "name": self.entries[id].start.name,
+                "case_size": self.entries[id].case_size.map(CaptureSize::as_str),
                 "state":"writing",
             }));
         }

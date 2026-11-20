@@ -11,7 +11,11 @@ Pass `domain` on individual MCP reads and watches when several callers share a c
 
 ### Added — read-only progress for parallel test runs
 
-Query a domain’s current run, active executions, verdicts, cases and recent runs using the CLI or MCP. Domain listings expose a compact active-run projection. Runners can supply a planned execution count at begin. See the [progress API](docs/test-log-progress.md).
+Query a domain’s current run, active executions, verdicts, cases and recent runs using the CLI or MCP. Domain listings expose a compact active-run projection. Runners can supply a planned execution count at begin or fill it in later by repeating begin while the run is open. See the [progress API](docs/test-log-progress.md).
+
+### Fixed — test-log cases survive capture pressure
+
+Abnormal endings get a case even when the capture budget or snapshot queue is exhausted. Reports name full, minimal, and bare cases and show how much evidence was omitted. One snapshot slot is reserved for `step:*` executions. The full failure limit follows the planned execution count unless the runner overrides it. Failed reruns now follow the failure policy.
 
 ### Fixed — an SDK call hung forever when the broker closed the connection mid-call
 

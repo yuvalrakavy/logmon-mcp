@@ -28,12 +28,16 @@ The broker retains the last **ten settled runs per domain**, plus the current ru
 
 ## Read progress
 
-- `executions` counts attempts and chains. An execution with several dependent steps contributes one. Set the optional `--planned-executions N` on `test-log begin` when the runner already knows the total in these units. The original plan stays fixed. Unknown is null, an explicitly empty plan is zero, and a run can settle below its plan when tests are cut.
+- `executions` counts attempts and chains. An execution with several dependent steps contributes one. Set `--planned-executions N` on `test-log begin` when the runner knows the total in these units. An unknown count is null, and zero is an explicitly empty plan. A run can settle below its plan when tests are cut.
 - `by_verdict` includes OK, FAIL, TIMEOUT, ABORTED and NO_VERDICT, even for zero counts. Its sum equals `ended`. A broker deadline without a runner result contributes NO_VERDICT. A runner-reported timeout contributes TIMEOUT. A subsequently accepted end can replace a missing verdict without increasing ended.
 - `longest_in_flight` shows up to three executions by oldest start, including their execution ID, trace ID when known, age and overdue time. `last_completion_at` is null until the first execution ends.
 - `recent_failures` shows the latest 20 runner failures, newest first, with the assertion and case outcome when available. A truncation flag indicates that older failures exist. The runner can supply a rerun command. Case paths are relative to the JSONL directory. A remote page must map that directory to an accessible location.
 - The `cases` counters describe capture decisions for individual executions. Several executions may share one report. Use `distinct_cases_written` and the grouped file list to count or navigate actual cases. Use `summaries.pending` to see how many ended executions still await their final summary. `replayed_ends` counts newly applied replayed ends. Unconfirmed local deliveries are known only to the runner.
+- `case_status` tracks creation as `pending`, `ready`, or `error`. `case_size` describes the evidence as `full`, `minimal`, or `bare`. A bare case reports `capture_queue_full` or `capture_pool_exhausted` in `case_detail`. An OK rerun or slow pass can still report `skipped_rerun_limit` or `skipped_slow_limit`. A queued slow-pass snapshot can be marked `evicted_for_priority` when a higher-priority capture takes its slot.
+- `cases.max_failures` is the current full-case limit, and `cases.minimal_by_failure_limit` counts minimal cases admitted under it. The legacy `refused_by_max_failures` counter stays zero. See the [test-log guide](../README.md#nightly-test-logs).
 - Times use UTC and durations use milliseconds. The journal health field reports known write errors. For offline readers, consume complete JSONL lines. A `case-ready` record links the case, `case-error` reports a failed write, and `run-settled` records final counts in `aggregates.executions`, `aggregates.cases`, `aggregates.summaries` and `aggregates.replayed_ends`.
+
+If the count becomes known later, repeat `test-log begin` with the same domain, run ID and JSONL path, and supply `--planned-executions N`. The open run records the count in a `test-log-plan` journal event and publishes it in status and list. The repeat updates only the plan. An identical count is idempotent, and a different count for an existing plan is refused with `planned_executions_conflict`.
 
 ## Error handling and compatibility
 

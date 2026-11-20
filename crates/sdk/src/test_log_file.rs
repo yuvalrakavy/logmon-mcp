@@ -109,7 +109,7 @@ impl TestLogFile {
                 entry.insert("summary_final".into(), Value::Bool(kind == "summary-final"));
             }
             "case-ready" | "case-skipped" | "case-error" => {
-                for key in ["case_status", "case_path"] {
+                for key in ["case_status", "case_path", "case_size", "case_detail"] {
                     if let Some(v) = row.remove(key) {
                         entry.insert(key.into(), v);
                     }

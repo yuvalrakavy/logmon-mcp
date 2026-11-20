@@ -27,7 +27,8 @@ pub struct TestLogSelector {
 pub struct TestLogBegin {
     /// Identity of this run, unique across invocations.
     pub run_id: String,
-    /// Original number of planned executions. Zero is an explicitly empty plan.
+    /// Planned executions. Set it on begin or repeat begin to fill an unknown count
+    /// while the run is open. Zero is an explicitly empty plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_executions: Option<u64>,
     /// Absolute JSONL path chosen by the run owner.
@@ -50,10 +51,12 @@ pub struct TestLogBegin {
     /// Caller acknowledgement budget for live start/end in milliseconds, default 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_ack_timeout_ms: Option<u64>,
-    /// Number of primary failures eligible for cases, default 500.
+    /// Override the number of test failures eligible for full cases. Otherwise use
+    /// 10% of the planned executions (20 to 300), or 50 if the plan is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_failures: Option<u64>,
-    /// Number of isolated reruns eligible for cases, including passes.
+    /// Number of OK isolated reruns eligible for cases. Failed reruns use the
+    /// same policy as other failed tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rerun_cases: Option<u64>,
     /// Maximum slow-pass admissions before refusing further slow cases, default 20.
@@ -193,6 +196,9 @@ pub struct TestLogPendingCase {
     pub name: String,
     /// Current pending state.
     pub state: String,
+    /// Size selected for the case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
