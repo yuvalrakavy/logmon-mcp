@@ -80,7 +80,7 @@ through `logmon_broker_sdk::test_log` and the following methods on `Broker`.
 | `test_log_begin` | Run ID, absolute JSONL path, capture and summary settings |
 | `test_log_start` | Run ID, execution ID, name, selector and original start timestamp |
 | `test_log_end` | Repeat that identity and start timestamp, add end timestamp, verdict and structured failure fields |
-| `test_log_machine_load` | Run ID, host, timestamp and sampler fields |
+| `test_log_machine_load` | Run ID, host, source timestamp, optional sampler kind (default `machine-load`) and sampler fields |
 | `test_log_replay` | Run ID and up to 100 original end payloads in delivery order |
 | `test_log_close` / `test_log_seal` | Run ID and wait budget in milliseconds |
 

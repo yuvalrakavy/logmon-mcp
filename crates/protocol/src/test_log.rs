@@ -134,6 +134,9 @@ pub struct TestLogEnd {
 pub struct TestLogMachineLoad {
     /// Identity of the active run.
     pub run_id: String,
+    /// External sampler identity. Older callers default to machine-load.
+    #[serde(default = "default_machine_kind")]
+    pub kind: String,
     /// Source timestamp for the machine sample.
     pub ts: DateTime<Utc>,
     /// Name of the sampled host.
@@ -301,4 +304,69 @@ pub struct TestLogReplayResult {
     /// Per-item applied, already_applied or refused decisions in input order.
     #[serde(default)]
     pub results: Vec<TestLogAck>,
+}
+
+fn default_machine_kind() -> String {
+    "machine-load".into()
+}
+
+/// Source-time index, separately bracketed for each host and sampler.
+pub struct MachineSeries<T> {
+    streams: BTreeMap<(String, String), BTreeMap<(DateTime<Utc>, u64), T>>,
+    count: u64,
+}
+
+impl<T> Default for MachineSeries<T> {
+    fn default() -> Self {
+        Self {
+            streams: BTreeMap::new(),
+            count: 0,
+        }
+    }
+}
+impl<T> MachineSeries<T> {
+    pub fn insert(&mut self, host: &str, kind: &str, ts: DateTime<Utc>, sample: T) {
+        self.count += 1;
+        self.streams
+            .entry((host.into(), kind.into()))
+            .or_default()
+            .insert((ts, self.count), sample);
+    }
+
+    pub fn window(&self, start: DateTime<Utc>, end: DateTime<Utc>, bracket: bool) -> Vec<&T> {
+        let mut selected = Vec::new();
+        let first = (start, 0);
+        let last = (end.max(start), u64::MAX);
+        for stream in self.streams.values() {
+            if bracket {
+                selected.extend(stream.range(..first).next_back());
+            }
+            selected.extend(stream.range(first..=last));
+            if bracket {
+                use std::ops::Bound::{Excluded, Unbounded};
+                selected.extend(stream.range((Excluded(last), Unbounded)).next());
+            }
+        }
+        selected.sort_unstable_by_key(|(key, _)| **key);
+        selected.into_iter().map(|(_, v)| v).collect()
+    }
+}
+
+/// Render the scheduling fields first and preserve the complete sampler payload.
+pub fn machine_fields(fields: &Value) -> String {
+    const FIRST: [&str; 5] = ["load", "idle", "runnable", "own_pri", "spawned"];
+    let Some(map) = fields.as_object() else {
+        return fields.to_string();
+    };
+    FIRST
+        .into_iter()
+        .filter_map(|key| map.get(key).map(|v| (key, v)))
+        .chain(
+            map.iter()
+                .filter(|(k, _)| !FIRST.contains(&k.as_str()))
+                .map(|(k, v)| (k.as_str(), v)),
+        )
+        .map(|(k, v)| format!("{}={v}", k.escape_debug()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }

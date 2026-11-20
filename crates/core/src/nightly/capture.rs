@@ -434,6 +434,10 @@ impl CaptureSnapshot {
         self.end = self.end.max(other.end);
     }
 
+    pub(crate) fn add_machine_sample(&mut self, row: Arc<LogEntry>) {
+        self.logs.insert(row.seq, row);
+    }
+
     pub fn is_over_budget(&self) -> bool {
         self.omitted.iter().any(|&count| count != 0)
     }
@@ -760,18 +764,24 @@ Case size: {}
                 == Some("machine-load")
                 && record.additional_fields.get("run_id") == meta.get("run_id")
         });
-        writeln!(body, "\n## Machine samples ({})\n", samples.clone().count()).unwrap();
-        if let Some(sample) = samples.max_by_key(|record| (record.timestamp, record.seq)) {
-            if let Some(fields) = sample.additional_fields.get("sample") {
-                writeln!(
-                    body,
-                    "Latest retained sample from {} at {}:\n\n    {}\n",
-                    sample.host,
-                    sample.timestamp.with_timezone(&zone).to_rfc3339(),
-                    fields.to_string().chars().take(1000).collect::<String>()
-                )
-                .unwrap();
-            }
+        let mut samples: Vec<_> = samples.collect();
+        samples.sort_by_key(|r| (r.timestamp, r.seq));
+        writeln!(body, "\n## Machine samples ({})\n", samples.len()).unwrap();
+        for sample in samples {
+            writeln!(
+                body,
+                "    {} {} {} {}",
+                sample.timestamp.with_timezone(&zone).to_rfc3339(),
+                sample.host.escape_debug(),
+                sample
+                    .additional_fields
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("machine-load")
+                    .escape_debug(),
+                logmon_broker_protocol::machine_fields(&sample.additional_fields["sample"])
+            )
+            .unwrap();
         }
         let mut slow: Vec<_> = self
             .spans

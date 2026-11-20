@@ -68,3 +68,11 @@ Use `unknown_domain` for an absent lane, `run_not_found` for an explicit ID abse
 Build the release broker and CLI with `cargo build --release --all-features`, then run `python3 scripts/bench-test-log-progress.py target/release`. The script starts an isolated broker with eight domains, sends logs, spans and lifecycle calls from eight workers in each domain, and compares two runs of the same workload. The second run launches separate CLI processes for domain discovery, current status on every lane, and retained history on one lane every two seconds. The output reports wall time and latency percentiles including process startup. Both runs verify final counts and the transition back to idle.
 
 A parent may set its session default with `use_domain`. A subagent using a second lane passes that lane as `domain` on begin, start, end, replay, machine-load, close, and seal. Pass it on status and list as well. Each lifecycle reply identifies its serving domain. Clearing logs also accepts an explicit domain.
+
+### Machine samples in a case
+
+Send external observations through `test_log.machine_load` with the run ID, source timestamp (`ts`), host and a JSON object of fields. The optional `kind` names the sampler and defaults to `machine-load`. The journal event stays `machine-load` for every kind. For example, select thread observations with `jq 'select(.event == "machine-load" and .kind == "thread-qos")'`.
+
+Full and reduced cases show the focus interval and the closest available sample on either side for each host and kind, in source-time order. Only samples received before the case writer takes the snapshot can appear. The offline summary reads the complete journal and shows in-window observations for failed executions and flagged slow passes. Bare cases retain their minimal evidence policy.
+
+Samples use their own run allowance (8 MiB, charged as serialized bytes plus 512 bytes per row) and their own per-domain journal queue allowance (256 rows or 1 MiB). They consume no slots in the domain log ring or execution quotas. At capacity the sender receives `status: refused` with `machine_sample_capacity` or `journal_queue_overflow`. The existing journal health result reports asynchronous write failures.

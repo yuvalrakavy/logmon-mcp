@@ -22,6 +22,7 @@ fn field<'a>(r: &'a Row, k: &str) -> &'a str {
 pub struct Report {
     log: TestLogFile,
     deadline: BTreeSet<String>,
+    samples: logmon_broker_protocol::MachineSeries<Row>,
     loads: Option<(f64, f64)>,
     unresolved: usize,
     zone: Tz,
@@ -34,6 +35,7 @@ impl Report {
         let mut report = Self {
             log,
             deadline: BTreeSet::new(),
+            samples: Default::default(),
             loads: None,
             unresolved,
             zone: chrono_tz::UTC,
@@ -80,6 +82,18 @@ impl Report {
                     let (lo, hi) = report.loads.get_or_insert((n, n));
                     *lo = lo.min(n);
                     *hi = hi.max(n);
+                }
+                if let Some(ts) = row
+                    .get("ts")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                {
+                    let host = field(&row, "host").to_owned();
+                    let kind = row
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("machine-load")
+                        .to_owned();
+                    report.samples.insert(&host, &kind, ts, row);
                 }
             }
         }
@@ -214,6 +228,39 @@ impl Report {
                 );
             }
             rows.push('\n');
+            if verdict != "OK" || reason == "slow_pass" || self.deadline.contains(id) {
+                let time = |key: &str| {
+                    row.get(key)
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                };
+                if let (Some(start), Some(end)) = (
+                    time("started_at"),
+                    time("ended_at")
+                        .or_else(|| time("captured_at"))
+                        .or_else(|| {
+                            row.get("coverage")?
+                                .get("case_snapshot_at")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        }),
+                ) {
+                    for sample in self.samples.window(start, end, false) {
+                        let _ = writeln!(
+                            rows,
+                            "      {} {} {} {}",
+                            field(sample, "ts"),
+                            field(sample, "host").escape_debug(),
+                            sample
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("machine-load")
+                                .escape_debug(),
+                            logmon_broker_protocol::machine_fields(
+                                sample.get("fields").unwrap_or(&Value::Null)
+                            )
+                        );
+                    }
+                }
+            }
         }
         let status = if !self.log.settled {
             "Finalization pending"
@@ -520,6 +567,33 @@ mod tests {
         for row in rows {
             writeln!(file, "{row}").unwrap();
         }
+    }
+
+    #[test]
+    fn report_machine_series_scopes_slow_and_failed_executions() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("series.jsonl");
+        let ts = "2026-11-20T00:01:00Z";
+        let mut rows = vec![
+            json!({"event":"machine-load","host":"a","ts":ts,"fields":{"load":4,"idle":70,"abnormal":"starved"}}),
+            json!({"event":"machine-load","host":"a","ts":"2026-11-20T00:00:00Z","kind":"recorder","fields":{"outside":true}}),
+        ];
+        for (id, verdict, reason) in [
+            ("a", "FAIL", "failure"),
+            ("b", "OK", "slow_pass"),
+            ("c", "OK", ""),
+        ] {
+            rows.push(json!({"event":"end-test","execution_id":id,"started_at":ts,"ended_at":ts,"verdict":verdict,"case_reason":reason}));
+        }
+        write_rows(&journal, &rows);
+        let md = Report::open(&journal, 0).unwrap().markdown();
+        assert_eq!(
+            md.matches("machine-load load=4 idle=70 abnormal=").count(),
+            2,
+            "{md}"
+        );
+        assert!(!md.contains("outside=true"));
     }
 
     #[test]

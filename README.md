@@ -1174,6 +1174,8 @@ tests, telemetry drops, and start/end acknowledgement latency. If full collectio
 costs too much for your CI window, try an intermediate percentage. Sampling by
 stable name keeps the same tests available for comparisons across builds.
 
+Machine observations from parallel test runs carry a host, source timestamp, optional sampler kind and arbitrary fields. Failure cases include a time series around the focus execution. The offline summary shows overlapping observations for failures and flagged slow passes. [Machine sample reporting and admission](docs/test-log-progress.md#machine-samples-in-a-case)
+
 ## Configuration
 
 For parallel producers, size the log and span rings independently. Optional maxima let a ring grow when eviction would cut into an active test or its grace period. Inspect current capacities and estimated memory before increasing a domain’s limits. See the [domain capacity and lifetime guide](docs/domain-capacity.md) for creation, resize, cleanup and restart examples.

@@ -603,6 +603,8 @@ load_case(path: "/abs/path/checkout-hang-260731-021530.md")   # loose files work
 3. **Check competing explanations.** Read the overlap table and inspect each relevant peer by its own trace ID in the same domain. Compare its interval with the focus slowdown or gap. Then examine domain-wide logs and any machine-load samples for shared-service errors or load. State the offset when comparing timestamps with an external report. Overlap alone establishes concurrency; a causal claim needs supporting evidence such as a recorded wait on the same resource.
 4. **Compare and report.** When an isolated rerun or passing baseline has a case, load it into a second postmortem domain. Compare the same operation in each, citing the trace or span ID, timestamp, duration and observed outcome. Qualify comparisons where a ring evicted early activity, a peer lacks a trace ID, or the window contains no load sample.
 
+For slow or failed executions, read the case’s **Machine samples** section in source-time order. Use host and sampler kind to compare observations. The nearest sample on either side gives context outside the execution. The offline run summary shows the in-window observations. Older journals without a sampler kind use `machine-load`.
+
 Example MCP reads after loading a case (substitute the returned domain and actual IDs):
 
 ```

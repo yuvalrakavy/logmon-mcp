@@ -160,6 +160,8 @@ pub(super) struct Run {
     pub(super) progress: super::progress::Progress,
     pub config: TestLogBegin,
     pub journal: Arc<Journal>,
+    samples: MachineSeries<Arc<LogEntry>>,
+    sample_bytes: usize,
     began_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub closing: bool,
@@ -497,6 +499,8 @@ impl Run {
             pending: HashMap::new(),
             writing: HashSet::new(),
             writing_members: HashMap::new(),
+            samples: MachineSeries::default(),
+            sample_bytes: 0,
             primary: 0,
             dirty_late: HashSet::new(),
             last_late_flush: Instant::now(),
@@ -628,8 +632,18 @@ impl Run {
         if self.closing {
             return refused(&sample.run_id, "run_closed");
         }
-        self.append("machine-load", serde_json::to_value(&sample).unwrap());
-        // Machine rows have no trace ID, but can match an explicit field selector.
+        // Independent, bounded retention. Charge a minimum per row for index overhead.
+        let cost = serde_json::to_vec(&sample).unwrap().len() + 512;
+        if cost > (8 << 20) - self.sample_bytes {
+            return refused(&sample.run_id, "machine_sample_capacity");
+        }
+        let mut data = serde_json::to_value(&sample).unwrap();
+        self.progress.apply("machine-load", &mut data);
+        data["event"] = json!("machine-load");
+        if !self.journal.append(data) {
+            return refused(&sample.run_id, "journal_queue_overflow");
+        }
+        self.sample_bytes += cost;
         let mut row = LogEntry::synthetic(Level::Info, "machine-load");
         row.timestamp = sample.ts;
         row.host = sample.host;
@@ -640,10 +654,11 @@ impl Run {
             .insert("run_id".into(), json!(sample.run_id));
         row.additional_fields
             .insert("sample".into(), json!(sample.fields));
-        if self.admit_record(Record::Log(&row)).0 {
-            domain.pipeline.append_to_store(row.clone());
-            self.observe_log(&row);
-        }
+        row.additional_fields
+            .insert("kind".into(), json!(sample.kind));
+        let host = row.host.clone();
+        self.samples
+            .insert(&host, &sample.kind, sample.ts, Arc::new(row));
         json!({"status":"accepted","run_id":self.config.run_id})
     }
     pub fn end(
@@ -1341,7 +1356,16 @@ impl Run {
                 })
                 .map(|(id, _)| id.clone());
             let Some(id) = candidate else { break };
-            let p = self.pending.remove(&id).unwrap();
+            let mut p = self.pending.remove(&id).unwrap();
+            if p.snapshot.size != CaptureSize::Bare {
+                let start = serde_json::from_value(p.metadata["started_at"].clone())
+                    .expect("execution start");
+                let end = serde_json::from_value(p.metadata["ended_at"].clone())
+                    .unwrap_or(p.snapshot.captured_at());
+                for row in self.samples.window(start, end, true) {
+                    p.snapshot.add_machine_sample(row.clone());
+                }
+            }
             let tx = self.finished_tx.clone();
             let key = id.clone();
             let members: Vec<_> = p.members.iter().map(|m| m.0.clone()).collect();

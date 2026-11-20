@@ -18,13 +18,22 @@ const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// Account for both queues against the same per-domain allowance.
 #[derive(Default)]
 pub(super) struct QueueBudget {
+    machine: Mutex<(usize, usize)>,
     used: Mutex<(usize, usize)>, // records and encoded bytes
 }
 
 impl QueueBudget {
     fn reserve(&self, bytes: usize) -> bool {
-        let mut used = self.used.lock().unwrap();
-        if used.0 >= MAX_RECORDS || bytes > MAX_BYTES.saturating_sub(used.1) {
+        Self::reserve_from(&self.used, MAX_RECORDS, MAX_BYTES, bytes)
+    }
+    fn reserve_from(
+        pool: &Mutex<(usize, usize)>,
+        records: usize,
+        limit: usize,
+        bytes: usize,
+    ) -> bool {
+        let mut used = pool.lock().unwrap();
+        if used.0 >= records || bytes > limit.saturating_sub(used.1) {
             return false;
         }
         used.0 += 1;
@@ -42,7 +51,7 @@ impl QueueBudget {
 #[derive(Default)]
 struct State {
     budget: Arc<QueueBudget>,
-    queue: VecDeque<Arc<[u8]>>,
+    queue: VecDeque<(Arc<[u8]>, bool)>,
     bytes: usize,
     lost: u64,
     gap_reported: u64,
@@ -54,7 +63,14 @@ struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        self.budget.release(self.queue.len(), self.bytes);
+        let machine = self.queue.iter().filter(|(_, sample)| *sample);
+        let count = machine.clone().count();
+        let bytes = machine.map(|(data, _)| data.len()).sum::<usize>();
+        self.budget
+            .release(self.queue.len() - count, self.bytes - bytes);
+        let mut used = self.budget.machine.lock().unwrap();
+        used.0 -= count;
+        used.1 -= bytes;
     }
 }
 
@@ -109,19 +125,26 @@ impl Journal {
         })
     }
 
-    pub fn append(&self, record: Value) {
+    pub fn append(&self, record: Value) -> bool {
+        let machine = record["event"] == "machine-load";
         let mut bytes = serde_json::to_vec(&record).expect("JSON value serializes");
         bytes.push(b'\n');
         let mut s = self.shared.0.lock().unwrap();
-        if !s.budget.reserve(bytes.len()) {
+        let reserved = if machine {
+            QueueBudget::reserve_from(&s.budget.machine, 256, 1024 * 1024, bytes.len())
+        } else {
+            s.budget.reserve(bytes.len())
+        };
+        if !reserved {
             s.lost += 1;
             self.shared.2.lost.store(s.lost, Ordering::Release);
             self.shared.1.notify_one();
-            return;
+            return false;
         }
         s.bytes += bytes.len();
-        s.queue.push_back(bytes.into());
+        s.queue.push_back((bytes.into(), machine));
         self.shared.1.notify_one();
+        true
     }
 
     pub fn progress_health(&self) -> Arc<Health> {
@@ -161,7 +184,7 @@ fn write_loop(mut file: File, shared: Shared) {
                 s = shared.1.wait(s).unwrap();
             }
             if let Some(front) = s.queue.front() {
-                (front.clone(), None)
+                (front.0.clone(), None)
             } else if s.gap_reported < s.lost {
                 let mut bytes =
                     serde_json::to_vec(&json!({"event":"test-log-gap","lost_records":s.lost}))
@@ -187,9 +210,15 @@ fn write_loop(mut file: File, shared: Shared) {
                 if let Some(lost) = gap {
                     s.gap_reported = lost;
                 } else {
-                    s.queue.pop_front();
+                    let (_, machine) = s.queue.pop_front().unwrap();
                     s.bytes -= bytes.len();
-                    s.budget.release(1, bytes.len());
+                    if machine {
+                        let mut used = s.budget.machine.lock().unwrap();
+                        used.0 -= 1;
+                        used.1 -= bytes.len();
+                    } else {
+                        s.budget.release(1, bytes.len());
+                    }
                 }
                 s.degraded = false;
             }
@@ -214,6 +243,23 @@ fn write_loop(mut file: File, shared: Shared) {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn sample_queue_overflow_preserves_lifecycle_capacity() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let journal = Journal::from_file(
+            temp.path(),
+            File::open(temp.path()).unwrap(),
+            Arc::default(),
+        )
+        .unwrap();
+        for _ in 0..256 {
+            assert!(journal.append(json!({"event":"machine-load"})));
+        }
+        assert!(!journal.append(json!({"event":"machine-load"})));
+        assert!(journal.append(json!({"event":"end-test"})));
+        assert_eq!(journal.status()["lost_records"], 1);
+    }
 
     #[test]
     fn successive_unwritable_runs_share_the_domain_byte_budget() {

@@ -1200,6 +1200,11 @@
           "description": "Identity of the active run.",
           "type": "string"
         },
+        "kind": {
+          "description": "External sampler identity. Older callers default to machine-load.",
+          "type": "string",
+          "default": "machine-load"
+        },
         "ts": {
           "description": "Source timestamp for the machine sample.",
           "type": "string",

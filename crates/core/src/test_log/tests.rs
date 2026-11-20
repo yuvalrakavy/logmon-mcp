@@ -1662,3 +1662,63 @@ fn progress_lists_oldest_three_and_freezes_at_settlement() {
         log.status("tests", Some("one"))["test_log"]["elapsed_ms"]
     );
 }
+
+#[test]
+fn machine_series_brackets_focus_without_displacing_execution_evidence() {
+    let f = Fixture::with_capacity(1);
+    f.rpc("begin", json!({"run_id":"one","jsonl_path":f.dir.path().join("one.jsonl"),"expanded_cases":true,"grace_period_ms":0}));
+    let mut execution = f.event("a");
+    let origin = Utc::now() - chrono::Duration::minutes(1);
+    let ts = |n| origin + chrono::Duration::seconds(n);
+    execution["started_at"] = json!(ts(10));
+    f.rpc("start", execution.clone());
+    f.log(1, "must survive");
+    for n in [21, 0, 9, 20, 10, 22] {
+        assert_eq!(f.rpc("machine_load",json!({"run_id":"one","ts":ts(n),"host":"test","kind":"recorder","fields":{"sequence":n}}))["status"],"accepted");
+    }
+    execution["ended_at"] = json!(ts(20));
+    execution["verdict"] = json!("FAIL");
+    f.rpc("end", execution);
+    f.close("one");
+    let ready = f.case_row("a");
+    let report =
+        std::fs::read_to_string(f.dir.path().join(ready["case_path"].as_str().unwrap())).unwrap();
+    assert!(report.contains("Machine samples (4)"));
+    assert!(report.contains("test recorder sequence=9"));
+    assert!(!report.contains("sequence=22"));
+    let logs = f.case_logs(&ready);
+    assert!(logs.iter().any(|log| log.message == "must survive"));
+    let mut values: Vec<_> = logs
+        .iter()
+        .filter(|r| r.message == "machine-load")
+        .map(|r| {
+            assert_eq!(r.additional_fields["kind"], "recorder");
+            r.additional_fields["sample"]["sequence"].as_i64().unwrap()
+        })
+        .collect();
+    values.sort();
+    assert_eq!(values, [9, 10, 20, 21]);
+}
+
+#[test]
+fn machine_sample_capacity_refuses_explicitly() {
+    let f = Fixture::new();
+    f.begin("one", 0);
+    let row = json!({"run_id":"one","ts":Utc::now(),"host":"a","fields":{"s":"x".repeat(8 << 20)}});
+    assert_eq!(
+        f.rpc("machine_load", row)["code"],
+        "machine_sample_capacity"
+    );
+    assert_eq!(
+        f.rpc(
+            "machine_load",
+            json!({"run_id":"one","ts":Utc::now(),"host":"a"})
+        )["status"],
+        "accepted"
+    );
+    f.close("one");
+    assert!(f
+        .rows()
+        .iter()
+        .any(|r| r["event"] == "machine-load" && r["kind"] == "machine-load"));
+}
