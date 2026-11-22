@@ -4,6 +4,7 @@
 <dict>
     <key>Label</key>            <string>logmon.broker</string>
     <key>ProgramArguments</key> <array><string>{BINARY_PATH}</string></array>
+    <key>ProcessType</key>      <string>Interactive</string>
     <key>RunAtLoad</key>        <true/>
     <key>KeepAlive</key>        <true/>
     <key>StandardErrorPath</key> <string>{STDERR_PATH}</string>
