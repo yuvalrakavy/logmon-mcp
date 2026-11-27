@@ -46,6 +46,10 @@ struct Mcp {
 
 impl Mcp {
     fn start(socket: &Path, config_dir: &Path) -> Self {
+        Self::start_with_probe(socket, config_dir, false)
+    }
+
+    fn start_with_probe(socket: &Path, config_dir: &Path, probe: bool) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_logmon-mcp"))
             // A NAMED session, because collectors refuse an anonymous one —
             // "they outlive a disconnect, and an anonymous session's identity
@@ -71,6 +75,10 @@ impl Mcp {
             init: Value::Null,
         };
 
+        if probe {
+            let reply = m.request("server/discover", json!({}));
+            assert_eq!(reply["error"]["code"], -32601, "{reply}");
+        }
         let r = m.request(
             "initialize",
             json!({
@@ -163,6 +171,20 @@ where
         let scratch = tempfile::tempdir().expect("tempdir");
         let mut mcp = Mcp::start(&socket, scratch.path());
         work(&mut mcp, scratch.path());
+    })
+    .await
+    .expect("blocking work");
+    drop(daemon);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_probe_falls_back_to_initialize_on_the_same_connection() {
+    let (daemon, _) = spawn_with_cli().await;
+    let socket = daemon.socket_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let mut mcp = Mcp::start_with_probe(&socket, scratch.path(), true);
+        assert!(mcp.tool_names().iter().any(|name| name == "get_status"));
     })
     .await
     .expect("blocking work");

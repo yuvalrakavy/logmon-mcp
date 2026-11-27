@@ -244,6 +244,16 @@ Add to `~/.gemini/settings.json`:
 </details>
 
 <details>
+<summary><b>Google Antigravity</b></summary>
+
+Register the installed stdio binary with `agy mcp add logmon "$HOME/.cargo/bin/logmon-mcp"`.
+Logmon answers Antigravity's initial `server/discover` probe with JSON-RPC
+`Method not found`, so Antigravity continues with MCP `initialize` on the same
+connection.
+
+</details>
+
+<details>
 <summary><b>OpenAI Codex — desktop app, CLI, and IDE extension</b></summary>
 
 Codex uses **TOML**, not `~/.codex/config.json` or the `mcpServers` JSON
